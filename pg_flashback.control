@@ -1,0 +1,6 @@
+comment = 'pg_flashback:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_flashback'
+relocatable = false
+superuser = true
+trusted = false

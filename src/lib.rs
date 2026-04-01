@@ -1,0 +1,111 @@
+use pgrx::pg_sys;
+use pgrx::prelude::*;
+
+mod api;
+mod capture;
+mod restore;
+mod runtime_guard;
+mod storage;
+
+::pgrx::pg_module_magic!(name, version);
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    capture::ddl_hook::install_process_utility_hook();
+    storage::worker::register_worker_and_guc();
+}
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
+    storage::worker::pg_flashback_delta_worker_main(arg);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPluginCallbacks) {
+    capture::logical_decoding::output_plugin_init(cb);
+}
+
+#[pg_extern]
+fn hello_pg_flashback() -> &'static str {
+    "Hello, pg_flashback"
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    const COMMON_SETUP: &str = include_str!("../tests/sql/integration/_common_setup.sql");
+
+    fn run_integration_sql(sql: &str) {
+        Spi::run(COMMON_SETUP).expect("common integration setup failed");
+        Spi::run(sql).expect("integration SQL scenario failed");
+    }
+
+    macro_rules! sql_test {
+        ($name:ident, $path:literal) => {
+            #[pg_test]
+            fn $name() {
+                run_integration_sql(include_str!($path));
+            }
+        };
+    }
+
+    #[pg_test]
+    fn test_hello_pg_flashback() {
+        assert_eq!("Hello, pg_flashback", crate::hello_pg_flashback());
+    }
+
+    sql_test!(it_dml_insert_restore, "../tests/sql/integration/dml_insert_restore.sql");
+    sql_test!(it_dml_update_restore, "../tests/sql/integration/dml_update_restore.sql");
+    sql_test!(it_dml_delete_restore, "../tests/sql/integration/dml_delete_restore.sql");
+    sql_test!(it_dml_ten_updates_restore, "../tests/sql/integration/dml_ten_updates_restore.sql");
+    sql_test!(it_dml_batch_insert_1000_restore, "../tests/sql/integration/dml_batch_insert_1000_restore.sql");
+    sql_test!(it_dml_update_all_rows_restore, "../tests/sql/integration/dml_update_all_rows_restore.sql");
+
+    sql_test!(it_ddl_truncate_restore, "../tests/sql/integration/ddl_truncate_restore.sql");
+    sql_test!(it_ddl_drop_restore, "../tests/sql/integration/ddl_drop_restore.sql");
+    sql_test!(it_ddl_truncate_then_insert_restore, "../tests/sql/integration/ddl_truncate_then_insert_restore.sql");
+    sql_test!(it_ddl_drop_recreate_same_name_restore, "../tests/sql/integration/ddl_drop_recreate_same_name_restore.sql");
+
+    sql_test!(it_schema_add_column_restore_old_time, "../tests/sql/integration/schema_add_column_restore_old_time.sql");
+    sql_test!(it_schema_drop_column_restore_old_time, "../tests/sql/integration/schema_drop_column_restore_old_time.sql");
+    sql_test!(it_schema_alter_type_restore, "../tests/sql/integration/schema_alter_type_restore.sql");
+    sql_test!(it_schema_multiple_alters_restore_oldest, "../tests/sql/integration/schema_multiple_alters_restore_oldest.sql");
+
+    sql_test!(it_multi_two_tables_restore, "../tests/sql/integration/multi_two_tables_restore.sql");
+    sql_test!(it_multi_fk_two_tables_restore, "../tests/sql/integration/multi_fk_two_tables_restore.sql");
+    sql_test!(it_multi_three_tables_restore, "../tests/sql/integration/multi_three_tables_restore.sql");
+    sql_test!(it_multi_drop_one_update_other_restore, "../tests/sql/integration/multi_drop_one_update_other_restore.sql");
+
+    sql_test!(it_edge_empty_table_restore, "../tests/sql/integration/edge_empty_table_restore.sql");
+    sql_test!(it_edge_null_values_restore, "../tests/sql/integration/edge_null_values_restore.sql");
+    sql_test!(it_edge_toast_long_text_restore, "../tests/sql/integration/edge_toast_long_text_restore.sql");
+    sql_test!(it_edge_same_tx_insert_update_delete_restore, "../tests/sql/integration/edge_same_tx_insert_update_delete_restore.sql");
+    sql_test!(it_edge_restore_without_tracking_error, "../tests/sql/integration/edge_restore_without_tracking_error.sql");
+    sql_test!(it_edge_partial_coverage_drop_restore, "../tests/sql/integration/edge_partial_coverage_drop_restore.sql");
+
+    sql_test!(it_checkpoint_after_restore, "../tests/sql/integration/checkpoint_after_restore.sql");
+    sql_test!(it_checkpoint_between_two_points_restore, "../tests/sql/integration/checkpoint_between_two_points_restore.sql");
+    sql_test!(it_checkpoint_no_checkpoint_long_chain_restore, "../tests/sql/integration/checkpoint_no_checkpoint_long_chain_restore.sql");
+}
+
+/// This module is required by `cargo pgrx test` invocations.
+/// It must be visible at the root of your extension crate.
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {
+        // perform one-off initialization when the pg_test framework starts
+    }
+
+    #[must_use]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        // return any postgresql.conf settings that are required for your tests
+        vec![
+            "wal_level=logical",
+            "max_replication_slots=10",
+            "shared_preload_libraries='pg_flashback'",
+        ]
+    }
+}

@@ -1,0 +1,30 @@
+DO $tv$
+DECLARE t_before timestamptz;
+BEGIN
+    DROP TABLE IF EXISTS public.it_m3_c;
+    DROP TABLE IF EXISTS public.it_m3_b;
+    DROP TABLE IF EXISTS public.it_m3_a;
+    CREATE TABLE public.it_m3_a (id int primary key, v text);
+    CREATE TABLE public.it_m3_b (id int primary key, v text);
+    CREATE TABLE public.it_m3_c (id int primary key, v text);
+    INSERT INTO public.it_m3_a VALUES (1,'a0');
+    INSERT INTO public.it_m3_b VALUES (1,'b0');
+    INSERT INTO public.it_m3_c VALUES (1,'c0');
+    PERFORM flashback_track('public.it_m3_a');
+    PERFORM flashback_test_attach_capture_trigger('public.it_m3_a'::regclass);
+    PERFORM flashback_track('public.it_m3_b');
+    PERFORM flashback_test_attach_capture_trigger('public.it_m3_b'::regclass);
+    PERFORM flashback_track('public.it_m3_c');
+    PERFORM flashback_test_attach_capture_trigger('public.it_m3_c'::regclass);
+    t_before := clock_timestamp();
+    UPDATE public.it_m3_a SET v='a1' WHERE id=1;
+    UPDATE public.it_m3_b SET v='b1' WHERE id=1;
+    UPDATE public.it_m3_c SET v='c1' WHERE id=1;
+    PERFORM flashback_restore('public.it_m3_a', t_before);
+    PERFORM flashback_restore('public.it_m3_b', t_before);
+    PERFORM flashback_restore('public.it_m3_c', t_before);
+    IF NOT EXISTS (SELECT 1 FROM public.it_m3_a WHERE v='a0') THEN RAISE EXCEPTION 'm3 a failed'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.it_m3_b WHERE v='b0') THEN RAISE EXCEPTION 'm3 b failed'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.it_m3_c WHERE v='c0') THEN RAISE EXCEPTION 'm3 c failed'; END IF;
+END;
+$tv$;
