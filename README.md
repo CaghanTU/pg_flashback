@@ -45,6 +45,13 @@ SELECT flashback_restore('orders', now() - interval '30 seconds');
 
 -- Verify
 SELECT count(*) FROM orders;  -- All rows back
+
+-- Or just QUERY the past without restoring
+SELECT * FROM flashback_query(
+    'orders',
+    now() - interval '30 seconds',
+    'SELECT * FROM $FB_TABLE WHERE total > 100'
+) AS t(id int, total numeric, status text);
 ```
 
 ## Features
@@ -53,6 +60,7 @@ SELECT count(*) FROM orders;  -- All rows back
 |---------|--------|
 | Single-table restore to any timestamp | ✅ |
 | Multi-table restore in one transaction | ✅ |
+| **Flashback Query (SELECT AS OF)** | ✅ |
 | Schema evolution awareness (ADD/DROP COLUMN) | ✅ |
 | DDL capture (TRUNCATE, DROP TABLE, ALTER TABLE) | ✅ |
 | Automatic checkpoints for fast restore | ✅ |
@@ -60,9 +68,10 @@ SELECT count(*) FROM orders;  -- All rows back
 | Serial/sequence restoration | ✅ |
 | Global kill switch (`pg_flashback.enabled`) | ✅ |
 | Monitoring view (`pg_stat_flashback`) | ✅ |
-| Restore audit log | ✅ |
+| Restore audit log + progress reporting | ✅ |
 | Large row protection (TOAST guard) | ✅ |
-| Concurrent restore safety (advisory lock) | ✅ |
+| Per-table concurrent restore safety | ✅ |
+| Native JSONB pipeline (zero conversion) | ✅ |
 
 ## Write Overhead Benchmark
 
@@ -75,7 +84,7 @@ Measured on PostgreSQL 17, single-node:
 | Mixed DML 15K ops | 37 ms | 99 ms | **2.7x** |
 | Wide table UPDATE (15 cols, 5K rows) | 11 ms | 91 ms | **8.0x** |
 
-Bulk INSERT uses statement-level triggers with transition tables. UPDATE uses per-row triggers. Staging writes use `json`; the background worker converts to `jsonb` asynchronously.
+Bulk INSERT uses statement-level triggers with transition tables. UPDATE uses per-row triggers. All stages use native `jsonb` — no json→jsonb conversion overhead.
 
 ## Architecture
 

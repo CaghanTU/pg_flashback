@@ -146,7 +146,7 @@ fn flush_staging_to_delta_log() {
                     ORDER BY sv.schema_version DESC
                     LIMIT 1
                 ), 1),
-                m.old_data::jsonb, m.new_data::jsonb
+                m.old_data, m.new_data
             FROM moved m
             WHERE EXISTS (
                 SELECT 1 FROM flashback.tracked_tables tt

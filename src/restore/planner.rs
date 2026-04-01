@@ -17,7 +17,6 @@ extension_sql!(
         v_target_schema_version bigint;
         v_target_schema_def jsonb;
         v_start_schema_def jsonb;
-        v_snapshot_rows jsonb;
         v_skipped_defaults jsonb;
         current_rel_oid oid;
         rec record;
@@ -26,10 +25,12 @@ extension_sql!(
         cols text;
         vals text;
         applied bigint := 0;
+        v_total_events bigint;
     BEGIN
         -- Serialize concurrent restores with an advisory lock.
         -- Uses xact-level lock: released automatically on COMMIT/ROLLBACK.
-        PERFORM pg_advisory_xact_lock(3589442679);
+        -- Lock key is per-table (rel_oid), so unrelated tables can restore concurrently.
+        PERFORM pg_advisory_xact_lock(358944::integer, to_regclass(target_table)::oid::integer);
 
         PERFORM flashback_set_restore_in_progress(true);
 
@@ -127,18 +128,22 @@ extension_sql!(
             RAISE EXCEPTION 'flashback_restore: failed to create target table %.%', v_schema_name, v_table_name;
         END IF;
 
+        -- Bulk-load snapshot using INSERT...SELECT (no row-by-row, no jsonb blob)
         EXECUTE format(
-            'SELECT COALESCE(jsonb_agg(to_jsonb(t)), ''[]''::jsonb) FROM %s t',
-            v_start_table
-        )
-          INTO v_snapshot_rows;
-
-        PERFORM flashback_restore_rows_from_snapshot(
-            current_rel_oid,
-            v_schema_name,
-            v_table_name,
-            v_snapshot_rows
+            'INSERT INTO %I.%I SELECT * FROM %s',
+            v_schema_name, v_table_name, v_start_table
         );
+        RAISE NOTICE 'flashback_restore [%]: snapshot loaded from %', target_table, v_start_table;
+
+        -- Count total events to replay for progress reporting
+        SELECT count(*) INTO v_total_events
+        FROM flashback.delta_log d
+        WHERE d.rel_oid = v_rel_oid
+          AND d.committed_at IS NOT NULL
+          AND d.event_time > v_start_at
+          AND d.event_time <= target_time;
+
+        RAISE NOTICE 'flashback_restore [%]: replaying % events ...', target_table, v_total_events;
 
         FOR rec IN
             SELECT d.event_id, d.event_type, d.old_data, d.new_data
@@ -226,6 +231,12 @@ extension_sql!(
             END IF;
 
             applied := applied + 1;
+
+            IF applied % 10000 = 0 THEN
+                RAISE NOTICE 'flashback_restore [%]: % / % events applied (% %%)',
+                    target_table, applied, v_total_events,
+                    round(100.0 * applied / GREATEST(v_total_events, 1), 1);
+            END IF;
         END LOOP;
 
         -- Restore serial defaults that were deferred to avoid DDL-hook recursion
@@ -302,6 +313,7 @@ extension_sql!(
             VALUES (target_table, target_time, applied, true, NULL);
         END IF;
 
+        RAISE NOTICE 'flashback_restore [%]: complete — % events applied', target_table, applied;
         PERFORM flashback_set_restore_in_progress(false);
         RETURN applied;
     EXCEPTION WHEN OTHERS THEN
@@ -392,6 +404,147 @@ extension_sql!(
             PERFORM set_config('session_replication_role', 'origin', true);
             RAISE;
         END;
+    END;
+    $$;
+
+    -- ----------------------------------------------------------------
+    -- flashback_query: point-in-time SELECT without modifying the table
+    -- ----------------------------------------------------------------
+    -- Reconstructs the table state at `target_time` into a temporary
+    -- table and executes the given query against it.  The query must
+    -- contain the token `$FB_TABLE` which is replaced with the temp
+    -- table name.  Returns SETOF record via a refcursor so the caller
+    -- can iterate the result set.
+    --
+    -- Usage:
+    --   SELECT * FROM flashback_query(
+    --       'public.orders',
+    --       '2025-01-01 12:00:00'::timestamptz,
+    --       'SELECT * FROM $FB_TABLE WHERE total > 100'
+    --   ) AS t(id int, total numeric, status text);
+    -- ----------------------------------------------------------------
+    CREATE OR REPLACE FUNCTION flashback_query(
+        target_table text,
+        target_time  timestamptz,
+        query        text DEFAULT NULL
+    )
+    RETURNS SETOF record
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        v_rel_oid oid;
+        v_schema_name text;
+        v_table_name text;
+        v_base_snapshot_table text;
+        v_tracked_since timestamptz;
+        v_start_at timestamptz;
+        v_start_table text;
+        v_start_schema_def jsonb;
+        v_tmp text;
+        rec record;
+        pred text;
+        cols text;
+        vals text;
+        v_query text;
+    BEGIN
+        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
+          INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND (
+              tt.rel_oid = to_regclass(target_table)::oid
+              OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
+              OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
+          )
+        ORDER BY
+            (tt.rel_oid = to_regclass(target_table)::oid) DESC,
+            (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
+            tt.tracked_since DESC
+        LIMIT 1;
+
+        IF v_rel_oid IS NULL THEN
+            RAISE EXCEPTION 'flashback_query: table % is not tracked', target_table;
+        END IF;
+        IF target_time < v_tracked_since THEN
+            RAISE EXCEPTION 'flashback_query: target_time % is before tracked_since %', target_time, v_tracked_since;
+        END IF;
+
+        -- Find nearest snapshot <= target_time
+        SELECT s.captured_at, s.snapshot_table
+          INTO v_start_at, v_start_table
+        FROM flashback.snapshots s
+        WHERE s.rel_oid = v_rel_oid AND s.captured_at <= target_time
+        ORDER BY s.captured_at DESC LIMIT 1;
+
+        IF v_start_table IS NULL OR v_start_table = '' THEN
+            v_start_table := v_base_snapshot_table;
+            v_start_at := v_tracked_since;
+        END IF;
+        IF v_start_table IS NULL THEN
+            RAISE EXCEPTION 'flashback_query: no snapshot for %', target_table;
+        END IF;
+
+        -- Create temp table with same structure and load snapshot
+        v_tmp := '_fb_query_' || pg_backend_pid()::text || '_' || extract(epoch FROM clock_timestamp())::bigint::text || '_' || (random() * 100000)::integer::text;
+        EXECUTE format('CREATE TEMP TABLE %I (LIKE %I.%I INCLUDING ALL) ON COMMIT DROP', v_tmp, v_schema_name, v_table_name);
+        EXECUTE format('INSERT INTO %I SELECT * FROM %s', v_tmp, v_start_table);
+
+        -- Replay delta events
+        FOR rec IN
+            SELECT d.event_type, d.old_data, d.new_data
+            FROM flashback.delta_log d
+            WHERE d.rel_oid = v_rel_oid
+              AND d.committed_at IS NOT NULL
+              AND d.event_time > v_start_at
+              AND d.event_time <= target_time
+            ORDER BY d.event_id ASC
+        LOOP
+            IF rec.event_type = 'TRUNCATE' THEN
+                EXECUTE format('TRUNCATE %s', v_tmp);
+            ELSIF rec.event_type = 'INSERT' THEN
+                SELECT col_list, val_list INTO cols, vals
+                FROM flashback_build_insert_parts(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.new_data
+                );
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+                END IF;
+            ELSIF rec.event_type = 'DELETE' THEN
+                pred := flashback_build_predicate(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.old_data
+                );
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
+                END IF;
+            ELSIF rec.event_type = 'UPDATE' THEN
+                pred := flashback_build_predicate(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.old_data
+                );
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
+                END IF;
+                SELECT col_list, val_list INTO cols, vals
+                FROM flashback_build_insert_parts(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.new_data
+                );
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+                END IF;
+            END IF;
+        END LOOP;
+
+        -- Execute user query or default SELECT *
+        IF query IS NOT NULL THEN
+            v_query := replace(query, '$FB_TABLE', quote_ident(v_tmp));
+        ELSE
+            v_query := format('SELECT * FROM %I', v_tmp);
+        END IF;
+
+        RETURN QUERY EXECUTE v_query;
     END;
     $$;
     "#,

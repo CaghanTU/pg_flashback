@@ -219,6 +219,22 @@ extension_sql!(
 
     DO $$
     BEGIN
+        IF to_regclass('flashback.delta_log_rel_oid_event_time_idx') IS NULL THEN
+            EXECUTE 'CREATE INDEX delta_log_rel_oid_event_time_idx ON flashback.delta_log (rel_oid, event_time) WHERE committed_at IS NOT NULL';
+        END IF;
+    END
+    $$;
+
+    DO $$
+    BEGIN
+        IF to_regclass('flashback.delta_log_rel_oid_committed_at_idx') IS NULL THEN
+            EXECUTE 'CREATE INDEX delta_log_rel_oid_committed_at_idx ON flashback.delta_log (rel_oid, committed_at DESC)';
+        END IF;
+    END
+    $$;
+
+    DO $$
+    BEGIN
         IF to_regclass('flashback.staging_events') IS NULL THEN
             EXECUTE 'CREATE UNLOGGED TABLE flashback.staging_events (
                 staging_id  BIGSERIAL PRIMARY KEY,
@@ -227,8 +243,8 @@ extension_sql!(
                 source_xid  BIGINT NOT NULL DEFAULT txid_current()::bigint,
                 event_type  TEXT NOT NULL,
                 table_name  TEXT NOT NULL,
-                old_data    JSON,
-                new_data    JSON
+                old_data    JSONB,
+                new_data    JSONB
             )';
         END IF;
     END

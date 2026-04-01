@@ -148,7 +148,7 @@ extension_sql!(
         IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
             RETURN NULL;
         END IF;
-        IF flashback_is_restore_in_progress() THEN
+        IF flashback_is_restore_in_progress(TG_RELID) THEN
             RETURN NULL;
         END IF;
 
@@ -162,7 +162,7 @@ extension_sql!(
         INSERT INTO flashback.staging_events
                (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
         SELECT  clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID), txid_current()::bigint,
-                'INSERT', v_table_name, NULL, to_json(r.*)
+                'INSERT', v_table_name, NULL, to_jsonb(r.*)
         FROM    _fb_new r
         WHERE   pg_column_size(r.*) <= v_max_size;
 
@@ -187,7 +187,7 @@ extension_sql!(
         IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
             RETURN NULL;
         END IF;
-        IF flashback_is_restore_in_progress() THEN
+        IF flashback_is_restore_in_progress(TG_RELID) THEN
             RETURN NULL;
         END IF;
 
@@ -207,7 +207,7 @@ extension_sql!(
         INSERT INTO flashback.staging_events
                (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
         VALUES (clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID), txid_current()::bigint, 'UPDATE',
-                v_table_name, to_json(OLD), to_json(NEW));
+                v_table_name, to_jsonb(OLD), to_jsonb(NEW));
         RETURN NULL;
     END;
     $$;
@@ -225,7 +225,7 @@ extension_sql!(
         IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
             RETURN NULL;
         END IF;
-        IF flashback_is_restore_in_progress() THEN
+        IF flashback_is_restore_in_progress(TG_RELID) THEN
             RETURN NULL;
         END IF;
 
@@ -239,7 +239,7 @@ extension_sql!(
         INSERT INTO flashback.staging_events
                (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
         SELECT  clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID), txid_current()::bigint,
-                'DELETE', v_table_name, to_json(r.*), NULL
+                'DELETE', v_table_name, to_jsonb(r.*), NULL
         FROM    _fb_old r
         WHERE   pg_column_size(r.*) <= v_max_size;
 

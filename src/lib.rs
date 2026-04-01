@@ -172,6 +172,11 @@ mod tests {
         it_checkpoint_no_checkpoint_long_chain_restore,
         "../tests/sql/integration/checkpoint_no_checkpoint_long_chain_restore.sql"
     );
+
+    sql_test!(
+        it_flashback_query_basic,
+        "../tests/sql/integration/flashback_query_basic.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -21,16 +21,16 @@ BEGIN
     END IF;
 
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data)
-        VALUES (clock_timestamp(), 'INSERT', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, NULL, to_jsonb(NEW));
+        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data, committed_at)
+        VALUES (clock_timestamp(), 'INSERT', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, NULL, to_jsonb(NEW), clock_timestamp());
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data)
-        VALUES (clock_timestamp(), 'UPDATE', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, to_jsonb(OLD), to_jsonb(NEW));
+        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data, committed_at)
+        VALUES (clock_timestamp(), 'UPDATE', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, to_jsonb(OLD), to_jsonb(NEW), clock_timestamp());
         RETURN NEW;
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data)
-        VALUES (clock_timestamp(), 'DELETE', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, to_jsonb(OLD), NULL);
+        INSERT INTO flashback.delta_log(event_time, event_type, table_name, rel_oid, schema_version, old_data, new_data, committed_at)
+        VALUES (clock_timestamp(), 'DELETE', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_RELID, v_schema_version, to_jsonb(OLD), NULL, clock_timestamp());
         RETURN OLD;
     END IF;
 
