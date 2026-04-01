@@ -114,9 +114,9 @@ fn flush_staging_to_delta_log() {
     let batch_size = effective_worker_batch_size() as i64;
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         // Skip if staging_events table doesn't exist yet (extension not fully installed)
-        let table_exists = Spi::get_one::<bool>(
-            "SELECT to_regclass('flashback.staging_events') IS NOT NULL"
-        )?.unwrap_or(false);
+        let table_exists =
+            Spi::get_one::<bool>("SELECT to_regclass('flashback.staging_events') IS NOT NULL")?
+                .unwrap_or(false);
         if !table_exists {
             return Ok(());
         }
@@ -166,15 +166,15 @@ fn flush_staging_to_delta_log() {
 
 fn run_periodic_checkpoints() {
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-                Spi::run(
-                        "DO $$
+        Spi::run(
+            "DO $$
                          BEGIN
                              IF to_regprocedure('flashback_take_due_checkpoints()') IS NOT NULL THEN
                                  PERFORM flashback_take_due_checkpoints();
                              END IF;
                          END
                          $$",
-                )?;
+        )?;
         Ok(())
     });
 
@@ -185,15 +185,15 @@ fn run_periodic_checkpoints() {
 
 fn run_retention_purge() {
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-                Spi::run(
-                        "DO $$
+        Spi::run(
+            "DO $$
                          BEGIN
                              IF to_regprocedure('flashback_apply_retention()') IS NOT NULL THEN
                                  PERFORM flashback_apply_retention();
                              END IF;
                          END
                          $$",
-                )?;
+        )?;
         Ok(())
     });
 

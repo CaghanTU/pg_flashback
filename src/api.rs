@@ -88,7 +88,46 @@ extension_sql!(
                     WHERE inh.inhparent = c.oid
                 ), '[]'::jsonb)
                 ELSE NULL
-            END
+            END,
+            'triggers', COALESCE((
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'name', tg.tgname,
+                        'def', pg_get_triggerdef(tg.oid)
+                    )
+                    ORDER BY tg.tgname
+                )
+                FROM pg_trigger tg
+                WHERE tg.tgrelid = c.oid
+                  AND NOT tg.tgisinternal
+                  AND tg.tgname NOT LIKE 'flashback_capture_%'
+            ), '[]'::jsonb),
+            'rls_policies', COALESCE((
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'name', pol.polname,
+                        'cmd', CASE pol.polcmd
+                            WHEN 'r' THEN 'SELECT'
+                            WHEN 'a' THEN 'INSERT'
+                            WHEN 'w' THEN 'UPDATE'
+                            WHEN 'd' THEN 'DELETE'
+                            ELSE 'ALL'
+                        END,
+                        'permissive', (pol.polpermissive),
+                        'roles', COALESCE((
+                            SELECT jsonb_agg(rolname)
+                            FROM pg_roles r2
+                            WHERE r2.oid = ANY(pol.polroles)
+                        ), '[]'::jsonb),
+                        'qual', pg_get_expr(pol.polqual, pol.polrelid),
+                        'with_check', pg_get_expr(pol.polwithcheck, pol.polrelid)
+                    )
+                    ORDER BY pol.polname
+                )
+                FROM pg_policy pol
+                WHERE pol.polrelid = c.oid
+            ), '[]'::jsonb),
+            'rls_enabled', c.relrowsecurity
         )
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -104,6 +143,7 @@ extension_sql!(
     DECLARE
         v_table_name text;
         v_max_size   integer;
+        v_skipped    bigint;
     BEGIN
         IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
             RETURN NULL;
@@ -125,6 +165,11 @@ extension_sql!(
                 'INSERT', v_table_name, NULL, to_json(r.*)
         FROM    _fb_new r
         WHERE   pg_column_size(r.*) <= v_max_size;
+
+        SELECT count(*) INTO v_skipped FROM _fb_new r WHERE pg_column_size(r.*) > v_max_size;
+        IF v_skipped > 0 THEN
+            RAISE WARNING 'pg_flashback: % rows skipped (exceed max_row_size %) for %', v_skipped, v_max_size, v_table_name;
+        END IF;
 
         RETURN NULL;
     END;
@@ -175,6 +220,7 @@ extension_sql!(
     DECLARE
         v_table_name text;
         v_max_size   integer;
+        v_skipped    bigint;
     BEGIN
         IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
             RETURN NULL;
@@ -196,6 +242,11 @@ extension_sql!(
                 'DELETE', v_table_name, to_json(r.*), NULL
         FROM    _fb_old r
         WHERE   pg_column_size(r.*) <= v_max_size;
+
+        SELECT count(*) INTO v_skipped FROM _fb_old r WHERE pg_column_size(r.*) > v_max_size;
+        IF v_skipped > 0 THEN
+            RAISE WARNING 'pg_flashback: % rows skipped (exceed max_row_size %) for %', v_skipped, v_max_size, v_table_name;
+        END IF;
 
         RETURN NULL;
     END;
@@ -330,7 +381,10 @@ extension_sql!(
                 'check_unique_fk', COALESCE(schema_def -> 'constraints', '[]'::jsonb),
                 'indexes', COALESCE(schema_def -> 'indexes', '[]'::jsonb),
                 'partition_by', schema_def -> 'partition_by',
-                'partitions', schema_def -> 'partitions'
+                'partitions', schema_def -> 'partitions',
+                'triggers', COALESCE(schema_def -> 'triggers', '[]'::jsonb),
+                'rls_policies', COALESCE(schema_def -> 'rls_policies', '[]'::jsonb),
+                'rls_enabled', COALESCE((schema_def -> 'rls_enabled')::boolean, false)
             )
         FROM (
             SELECT COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb) AS schema_def
@@ -776,7 +830,10 @@ extension_sql!(
                     'check_unique_fk', COALESCE(ddl_info -> 'constraints', '[]'::jsonb),
                     'indexes', COALESCE(ddl_info -> 'indexes', '[]'::jsonb),
                     'partition_by', ddl_info -> 'partition_by',
-                    'partitions', ddl_info -> 'partitions'
+                    'partitions', ddl_info -> 'partitions',
+                    'triggers', COALESCE(ddl_info -> 'triggers', '[]'::jsonb),
+                    'rls_policies', COALESCE(ddl_info -> 'rls_policies', '[]'::jsonb),
+                    'rls_enabled', COALESCE((ddl_info -> 'rls_enabled')::boolean, false)
                 );
         ELSE
             ddl_info := COALESCE(flashback_collect_schema_def(tracked.rel_oid), '{}'::jsonb);

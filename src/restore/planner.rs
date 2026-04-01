@@ -66,7 +66,10 @@ extension_sql!(
                 'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
                 'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
                 'partition_by', sv.constraints -> 'partition_by',
-                'partitions', sv.constraints -> 'partitions'
+                'partitions', sv.constraints -> 'partitions',
+                'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
+                'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
+                'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false)
             )
           INTO v_target_schema_version, v_target_schema_def
         FROM flashback.schema_versions sv
@@ -101,7 +104,10 @@ extension_sql!(
                     'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
                     'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
                     'partition_by', sv.constraints -> 'partition_by',
-                    'partitions', sv.constraints -> 'partitions'
+                    'partitions', sv.constraints -> 'partitions',
+                    'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
+                    'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
+                    'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false)
                 )
               INTO v_start_schema_def
             FROM flashback.schema_versions sv
@@ -354,6 +360,7 @@ extension_sql!(
             FROM walk w
             JOIN edges e
               ON e.child_relid = w.current_relid
+            WHERE w.depth < 100
         ),
         max_depth AS (
             SELECT w.start_relid AS relid,
@@ -389,6 +396,9 @@ extension_sql!(
     $$;
     "#,
     name = "flashback_restore_planner_api",
-    requires = ["flashback_storage_schema_bootstrap", "flashback_restore_replay_helpers"],
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_restore_replay_helpers"
+    ],
     finalize,
 );

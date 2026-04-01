@@ -35,7 +35,8 @@ extension_sql!(
           ON kv.key = a.attname
         WHERE a.attrelid = target_rel
           AND a.attnum > 0
-          AND NOT a.attisdropped;
+          AND NOT a.attisdropped
+          AND a.attgenerated = '';
     $$;
 
     CREATE OR REPLACE FUNCTION flashback_build_insert_parts(
@@ -76,7 +77,8 @@ extension_sql!(
           ON kv.key = a.attname
         WHERE a.attrelid = target_rel
           AND a.attnum > 0
-          AND NOT a.attisdropped;
+          AND NOT a.attisdropped
+          AND a.attgenerated = '';
     $$;
 
     CREATE OR REPLACE FUNCTION flashback_restore_rows_from_snapshot(
@@ -127,6 +129,8 @@ extension_sql!(
         v_con record;
         v_idx record;
         v_part record;
+        v_trig record;
+        v_pol record;
     BEGIN
         IF ddl_info IS NULL THEN
             RAISE EXCEPTION 'flashback_recreate_table_from_ddl: ddl_info is null';
@@ -234,6 +238,45 @@ extension_sql!(
             FROM jsonb_array_elements(COALESCE(ddl_info->'indexes', '[]'::jsonb)) AS idx
         LOOP
             EXECUTE v_idx.def;
+        END LOOP;
+
+        -- Restore user triggers (excluding flashback capture triggers)
+        FOR v_trig IN
+            SELECT trig->>'def' AS def
+            FROM jsonb_array_elements(COALESCE(ddl_info->'triggers', '[]'::jsonb)) AS trig
+        LOOP
+            EXECUTE v_trig.def;
+        END LOOP;
+
+        -- Restore RLS: enable if it was enabled
+        IF COALESCE((ddl_info->>'rls_enabled')::boolean, false) THEN
+            EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', v_schema, v_table);
+        END IF;
+
+        -- Restore RLS policies
+        FOR v_pol IN
+            SELECT pol->>'name' AS name,
+                   pol->>'cmd' AS cmd,
+                   COALESCE((pol->>'permissive')::boolean, true) AS permissive,
+                   pol->>'qual' AS qual,
+                   pol->>'with_check' AS with_check,
+                   COALESCE((
+                       SELECT string_agg(r::text, ', ')
+                       FROM jsonb_array_elements_text(COALESCE(pol->'roles', '[]'::jsonb)) r
+                   ), 'PUBLIC') AS roles
+            FROM jsonb_array_elements(COALESCE(ddl_info->'rls_policies', '[]'::jsonb)) AS pol
+        LOOP
+            EXECUTE format(
+                'CREATE POLICY %I ON %I.%I AS %s FOR %s TO %s%s%s',
+                v_pol.name,
+                v_schema,
+                v_table,
+                CASE WHEN v_pol.permissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END,
+                v_pol.cmd,
+                v_pol.roles,
+                CASE WHEN v_pol.qual IS NOT NULL AND v_pol.qual <> '' THEN format(' USING (%s)', v_pol.qual) ELSE '' END,
+                CASE WHEN v_pol.with_check IS NOT NULL AND v_pol.with_check <> '' THEN format(' WITH CHECK (%s)', v_pol.with_check) ELSE '' END
+            );
         END LOOP;
 
         RETURN v_skipped_defaults;

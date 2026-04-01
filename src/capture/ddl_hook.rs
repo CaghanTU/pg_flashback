@@ -1,7 +1,7 @@
+use crate::runtime_guard::is_restore_in_progress;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::spi::Error as SpiError;
-use crate::runtime_guard::is_restore_in_progress;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 
@@ -27,6 +27,7 @@ pub fn install_process_utility_hook() {
 }
 
 #[pg_guard]
+#[allow(clippy::too_many_arguments)]
 unsafe extern "C-unwind" fn tv_process_utility_hook(
     pstmt: *mut pg_sys::PlannedStmt,
     query_string: *const std::ffi::c_char,
@@ -44,9 +45,27 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
     let is_table_ddl = !pstmt.is_null() && is_table_related_utility(pstmt);
     if !is_table_ddl {
         if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-            prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            prev_hook(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         } else {
-            pg_sys::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            pg_sys::standard_ProcessUtility(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         }
         return;
     }
@@ -55,7 +74,16 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         log!("pg_flashback DDL_CAPTURE_SKIPPED reason=restore_in_progress");
 
         if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
-            prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            prev_hook(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         } else {
             pg_sys::standard_ProcessUtility(
                 pstmt,
@@ -90,7 +118,10 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
-                log!("pg_flashback DDL_CAPTURE_ERROR stage=pre event_type={} error={err:?}", event_type);
+                log!(
+                    "pg_flashback DDL_CAPTURE_ERROR stage=pre event_type={} error={err:?}",
+                    event_type
+                );
             }
         }
     }
@@ -126,7 +157,10 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
     {
         if let Some((event_type, targets)) = parse_post_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
-                log!("pg_flashback DDL_CAPTURE_ERROR stage=post event_type={} error={err:?}", event_type);
+                log!(
+                    "pg_flashback DDL_CAPTURE_ERROR stage=post event_type={} error={err:?}",
+                    event_type
+                );
             }
         }
     }
@@ -167,6 +201,11 @@ unsafe fn is_table_related_utility(pstmt: *mut pg_sys::PlannedStmt) -> bool {
         pg_sys::NodeTag::T_DropStmt => {
             let stmt = utility_stmt as *mut pg_sys::DropStmt;
             (*stmt).removeType == pg_sys::ObjectType::OBJECT_TABLE
+        }
+        pg_sys::NodeTag::T_RenameStmt => {
+            let stmt = utility_stmt as *mut pg_sys::RenameStmt;
+            (*stmt).renameType == pg_sys::ObjectType::OBJECT_COLUMN
+                || (*stmt).renameType == pg_sys::ObjectType::OBJECT_TABLE
         }
         _ => false,
     }
@@ -255,6 +294,27 @@ unsafe fn parse_post_utility_targets(
         pg_sys::NodeTag::T_AlterTableStmt => {
             let stmt = utility_stmt as *mut pg_sys::AlterTableStmt;
             if (*stmt).objtype != pg_sys::ObjectType::OBJECT_TABLE {
+                return None;
+            }
+
+            let relation = (*stmt).relation;
+            if relation.is_null() {
+                return None;
+            }
+
+            let table = c_ptr_to_option_string((*relation).relname).unwrap_or_default();
+            if table.is_empty() {
+                return None;
+            }
+
+            let schema = c_ptr_to_option_string((*relation).schemaname);
+            Some(("ALTER", vec![UtilityTarget { schema, table }]))
+        }
+        pg_sys::NodeTag::T_RenameStmt => {
+            let stmt = utility_stmt as *mut pg_sys::RenameStmt;
+            if (*stmt).renameType != pg_sys::ObjectType::OBJECT_COLUMN
+                && (*stmt).renameType != pg_sys::ObjectType::OBJECT_TABLE
+            {
                 return None;
             }
 
