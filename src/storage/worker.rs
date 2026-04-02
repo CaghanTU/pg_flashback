@@ -8,7 +8,7 @@ use std::time::Duration;
 
 static WORKER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(75);
 static WORKER_BATCH_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(4096);
-static MAX_ROW_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(8192);
+static MAX_ROW_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(65536);
 static ENABLED_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
@@ -55,7 +55,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.max_row_size",
         c"pg_flashback maximum captured row size in bytes",
-        c"Rows larger than this (in bytes) are skipped during capture to prevent OOM. Default 8192 (8KB).",
+        c"Rows larger than this (in bytes) are skipped during capture to prevent OOM. Default 65536 (64KB).",
         &MAX_ROW_SIZE_GUC,
         512,
         104_857_600, // 100MB hard ceiling
@@ -102,14 +102,33 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
 
         // When pg_flashback.enabled = off, worker idles completely.
         if is_capture_enabled() {
+            let cycle_start = std::time::Instant::now();
+
+            let t0 = std::time::Instant::now();
             flush_staging_to_delta_log();
+            let flush_ms = t0.elapsed().as_millis();
 
             // Skip checkpoint and retention during active restore to avoid
             // snapshotting a partially-restored table or purging needed deltas.
             // Worker is a separate process, so check advisory locks via SPI.
+            let mut ckpt_ms: u128 = 0;
+            let mut retention_ms: u128 = 0;
             if !is_any_restore_active() {
+                let t1 = std::time::Instant::now();
                 run_periodic_checkpoints();
+                ckpt_ms = t1.elapsed().as_millis();
+
+                let t2 = std::time::Instant::now();
                 run_retention_purge();
+                retention_ms = t2.elapsed().as_millis();
+            }
+
+            let cycle_ms = cycle_start.elapsed().as_millis();
+            let interval_ms_val = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u128;
+            if cycle_ms > interval_ms_val {
+                warning!(
+                    "pg_flashback WORKER_SLOW_CYCLE cycle_ms={cycle_ms} flush_ms={flush_ms} ckpt_ms={ckpt_ms} retention_ms={retention_ms} interval_ms={interval_ms_val}"
+                );
             }
         }
 

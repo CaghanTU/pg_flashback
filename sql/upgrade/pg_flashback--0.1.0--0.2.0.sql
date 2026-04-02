@@ -40,8 +40,6 @@ COMMENT ON FUNCTION flashback_build_predicate(oid, jsonb)
     IS 'Build a WHERE-clause predicate from a JSONB row payload, handling arrays, json, and NULL values.';
 COMMENT ON FUNCTION flashback_build_insert_parts(oid, jsonb)
     IS 'Build column-list and values-list from a JSONB row payload for constructing INSERT statements.';
-COMMENT ON FUNCTION flashback_restore_rows_from_snapshot(oid, text, text, jsonb)
-    IS 'Insert rows from a JSONB snapshot array into a target table. Used during legacy snapshot restore.';
 COMMENT ON FUNCTION flashback_recreate_table_from_ddl(jsonb)
     IS 'Recreate a table from a DDL definition (columns, PK, constraints, indexes, triggers, RLS, partitions).';
 COMMENT ON FUNCTION flashback_capture_insert_trigger()

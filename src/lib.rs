@@ -21,13 +21,6 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     storage::worker::pg_flashback_delta_worker_main(arg);
 }
 
-#[unsafe(no_mangle)]
-/// # Safety
-/// Must be called by PostgreSQL during output plugin initialization.
-pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPluginCallbacks) {
-    capture::logical_decoding::output_plugin_init(cb);
-}
-
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -166,6 +159,39 @@ mod tests {
     sql_test!(
         it_flashback_query_basic,
         "../tests/sql/integration/flashback_query_basic.sql"
+    );
+
+    sql_test!(
+        it_partitioned_table_restore,
+        "../tests/sql/integration/partitioned_table_restore.sql"
+    );
+    sql_test!(
+        it_post_restore_checkpoint,
+        "../tests/sql/integration/post_restore_checkpoint.sql"
+    );
+    sql_test!(
+        it_acl_preservation_restore,
+        "../tests/sql/integration/acl_preservation_restore.sql"
+    );
+    sql_test!(
+        it_subtxn_rollback_restore,
+        "../tests/sql/integration/subtxn_rollback_restore.sql"
+    );
+    sql_test!(
+        it_pgdump_compat,
+        "../tests/sql/integration/pgdump_compat.sql"
+    );
+    sql_test!(
+        it_rbac_enforcement,
+        "../tests/sql/integration/rbac_enforcement.sql"
+    );
+    sql_test!(
+        it_pitr_time_filtering,
+        "../tests/sql/integration/pitr_time_filtering.sql"
+    );
+    sql_test!(
+        it_concurrent_restore_stress,
+        "../tests/sql/integration/concurrent_restore_stress.sql"
     );
 }
 
