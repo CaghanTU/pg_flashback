@@ -1,7 +1,37 @@
 -- =================================================================
 -- Restore helper functions: predicate builder, insert builder,
--- table recreation (with shadow-table support), and atomic swap.
+-- update-set builder, jsonb merge aggregate, table recreation
+-- (with shadow-table support), and atomic swap.
 -- =================================================================
+
+-- ----------------------------------------------------------------
+-- flashback_jsonb_concat: NULL-safe jsonb merge (right side wins)
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_jsonb_concat(a jsonb, b jsonb)
+RETURNS jsonb
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT CASE WHEN b IS NULL THEN a WHEN a IS NULL THEN b ELSE a || b END;
+$$;
+
+-- Custom aggregate: overlay jsonb objects in order (later keys win)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public' AND p.proname = 'flashback_jsonb_merge_agg'
+          AND p.prokind = 'a'
+    ) THEN
+        CREATE AGGREGATE flashback_jsonb_merge_agg(jsonb) (
+            SFUNC = flashback_jsonb_concat,
+            STYPE = jsonb,
+            INITCOND = '{}'
+        );
+    END IF;
+END
+$$;
 
 CREATE OR REPLACE FUNCTION flashback_build_predicate(target_rel oid, payload jsonb)
 RETURNS text
@@ -80,6 +110,336 @@ AS $$
       AND a.attnum > 0
       AND NOT a.attisdropped
       AND a.attgenerated = '';
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback_build_update_set: builds SET clause for UPDATE replay
+-- Generates "col1 = val1, col2 = val2, ..." from new_data jsonb.
+-- Excludes PK columns from the SET clause (they don't change).
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_build_update_set(
+    target_rel oid,
+    new_data   jsonb,
+    OUT set_clause text,
+    OUT pk_predicate text
+)
+LANGUAGE sql
+AS $$
+    WITH pk_cols AS (
+        SELECT att.attname
+        FROM pg_index i
+        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+        JOIN pg_attribute att ON att.attrelid = i.indrelid AND att.attnum = k.attnum
+        WHERE i.indrelid = target_rel
+          AND i.indisprimary
+    )
+    SELECT
+        -- SET clause: non-PK columns from new_data
+        (SELECT string_agg(
+            format(
+                '%I = %s',
+                a.attname,
+                CASE
+                    WHEN kv.value = 'null'::jsonb THEN 'NULL'
+                    WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
+                        format('%L::%s',
+                            translate(kv.value::text, '[]', '{}'),
+                            pg_catalog.format_type(a.atttypid, a.atttypmod))
+                    WHEN t.typname IN ('jsonb', 'json') THEN
+                        format('%L::%s',
+                            kv.value::text,
+                            pg_catalog.format_type(a.atttypid, a.atttypmod))
+                    ELSE format(
+                        '%L::%s',
+                        kv.value #>> '{}',
+                        pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    )
+                END
+            ),
+            ', '
+            ORDER BY a.attnum
+        )
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        JOIN LATERAL jsonb_each(new_data) kv(key, value)
+          ON kv.key = a.attname
+        WHERE a.attrelid = target_rel
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attgenerated = ''
+          AND a.attname NOT IN (SELECT attname FROM pk_cols)
+        ),
+        -- PK predicate: WHERE pk_col1 = val1 AND pk_col2 = val2
+        (SELECT string_agg(
+            CASE
+                WHEN kv.value = 'null'::jsonb THEN format('%I IS NULL', a.attname)
+                ELSE format(
+                    '%I = %L::%s',
+                    a.attname,
+                    kv.value #>> '{}',
+                    pg_catalog.format_type(a.atttypid, a.atttypmod)
+                )
+            END,
+            ' AND '
+            ORDER BY a.attnum
+        )
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        JOIN LATERAL jsonb_each(new_data) kv(key, value)
+          ON kv.key = a.attname
+        WHERE a.attrelid = target_rel
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attname IN (SELECT attname FROM pk_cols)
+        );
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback_replay_batch_pk: batch replay for tables WITH primary key
+-- ----------------------------------------------------------------
+-- Uses net-effect computation: for each PK, determines the final
+-- desired row state and applies it in bulk.
+-- 1. TRUNCATE/DROP barrier optimization (skip events before last barrier)
+-- 2. Net-effect per PK via generation tracking + jsonb merge
+-- 3. Bulk DELETE / UPSERT / UPDATE in three passes
+-- Returns the total number of delta events consumed (not rows affected).
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_replay_batch_pk(
+    p_shadow_schema text,
+    p_shadow_table  text,
+    p_shadow_oid    oid,
+    p_rel_oid       oid,
+    p_start_at      timestamptz,
+    p_target_time   timestamptz,
+    p_label         text DEFAULT 'batch_replay'
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_pk_cols       text[];
+    v_pk_col_list   text;
+    v_all_cols      text[];
+    v_col_list      text;
+    v_select_cols   text;
+    v_total_events  bigint;
+    v_pk_extract    text;
+    v_pk_join       text;
+    v_conflict_set  text;
+    v_cond_set      text;
+    v_last_barrier  bigint;
+    v_barrier_type  text;
+    v_start_id      bigint := 0;
+    v_deleted       bigint := 0;
+    v_upserted      bigint := 0;
+    v_updated       bigint := 0;
+    v_net_count     bigint;
+BEGIN
+    -- ── Resolve PK columns ──────────────────────────────────────
+    SELECT array_agg(att.attname ORDER BY k.ord)
+      INTO v_pk_cols
+    FROM pg_index i
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+    JOIN pg_attribute att ON att.attrelid = i.indrelid AND att.attnum = k.attnum
+    WHERE i.indrelid = p_shadow_oid AND i.indisprimary;
+
+    IF v_pk_cols IS NULL OR array_length(v_pk_cols, 1) IS NULL THEN
+        RAISE EXCEPTION 'flashback_replay_batch_pk: table %.% has no primary key',
+            p_shadow_schema, p_shadow_table;
+    END IF;
+
+    v_pk_col_list := (SELECT string_agg(format('%I', c), ', ') FROM unnest(v_pk_cols) c);
+
+    -- ── Resolve all insertable columns ──────────────────────────
+    SELECT array_agg(a.attname ORDER BY a.attnum)
+      INTO v_all_cols
+    FROM pg_attribute a
+    WHERE a.attrelid = p_shadow_oid AND a.attnum > 0
+      AND NOT a.attisdropped AND a.attgenerated = '';
+
+    v_col_list   := (SELECT string_agg(format('%I', c), ', ') FROM unnest(v_all_cols) c);
+    v_select_cols := (SELECT string_agg(format('r.%I', c), ', ') FROM unnest(v_all_cols) c);
+
+    -- ── PK join expression: t.pk = (ne.pk_key->>'pk')::type ────
+    v_pk_join := (SELECT string_agg(
+        format('t.%I = (ne.pk_key->>%L)::%s',
+            a.attname, a.attname,
+            pg_catalog.format_type(a.atttypid, a.atttypmod)),
+        ' AND ' ORDER BY a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid = p_shadow_oid AND a.attname = ANY(v_pk_cols)
+      AND a.attnum > 0 AND NOT a.attisdropped);
+
+    -- ── TRUNCATE / DROP barrier optimisation ────────────────────
+    SELECT max(d.event_id) INTO v_last_barrier
+    FROM flashback.delta_log d
+    WHERE d.rel_oid = p_rel_oid
+      AND d.committed_at IS NOT NULL
+      AND d.event_time > p_start_at
+      AND d.event_time <= p_target_time
+      AND d.event_type IN ('TRUNCATE', 'DROP');
+
+    IF v_last_barrier IS NOT NULL THEN
+        SELECT d.event_type INTO v_barrier_type
+        FROM flashback.delta_log d WHERE d.event_id = v_last_barrier;
+
+        EXECUTE format('TRUNCATE TABLE %I.%I', p_shadow_schema, p_shadow_table);
+        v_start_id := v_last_barrier;
+
+        RAISE NOTICE 'flashback_replay_batch_pk [%]: barrier % at event_id=%, shadow truncated',
+            p_label, v_barrier_type, v_last_barrier;
+    END IF;
+
+    -- ── Count remaining DML events ──────────────────────────────
+    SELECT count(*) INTO v_total_events
+    FROM flashback.delta_log d
+    WHERE d.rel_oid = p_rel_oid
+      AND d.committed_at IS NOT NULL
+      AND d.event_time > p_start_at
+      AND d.event_time <= p_target_time
+      AND d.event_id > v_start_id
+      AND d.event_type IN ('INSERT', 'UPDATE', 'DELETE');
+
+    IF v_total_events = 0 THEN
+        RAISE NOTICE 'flashback_replay_batch_pk [%]: 0 DML events — nothing to replay', p_label;
+        RETURN 0;
+    END IF;
+
+    -- ── PK extraction SQL (picks key from new_data or old_data) ─
+    v_pk_extract := format(
+        'CASE WHEN d.event_type = ''DELETE''
+              THEN (SELECT jsonb_object_agg(k, d.old_data->k) FROM unnest(%L::text[]) k WHERE d.old_data ? k)
+              ELSE (SELECT jsonb_object_agg(k, d.new_data->k) FROM unnest(%L::text[]) k WHERE d.new_data ? k)
+         END',
+        v_pk_cols, v_pk_cols);
+
+    -- ── Materialise events with extracted PK ────────────────────
+    EXECUTE format(
+        'CREATE TEMP TABLE _fb_batch_events ON COMMIT DROP AS
+         SELECT d.event_id, d.event_type, d.old_data, d.new_data,
+                %s AS pk_key
+         FROM flashback.delta_log d
+         WHERE d.rel_oid = $1
+           AND d.committed_at IS NOT NULL
+           AND d.event_time > $2
+           AND d.event_time <= $3
+           AND d.event_id > $4
+           AND d.event_type IN (''INSERT'', ''UPDATE'', ''DELETE'')
+         ORDER BY d.event_id',
+        v_pk_extract
+    ) USING p_rel_oid, p_start_at, p_target_time, v_start_id;
+
+    -- ── Compute net-effect per PK ───────────────────────────────
+    -- Generation = running count of INSERTs per PK.
+    -- Within the latest generation the merged new_data is the final row.
+    EXECUTE '
+        CREATE TEMP TABLE _fb_net_effect ON COMMIT DROP AS
+        WITH events_gen AS (
+            SELECT *,
+                SUM(CASE WHEN event_type = ''INSERT'' THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY pk_key ORDER BY event_id) AS gen
+            FROM _fb_batch_events
+        ),
+        last_gen AS (
+            SELECT pk_key, MAX(gen) AS max_gen
+            FROM events_gen GROUP BY pk_key
+        ),
+        final_phase AS (
+            SELECT e.pk_key, e.event_id, e.event_type, e.new_data
+            FROM events_gen e
+            JOIN last_gen lg ON lg.pk_key = e.pk_key AND e.gen = lg.max_gen
+        )
+        SELECT
+            pk_key,
+            CASE
+                WHEN (array_agg(event_type ORDER BY event_id DESC))[1] = ''DELETE'' THEN ''DELETE''
+                WHEN (array_agg(event_type ORDER BY event_id))[1] = ''INSERT'' THEN ''UPSERT''
+                ELSE ''UPDATE''
+            END AS action,
+            flashback_jsonb_merge_agg(new_data ORDER BY event_id)
+                FILTER (WHERE new_data IS NOT NULL) AS merged_data
+        FROM final_phase
+        GROUP BY pk_key';
+
+    SELECT count(*) INTO v_net_count FROM _fb_net_effect;
+    RAISE NOTICE 'flashback_replay_batch_pk [%]: % events → % unique PKs',
+        p_label, v_total_events, v_net_count;
+
+    -- ── Phase 1: Bulk DELETE ────────────────────────────────────
+    EXECUTE format(
+        'DELETE FROM %I.%I t USING _fb_net_effect ne
+         WHERE ne.action = ''DELETE'' AND %s',
+        p_shadow_schema, p_shadow_table, v_pk_join);
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+    -- ── Phase 2: Bulk UPSERT (rows whose chain contains INSERT) ─
+    v_conflict_set := (SELECT string_agg(
+        format('%I = EXCLUDED.%I', a.attname, a.attname),
+        ', ' ORDER BY a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid = p_shadow_oid AND a.attnum > 0
+      AND NOT a.attisdropped AND a.attgenerated = ''
+      AND a.attname <> ALL(v_pk_cols));
+
+    IF v_conflict_set IS NOT NULL AND v_conflict_set <> '' THEN
+        EXECUTE format(
+            'INSERT INTO %I.%I (%s)
+             SELECT %s
+             FROM (SELECT (jsonb_populate_record(NULL::%I.%I, ne.merged_data)).* FROM _fb_net_effect ne WHERE ne.action = ''UPSERT'') r
+             ON CONFLICT (%s) DO UPDATE SET %s',
+            p_shadow_schema, p_shadow_table, v_col_list,
+            v_select_cols,
+            p_shadow_schema, p_shadow_table,
+            v_pk_col_list, v_conflict_set);
+    ELSE
+        -- PK-only table
+        EXECUTE format(
+            'INSERT INTO %I.%I (%s)
+             SELECT %s
+             FROM (SELECT (jsonb_populate_record(NULL::%I.%I, ne.merged_data)).* FROM _fb_net_effect ne WHERE ne.action = ''UPSERT'') r
+             ON CONFLICT (%s) DO NOTHING',
+            p_shadow_schema, p_shadow_table, v_col_list,
+            v_select_cols,
+            p_shadow_schema, p_shadow_table,
+            v_pk_col_list);
+    END IF;
+    GET DIAGNOSTICS v_upserted = ROW_COUNT;
+
+    -- ── Phase 3: Bulk UPDATE (rows with only UPDATE events) ─────
+    -- These rows exist in the snapshot; merged_data may be partial (diff).
+    -- Use CASE WHEN ? to set only columns present in the diff.
+    v_cond_set := (SELECT string_agg(
+        format(
+            '%I = CASE WHEN ne.merged_data ? %L '
+            'THEN (jsonb_populate_record(NULL::%I.%I, ne.merged_data)).%I '
+            'ELSE t.%I END',
+            a.attname, a.attname,
+            p_shadow_schema, p_shadow_table, a.attname, a.attname),
+        ', ' ORDER BY a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid = p_shadow_oid AND a.attnum > 0
+      AND NOT a.attisdropped AND a.attgenerated = ''
+      AND a.attname <> ALL(v_pk_cols));
+
+    IF v_cond_set IS NOT NULL AND v_cond_set <> '' THEN
+        EXECUTE format(
+            'UPDATE %I.%I t SET %s
+             FROM _fb_net_effect ne
+             WHERE ne.action = ''UPDATE'' AND %s',
+            p_shadow_schema, p_shadow_table, v_cond_set, v_pk_join);
+        GET DIAGNOSTICS v_updated = ROW_COUNT;
+    END IF;
+
+    DROP TABLE IF EXISTS _fb_batch_events;
+    DROP TABLE IF EXISTS _fb_net_effect;
+
+    RAISE NOTICE 'flashback_replay_batch_pk [%]: complete — % deleted, % upserted, % updated',
+        p_label, v_deleted, v_upserted, v_updated;
+
+    RETURN v_total_events;
+END;
 $$;
 
 -- ----------------------------------------------------------------

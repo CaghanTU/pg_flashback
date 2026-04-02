@@ -175,7 +175,10 @@ BEGIN
 END;
 $$;
 
--- Per-row trigger for UPDATE
+-- Per-row trigger for UPDATE (diff-only capture)
+-- For tables WITH a primary key: stores only PK columns + changed columns.
+-- For tables WITHOUT a primary key: stores full OLD and NEW rows (fallback).
+-- Skips capture entirely if no columns actually changed.
 CREATE OR REPLACE FUNCTION flashback_capture_update_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -183,6 +186,11 @@ AS $$
 DECLARE
     v_table_name text;
     v_max_size integer;
+    v_old_json jsonb;
+    v_new_json jsonb;
+    v_pk_cols text[];
+    v_old_diff jsonb;
+    v_new_diff jsonb;
 BEGIN
     IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
@@ -198,7 +206,43 @@ BEGIN
     END IF;
 
     v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-    IF pg_column_size(NEW) > v_max_size OR pg_column_size(OLD) > v_max_size THEN
+
+    v_old_json := to_jsonb(OLD);
+    v_new_json := to_jsonb(NEW);
+
+    -- Skip capture if no columns actually changed (no-op UPDATE)
+    IF v_old_json = v_new_json THEN
+        RETURN NULL;
+    END IF;
+
+    -- Get primary key columns for this table
+    SELECT array_agg(a.attname ORDER BY k.ord)
+      INTO v_pk_cols
+    FROM pg_index i
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+    WHERE i.indrelid = TG_RELID AND i.indisprimary;
+
+    IF v_pk_cols IS NOT NULL AND array_length(v_pk_cols, 1) > 0 THEN
+        -- Diff-only: PK columns + changed columns only
+        SELECT jsonb_object_agg(kv.key, kv.value)
+          INTO v_old_diff
+        FROM jsonb_each(v_old_json) kv
+        WHERE kv.key = ANY(v_pk_cols)
+           OR v_old_json->kv.key IS DISTINCT FROM v_new_json->kv.key;
+
+        SELECT jsonb_object_agg(kv.key, kv.value)
+          INTO v_new_diff
+        FROM jsonb_each(v_new_json) kv
+        WHERE kv.key = ANY(v_pk_cols)
+           OR v_old_json->kv.key IS DISTINCT FROM v_new_json->kv.key;
+    ELSE
+        -- No PK: store full rows for reliable matching during restore
+        v_old_diff := v_old_json;
+        v_new_diff := v_new_json;
+    END IF;
+
+    IF pg_column_size(v_old_diff) > v_max_size OR pg_column_size(v_new_diff) > v_max_size THEN
         RAISE WARNING 'pg_flashback: row too large, skipping capture for %', v_table_name;
         RETURN NULL;
     END IF;
@@ -206,7 +250,7 @@ BEGIN
     INSERT INTO flashback.staging_events
            (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
     VALUES (clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID), txid_current()::bigint, 'UPDATE',
-            v_table_name, to_jsonb(OLD), to_jsonb(NEW));
+            v_table_name, v_old_diff, v_new_diff);
     RETURN NULL;
 END;
 $$;

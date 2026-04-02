@@ -29,6 +29,21 @@ BEGIN
 END
 $$;
 
+-- Enable lz4 compression on JSONB columns for storage efficiency.
+-- Silently skips if server was not built with lz4 support.
+DO $$
+BEGIN
+    IF to_regclass('flashback.delta_log') IS NOT NULL THEN
+        BEGIN
+            ALTER TABLE flashback.delta_log ALTER COLUMN old_data SET COMPRESSION lz4;
+            ALTER TABLE flashback.delta_log ALTER COLUMN new_data SET COMPRESSION lz4;
+        EXCEPTION WHEN feature_not_supported THEN
+            RAISE NOTICE 'pg_flashback: lz4 compression not available, using default compression for delta_log';
+        END;
+    END IF;
+END
+$$;
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -219,6 +234,20 @@ BEGIN
             old_data    JSONB,
             new_data    JSONB
         )';
+    END IF;
+END
+$$;
+
+-- lz4 compression for staging_events JSONB columns
+DO $$
+BEGIN
+    IF to_regclass('flashback.staging_events') IS NOT NULL THEN
+        BEGIN
+            ALTER TABLE flashback.staging_events ALTER COLUMN old_data SET COMPRESSION lz4;
+            ALTER TABLE flashback.staging_events ALTER COLUMN new_data SET COMPRESSION lz4;
+        EXCEPTION WHEN feature_not_supported THEN
+            NULL; -- silently skip if lz4 not available
+        END;
     END IF;
 END
 $$;

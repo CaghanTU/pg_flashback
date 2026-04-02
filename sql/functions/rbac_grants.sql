@@ -26,6 +26,9 @@ REVOKE ALL ON FUNCTION flashback_apply_retention()                    FROM PUBLI
 -- These are called internally by restore functions only.
 REVOKE ALL ON FUNCTION flashback_build_predicate(oid, jsonb)              FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_build_insert_parts(oid, jsonb)           FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_build_update_set(oid, jsonb)             FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_replay_batch_pk(text, text, oid, oid, timestamptz, timestamptz, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_jsonb_concat(jsonb, jsonb)               FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_collect_schema_def(oid)                  FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb) FROM PUBLIC;
@@ -110,6 +113,12 @@ COMMENT ON FUNCTION flashback_build_predicate(oid, jsonb)
     IS '[Internal] Build a WHERE-clause predicate from a JSONB row payload.';
 COMMENT ON FUNCTION flashback_build_insert_parts(oid, jsonb)
     IS '[Internal] Build column-list and values-list from a JSONB payload for INSERT.';
+COMMENT ON FUNCTION flashback_build_update_set(oid, jsonb)
+    IS '[Internal] Build SET clause and PK WHERE clause for UPDATE replay from JSONB new_data.';
+COMMENT ON FUNCTION flashback_replay_batch_pk(text, text, oid, oid, timestamptz, timestamptz, text)
+    IS '[Internal] Batch replay for PK tables — net-effect computation with bulk DELETE/UPSERT/UPDATE.';
+COMMENT ON FUNCTION flashback_jsonb_concat(jsonb, jsonb)
+    IS '[Internal] NULL-safe jsonb merge helper for the flashback_jsonb_merge_agg aggregate.';
 COMMENT ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text)
     IS '[Internal] Recreate table from DDL definition. Supports shadow-table mode for crash-safe restore.';
 COMMENT ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb)
@@ -117,6 +126,6 @@ COMMENT ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb
 COMMENT ON FUNCTION flashback_capture_insert_trigger()
     IS 'Statement-level AFTER INSERT trigger — bulk-captures new rows via transition table into staging_events.';
 COMMENT ON FUNCTION flashback_capture_update_trigger()
-    IS 'Row-level AFTER UPDATE trigger — captures old and new row data into staging_events.';
+    IS 'Row-level AFTER UPDATE trigger — diff-only capture for PK tables (PK + changed columns), full-row for non-PK. Skips no-op updates.';
 COMMENT ON FUNCTION flashback_capture_delete_trigger()
     IS 'Statement-level AFTER DELETE trigger — bulk-captures deleted rows via transition table into staging_events.';

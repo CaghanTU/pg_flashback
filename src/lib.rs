@@ -193,6 +193,19 @@ mod tests {
         it_concurrent_restore_stress,
         "../tests/sql/integration/concurrent_restore_stress.sql"
     );
+
+    sql_test!(
+        it_diff_only_update_restore,
+        "../tests/sql/integration/diff_only_update_restore.sql"
+    );
+    sql_test!(
+        it_batch_replay_mixed_ops,
+        "../tests/sql/integration/batch_replay_mixed_ops.sql"
+    );
+    sql_test!(
+        it_noop_update_skip,
+        "../tests/sql/integration/noop_update_skip.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

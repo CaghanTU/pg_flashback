@@ -41,9 +41,13 @@ DECLARE
     pred text;
     cols text;
     vals text;
+    v_set_clause text;
+    v_pk_pred text;
     applied bigint := 0;
     v_total_events bigint;
     v_restore_start timestamptz;
+    v_has_pk boolean;
+    v_has_ddl boolean;
 BEGIN
     v_restore_start := clock_timestamp();
 
@@ -170,93 +174,123 @@ BEGIN
     -- ────────────────────────────────────────────────────────────
     -- Phase 3: Replay delta events into shadow table
     -- ────────────────────────────────────────────────────────────
-    SELECT count(*) INTO v_total_events
-    FROM flashback.delta_log d
-    WHERE d.rel_oid = v_rel_oid
-      AND d.committed_at IS NOT NULL
-      AND d.event_time > v_start_at
-      AND d.event_time <= target_time;
+    -- Choose replay strategy:
+    --   • PK table with no DDL barriers → batch (net-effect) path
+    --   • Otherwise → row-by-row path (handles DDL events safely)
 
-    RAISE NOTICE 'flashback_restore [%]: replaying % events into shadow ...',
-        target_table, v_total_events;
-
-    FOR rec IN
-        SELECT d.event_id, d.event_type, d.old_data, d.new_data
-        FROM flashback.delta_log d
+    -- Check for DDL events in the replay range
+    SELECT EXISTS(
+        SELECT 1 FROM flashback.delta_log d
         WHERE d.rel_oid = v_rel_oid
           AND d.committed_at IS NOT NULL
           AND d.event_time > v_start_at
           AND d.event_time <= target_time
-        ORDER BY d.event_id ASC
-    LOOP
-        -- Re-resolve shadow OID in case of DDL replay
-        shadow_oid := to_regclass(format('%I.%I', v_shadow_schema, v_shadow_name))::oid;
+          AND d.event_type IN ('ALTER', 'DROP', 'TRUNCATE')
+    ) INTO v_has_ddl;
 
-        IF rec.event_type = 'ALTER' THEN
-            CONTINUE;
-        ELSIF rec.event_type = 'DROP' THEN
-            -- DROP during replay: drop shadow (restore will create empty table)
-            EXECUTE format('DROP TABLE IF EXISTS %I.%I', v_shadow_schema, v_shadow_name);
-        ELSIF rec.event_type = 'TRUNCATE' THEN
-            IF shadow_oid IS NOT NULL THEN
-                EXECUTE format('TRUNCATE TABLE %I.%I', v_shadow_schema, v_shadow_name);
+    -- Check if shadow table has a primary key
+    SELECT EXISTS(
+        SELECT 1 FROM pg_index i
+        WHERE i.indrelid = shadow_oid AND i.indisprimary
+    ) INTO v_has_pk;
+
+    IF v_has_pk AND NOT v_has_ddl THEN
+        -- ── Batch replay path (PK, pure DML) ────────────────────
+        RAISE NOTICE 'flashback_restore [%]: using batch replay (PK table, no DDL events)',
+            target_table;
+
+        applied := flashback_replay_batch_pk(
+            v_shadow_schema, v_shadow_name, shadow_oid,
+            v_rel_oid, v_start_at, target_time, target_table
+        );
+    ELSIF v_has_pk AND v_has_ddl THEN
+        -- ── Batch replay with DDL barriers ──────────────────────
+        -- The batch function handles TRUNCATE/DROP barriers internally
+        RAISE NOTICE 'flashback_restore [%]: using batch replay (PK table, with DDL barriers)',
+            target_table;
+
+        applied := flashback_replay_batch_pk(
+            v_shadow_schema, v_shadow_name, shadow_oid,
+            v_rel_oid, v_start_at, target_time, target_table
+        );
+    ELSE
+        -- ── Row-by-row replay path (no PK) ──────────────────────
+        SELECT count(*) INTO v_total_events
+        FROM flashback.delta_log d
+        WHERE d.rel_oid = v_rel_oid
+          AND d.committed_at IS NOT NULL
+          AND d.event_time > v_start_at
+          AND d.event_time <= target_time;
+
+        RAISE NOTICE 'flashback_restore [%]: using row-by-row replay (no PK, % events)',
+            target_table, v_total_events;
+
+        FOR rec IN
+            SELECT d.event_id, d.event_type, d.old_data, d.new_data
+            FROM flashback.delta_log d
+            WHERE d.rel_oid = v_rel_oid
+              AND d.committed_at IS NOT NULL
+              AND d.event_time > v_start_at
+              AND d.event_time <= target_time
+            ORDER BY d.event_id ASC
+        LOOP
+            shadow_oid := to_regclass(format('%I.%I', v_shadow_schema, v_shadow_name))::oid;
+
+            IF rec.event_type = 'ALTER' THEN
+                CONTINUE;
+            ELSIF rec.event_type = 'DROP' THEN
+                EXECUTE format('DROP TABLE IF EXISTS %I.%I', v_shadow_schema, v_shadow_name);
+            ELSIF rec.event_type = 'TRUNCATE' THEN
+                IF shadow_oid IS NOT NULL THEN
+                    EXECUTE format('TRUNCATE TABLE %I.%I', v_shadow_schema, v_shadow_name);
+                END IF;
+            ELSIF rec.event_type = 'INSERT' THEN
+                IF shadow_oid IS NULL THEN CONTINUE; END IF;
+                SELECT col_list, val_list
+                  INTO cols, vals
+                FROM flashback_build_insert_parts(shadow_oid, rec.new_data);
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format(
+                        'INSERT INTO %I.%I (%s) VALUES (%s)',
+                        v_shadow_schema, v_shadow_name, cols, vals);
+                END IF;
+            ELSIF rec.event_type = 'DELETE' THEN
+                IF shadow_oid IS NULL THEN CONTINUE; END IF;
+                pred := flashback_build_predicate(shadow_oid, rec.old_data);
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format(
+                        'DELETE FROM %I.%I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
+                        v_shadow_schema, v_shadow_name,
+                        v_shadow_schema, v_shadow_name, pred);
+                END IF;
+            ELSIF rec.event_type = 'UPDATE' THEN
+                IF shadow_oid IS NULL THEN CONTINUE; END IF;
+                -- Full-row UPDATE: DELETE old + INSERT new (no PK tables)
+                pred := flashback_build_predicate(shadow_oid, rec.old_data);
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format(
+                        'DELETE FROM %I.%I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
+                        v_shadow_schema, v_shadow_name,
+                        v_shadow_schema, v_shadow_name, pred);
+                END IF;
+                SELECT col_list, val_list
+                  INTO cols, vals
+                FROM flashback_build_insert_parts(shadow_oid, rec.new_data);
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format(
+                        'INSERT INTO %I.%I (%s) VALUES (%s)',
+                        v_shadow_schema, v_shadow_name, cols, vals);
+                END IF;
             END IF;
-        ELSIF rec.event_type = 'INSERT' THEN
-            IF shadow_oid IS NULL THEN CONTINUE; END IF;
 
-            SELECT col_list, val_list
-              INTO cols, vals
-            FROM flashback_build_insert_parts(shadow_oid, rec.new_data);
-
-            IF cols IS NOT NULL AND cols <> '' THEN
-                EXECUTE format(
-                    'INSERT INTO %I.%I (%s) VALUES (%s)',
-                    v_shadow_schema, v_shadow_name, cols, vals
-                );
+            applied := applied + 1;
+            IF applied % 10000 = 0 THEN
+                RAISE NOTICE 'flashback_restore [%]: % / % events applied (% %%)',
+                    target_table, applied, v_total_events,
+                    round(100.0 * applied / GREATEST(v_total_events, 1), 1);
             END IF;
-        ELSIF rec.event_type = 'DELETE' THEN
-            IF shadow_oid IS NULL THEN CONTINUE; END IF;
-
-            pred := flashback_build_predicate(shadow_oid, rec.old_data);
-            IF pred IS NOT NULL AND pred <> '' THEN
-                EXECUTE format(
-                    'DELETE FROM %I.%I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
-                    v_shadow_schema, v_shadow_name,
-                    v_shadow_schema, v_shadow_name, pred
-                );
-            END IF;
-        ELSIF rec.event_type = 'UPDATE' THEN
-            IF shadow_oid IS NULL THEN CONTINUE; END IF;
-
-            pred := flashback_build_predicate(shadow_oid, rec.old_data);
-            IF pred IS NOT NULL AND pred <> '' THEN
-                EXECUTE format(
-                    'DELETE FROM %I.%I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
-                    v_shadow_schema, v_shadow_name,
-                    v_shadow_schema, v_shadow_name, pred
-                );
-            END IF;
-
-            SELECT col_list, val_list
-              INTO cols, vals
-            FROM flashback_build_insert_parts(shadow_oid, rec.new_data);
-
-            IF cols IS NOT NULL AND cols <> '' THEN
-                EXECUTE format(
-                    'INSERT INTO %I.%I (%s) VALUES (%s)',
-                    v_shadow_schema, v_shadow_name, cols, vals
-                );
-            END IF;
-        END IF;
-
-        applied := applied + 1;
-
-        IF applied % 10000 = 0 THEN
-            RAISE NOTICE 'flashback_restore [%]: % / % events applied (% %%)',
-                target_table, applied, v_total_events,
-                round(100.0 * applied / GREATEST(v_total_events, 1), 1);
-        END IF;
-    END LOOP;
+        END LOOP;
+    END IF;
 
     -- ────────────────────────────────────────────────────────────
     -- Phase 4: Atomic swap — brief exclusive lock on original
@@ -518,6 +552,8 @@ DECLARE
     pred text;
     cols text;
     vals text;
+    v_set_clause text;
+    v_pk_pred text;
     v_query text;
 BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
@@ -589,20 +625,34 @@ BEGIN
                 EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
             END IF;
         ELSIF rec.event_type = 'UPDATE' THEN
-            pred := flashback_build_predicate(
-                to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                rec.old_data
-            );
-            IF pred IS NOT NULL AND pred <> '' THEN
-                EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
-            END IF;
-            SELECT col_list, val_list INTO cols, vals
-            FROM flashback_build_insert_parts(
+            -- Try PK-based UPDATE SET (works for both diff and full format)
+            SELECT us.set_clause, us.pk_predicate
+              INTO v_set_clause, v_pk_pred
+            FROM flashback_build_update_set(
                 to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
                 rec.new_data
-            );
-            IF cols IS NOT NULL AND cols <> '' THEN
-                EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+            ) us;
+
+            IF v_set_clause IS NOT NULL AND v_set_clause <> ''
+               AND v_pk_pred IS NOT NULL AND v_pk_pred <> '' THEN
+                EXECUTE format('UPDATE %s SET %s WHERE %s', v_tmp, v_set_clause, v_pk_pred);
+            ELSE
+                -- No PK fallback: DELETE + INSERT
+                pred := flashback_build_predicate(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.old_data
+                );
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
+                END IF;
+                SELECT col_list, val_list INTO cols, vals
+                FROM flashback_build_insert_parts(
+                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
+                    rec.new_data
+                );
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+                END IF;
             END IF;
         END IF;
     END LOOP;

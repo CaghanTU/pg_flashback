@@ -11,6 +11,12 @@ static WORKER_BATCH_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(4096);
 static MAX_ROW_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(65536);
 static ENABLED_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+/// Comma-separated list of databases. Each gets its own background worker.
+/// When set, overrides the single `target_database` GUC.
+static TARGET_DATABASES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Maximum background workers to register (Postmaster context, requires restart).
+static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
@@ -66,32 +72,105 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_string_guc(
         c"pg_flashback.target_database",
         c"Database the pg_flashback worker connects to",
-        c"The background worker flushes staging_events in this database. Set to the database where the extension is installed. Default: postgres.",
+        c"The background worker flushes staging_events in this database. Set to the database where the extension is installed. Default: postgres. Overridden by target_databases if set.",
         &TARGET_DATABASE_GUC,
         GucContext::Postmaster,
         GucFlags::default(),
     );
 
-    BackgroundWorkerBuilder::new("pg_flashback delta worker")
-        .set_function("pg_flashback_delta_worker_main")
-        .set_library("pg_flashback")
-        .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
-        .enable_spi_access()
-        .set_restart_time(Some(Duration::from_secs(1)))
-        .load();
+    GucRegistry::define_string_guc(
+        c"pg_flashback.target_databases",
+        c"Comma-separated list of databases for pg_flashback workers",
+        c"Each database gets its own background worker. Overrides target_database when set. Example: 'db1,db2,db3'.",
+        &TARGET_DATABASES_GUC,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.max_workers",
+        c"Maximum number of pg_flashback background workers",
+        c"Each worker handles one database. Extra workers beyond the database count exit gracefully. Requires restart.",
+        &MAX_WORKERS_GUC,
+        1,
+        8,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    // Register up to max_workers background workers.
+    // Each worker receives its index (0-based) as the argument.
+    // At runtime, each worker reads the database list and connects to
+    // its assigned database, or exits if no database is assigned.
+    let max_w = MAX_WORKERS_GUC.get().clamp(1, 8) as usize;
+    for i in 0..max_w {
+        let name = if i == 0 {
+            "pg_flashback delta worker".to_string()
+        } else {
+            format!("pg_flashback delta worker {}", i)
+        };
+
+        BackgroundWorkerBuilder::new(&name)
+            .set_function("pg_flashback_delta_worker_main")
+            .set_library("pg_flashback")
+            .set_argument((i as i32).into_datum())
+            .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
+            .enable_spi_access()
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .load();
+    }
 }
 
-pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+/// Resolve the list of target databases from GUCs.
+/// Priority: target_databases (comma-separated) > target_database > "postgres".
+fn resolve_database_list() -> Vec<String> {
+    // Check target_databases first (comma-separated list)
+    if let Some(cs) = TARGET_DATABASES_GUC.get() {
+        if let Ok(s) = cs.to_str() {
+            let dbs: Vec<String> = s
+                .split(',')
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .collect();
+            if !dbs.is_empty() {
+                return dbs;
+            }
+        }
+    }
 
+    // Fallback to single target_database
     let db_setting = TARGET_DATABASE_GUC.get();
     let db_name = db_setting
         .as_deref()
         .and_then(|cs| cs.to_str().ok())
         .unwrap_or("postgres");
+    vec![db_name.to_string()]
+}
+
+pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    let worker_index = unsafe { i32::from_datum(arg, false) }.unwrap_or(0) as usize;
+
+    let db_list = resolve_database_list();
+
+    // If this worker's index exceeds the database list, exit gracefully.
+    if worker_index >= db_list.len() {
+        log!(
+            "pg_flashback worker {} exiting: only {} database(s) configured",
+            worker_index,
+            db_list.len()
+        );
+        return;
+    }
+
+    let db_name = &db_list[worker_index];
     BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
 
-    log!("pg_flashback delta worker started (database: {db_name})");
+    log!(
+        "pg_flashback delta worker {worker_index} started (database: {db_name}, {total} total database(s))",
+        total = db_list.len()
+    );
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -145,7 +224,9 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
             run_retention_purge();
         }
     }
-    log!("pg_flashback delta worker stopped");
+    log!(
+        "pg_flashback delta worker {worker_index} stopped (database: {db_name})"
+    );
 }
 
 /// Check if any backend is performing a flashback restore by looking for
