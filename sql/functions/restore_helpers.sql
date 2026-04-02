@@ -277,8 +277,8 @@ BEGIN
     FROM flashback.delta_log d
     WHERE d.rel_oid = p_rel_oid
       AND d.committed_at IS NOT NULL
-      AND d.event_time > p_start_at
-      AND d.event_time <= p_target_time
+      AND d.committed_at > p_start_at    -- partition pruning lower bound
+      AND d.event_time <= p_target_time  -- accurate PITR: tx commit time
       AND d.event_type IN ('TRUNCATE', 'DROP');
 
     IF v_last_barrier IS NOT NULL THEN
@@ -297,8 +297,8 @@ BEGIN
     FROM flashback.delta_log d
     WHERE d.rel_oid = p_rel_oid
       AND d.committed_at IS NOT NULL
-      AND d.event_time > p_start_at
-      AND d.event_time <= p_target_time
+      AND d.committed_at > p_start_at    -- partition pruning lower bound
+      AND d.event_time <= p_target_time  -- accurate PITR: tx commit time
       AND d.event_id > v_start_id
       AND d.event_type IN ('INSERT', 'UPDATE', 'DELETE');
 
@@ -323,8 +323,8 @@ BEGIN
          FROM flashback.delta_log d
          WHERE d.rel_oid = $1
            AND d.committed_at IS NOT NULL
-           AND d.event_time > $2
-           AND d.event_time <= $3
+           AND d.committed_at > $2    -- partition pruning lower bound
+           AND d.event_time <= $3     -- accurate PITR: tx commit time
            AND d.event_id > $4
            AND d.event_type IN (''INSERT'', ''UPDATE'', ''DELETE'')
          ORDER BY d.event_id',
@@ -583,17 +583,21 @@ BEGIN
         EXECUTE format('CREATE TABLE %I.%I (%s)', v_tgt_schema, v_tgt_table, col_defs);
     END IF;
 
-    -- Primary key
+    -- Primary key: defer in shadow mode for faster bulk load
     SELECT string_agg(format('%I', key_col), ', ')
       INTO pk_cols
     FROM jsonb_array_elements_text(COALESCE(ddl_info->'primary_key', '[]'::jsonb)) AS key_col;
 
-    IF pk_cols IS NOT NULL AND pk_cols <> '' THEN
-        EXECUTE format(
-            'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
-            v_tgt_schema, v_tgt_table, pk_cols
-        );
+    IF NOT v_is_shadow THEN
+        -- Non-shadow: create PK immediately
+        IF pk_cols IS NOT NULL AND pk_cols <> '' THEN
+            EXECUTE format(
+                'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
+                v_tgt_schema, v_tgt_table, pk_cols
+            );
+        END IF;
     END IF;
+    -- Shadow mode: PK is deferred — caller adds it after snapshot load
 
     -- CHECK / UNIQUE constraints (always); FK only in non-shadow mode
     FOR v_con IN
@@ -601,6 +605,10 @@ BEGIN
         FROM jsonb_array_elements(COALESCE(ddl_info->'constraints', '[]'::jsonb)) AS con
     LOOP
         IF v_is_shadow AND v_con.def ILIKE 'FOREIGN KEY%' THEN
+            CONTINUE;
+        END IF;
+        -- Defer UNIQUE constraints in shadow mode (index-backed, slow during load)
+        IF v_is_shadow AND v_con.def ILIKE 'UNIQUE%' THEN
             CONTINUE;
         END IF;
         BEGIN
@@ -613,30 +621,16 @@ BEGIN
         END;
     END LOOP;
 
-    -- Indexes
-    FOR v_idx IN
-        SELECT idx->>'def' AS def
-        FROM jsonb_array_elements(COALESCE(ddl_info->'indexes', '[]'::jsonb)) AS idx
-    LOOP
-        IF v_is_shadow THEN
-            DECLARE
-                v_idx_def text;
-            BEGIN
-                v_idx_def := replace(v_idx.def,
-                    format('%I.%I', v_schema, v_table),
-                    format('%I.%I', v_tgt_schema, v_tgt_table));
-                -- Also replace unqualified references
-                v_idx_def := replace(v_idx_def,
-                    format(' ON %I ', v_table),
-                    format(' ON %I.%I ', v_tgt_schema, v_tgt_table));
-                EXECUTE v_idx_def;
-            EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: shadow index skipped: %', SQLERRM;
-            END;
-        ELSE
+    -- Indexes: defer all in shadow mode for faster bulk load
+    IF NOT v_is_shadow THEN
+        FOR v_idx IN
+            SELECT idx->>'def' AS def
+            FROM jsonb_array_elements(COALESCE(ddl_info->'indexes', '[]'::jsonb)) AS idx
+        LOOP
             EXECUTE v_idx.def;
-        END IF;
-    END LOOP;
+        END LOOP;
+    END IF;
+    -- Shadow mode: indexes are deferred — caller adds them after delta replay
 
     -- Non-shadow mode: restore triggers, RLS, ACL
     IF NOT v_is_shadow THEN
@@ -704,6 +698,102 @@ END;
 $$;
 
 -- ----------------------------------------------------------------
+-- flashback_apply_deferred_pk: add PK to shadow after snapshot load
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_apply_deferred_pk(
+    p_shadow_schema text,
+    p_shadow_table  text,
+    ddl_info        jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    pk_cols text;
+BEGIN
+    SELECT string_agg(format('%I', key_col), ', ')
+      INTO pk_cols
+    FROM jsonb_array_elements_text(COALESCE(ddl_info->'primary_key', '[]'::jsonb)) AS key_col;
+
+    IF pk_cols IS NOT NULL AND pk_cols <> '' THEN
+        -- Higher maintenance_work_mem for faster index build on large tables
+        PERFORM set_config('maintenance_work_mem',
+            COALESCE(NULLIF(current_setting('pg_flashback.index_build_work_mem', true), ''), '512MB'),
+            true);
+        EXECUTE format(
+            'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
+            p_shadow_schema, p_shadow_table, pk_cols
+        );
+    END IF;
+
+    -- Also apply deferred UNIQUE constraints
+    DECLARE
+        v_con record;
+    BEGIN
+        FOR v_con IN
+            SELECT con->>'name' AS name, con->>'def' AS def
+            FROM jsonb_array_elements(COALESCE(ddl_info->'constraints', '[]'::jsonb)) AS con
+            WHERE con->>'def' ILIKE 'UNIQUE%'
+        LOOP
+            BEGIN
+                EXECUTE format(
+                    'ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+                    p_shadow_schema, p_shadow_table, v_con.name, v_con.def
+                );
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'flashback: deferred constraint % skipped: %', v_con.name, SQLERRM;
+            END;
+        END LOOP;
+    END;
+END;
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback_apply_deferred_indexes: add indexes after delta replay
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_apply_deferred_indexes(
+    p_orig_schema   text,
+    p_orig_table    text,
+    p_shadow_schema text,
+    p_shadow_table  text,
+    ddl_info        jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_idx record;
+    v_idx_def text;
+BEGIN
+    -- Higher maintenance_work_mem for faster index build on large tables
+    PERFORM set_config('maintenance_work_mem',
+        COALESCE(NULLIF(current_setting('pg_flashback.index_build_work_mem', true), ''), '512MB'),
+        true);
+
+    FOR v_idx IN
+        SELECT idx->>'def' AS def
+        FROM jsonb_array_elements(COALESCE(ddl_info->'indexes', '[]'::jsonb)) AS idx
+    LOOP
+        BEGIN
+            v_idx_def := replace(v_idx.def,
+                format('%I.%I', p_orig_schema, p_orig_table),
+                format('%I.%I', p_shadow_schema, p_shadow_table));
+            v_idx_def := replace(v_idx_def,
+                format(' ON %I ', p_orig_table),
+                format(' ON %I.%I ', p_shadow_schema, p_shadow_table));
+            EXECUTE v_idx_def;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: deferred index skipped: %', SQLERRM;
+        END;
+    END LOOP;
+END;
+$$;
+
+-- ----------------------------------------------------------------
 -- flashback_finalize_shadow_swap
 -- ----------------------------------------------------------------
 -- Performs the atomic swap:  brief AccessExclusiveLock on original,
@@ -747,6 +837,53 @@ BEGIN
     END IF;
     EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
         p_orig_schema, p_shadow_table, p_orig_table);
+
+    -- Rename shadow-prefixed PK constraint back to original name
+    DECLARE
+        v_shadow_con record;
+    BEGIN
+        FOR v_shadow_con IN
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = to_regclass(format('%I.%I', p_orig_schema, p_orig_table))
+              AND contype IN ('p', 'u')
+              AND conname LIKE p_shadow_table || '%'
+        LOOP
+            DECLARE
+                v_new_conname text;
+            BEGIN
+                v_new_conname := replace(v_shadow_con.conname, p_shadow_table, p_orig_table);
+                EXECUTE format('ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I',
+                    p_orig_schema, p_orig_table, v_shadow_con.conname, v_new_conname);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'flashback: constraint rename % → % failed: %',
+                    v_shadow_con.conname, v_new_conname, SQLERRM;
+            END;
+        END LOOP;
+    END;
+
+    -- Rename shadow-prefixed indexes back to original names
+    DECLARE
+        v_shadow_idx record;
+        v_new_idxname text;
+    BEGIN
+        FOR v_shadow_idx IN
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = p_orig_schema
+              AND tablename = p_orig_table
+              AND indexname LIKE p_shadow_table || '%'
+        LOOP
+            BEGIN
+                v_new_idxname := replace(v_shadow_idx.indexname, p_shadow_table, p_orig_table);
+                EXECUTE format('ALTER INDEX %I.%I RENAME TO %I',
+                    p_orig_schema, v_shadow_idx.indexname, v_new_idxname);
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'flashback: index rename % → % failed: %',
+                    v_shadow_idx.indexname, v_new_idxname, SQLERRM;
+            END;
+        END LOOP;
+    END;
 
     -- Rename partitions back to original names
     IF jsonb_typeof(ddl_info->'partitions') = 'array' AND jsonb_array_length(ddl_info->'partitions') > 0 THEN

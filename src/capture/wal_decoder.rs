@@ -26,6 +26,7 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut OutputPluginCall
     cb.change_cb = Some(fb_decode_change);
     cb.truncate_cb = Some(fb_decode_truncate);
     cb.commit_cb = Some(fb_decode_commit);
+    cb.message_cb = Some(fb_decode_message);
     cb.shutdown_cb = Some(fb_decode_shutdown);
 }
 
@@ -207,6 +208,43 @@ unsafe extern "C-unwind" fn fb_decode_commit(
         OutputPluginPrepareWrite(ctx, true);
         let buf = (*ctx).out;
         appendStringInfoString(buf, c_json.as_ptr());
+        OutputPluginWrite(ctx, true);
+    }
+}
+
+// ─── Logical Message (DDL events via pg_logical_emit_message) ────
+
+unsafe extern "C-unwind" fn fb_decode_message(
+    ctx: *mut LogicalDecodingContext,
+    _txn: *mut ReorderBufferTXN,
+    _message_lsn: XLogRecPtr,
+    _transactional: bool,
+    prefix: *const ::core::ffi::c_char,
+    message_size: Size,
+    message: *const ::core::ffi::c_char,
+) {
+    if prefix.is_null() || message.is_null() || message_size == 0 {
+        return;
+    }
+
+    let prefix_str = unsafe { CStr::from_ptr(prefix) }
+        .to_str()
+        .unwrap_or("");
+
+    if prefix_str != "pg_flashback" {
+        return;
+    }
+
+    // The message payload is the DDL event JSON — emit it as-is
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(message as *const u8, message_size as usize) };
+    let msg_str = std::str::from_utf8(msg_bytes).unwrap_or("{}");
+
+    let c_msg = std::ffi::CString::new(msg_str).unwrap_or_default();
+    unsafe {
+        OutputPluginPrepareWrite(ctx, true);
+        let buf = (*ctx).out;
+        appendStringInfoString(buf, c_msg.as_ptr());
         OutputPluginWrite(ctx, true);
     }
 }

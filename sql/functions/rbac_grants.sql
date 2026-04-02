@@ -139,3 +139,6 @@ COMMENT ON FUNCTION flashback_capture_delete_row_trigger()
     IS '[Internal] Per-row AFTER DELETE trigger for partitioned tables — transition tables are not supported on partitioned tables.';
 COMMENT ON FUNCTION flashback_restore_parallel(text, timestamptz, int)
     IS 'Restore a table with parallel-worker hints (max_parallel_workers_per_gather). Also emits per-partition guidance for partitioned tables.';
+COMMENT ON FUNCTION flashback_ensure_delta_partition(date)
+    IS '[Internal] Ensures monthly delta_log partitions exist for the given date. Called automatically by background worker. No-op on non-partitioned installations.';
+REVOKE ALL ON FUNCTION flashback_ensure_delta_partition(date) FROM PUBLIC;

@@ -162,14 +162,30 @@ BEGIN
         target_table, v_shadow_schema, v_shadow_name;
 
     -- ────────────────────────────────────────────────────────────
-    -- Phase 2: Load snapshot into shadow table
+    -- Phase 2: Load snapshot into shadow table (no indexes = fast bulk load)
     -- ────────────────────────────────────────────────────────────
+    -- Shadow table has no PK or secondary indexes at this point.
+    -- This makes INSERT...SELECT significantly faster for large tables
+    -- because there's no index maintenance overhead during load.
+    PERFORM set_config('work_mem',
+        COALESCE(NULLIF(current_setting('pg_flashback.restore_work_mem', true), ''), '256MB'),
+        true);
+
     EXECUTE format(
         'INSERT INTO %I.%I SELECT * FROM %s',
         v_shadow_schema, v_shadow_name, v_start_table
     );
     RAISE NOTICE 'flashback_restore [%]: snapshot loaded into shadow from %',
         target_table, v_start_table;
+
+    -- ────────────────────────────────────────────────────────────
+    -- Phase 2b: Add PK to shadow (needed for batch delta replay)
+    -- ────────────────────────────────────────────────────────────
+    -- Building PK index AFTER bulk load is much faster than maintaining
+    -- it during each INSERT (single sort+write vs per-row updates).
+    PERFORM flashback_apply_deferred_pk(
+        v_shadow_schema, v_shadow_name, v_target_schema_def
+    );
 
     -- ────────────────────────────────────────────────────────────
     -- Phase 3: Replay delta events into shadow table
@@ -183,8 +199,8 @@ BEGIN
         SELECT 1 FROM flashback.delta_log d
         WHERE d.rel_oid = v_rel_oid
           AND d.committed_at IS NOT NULL
-          AND d.event_time > v_start_at
-          AND d.event_time <= target_time
+          AND d.committed_at > v_start_at  -- partition pruning lower bound
+          AND d.event_time <= target_time   -- accurate PITR: use tx commit time, not worker flush time
           AND d.event_type IN ('ALTER', 'DROP', 'TRUNCATE')
     ) INTO v_has_ddl;
 
@@ -219,8 +235,8 @@ BEGIN
         FROM flashback.delta_log d
         WHERE d.rel_oid = v_rel_oid
           AND d.committed_at IS NOT NULL
-          AND d.event_time > v_start_at
-          AND d.event_time <= target_time;
+          AND d.committed_at > v_start_at  -- partition pruning lower bound
+          AND d.event_time <= target_time;  -- accurate PITR: tx commit time
 
         RAISE NOTICE 'flashback_restore [%]: using row-by-row replay (no PK, % events)',
             target_table, v_total_events;
@@ -230,8 +246,8 @@ BEGIN
             FROM flashback.delta_log d
             WHERE d.rel_oid = v_rel_oid
               AND d.committed_at IS NOT NULL
-              AND d.event_time > v_start_at
-              AND d.event_time <= target_time
+              AND d.committed_at > v_start_at  -- partition pruning lower bound
+              AND d.event_time <= target_time   -- accurate PITR: tx commit time
             ORDER BY d.event_id ASC
         LOOP
             shadow_oid := to_regclass(format('%I.%I', v_shadow_schema, v_shadow_name))::oid;
@@ -291,6 +307,21 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
+
+    -- ────────────────────────────────────────────────────────────
+    -- Phase 3b: Build deferred secondary indexes on shadow table
+    -- ────────────────────────────────────────────────────────────
+    -- Creating indexes AFTER data load + delta replay is much faster
+    -- than maintaining them during each operation. For a 10M row table,
+    -- this can be 3-10x faster than building indexes before data load.
+    PERFORM flashback_apply_deferred_indexes(
+        v_schema_name, v_table_name,
+        v_shadow_schema, v_shadow_name,
+        v_target_schema_def
+    );
+
+    RAISE NOTICE 'flashback_restore [%]: deferred indexes built on shadow table',
+        target_table;
 
     -- ────────────────────────────────────────────────────────────
     -- Phase 4: Atomic swap — brief exclusive lock on original
@@ -528,6 +559,19 @@ $$;
 -- ----------------------------------------------------------------
 -- flashback_query: point-in-time SELECT without modifying the table
 -- ----------------------------------------------------------------
+-- Creates a temp table using the *historical* schema at target_time
+-- (from schema_versions), not LIKE the current live table. This means
+-- schema evolution (ADD/DROP/ALTER COLUMN) is reflected correctly.
+--
+-- Limitations:
+--   • ALTER events in the replay range are replayed as data events only
+--     (column set is fixed at target_time schema). Columns that were
+--     added or removed between the snapshot and target_time are handled
+--     by the column lists in old_data/new_data, not by schema mutation.
+--   • DROP TABLE events: if the table was dropped before target_time,
+--     the function returns 0 rows with a NOTICE (the table did not exist
+--     at that point in time).
+-- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION flashback_query(
     target_table text,
     target_time  timestamptz,
@@ -546,7 +590,8 @@ DECLARE
     v_tracked_since timestamptz;
     v_start_at timestamptz;
     v_start_table text;
-    v_start_schema_def jsonb;
+    v_target_schema_def jsonb;
+    v_col_defs text;
     v_tmp text;
     rec record;
     pred text;
@@ -555,6 +600,7 @@ DECLARE
     v_set_clause text;
     v_pk_pred text;
     v_query text;
+    v_table_dropped boolean := false;
 BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
@@ -578,6 +624,57 @@ BEGIN
         RAISE EXCEPTION 'flashback_query: target_time % is before tracked_since %', target_time, v_tracked_since;
     END IF;
 
+    -- ── Historical schema at target_time ────────────────────────
+    -- Use schema_versions snapshot instead of LIKE <live table> so that
+    -- ADD/DROP/ALTER COLUMN changes are reflected correctly.
+    SELECT
+        jsonb_build_object(
+            'schema', v_schema_name,
+            'table',  v_table_name,
+            'columns', COALESCE(sv.columns, '[]'::jsonb),
+            'primary_key', COALESCE(sv.primary_key, '[]'::jsonb)
+        )
+      INTO v_target_schema_def
+    FROM flashback.schema_versions sv
+    WHERE sv.rel_oid = v_rel_oid
+      AND sv.applied_at <= target_time
+    ORDER BY sv.schema_version DESC
+    LIMIT 1;
+
+    -- Fall back to collecting current live schema if no schema_version entry
+    IF v_target_schema_def IS NULL THEN
+        v_target_schema_def := COALESCE(
+            flashback_collect_schema_def(v_rel_oid),
+            jsonb_build_object(
+                'schema', v_schema_name,
+                'table', v_table_name,
+                'columns', '[]'::jsonb,
+                'primary_key', '[]'::jsonb
+            )
+        );
+    END IF;
+
+    -- Build column definitions for the temp table from historical schema
+    SELECT string_agg(
+        format('%I %s%s',
+            col->>'name',
+            col->>'type',
+            CASE WHEN COALESCE((col->>'not_null')::boolean, false) THEN ' NOT NULL' ELSE '' END
+        ),
+        ', '
+        ORDER BY ord
+    )
+      INTO v_col_defs
+    FROM jsonb_array_elements(v_target_schema_def->'columns') WITH ORDINALITY AS t(col, ord)
+    WHERE col->>'name' IS NOT NULL
+      AND col->>'generated' IS DISTINCT FROM 'always';  -- skip generated columns
+
+    -- If schema_versions has no column info, fall back to LIKE current table
+    IF v_col_defs IS NULL OR v_col_defs = '' THEN
+        v_col_defs := NULL;
+    END IF;
+
+    -- ── Find nearest snapshot ────────────────────────────────────
     SELECT s.captured_at, s.snapshot_table
       INTO v_start_at, v_start_table
     FROM flashback.snapshots s
@@ -592,66 +689,83 @@ BEGIN
         RAISE EXCEPTION 'flashback_query: no snapshot for %', target_table;
     END IF;
 
-    v_tmp := '_fb_query_' || pg_backend_pid()::text || '_' || extract(epoch FROM clock_timestamp())::bigint::text || '_' || (random() * 100000)::integer::text;
-    EXECUTE format('CREATE TEMP TABLE %I (LIKE %I.%I INCLUDING ALL) ON COMMIT DROP', v_tmp, v_schema_name, v_table_name);
+    -- ── Build temp table from historical column list ─────────────
+    v_tmp := '_fb_query_' || pg_backend_pid()::text
+             || '_' || extract(epoch FROM clock_timestamp())::bigint::text
+             || '_' || (random() * 100000)::integer::text;
+
+    IF v_col_defs IS NOT NULL THEN
+        EXECUTE format('CREATE TEMP TABLE %I (%s) ON COMMIT DROP', v_tmp, v_col_defs);
+    ELSE
+        -- Last-resort fallback: LIKE current live table (schema may differ from target_time)
+        RAISE NOTICE 'flashback_query: no schema_versions entry for % — using current table schema (results may differ for schema-evolved tables)', target_table;
+        EXECUTE format('CREATE TEMP TABLE %I (LIKE %I.%I) ON COMMIT DROP', v_tmp, v_schema_name, v_table_name);
+    END IF;
     EXECUTE format('INSERT INTO %I SELECT * FROM %s', v_tmp, v_start_table);
 
+    -- ── Replay delta events ──────────────────────────────────────
     FOR rec IN
-        SELECT d.event_type, d.old_data, d.new_data
+        SELECT d.event_type, d.old_data, d.new_data, d.event_id
         FROM flashback.delta_log d
         WHERE d.rel_oid = v_rel_oid
           AND d.committed_at IS NOT NULL
-          AND d.event_time > v_start_at
-          AND d.event_time <= target_time
+          AND d.committed_at > v_start_at  -- partition pruning lower bound
+          AND d.event_time <= target_time   -- accurate PITR: tx commit time
         ORDER BY d.event_id ASC
     LOOP
-        IF rec.event_type = 'TRUNCATE' THEN
-            EXECUTE format('TRUNCATE %s', v_tmp);
+        -- DROP: table did not exist at target_time → return 0 rows
+        IF rec.event_type = 'DROP' THEN
+            RAISE NOTICE 'flashback_query: table % was dropped at or before % (event_id=%) — returning empty result',
+                target_table, target_time, rec.event_id;
+            EXECUTE format('TRUNCATE %I', v_tmp);
+            v_table_dropped := true;
+            EXIT;  -- no further replay possible after a DROP
+
+        ELSIF rec.event_type = 'TRUNCATE' THEN
+            EXECUTE format('TRUNCATE %I', v_tmp);
+
+        ELSIF rec.event_type = 'ALTER' THEN
+            -- ALTER events change column shape; the temp table was built from the
+            -- target_time schema so column definitions are already correct.
+            -- Skip the DDL replay — data events after this ALTER will use the
+            -- updated old_data/new_data field sets automatically.
+            RAISE NOTICE 'flashback_query: ALTER event skipped (temp table built from target_time schema)';
+
         ELSIF rec.event_type = 'INSERT' THEN
             SELECT col_list, val_list INTO cols, vals
-            FROM flashback_build_insert_parts(
-                to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                rec.new_data
-            );
+            FROM flashback_build_insert_parts(v_rel_oid, rec.new_data);
             IF cols IS NOT NULL AND cols <> '' THEN
-                EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+                EXECUTE format('INSERT INTO %I (%s) VALUES (%s)', v_tmp, cols, vals);
             END IF;
+
         ELSIF rec.event_type = 'DELETE' THEN
-            pred := flashback_build_predicate(
-                to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                rec.old_data
-            );
+            pred := flashback_build_predicate(v_rel_oid, rec.old_data);
             IF pred IS NOT NULL AND pred <> '' THEN
-                EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
+                EXECUTE format(
+                    'DELETE FROM %I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I WHERE %s LIMIT 1)',
+                    v_tmp, v_tmp, pred);
             END IF;
+
         ELSIF rec.event_type = 'UPDATE' THEN
-            -- Try PK-based UPDATE SET (works for both diff and full format)
             SELECT us.set_clause, us.pk_predicate
               INTO v_set_clause, v_pk_pred
-            FROM flashback_build_update_set(
-                to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                rec.new_data
-            ) us;
+            FROM flashback_build_update_set(v_rel_oid, rec.new_data) us;
 
             IF v_set_clause IS NOT NULL AND v_set_clause <> ''
                AND v_pk_pred IS NOT NULL AND v_pk_pred <> '' THEN
-                EXECUTE format('UPDATE %s SET %s WHERE %s', v_tmp, v_set_clause, v_pk_pred);
+                EXECUTE format('UPDATE %I SET %s WHERE %s', v_tmp, v_set_clause, v_pk_pred);
             ELSE
                 -- No PK fallback: DELETE + INSERT
-                pred := flashback_build_predicate(
-                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                    rec.old_data
-                );
+                pred := flashback_build_predicate(v_rel_oid, rec.old_data);
                 IF pred IS NOT NULL AND pred <> '' THEN
-                    EXECUTE format('DELETE FROM %s WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %s WHERE %s LIMIT 1)', v_tmp, v_tmp, pred);
+                    EXECUTE format(
+                        'DELETE FROM %I WHERE (tableoid, ctid) IN (SELECT tableoid, ctid FROM %I WHERE %s LIMIT 1)',
+                        v_tmp, v_tmp, pred);
                 END IF;
                 SELECT col_list, val_list INTO cols, vals
-                FROM flashback_build_insert_parts(
-                    to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid,
-                    rec.new_data
-                );
+                FROM flashback_build_insert_parts(v_rel_oid, rec.new_data);
                 IF cols IS NOT NULL AND cols <> '' THEN
-                    EXECUTE format('INSERT INTO %s (%s) VALUES (%s)', v_tmp, cols, vals);
+                    EXECUTE format('INSERT INTO %I (%s) VALUES (%s)', v_tmp, cols, vals);
                 END IF;
             END IF;
         END IF;

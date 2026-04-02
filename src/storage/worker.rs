@@ -21,9 +21,26 @@ static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
 /// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
 static CAPTURE_MODE_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
+/// Logical replication slot name. Allows multiple pg_flashback instances on the same cluster.
+static SLOT_NAME_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+/// work_mem override for snapshot bulk load during flashback_restore.
+static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// maintenance_work_mem override for deferred index builds during flashback_restore.
+static INDEX_BUILD_WORK_MEM_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
+}
+
+/// Returns the configured replication slot name, falling back to 'pg_flashback_slot'.
+fn effective_slot_name() -> String {
+    SLOT_NAME_GUC
+        .get()
+        .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pg_flashback_slot".to_string())
 }
 
 fn effective_worker_batch_size() -> usize {
@@ -107,6 +124,33 @@ pub fn register_worker_and_guc() {
         c"pg_flashback capture mode: auto, wal, or trigger",
         c"'wal' = WAL-based logical decoding (requires wal_level=logical), 'trigger' = legacy trigger-based capture, 'auto' = detect wal_level and choose (default: auto).",
         &CAPTURE_MODE_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.slot_name",
+        c"Logical replication slot name used by pg_flashback",
+        c"Override when running multiple pg_flashback installations on the same cluster. Default: pg_flashback_slot.",
+        &SLOT_NAME_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.restore_work_mem",
+        c"work_mem for snapshot bulk load during flashback_restore",
+        c"Passed to set_config('work_mem') before INSERT ... SELECT snapshot load. Higher values speed up large tables. Default: 256MB.",
+        &RESTORE_WORK_MEM_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.index_build_work_mem",
+        c"maintenance_work_mem for deferred index builds during flashback_restore",
+        c"Passed to set_config('maintenance_work_mem') before building PK and secondary indexes on shadow table. Default: 512MB.",
+        &INDEX_BUILD_WORK_MEM_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -217,7 +261,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
                 if !slot_ready {
                     slot_ready = ensure_replication_slot();
                     if !slot_ready && !slot_warned {
-                        log!("pg_flashback: replication slot 'pg_flashback_slot' not found, waiting for flashback_track() to create it");
+                        log!("pg_flashback: replication slot '{}' not found, waiting for flashback_track() to create it", effective_slot_name());
                         slot_warned = true;
                     }
                 }
@@ -239,6 +283,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             if !is_any_restore_active() {
                 let t1 = std::time::Instant::now();
                 run_periodic_checkpoints();
+                run_ensure_partitions();
                 ckpt_ms = t1.elapsed().as_millis();
 
                 let t2 = std::time::Instant::now();
@@ -334,9 +379,11 @@ fn effective_capture_mode() -> &'static str {
 /// transaction. Instead, the slot should be created by flashback_track()
 /// or manually by the DBA. This function only checks for existence.
 fn ensure_replication_slot() -> bool {
+    let slot_name = effective_slot_name();
     let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
-        let exists = Spi::get_one::<bool>(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot')",
+        let exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[slot_name.as_str().into()],
         )?
         .unwrap_or(false);
         Ok(exists)
@@ -347,6 +394,7 @@ fn ensure_replication_slot() -> bool {
 /// Consume WAL changes from the logical replication slot and insert into delta_log.
 /// Each change is a JSON line produced by our output plugin (_PG_output_plugin_init).
 fn consume_wal_changes() {
+    let slot_name = effective_slot_name();
     let batch_size = effective_worker_batch_size() as i32;
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         let table_exists =
@@ -358,11 +406,21 @@ fn consume_wal_changes() {
 
         // Consume changes from the slot in a batch
         // pg_logical_slot_get_changes returns (lsn, xid, data) rows
-        Spi::run_with_args(
+        // Handles both DML events (from change_cb) and DDL events (from message_cb)
+        //
+        // slot_name cannot be passed as a bind parameter to pg_logical_slot_get_changes
+        // (it only accepts a literal name). The slot name originates from a superuser-only
+        // GUC (pg_flashback.slot_name), so we sanitize to alphanumeric/underscore/hyphen
+        // characters only before embedding it in the query string.
+        let safe_slot: String = slot_name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let query = format!(
             "WITH wal_changes AS (
                 SELECT lsn, xid, data
                 FROM pg_logical_slot_get_changes(
-                    'pg_flashback_slot', NULL, $1
+                    '{}', NULL, $1
                 )
             ),
             parsed AS (
@@ -372,14 +430,17 @@ fn consume_wal_changes() {
                     ((data::jsonb)->>'oid')::oid AS rel_oid,
                     xid::text::bigint AS source_xid,
                     (data::jsonb)->'old' AS old_data,
-                    (data::jsonb)->'new' AS new_data
+                    (data::jsonb)->'new' AS new_data,
+                    (data::jsonb)->'ddl_info' AS ddl_info,
+                    ((data::jsonb)->>'schema_version')::bigint AS msg_schema_version
                 FROM wal_changes
                 WHERE (data::jsonb)->>'op' IS NOT NULL
-                  AND (data::jsonb)->>'op' IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+                  AND (data::jsonb)->>'op' IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE',
+                                                'DROP', 'ALTER')
             )
             INSERT INTO flashback.delta_log (
                 event_time, event_type, table_name, rel_oid, source_xid,
-                committed_at, schema_version, old_data, new_data
+                committed_at, schema_version, old_data, new_data, ddl_info
             )
             SELECT
                 clock_timestamp(),
@@ -388,7 +449,7 @@ fn consume_wal_changes() {
                 p.rel_oid,
                 p.source_xid,
                 clock_timestamp(),
-                COALESCE((
+                COALESCE(p.msg_schema_version, (
                     SELECT sv.schema_version
                     FROM flashback.schema_versions sv
                     WHERE sv.rel_oid = p.rel_oid
@@ -397,15 +458,17 @@ fn consume_wal_changes() {
                     LIMIT 1
                 ), 1),
                 p.old_data,
-                p.new_data
+                p.new_data,
+                p.ddl_info
             FROM parsed p
             WHERE EXISTS (
                 SELECT 1 FROM flashback.tracked_tables tt
                 WHERE tt.rel_oid = p.rel_oid
                   AND tt.is_active
             )",
-            &[batch_size.into()],
-        )?;
+            safe_slot
+        );
+        Spi::run_with_args(&query, &[batch_size.into()])?;
         Ok(())
     });
 
@@ -425,16 +488,15 @@ fn flush_staging_to_delta_log() {
             return Ok(());
         }
 
-        // In WAL mode, only flush DDL events from staging_events.
-        // DML events are consumed directly from the logical replication slot.
+        // In WAL mode, DML comes from the slot and DDL comes from WAL messages.
+        // staging_events only holds DML events from trigger mode.
+        // So in WAL mode, staging_events should be empty — skip the flush.
         let mode = effective_capture_mode();
-        let extra_filter = if mode == "wal" {
-            " AND m.event_type IN ('DDL', 'ALTER_TABLE', 'DROP_TABLE', 'RENAME_TABLE', 'TRUNCATE')"
-        } else {
-            ""
-        };
+        if mode == "wal" {
+            return Ok(());
+        }
 
-        let query = format!(
+        let query =
             "WITH moved AS (
                 DELETE FROM flashback.staging_events
                 WHERE staging_id IN (
@@ -467,8 +529,7 @@ fn flush_staging_to_delta_log() {
                 WHERE tt.rel_oid = m.rel_oid
                   AND tt.is_active
                   AND m.event_time >= tt.tracked_since
-            ){extra_filter}"
-        );
+            )";
 
         Spi::run_with_args(&query, &[batch_size.into()])?;
         Ok(())
@@ -514,5 +575,26 @@ fn run_retention_purge() {
 
     if let Err(err) = result {
         log!("pg_flashback RETENTION_PURGE_ERROR error={err:?}");
+    }
+}
+
+/// Ensure delta_log has a partition covering today (and next month if near month-end).
+/// No-op if delta_log is not partitioned.
+fn run_ensure_partitions() {
+    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+        Spi::run(
+            "DO $$
+             BEGIN
+                 IF to_regprocedure('flashback_ensure_delta_partition(date)') IS NOT NULL THEN
+                     PERFORM flashback_ensure_delta_partition(CURRENT_DATE);
+                 END IF;
+             END
+             $$",
+        )?;
+        Ok(())
+    });
+
+    if let Err(err) = result {
+        log!("pg_flashback PARTITION_ENSURE_ERROR error={err:?}");
     }
 }

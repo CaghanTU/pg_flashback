@@ -219,6 +219,10 @@ mod tests {
         it_restore_parallel_basic,
         "../tests/sql/integration/restore_parallel_basic.sql"
     );
+    sql_test!(
+        it_wal_mode_behaviors,
+        "../tests/sql/integration/wal_mode_behaviors.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

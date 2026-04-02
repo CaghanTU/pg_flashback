@@ -506,15 +506,22 @@ BEGIN
     -- background worker will pick it up on its next cycle.
     IF flashback_effective_capture_mode() = 'wal' THEN
         IF NOT EXISTS (
-            SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot'
+            SELECT 1 FROM pg_replication_slots
+            WHERE slot_name = COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot')
         ) THEN
             BEGIN
-                PERFORM pg_create_logical_replication_slot('pg_flashback_slot', 'pg_flashback');
-                RAISE NOTICE 'pg_flashback: created logical replication slot pg_flashback_slot';
+                PERFORM pg_create_logical_replication_slot(
+                    COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot'),
+                    'pg_flashback'
+                );
+                RAISE NOTICE 'pg_flashback: created logical replication slot %',
+                    COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot');
             EXCEPTION WHEN OTHERS THEN
                 RAISE WARNING 'pg_flashback: could not create replication slot in this transaction (%), background worker will retry', SQLERRM;
             END;
         END IF;
+        -- WAL mode: enable REPLICA IDENTITY FULL so old_data is available in UPDATE events
+        EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
     ELSE
         PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
     END IF;
@@ -707,7 +714,7 @@ BEGIN
     LOOP
         DELETE FROM flashback.delta_log d
         WHERE d.rel_oid = rec.rel_oid
-          AND d.event_time < clock_timestamp() - rec.retention_interval;
+          AND d.committed_at < clock_timestamp() - rec.retention_interval;
         GET DIAGNOSTICS v_rows = ROW_COUNT;
         v_deleted := v_deleted + v_rows;
 
@@ -1019,15 +1026,153 @@ BEGIN
         END IF;
     END;
 
-    INSERT INTO flashback.delta_log (
-        event_time, event_type, table_name, rel_oid, source_xid,
-        committed_at, schema_version, old_data, new_data, ddl_info
-    )
-    VALUES (
-        ddl_event_time, upper(event_type),
-        format('%I.%I', tracked.schema_name, tracked.table_name),
-        tracked.rel_oid, txid_current()::bigint, clock_timestamp(),
-        new_version, row_snapshot, NULL, ddl_info
+    -- In WAL mode: emit DDL event as a WAL message (same pipeline as DML).
+    -- In trigger mode: direct delta_log INSERT (legacy path).
+    IF flashback_effective_capture_mode() = 'wal' THEN
+        PERFORM pg_logical_emit_message(
+            true,   -- transactional: tied to current transaction
+            'pg_flashback',
+            jsonb_build_object(
+                'op', upper(event_type),
+                'schema', tracked.schema_name,
+                'table', tracked.table_name,
+                'oid', tracked.rel_oid,
+                'xid', txid_current(),
+                'old', row_snapshot,
+                'ddl_info', ddl_info,
+                'schema_version', new_version
+            )::text
+        );
+    ELSE
+        INSERT INTO flashback.delta_log (
+            event_time, event_type, table_name, rel_oid, source_xid,
+            committed_at, schema_version, old_data, new_data, ddl_info
+        )
+        VALUES (
+            ddl_event_time, upper(event_type),
+            format('%I.%I', tracked.schema_name, tracked.table_name),
+            tracked.rel_oid, txid_current()::bigint, clock_timestamp(),
+            new_version, row_snapshot, NULL, ddl_info
+        );
+    END IF;
+END;
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback_ensure_delta_partition
+-- ----------------------------------------------------------------
+-- Called by the background worker each cycle (via run_ensure_partitions).
+-- Creates monthly range partitions for delta_log if it is a partitioned table.
+-- Idempotent — safe to call repeatedly.
+-- Creates the current month's partition and next month's partition
+-- (pre-created 7 days before month-end to prevent data loss at rollover).
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_ensure_delta_partition(for_date date DEFAULT CURRENT_DATE)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_is_partitioned boolean;
+    v_month_start    timestamptz;
+    v_month_end      timestamptz;
+    v_next_start     timestamptz;
+    v_next_end       timestamptz;
+    v_part_name      text;
+    v_next_part_name text;
+BEGIN
+    -- Only act if delta_log is a partitioned table
+    SELECT c.relkind = 'p'
+      INTO v_is_partitioned
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'flashback' AND c.relname = 'delta_log';
+
+    IF NOT FOUND OR NOT v_is_partitioned THEN
+        RETURN;
+    END IF;
+
+    -- Current month boundaries
+    v_month_start := date_trunc('month', for_date::timestamptz);
+    v_month_end   := date_trunc('month', for_date::timestamptz) + interval '1 month';
+    v_part_name   := 'delta_log_' || to_char(for_date, 'YYYY_MM');
+
+    PERFORM flashback__create_range_partition(v_part_name, v_month_start, v_month_end);
+
+    -- Pre-create next month's partition when within the last 7 days of the month
+    IF for_date >= (v_month_end::date - 7) THEN
+        v_next_start     := v_month_end;
+        v_next_end       := v_month_end + interval '1 month';
+        v_next_part_name := 'delta_log_' || to_char(v_next_start, 'YYYY_MM');
+        PERFORM flashback__create_range_partition(v_next_part_name, v_next_start, v_next_end);
+    END IF;
+END;
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback__create_range_partition (internal helper)
+-- ----------------------------------------------------------------
+-- Creates a monthly delta_log partition.
+-- If the default partition has rows in this range, migrates them first.
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback__create_range_partition(
+    p_part_name  text,
+    p_range_from timestamptz,
+    p_range_to   timestamptz
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_default_oid oid;
+    v_tmp_table   text;
+BEGIN
+    -- Already exists: nothing to do
+    IF to_regclass(format('flashback.%I', p_part_name)) IS NOT NULL THEN
+        RETURN;
+    END IF;
+
+    -- Check if default partition has rows in this range (would block CREATE PARTITION)
+    v_default_oid := to_regclass('flashback.delta_log_default');
+    IF v_default_oid IS NOT NULL THEN
+        v_tmp_table := '_fb_part_mig_' || p_part_name;
+
+        -- Move rows out of default partition into a temp table
+        EXECUTE format(
+            'CREATE TEMP TABLE %I ON COMMIT PRESERVE ROWS AS
+             WITH migrated AS (
+                 DELETE FROM flashback.delta_log_default
+                 WHERE committed_at >= %L AND committed_at < %L
+                 RETURNING *
+             )
+             SELECT * FROM migrated',
+            v_tmp_table, p_range_from, p_range_to
+        );
+    END IF;
+
+    -- Now create the named partition (default partition is clear)
+    EXECUTE format(
+        'CREATE TABLE flashback.%I PARTITION OF flashback.delta_log
+         FOR VALUES FROM (%L) TO (%L)',
+        p_part_name, p_range_from, p_range_to
     );
+
+    -- Re-insert migrated rows into the new named partition
+    IF v_default_oid IS NOT NULL THEN
+        EXECUTE format(
+            'INSERT INTO flashback.%I SELECT * FROM %I',
+            p_part_name, v_tmp_table
+        );
+        EXECUTE format('DROP TABLE IF EXISTS %I', v_tmp_table);
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    -- Clean up temp table if it was created
+    IF v_tmp_table IS NOT NULL THEN
+        EXECUTE format('DROP TABLE IF EXISTS %I', v_tmp_table);
+    END IF;
+    RAISE WARNING 'flashback: could not create partition %: %', p_part_name, SQLERRM;
 END;
 $$;

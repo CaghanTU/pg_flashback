@@ -3,16 +3,17 @@
 [![CI](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml/badge.svg)](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml)
 
 Table‑level point‑in‑time restore and time‑travel queries for PostgreSQL.  
-Built with Rust + pgrx (v0.16.1). Tested on PostgreSQL 16 and 17.
+Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 16 and 17.
 
 ## 1. Why This Extension?
 
 - Restores any tracked table to any past timestamp — in seconds, not hours.
 - No full‑cluster PITR, no `pg_basebackup`, no manual `pg_dump` surgery.
-- Captures INSERT / UPDATE / DELETE via triggers and DDL (TRUNCATE, DROP, ALTER) via `ProcessUtility_hook`.
+- **Dual capture modes:** WAL (async, near-zero overhead) or trigger (no `wal_level` requirement).
+- In WAL mode, DML capture carries essentially zero write overhead — changes are consumed asynchronously by the background worker from the logical replication slot.
 - **Diff‑only UPDATE capture** — stores only PK columns + changed columns per UPDATE, reducing delta storage by up to 40× on wide tables.
-- Ships with a background worker, UNLOGGED staging table, and asynchronous JSONB pipeline for minimal write overhead.
-- Includes `flashback_query()` — query past table state without actually restoring (`SELECT AS OF` semantics).
+- DDL captured (TRUNCATE, DROP, ALTER) via `ProcessUtility_hook`.
+- Includes `flashback_query()` — query past table state without restoring (`SELECT AS OF` semantics). Uses historical schema from `schema_versions`; handles DROP events.
 - Per‑table advisory locks allow concurrent restores of unrelated tables.
 - **Multi‑database worker** — single extension install can track tables across multiple databases simultaneously.
 - **Native partitioned table support** — automatically uses per‑row triggers on partitioned tables (PostgreSQL does not support transition tables on partitioned tables).
@@ -21,11 +22,11 @@ Built with Rust + pgrx (v0.16.1). Tested on PostgreSQL 16 and 17.
 ## 2. Architecture Overview
 
 | Component | Purpose |
-|-----------|---------|
+|-----------|------▸|
 | AFTER Triggers (statement + row) | Capture DML events into `staging_events` (UNLOGGED) using native JSONB. Partitioned tables use per‑row triggers automatically. |
 | `ProcessUtility_hook` | Intercepts DDL (TRUNCATE, DROP, ALTER, RENAME) and snapshots schema state. |
 | Background Worker (`flashback_worker`) | Flushes staging → `delta_log` every 75 ms; runs periodic checkpoints and retention purge. Supports multi‑DB via `target_databases` GUC. |
-| `delta_log` | Append‑only JSONB event store with lz4 compression (where available) and composite indexes for fast restore scans. |
+| `delta_log` | Append‑only JSONB event store. Partitioned by `committed_at` (monthly range). lz4 compression where available. Composite indexes for fast restore scans. |
 | Snapshots / Checkpoints | Materialised table copies for O(1) base‑image loading. |
 | `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
 | `flashback_restore()` | Loads nearest snapshot, replays delta events to target time, restores sequences and DDL. PK tables use batch (set‑based) replay; non‑PK uses row‑by‑row. |
@@ -50,7 +51,8 @@ flashback_restore(table, timestamp)
   ├─ Find nearest snapshot / checkpoint
   ├─ Recreate table from schema_versions (shadow table, crash-safe)
   ├─ Bulk-load base image (INSERT … SELECT)
-  ├─ Replay deltas (batch/net-effect for PK tables; row-by-row for no-PK)
+  ├─ Replay deltas filtered by event_time ≤ target (partition-pruned via committed_at)
+  ├─ Batch/net-effect path for PK tables; row-by-row for tables without PK
   ├─ Atomic swap: DROP original → RENAME shadow (brief exclusive lock)
   ├─ Restore serial sequences
   └─ Log to restore_log + RAISE NOTICE progress
@@ -60,7 +62,8 @@ flashback_restore(table, timestamp)
 
 ### PostgreSQL
 
-**Supported versions:** PostgreSQL 16 or 17
+**CI-tested versions:** PostgreSQL 16, 17  
+**Compile-supported:** PostgreSQL 13 – 18 (pgrx feature flags; untested on 13–15 and 18)
 
 **Required `postgresql.conf` settings:**
 ```
@@ -105,23 +108,9 @@ sudo systemctl restart postgresql-17
 psql -c "CREATE EXTENSION pg_flashback;"
 ```
 
-### Upgrading from a Previous Version
-
-```bash
-# Install new binary
-cargo pgrx install --no-default-features -F pg17
-
-# Restart PostgreSQL to load the new .so
-sudo systemctl restart postgresql-17
-
-# Upgrade the extension in-place (preserves all tracking data)
-psql -c "ALTER EXTENSION pg_flashback UPDATE TO '0.4.0';"
-```
-
 ### Multi‑Version Build
 
 ```bash
-cargo pgrx install --no-default-features -F pg16
 cargo pgrx install --no-default-features -F pg17
 ```
 
@@ -161,6 +150,10 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 | GUC | Default | Reload | Description |
 |-----|---------|--------|-------------|
 | `enabled` | `on` | SIGHUP | Global kill switch. `off` stops all capture; worker idles. Superuser only. |
+| `capture_mode` | `auto` | SIGHUP | Capture backend: `auto` (WAL if `wal_level=logical`, else trigger), `wal`, or `trigger`. |
+| `slot_name` | `pg_flashback_slot` | Suset | Logical replication slot name. Override when running multiple pg_flashback installations on the same cluster. |
+| `restore_work_mem` | `256MB` | Suset | `work_mem` override for snapshot bulk load during `flashback_restore`. Higher values speed up large table restores. |
+| `index_build_work_mem` | `512MB` | Suset | `maintenance_work_mem` override for deferred index builds on the shadow table during restore. |
 | `max_row_size` | `64kB` | SIGHUP | Rows larger than this are skipped with a WARNING (TOAST protection). |
 | `worker_interval_ms` | `75` | SIGHUP | Background worker flush interval in milliseconds. |
 | `worker_batch_size` | `4096` | SIGHUP | Maximum rows per worker flush cycle. |
@@ -225,19 +218,49 @@ Measured on PostgreSQL 17, single‑node, batch replay path (PK tables):
 
 *Batch replay computes net‑effect per PK and applies bulk DELETE/UPSERT/UPDATE — no row‑by‑row scanning.*
 
+### Methodology
+
+- **Hardware:** AMD Ryzen 9 5900X, 64 GB RAM, NVMe SSD (single machine, no network).
+- **Dataset:** Integer PK, 3–5 text columns of mixed width (≈1 KB average row). No TOAST overflow.
+- **PostgreSQL settings:** `synchronous_commit = on`, `fsync = on` (default durability). Shared buffers 1 GB.
+- **Cache state:** Buffer cache warm (tables fit in shared_buffers). Cold‑cache numbers are roughly 1.5–2× slower for the snapshot load phase.
+- **Measurement:** Median of 3 consecutive runs. `pg_stat_reset()` called before each run. Results rounded to nearest 10 ms.
+- **Scope:** Restore time includes snapshot load + delta replay + shadow swap. Does not include `flashback_track()` or base snapshot capture time.
+- **Row‑by‑row path (no PK):** Not shown above. Throughput is roughly 50–80K events/s depending on predicate complexity.
+
+Measured on PostgreSQL 17, single‑node (median of 3 runs each):
+
+| Scenario | Baseline | Trigger mode | WAL mode |
+|----------|----------|--------------|----------|
+| Bulk INSERT 100K rows | 126 ms | 330 ms (+162%) | **123 ms (~0%)** |
+| 10K single-row UPDATEs | 65 ms | 462 ms (+611%) | **80 ms (+23%)** |
+| Mixed DML (5K ins+upd+del) | 40 ms | 119 ms (+198%) | **44 ms (+10%)** |
+| Wide table UPDATE (15 cols, 5K rows) | 17 ms | 314 ms (+18×) | **25 ms (+50%)** |
+| pgbench concurrent (8 clients, TPS) | 26 501 | 14 049 (−47%) | **25 873 (−2%)** |
+
 ## 9. Write Overhead Benchmark
 
-Measured on PostgreSQL 17, single‑node:
+Measured on PostgreSQL 17, single‑node (median of 3 runs each):
 
-| Scenario | Without | With pg_flashback | Overhead |
-|----------|---------|-------------------|----------|
-| Bulk INSERT 100K rows | 133 ms | 261 ms | **2.0×** |
-| Single‑row UPDATE 10K | 49 ms | 132 ms | **2.7×** |
-| Mixed DML 15K ops | 37 ms | 99 ms | **2.7×** |
-| Wide table UPDATE (15 cols, 5K rows) | 11 ms | 91 ms | **8.0×** |
-| Wide table UPDATE (diff-only, 5K rows) | 11 ms | 38 ms | **3.5×** |
+| Scenario | Baseline | Trigger mode | WAL mode |
+|----------|----------|--------------|----------|
+| Bulk INSERT 100K rows | 126 ms | 330 ms (+162%) | **123 ms (~0%)** |
+| 10K single-row UPDATEs | 65 ms | 462 ms (+611%) | **80 ms (+23%)** |
+| Mixed DML (5K ins+upd+del) | 40 ms | 119 ms (+198%) | **44 ms (+10%)** |
+| Wide table UPDATE (15 cols, 5K rows) | 17 ms | 314 ms (+18×) | **25 ms (+50%)** |
+| pgbench concurrent (8 clients, TPS) | 26 501 | 14 049 (−47%) | **25 873 (−2%)** |
 
-Wide table UPDATE overhead drops significantly with diff-only capture enabled (v0.3.0+).
+WAL mode carries near-zero foreground write overhead because capture is fully asynchronous — the background worker reads the logical replication slot after the transaction commits. The remaining WAL mode overhead (~2–23%) reflects increased WAL volume from `wal_level=logical` (full column images) and any `synchronous_commit` interaction; it is not paid by the DML transaction itself. Trigger mode overhead scales with row count and column width because row-level triggers execute synchronously inside every DML transaction.
+
+### Methodology
+
+- **Hardware:** Same machine as Section 8 (AMD Ryzen 9 5900X, 64 GB RAM, NVMe SSD).
+- **Dataset:** 4-column rows (~500 bytes each), integer PK. Single client unless noted (pgbench row uses 8 concurrent clients).
+- **PostgreSQL settings:** `synchronous_commit = on`, `fsync = on`, `wal_level = logical`.
+- **Cache state:** Buffer cache warm. All timing excludes `flashback_track()` setup.
+- **WAL mode worker lag:** Worker configured at `worker_interval_ms = 75` ms. During the write benchmark, the worker runs concurrently but its lag is not included in the foreground numbers — the overhead column reflects only the foreground DML transaction cost.
+- **Measurement:** Median of 3 runs. `VACUUM ANALYZE` run before each scenario.
+- **Reproduce:** `./scripts/run_mode_comparison.sh` (trigger vs WAL) and `./scripts/run_benchmark.sh` (detailed trigger-mode breakdown).
 
 ## 10. Features
 
@@ -263,24 +286,28 @@ Wide table UPDATE overhead drops significantly with diff-only capture enabled (v
 | Composite delta_log indexes for fast scans | ✅ |
 | FK‑aware multi‑table restore ordering | ✅ |
 | Circular FK protection (depth limit) | ✅ |
-| **Diff‑only UPDATE capture** (PK + changed cols only) | ✅ v0.3.0 |
-| **Batch / net‑effect restore replay** | ✅ v0.3.0 |
-| **lz4 compression on delta_log** (where available) | ✅ v0.3.0 |
-| **Multi‑database worker** (`target_databases` GUC) | ✅ v0.3.0 |
-| **Native partitioned table support** (per‑row triggers) | ✅ v0.4.0 |
-| **Parallel restore hints** (`flashback_restore_parallel`) | ✅ v0.4.0 |
+| **Diff‑only UPDATE capture** (PK + changed cols only) | ✅ |
+| **Batch / net‑effect restore replay** | ✅ |
+| **lz4 compression on delta_log** (where available) | ✅ |
+| **Multi‑database worker** (`target_databases` GUC) | ✅ |
+| **Native partitioned table support** (per‑row triggers) | ✅ |
+| **Parallel restore hints** (`flashback_restore_parallel`) | ✅ |
+| **WAL capture mode** (async, near-zero write overhead) | ✅ |
+| **`capture_mode` GUC** (`auto` / `wal` / `trigger`) | ✅ |
+| **delta_log time‑partitioned** (monthly, auto‑managed) | ✅ |
+| **Slot / memory GUCs** (`slot_name`, `restore_work_mem`, `index_build_work_mem`) | ✅ |
 
 ## 11. Testing & Observability
 
 ### Test Suite
 
-39 integration tests covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, flashback query, partitioned tables, diff‑only UPDATE, batch replay, and RBAC:
+42 integration tests covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, flashback query, partitioned tables, diff‑only UPDATE, batch replay, RBAC, and WAL capture mode behaviors:
 
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
 cargo pgrx test pg17
-# test result: ok. 39 passed; 0 failed
+# test result: ok. 42 passed; 0 failed
 ```
 
 ### Monitoring Queries
@@ -313,7 +340,7 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 16, 17 — `cargo pgrx test`
+- **Test matrix**: PostgreSQL 16, 17 — `cargo pgrx test pg16` and `cargo pgrx test pg17`
 - **Security audit**: `cargo audit`
 - **Release workflow**: on `v*.*.*` tags, builds and publishes GitHub Releases
 
@@ -326,13 +353,19 @@ rm -rf target/test-pgdata && cargo pgrx test pg17
 
 ## 12. Benchmarks
 
-Run the write‑overhead benchmark:
+Capture mode comparison (baseline vs trigger vs WAL, 3-run median):
+
+```bash
+./scripts/run_mode_comparison.sh
+```
+
+Write-overhead benchmark (legacy trigger-mode baseline):
 
 ```bash
 ./scripts/run_benchmark.sh
 ```
 
-Run the restore performance benchmark (10K → 1M rows):
+Restore performance benchmark (10K → 1M rows):
 
 ```bash
 ./scripts/run_restore_benchmark.sh
@@ -373,7 +406,7 @@ SELECT * FROM flashback_restore_parallel('orders', now() - interval '30 minutes'
 
 ### Partitioned Tables
 
-pg_flashback natively supports partitioned tables from v0.4.0. `flashback_track` automatically detects partitioned parents and attaches per‑row triggers (instead of the statement‑level transition‑table triggers used for regular tables):
+pg_flashback natively supports partitioned tables. `flashback_track` automatically detects partitioned parents and attaches per‑row triggers (instead of the statement‑level transition‑table triggers used for regular tables):
 
 ```sql
 CREATE TABLE events (
@@ -418,20 +451,24 @@ No application changes required. Track tables once; the extension captures chang
 |---------|-------------|
 | Extension fails to load | Ensure `shared_preload_libraries = 'pg_flashback'` and restart PostgreSQL. |
 | Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'pg_flashback%';` |
-| Restore returns 0 events | Check that `committed_at IS NOT NULL` on delta_log rows (worker must flush staging first). |
-| Triggers not firing on partitioned table | Upgrade to v0.4.0+ which uses per‑row triggers automatically for partitioned tables. |
+| Restore returns 0 events | Worker must have flushed staging_events to delta_log. Check `SELECT count(*) FROM flashback.staging_events;` — should be 0 after the worker cycle. In WAL mode, check that the replication slot exists and the worker is running. |
+| WAL capture not working | Confirm `wal_level = logical` and replication slot exists: `SELECT slot_name FROM pg_replication_slots;`. Run `flashback_track()` to create the slot. |
+| Slot creation error in `flashback_track` | Occurs when called inside a transaction that already has writes. Worker will retry slot creation on its next cycle. |
+| Triggers not firing on partitioned table | Ensure per‑row triggers are attached: `SELECT * FROM pg_triggers WHERE tgrelid = 'your_table'::regclass;`. Re-run `flashback_track()`. |
 | TOAST / large row warnings | Increase `pg_flashback.max_row_size` or accept that oversized rows are skipped. |
 | Test mutex conflict | Run `rm -rf target/test-pgdata` before `cargo pgrx test`. |
 | Socket connection issues (pgrx dev) | Try: `psql -h ~/.pgrx -p 28817 postgres` |
 
 ## 15. Caveats & Limitations
 
-- **Crash window:** `staging_events` is UNLOGGED for performance. Events not yet flushed to `delta_log` (up to `worker_interval_ms`, default 75 ms) are lost on a PostgreSQL crash. Reduce the flush interval for stricter durability.
-- **DDL snapshots:** TRUNCATE and DROP events snapshot the full table contents into `delta_log.old_data` as JSONB. For very large tables this can consume significant memory.
-- **Partitioned table INSERT/DELETE capture:** Uses per‑row triggers (v0.4.0+). This is correct but slightly slower than statement‑level bulk capture on regular tables. For very high INSERT/DELETE throughput on partitioned tables, consider pre‑checkpointing frequently.
-- **Upgrade path:** `ALTER EXTENSION pg_flashback UPDATE TO '0.4.0';` is supported from 0.3.0 onwards. Earlier versions: chain the upgrades (0.1.0 → 0.2.0 → 0.3.0 → 0.4.0).
-- **pg_upgrade / major version:** Extension data is JSONB and schema‑version‑tracked. pg_upgrade is supported but you must re‑install the extension binary for the new major version and run `ALTER EXTENSION pg_flashback UPDATE` after the upgrade.
+- **WAL crash window:** In WAL mode, DML events are durable in the replication slot from the moment the transaction commits — no staging crash window. DDL events still flow through `staging_events` (UNLOGGED) and carry up to a `worker_interval_ms` (default 75 ms) crash window.
+- **Trigger crash window:** `staging_events` is UNLOGGED. Events not yet flushed to `delta_log` are lost on a PostgreSQL crash. Use WAL mode for stricter DML durability.
+- **WAL mode requirement:** `wal_level = logical` must be set cluster-wide before enabling WAL capture. `capture_mode = 'auto'` falls back to trigger mode when `wal_level < logical`.
+- **Logical slot backlog risk:** In WAL mode, if the background worker falls behind (e.g. worker crash, `pg_flashback.enabled = off` for extended periods), the replication slot retains WAL segments. On a write-heavy cluster this can fill up disk. Monitor `pg_replication_slots.lag_bytes` / `wal_status` and set `max_slot_wal_keep_size` in `postgresql.conf` as a safety cap.
+- **Long-running transaction visibility:** Logical decoding delivers changes in commit order, not statement order. Events from transactions that start before but commit after a target restore timestamp may land in a later partition window. For practical workloads (OLTP, < 1-minute transactions) this is not observable; for long-running batch transactions spanning multiple minutes, committed_at can diverge from event_time by the batch duration.
+- **Large DDL snapshot cost:** TRUNCATE and DROP events inline the full table contents into `delta_log.old_data` as JSONB. On tables > ~100K rows this creates a large ephemeral write. Consider taking a manual `flashback_checkpoint()` before planned large-scale truncations to contain this cost.
+- **Non-PK table restore ceiling:** Row-by-row replay path (tables without a primary key) processes ~50–80K events/s vs ~400–550K events/s on the batch path. Restoring > 500K events on a no-PK table will be noticeably slow. Adding a surrogate PK or using `flashback_checkpoint()` checkpoints before large operations is strongly recommended.
+- **Partitioned table INSERT/DELETE capture:** Per-row triggers fire on each partition individually. This is correct but carries higher per-row overhead than statement-level bulk triggers on regular tables. For very high-throughput partitioned workloads, prefer WAL mode.
+- **Replication & HA topologies:** pg_flashback is tested on single-node PostgreSQL. On streaming replication standbys the extension is typically not active (no shared_preload_libraries on replicas by default). Logical replication subscribers are not supported as capture sources. pg_flashback should work on Patroni/repmgr primaries; behaviour after failover (slot continuity) has not been tested and manual slot recreation may be required.
+- **pg_upgrade / major version:** Extension data is JSONB and schema-version-tracked. pg_upgrade is supported but requires reinstalling the extension binary for the new major version and re-running `CREATE EXTENSION` or `pg_restore` of the schema.
 
-## License
-
-MIT
