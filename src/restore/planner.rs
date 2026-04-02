@@ -5,6 +5,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_restore(target_table text, target_time timestamptz)
     RETURNS bigint
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -127,6 +128,17 @@ extension_sql!(
         current_rel_oid := to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid;
         IF current_rel_oid IS NULL THEN
             RAISE EXCEPTION 'flashback_restore: failed to create target table %.%', v_schema_name, v_table_name;
+        END IF;
+
+        -- After DROP + CREATE the table has a new OID.  Propagate it to all
+        -- flashback metadata so that subsequent operations (checkpoint, DDL
+        -- capture, next restore) continue to work correctly.
+        IF current_rel_oid <> v_rel_oid THEN
+            UPDATE flashback.tracked_tables  SET rel_oid = current_rel_oid WHERE rel_oid = v_rel_oid;
+            UPDATE flashback.delta_log       SET rel_oid = current_rel_oid WHERE rel_oid = v_rel_oid;
+            UPDATE flashback.snapshots       SET rel_oid = current_rel_oid WHERE rel_oid = v_rel_oid;
+            UPDATE flashback.schema_versions SET rel_oid = current_rel_oid WHERE rel_oid = v_rel_oid;
+            v_rel_oid := current_rel_oid;
         END IF;
 
         -- Bulk-load snapshot using INSERT...SELECT (no row-by-row, no jsonb blob)
@@ -308,6 +320,47 @@ extension_sql!(
             END LOOP;
         END IF;
 
+        -- Re-attach capture triggers on the restored table so that future
+        -- DML continues to be tracked.  The old triggers were lost when the
+        -- table was dropped + recreated.
+        PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+
+        -- Create a post-restore checkpoint so that future restores start
+        -- from the restored state and do not replay stale events that were
+        -- already applied (or made obsolete) by this restore.
+        DECLARE
+            v_post_snap_id bigint;
+            v_post_snap_tbl text;
+            v_post_row_count bigint;
+        BEGIN
+            INSERT INTO flashback.snapshots (
+                rel_oid, snapshot_table, snapshot_lsn, schema_def, row_count, captured_at
+            ) VALUES (
+                v_rel_oid, '', pg_current_wal_lsn(),
+                COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb),
+                0, clock_timestamp()
+            ) RETURNING snapshot_id INTO v_post_snap_id;
+
+            v_post_snap_tbl := format('snap_%s_%s', v_rel_oid::text, v_post_snap_id::text);
+
+            EXECUTE format('DROP TABLE IF EXISTS flashback.%I', v_post_snap_tbl);
+            EXECUTE format(
+                'CREATE TABLE flashback.%I AS TABLE %I.%I',
+                v_post_snap_tbl, v_schema_name, v_table_name
+            );
+            EXECUTE format('SELECT count(*) FROM flashback.%I', v_post_snap_tbl)
+              INTO v_post_row_count;
+
+            UPDATE flashback.snapshots
+               SET snapshot_table = format('flashback.%I', v_post_snap_tbl),
+                   row_count      = v_post_row_count,
+                   captured_at    = clock_timestamp()
+             WHERE snapshot_id = v_post_snap_id;
+
+            RAISE NOTICE 'flashback_restore [%]: post-restore checkpoint created (snap_id=%, rows=%)',
+                target_table, v_post_snap_id, v_post_row_count;
+        END;
+
         -- Log successful restore to audit table
         IF to_regclass('flashback.restore_log') IS NOT NULL THEN
             INSERT INTO flashback.restore_log (table_name, target_time, rows_affected, success, error_message)
@@ -332,6 +385,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_restore(tables text[], target_time timestamptz)
     RETURNS bigint
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -343,8 +397,9 @@ extension_sql!(
             RAISE EXCEPTION 'flashback_restore: tables array is empty';
         END IF;
 
-        -- Restore child tables before parents to avoid FK dependency failures
-        -- while DROP/CREATE is performed inside flashback_restore(tbl, ...).
+        -- Restore parent tables before children so that child FK constraints
+        -- resolve correctly after DROP/CREATE.  session_replication_role =
+        -- 'replica' disables FK trigger enforcement during data load.
         WITH RECURSIVE rels AS (
             SELECT t.tbl,
                    t.ord,
@@ -382,7 +437,7 @@ extension_sql!(
             FROM walk w
             GROUP BY w.start_relid
         )
-        SELECT array_agg(r.tbl ORDER BY COALESCE(md.depth, 0) DESC, r.ord)
+        SELECT array_agg(r.tbl ORDER BY COALESCE(md.depth, 0) ASC, r.ord)
         INTO ordered_tables
         FROM rels r
         LEFT JOIN max_depth md
@@ -432,6 +487,7 @@ extension_sql!(
     )
     RETURNS SETOF record
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE

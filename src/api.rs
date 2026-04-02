@@ -299,6 +299,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_track(target_table text)
     RETURNS boolean
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -400,6 +401,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_checkpoint(target_table text)
     RETURNS bigint
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -475,6 +477,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_take_due_checkpoints()
     RETURNS integer
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -507,6 +510,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_apply_retention()
     RETURNS integer
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -595,6 +599,7 @@ extension_sql!(
         retention_warning boolean
     )
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -634,6 +639,7 @@ extension_sql!(
         new_data jsonb
     )
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -710,6 +716,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_untrack(target_table text)
     RETURNS boolean
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE

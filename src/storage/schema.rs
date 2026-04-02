@@ -320,13 +320,30 @@ extension_sql!(
     REVOKE ALL ON FUNCTION flashback_apply_retention()                    FROM PUBLIC;
 
     -- Grant admin functions to the dedicated role
-    GRANT USAGE ON SCHEMA flashback TO flashback_admin;
+    GRANT USAGE, CREATE ON SCHEMA flashback TO flashback_admin;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA flashback TO flashback_admin;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA flashback TO flashback_admin;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO flashback_admin;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
+        GRANT USAGE, SELECT ON SEQUENCES TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_track(text)                  TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_untrack(text)                TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)   TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz) TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_checkpoint(text)             TO flashback_admin;
     GRANT EXECUTE ON FUNCTION flashback_apply_retention()            TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_set_restore_in_progress(bool) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_collect_schema_def(oid)       TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_recreate_table_from_ddl(jsonb) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_build_insert_parts(oid, jsonb) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_build_predicate(oid, jsonb)    TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_attach_capture_trigger(text, text) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_detach_capture_trigger(text, text) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_query(text, timestamptz, text)     TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_history(text, interval)            TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_retention_status()                  TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)        TO flashback_admin;
 
     -- Read-only monitoring is available to pg_monitor (built-in role)
     GRANT USAGE ON SCHEMA flashback TO pg_monitor;

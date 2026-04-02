@@ -89,6 +89,7 @@ extension_sql!(
     )
     RETURNS void
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -120,6 +121,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_recreate_table_from_ddl(ddl_info jsonb)
     RETURNS jsonb
     LANGUAGE plpgsql
+    SECURITY DEFINER
     SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
@@ -133,6 +135,9 @@ extension_sql!(
         v_part record;
         v_trig record;
         v_pol record;
+        v_saved_acl aclitem[];
+        v_owner regrole;
+        v_acl_text text;
     BEGIN
         IF ddl_info IS NULL THEN
             RAISE EXCEPTION 'flashback_recreate_table_from_ddl: ddl_info is null';
@@ -190,7 +195,17 @@ extension_sql!(
           INTO v_skipped_defaults
         FROM jsonb_array_elements(COALESCE(ddl_info->'columns', '[]'::jsonb)) WITH ORDINALITY AS t(col, ord);
 
-        EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', v_schema);
+        IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = v_schema) THEN
+            EXECUTE format('CREATE SCHEMA %I', v_schema);
+        END IF;
+
+        -- Save ACL and owner before DROP so we can restore them after CREATE
+        SELECT c.relacl, c.relowner::regrole
+          INTO v_saved_acl, v_owner
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = v_schema AND c.relname = v_table;
+
         EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', v_schema, v_table);
 
         IF ddl_info->>'partition_by' IS NOT NULL THEN
@@ -280,6 +295,30 @@ extension_sql!(
                 CASE WHEN v_pol.with_check IS NOT NULL AND v_pol.with_check <> '' THEN format(' WITH CHECK (%s)', v_pol.with_check) ELSE '' END
             );
         END LOOP;
+
+        -- Restore original owner and ACL after recreating the table
+        IF v_owner IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE %I.%I OWNER TO %s', v_schema, v_table, v_owner);
+        END IF;
+        IF v_saved_acl IS NOT NULL THEN
+            DECLARE
+                v_acl_rec record;
+            BEGIN
+                FOR v_acl_rec IN
+                    SELECT (aclexplode(v_saved_acl)).*
+                LOOP
+                    IF v_acl_rec.grantee = 0 THEN
+                        -- PUBLIC
+                        EXECUTE format('GRANT %s ON %I.%I TO PUBLIC',
+                            v_acl_rec.privilege_type, v_schema, v_table);
+                    ELSE
+                        EXECUTE format('GRANT %s ON %I.%I TO %s',
+                            v_acl_rec.privilege_type, v_schema, v_table,
+                            quote_ident((SELECT rolname FROM pg_roles WHERE oid = v_acl_rec.grantee)));
+                    END IF;
+                END LOOP;
+            END;
+        END IF;
 
         RETURN v_skipped_defaults;
     END;

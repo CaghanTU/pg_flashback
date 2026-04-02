@@ -14,8 +14,18 @@ pub fn is_restore_in_progress() -> bool {
 #[pg_extern]
 fn flashback_set_restore_in_progress(val: bool) -> bool {
     // Only superusers / flashback_admin should toggle the restore flag
-    if unsafe { !pgrx::pg_sys::superuser() } {
-        pgrx::error!("flashback_set_restore_in_progress requires superuser");
+    let is_su = unsafe { pgrx::pg_sys::superuser() };
+    let is_admin = if !is_su {
+        // Check membership in flashback_admin role
+        Spi::get_one::<bool>("SELECT pg_has_role(current_user, 'flashback_admin', 'MEMBER')")
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if !is_su && !is_admin {
+        pgrx::error!("flashback_set_restore_in_progress requires superuser or flashback_admin");
     }
     set_restore_in_progress(val);
     true
