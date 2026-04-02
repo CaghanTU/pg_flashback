@@ -3,12 +3,14 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use pgrx::spi::Error as SpiError;
+use std::ffi::CString;
 use std::time::Duration;
 
 static WORKER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(75);
 static WORKER_BATCH_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(4096);
 static MAX_ROW_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(8192);
 static ENABLED_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
+static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
@@ -61,6 +63,15 @@ pub fn register_worker_and_guc() {
         GucFlags::UNIT_BYTE,
     );
 
+    GucRegistry::define_string_guc(
+        c"pg_flashback.target_database",
+        c"Database the pg_flashback worker connects to",
+        c"The background worker flushes staging_events in this database. Set to the database where the extension is installed. Default: postgres.",
+        &TARGET_DATABASE_GUC,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
     BackgroundWorkerBuilder::new("pg_flashback delta worker")
         .set_function("pg_flashback_delta_worker_main")
         .set_library("pg_flashback")
@@ -72,9 +83,15 @@ pub fn register_worker_and_guc() {
 
 pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    log!("pg_flashback delta worker started");
+    let db_setting = TARGET_DATABASE_GUC.get();
+    let db_name = db_setting
+        .as_deref()
+        .and_then(|cs| cs.to_str().ok())
+        .unwrap_or("postgres");
+    BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
+
+    log!("pg_flashback delta worker started (database: {db_name})");
 
     loop {
         if BackgroundWorker::sighup_received() {

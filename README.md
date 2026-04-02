@@ -98,6 +98,19 @@ sudo systemctl restart postgresql-17
 psql -c "CREATE EXTENSION pg_flashback;"
 ```
 
+### Upgrading from a Previous Version
+
+```bash
+# Install new binary
+cargo pgrx install --no-default-features -F pg17
+
+# Restart PostgreSQL to load the new .so
+sudo systemctl restart postgresql-17
+
+# Upgrade the extension in-place (preserves all tracking data)
+psql -c "ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';"
+```
+
 ### Multi‑Version Build
 
 ```bash
@@ -140,8 +153,9 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 | `max_row_size` | `8kB` | Rows larger than this are skipped with a WARNING (TOAST protection). |
 | `worker_interval_ms` | `75` | Background worker flush interval in milliseconds. |
 | `worker_batch_size` | `4096` | Maximum rows per worker flush cycle. |
+| `target_database` | `postgres` | Database the background worker connects to. Requires restart. |
 
-Changes take effect immediately; no restart is required after `shared_preload_libraries` is set.
+All GUCs except `target_database` take effect immediately via `SIGHUP` reload; no restart is required.
 
 ## 7. SQL API Cheatsheet
 
@@ -305,8 +319,8 @@ No application changes required. Track tables once; the extension captures chang
 
 - **Crash window:** `staging_events` is UNLOGGED for performance. Events not yet flushed to `delta_log` (up to `worker_interval_ms`, default 75 ms) are lost on a PostgreSQL crash. If you need zero‑loss guarantees, set `pg_flashback.staging_logged = on` (planned) or reduce the flush interval.
 - **DDL snapshots:** TRUNCATE and DROP events snapshot the full table contents into `delta_log.old_data` as JSONB. For very large tables this can consume significant memory. A `pg_flashback.max_ddl_snapshot_rows` guard is planned.
-- **Single database:** The background worker connects to one database. Multi‑database deployments require one `shared_preload_libraries` entry per database (planned).
-- **No extension upgrade path yet:** The extension ships as version 0.1.0. Future versions will include `ALTER EXTENSION … UPDATE` migration scripts.
+- **Single database:** The background worker connects to the database set by `pg_flashback.target_database` (default: `postgres`). To use a different database, set this GUC in `postgresql.conf` and restart.
+- **Upgrade path:** `ALTER EXTENSION pg_flashback UPDATE TO '0.2.0';` is supported from 0.1.0. Future versions will ship migration scripts.
 
 ## License
 
