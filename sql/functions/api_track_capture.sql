@@ -499,9 +499,23 @@ BEGIN
         RAISE EXCEPTION 'flashback_track: table % does not exist', target_table;
     END IF;
 
-    -- In WAL mode, DML capture comes from the logical replication slot.
-    -- Only attach triggers in trigger mode.
-    IF flashback_effective_capture_mode() = 'trigger' THEN
+    -- In WAL mode, ensure replication slot exists.
+    -- pg_create_logical_replication_slot requires a write-free transaction,
+    -- so we wrap it in a sub-block with EXCEPTION handler. If it fails
+    -- (e.g. inside a test harness or an already-dirty transaction), the
+    -- background worker will pick it up on its next cycle.
+    IF flashback_effective_capture_mode() = 'wal' THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot'
+        ) THEN
+            BEGIN
+                PERFORM pg_create_logical_replication_slot('pg_flashback_slot', 'pg_flashback');
+                RAISE NOTICE 'pg_flashback: created logical replication slot pg_flashback_slot';
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'pg_flashback: could not create replication slot in this transaction (%), background worker will retry', SQLERRM;
+            END;
+        END IF;
+    ELSE
         PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
     END IF;
 

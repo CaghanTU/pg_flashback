@@ -236,6 +236,7 @@ pub mod pg_test {
             "wal_level=logical",
             "max_replication_slots=10",
             "shared_preload_libraries='pg_flashback'",
+            "pg_flashback.capture_mode='trigger'",
         ]
     }
 }

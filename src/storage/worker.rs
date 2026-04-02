@@ -180,19 +180,23 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let db_name = &db_list[worker_index];
     BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
 
-    // Detect capture mode once at startup (re-evaluated on SIGHUP for 'auto')
-    let initial_mode = effective_capture_mode();
+    // Detect capture mode once at startup
+    // Note: for 'auto', the mode is re-evaluated each cycle in the loop.
+    // At startup we just log the initial mode without SPI to avoid
+    // polluting the transaction state before slot creation.
+    let mode_setting = CAPTURE_MODE_GUC.get();
+    let initial_mode_str = mode_setting
+        .as_deref()
+        .and_then(|cs| cs.to_str().ok())
+        .unwrap_or("auto");
     log!(
-        "pg_flashback delta worker {worker_index} started (database: {db_name}, mode: {initial_mode}, {total} total database(s))",
+        "pg_flashback delta worker {worker_index} started (database: {db_name}, capture_mode_guc: {initial_mode_str}, {total} total database(s))",
         total = db_list.len()
     );
 
-    // For WAL mode, ensure the replication slot exists
-    if initial_mode == "wal" {
-        if !ensure_replication_slot() {
-            warning!("pg_flashback: failed to create replication slot, falling back to trigger mode");
-        }
-    }
+    // Track whether slot is ready (lazily created on first WAL cycle)
+    let mut slot_ready = false;
+    let mut slot_warned = false;
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -209,7 +213,19 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
 
             let t0 = std::time::Instant::now();
             if mode == "wal" {
-                consume_wal_changes();
+                // Lazily ensure slot exists (handles upgrade from trigger-only versions)
+                if !slot_ready {
+                    slot_ready = ensure_replication_slot();
+                    if !slot_ready && !slot_warned {
+                        log!("pg_flashback: replication slot 'pg_flashback_slot' not found, waiting for flashback_track() to create it");
+                        slot_warned = true;
+                    }
+                }
+                if slot_ready {
+                    consume_wal_changes();
+                }
+            } else {
+                slot_ready = false; // reset if mode changes away from WAL
             }
             // Always flush staging_events (DDL events go through staging even in WAL mode)
             flush_staging_to_delta_log();
@@ -274,6 +290,9 @@ fn is_any_restore_active() -> bool {
 
 /// Determine the effective capture mode based on GUC and wal_level.
 /// Returns "wal" or "trigger".
+///
+/// Does NOT use SPI — reads wal_level directly via GetConfigOption
+/// to avoid polluting transaction state in the background worker.
 fn effective_capture_mode() -> &'static str {
     let mode_setting = CAPTURE_MODE_GUC.get();
     let mode = mode_setting
@@ -285,15 +304,20 @@ fn effective_capture_mode() -> &'static str {
         "wal" => "wal",
         "trigger" => "trigger",
         _ => {
-            // auto: check wal_level
-            let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
-                let is_logical = Spi::get_one::<bool>(
-                    "SELECT current_setting('wal_level') = 'logical'",
-                )?
-                .unwrap_or(false);
-                Ok(is_logical)
-            });
-            if result.unwrap_or(false) {
+            // auto: check wal_level via C API (no SPI needed)
+            let wal_level = unsafe {
+                let opt_name = std::ffi::CString::new("wal_level").unwrap();
+                let val = pg_sys::GetConfigOption(opt_name.as_ptr(), true, false);
+                if val.is_null() {
+                    "replica".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(val)
+                        .to_str()
+                        .unwrap_or("replica")
+                        .to_string()
+                }
+            };
+            if wal_level == "logical" {
                 "wal"
             } else {
                 "trigger"
@@ -303,21 +327,19 @@ fn effective_capture_mode() -> &'static str {
 }
 
 /// Ensure the pg_flashback logical replication slot exists.
-/// Creates it if missing. Returns true if slot is ready.
+/// Returns true if slot is ready.
+///
+/// NOTE: Slot creation by the background worker is unreliable because
+/// pg_create_logical_replication_slot() requires a clean, write-free
+/// transaction. Instead, the slot should be created by flashback_track()
+/// or manually by the DBA. This function only checks for existence.
 fn ensure_replication_slot() -> bool {
     let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
         let exists = Spi::get_one::<bool>(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot')",
         )?
         .unwrap_or(false);
-
-        if !exists {
-            Spi::run(
-                "SELECT pg_create_logical_replication_slot('pg_flashback_slot', 'pg_flashback')",
-            )?;
-            log!("pg_flashback: created logical replication slot 'pg_flashback_slot'");
-        }
-        Ok(true)
+        Ok(exists)
     });
     result.unwrap_or(false)
 }
@@ -325,7 +347,7 @@ fn ensure_replication_slot() -> bool {
 /// Consume WAL changes from the logical replication slot and insert into delta_log.
 /// Each change is a JSON line produced by our output plugin (_PG_output_plugin_init).
 fn consume_wal_changes() {
-    let batch_size = effective_worker_batch_size() as i64;
+    let batch_size = effective_worker_batch_size() as i32;
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         let table_exists =
             Spi::get_one::<bool>("SELECT to_regclass('flashback.delta_log') IS NOT NULL")?
@@ -348,7 +370,7 @@ fn consume_wal_changes() {
                     (data::jsonb)->>'op' AS event_type,
                     format('%I.%I', (data::jsonb)->>'schema', (data::jsonb)->>'table') AS table_name,
                     ((data::jsonb)->>'oid')::oid AS rel_oid,
-                    xid::bigint AS source_xid,
+                    xid::text::bigint AS source_xid,
                     (data::jsonb)->'old' AS old_data,
                     (data::jsonb)->'new' AS new_data
                 FROM wal_changes

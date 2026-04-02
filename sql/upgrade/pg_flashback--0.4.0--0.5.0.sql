@@ -61,7 +61,18 @@ BEGIN
     END IF;
 
     -- In WAL mode, DML capture comes from the logical replication slot.
-    IF flashback_effective_capture_mode() = 'trigger' THEN
+    IF flashback_effective_capture_mode() = 'wal' THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot'
+        ) THEN
+            BEGIN
+                PERFORM pg_create_logical_replication_slot('pg_flashback_slot', 'pg_flashback');
+                RAISE NOTICE 'pg_flashback: created logical replication slot pg_flashback_slot';
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'pg_flashback: could not create replication slot in this transaction (%), background worker will retry', SQLERRM;
+            END;
+        END IF;
+    ELSE
         PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
     END IF;
 
