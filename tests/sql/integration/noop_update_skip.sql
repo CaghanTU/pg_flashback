@@ -1,16 +1,19 @@
 -- Test: no-op UPDATE is skipped by capture trigger.
 -- When UPDATE doesn't change any column values, the trigger should
 -- not insert any event into staging_events.
+-- NOTE: This test requires trigger mode, force it explicitly.
 DO $tv$
 DECLARE
     v_count bigint;
 BEGIN
+    PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
+
     DROP TABLE IF EXISTS public.it_noop_update;
     CREATE TABLE public.it_noop_update (id int PRIMARY KEY, name text, val int);
     INSERT INTO public.it_noop_update VALUES (1, 'test', 42);
 
     PERFORM flashback_track('public.it_noop_update');
-    -- Use real capture triggers (not test helper)
+    -- flashback_track attaches real capture triggers in trigger mode
     -- flashback_track already attaches them
 
     -- Clear staging

@@ -7,6 +7,11 @@ mod restore;
 mod runtime_guard;
 mod storage;
 
+// Re-export so that the symbol is visible in the shared library.
+// PostgreSQL calls _PG_output_plugin_init when loading our .so as a
+// logical decoding output plugin (via pg_create_logical_replication_slot).
+pub use capture::wal_decoder::_PG_output_plugin_init;
+
 ::pgrx::pg_module_magic!(name, version);
 
 #[pg_guard]

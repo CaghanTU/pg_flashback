@@ -17,6 +17,10 @@ static TARGET_DATABASES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 /// Maximum background workers to register (Postmaster context, requires restart).
 static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
+/// Capture mode: 'wal' (WAL-based via logical decoding), 'trigger' (legacy trigger-based),
+/// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
+static CAPTURE_MODE_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
@@ -98,6 +102,15 @@ pub fn register_worker_and_guc() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_string_guc(
+        c"pg_flashback.capture_mode",
+        c"pg_flashback capture mode: auto, wal, or trigger",
+        c"'wal' = WAL-based logical decoding (requires wal_level=logical), 'trigger' = legacy trigger-based capture, 'auto' = detect wal_level and choose (default: auto).",
+        &CAPTURE_MODE_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     // Register up to max_workers background workers.
     // Each worker receives its index (0-based) as the argument.
     // At runtime, each worker reads the database list and connects to
@@ -167,10 +180,19 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let db_name = &db_list[worker_index];
     BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
 
+    // Detect capture mode once at startup (re-evaluated on SIGHUP for 'auto')
+    let initial_mode = effective_capture_mode();
     log!(
-        "pg_flashback delta worker {worker_index} started (database: {db_name}, {total} total database(s))",
+        "pg_flashback delta worker {worker_index} started (database: {db_name}, mode: {initial_mode}, {total} total database(s))",
         total = db_list.len()
     );
+
+    // For WAL mode, ensure the replication slot exists
+    if initial_mode == "wal" {
+        if !ensure_replication_slot() {
+            warning!("pg_flashback: failed to create replication slot, falling back to trigger mode");
+        }
+    }
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -183,7 +205,13 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
         if is_capture_enabled() {
             let cycle_start = std::time::Instant::now();
 
+            let mode = effective_capture_mode();
+
             let t0 = std::time::Instant::now();
+            if mode == "wal" {
+                consume_wal_changes();
+            }
+            // Always flush staging_events (DDL events go through staging even in WAL mode)
             flush_staging_to_delta_log();
             let flush_ms = t0.elapsed().as_millis();
 
@@ -244,6 +272,126 @@ fn is_any_restore_active() -> bool {
     result.unwrap_or(false)
 }
 
+/// Determine the effective capture mode based on GUC and wal_level.
+/// Returns "wal" or "trigger".
+fn effective_capture_mode() -> &'static str {
+    let mode_setting = CAPTURE_MODE_GUC.get();
+    let mode = mode_setting
+        .as_deref()
+        .and_then(|cs| cs.to_str().ok())
+        .unwrap_or("auto");
+
+    match mode {
+        "wal" => "wal",
+        "trigger" => "trigger",
+        _ => {
+            // auto: check wal_level
+            let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
+                let is_logical = Spi::get_one::<bool>(
+                    "SELECT current_setting('wal_level') = 'logical'",
+                )?
+                .unwrap_or(false);
+                Ok(is_logical)
+            });
+            if result.unwrap_or(false) {
+                "wal"
+            } else {
+                "trigger"
+            }
+        }
+    }
+}
+
+/// Ensure the pg_flashback logical replication slot exists.
+/// Creates it if missing. Returns true if slot is ready.
+fn ensure_replication_slot() -> bool {
+    let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
+        let exists = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pg_flashback_slot')",
+        )?
+        .unwrap_or(false);
+
+        if !exists {
+            Spi::run(
+                "SELECT pg_create_logical_replication_slot('pg_flashback_slot', 'pg_flashback')",
+            )?;
+            log!("pg_flashback: created logical replication slot 'pg_flashback_slot'");
+        }
+        Ok(true)
+    });
+    result.unwrap_or(false)
+}
+
+/// Consume WAL changes from the logical replication slot and insert into delta_log.
+/// Each change is a JSON line produced by our output plugin (_PG_output_plugin_init).
+fn consume_wal_changes() {
+    let batch_size = effective_worker_batch_size() as i64;
+    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+        let table_exists =
+            Spi::get_one::<bool>("SELECT to_regclass('flashback.delta_log') IS NOT NULL")?
+                .unwrap_or(false);
+        if !table_exists {
+            return Ok(());
+        }
+
+        // Consume changes from the slot in a batch
+        // pg_logical_slot_get_changes returns (lsn, xid, data) rows
+        Spi::run_with_args(
+            "WITH wal_changes AS (
+                SELECT lsn, xid, data
+                FROM pg_logical_slot_get_changes(
+                    'pg_flashback_slot', NULL, $1
+                )
+            ),
+            parsed AS (
+                SELECT
+                    (data::jsonb)->>'op' AS event_type,
+                    format('%I.%I', (data::jsonb)->>'schema', (data::jsonb)->>'table') AS table_name,
+                    ((data::jsonb)->>'oid')::oid AS rel_oid,
+                    xid::bigint AS source_xid,
+                    (data::jsonb)->'old' AS old_data,
+                    (data::jsonb)->'new' AS new_data
+                FROM wal_changes
+                WHERE (data::jsonb)->>'op' IS NOT NULL
+                  AND (data::jsonb)->>'op' IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+            )
+            INSERT INTO flashback.delta_log (
+                event_time, event_type, table_name, rel_oid, source_xid,
+                committed_at, schema_version, old_data, new_data
+            )
+            SELECT
+                clock_timestamp(),
+                p.event_type,
+                p.table_name,
+                p.rel_oid,
+                p.source_xid,
+                clock_timestamp(),
+                COALESCE((
+                    SELECT sv.schema_version
+                    FROM flashback.schema_versions sv
+                    WHERE sv.rel_oid = p.rel_oid
+                      AND sv.applied_at <= clock_timestamp()
+                    ORDER BY sv.schema_version DESC
+                    LIMIT 1
+                ), 1),
+                p.old_data,
+                p.new_data
+            FROM parsed p
+            WHERE EXISTS (
+                SELECT 1 FROM flashback.tracked_tables tt
+                WHERE tt.rel_oid = p.rel_oid
+                  AND tt.is_active
+            )",
+            &[batch_size.into()],
+        )?;
+        Ok(())
+    });
+
+    if let Err(err) = result {
+        log!("pg_flashback WAL_CONSUME_ERROR error={err:?}");
+    }
+}
+
 fn flush_staging_to_delta_log() {
     let batch_size = effective_worker_batch_size() as i64;
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
@@ -254,7 +402,17 @@ fn flush_staging_to_delta_log() {
         if !table_exists {
             return Ok(());
         }
-        Spi::run_with_args(
+
+        // In WAL mode, only flush DDL events from staging_events.
+        // DML events are consumed directly from the logical replication slot.
+        let mode = effective_capture_mode();
+        let extra_filter = if mode == "wal" {
+            " AND m.event_type IN ('DDL', 'ALTER_TABLE', 'DROP_TABLE', 'RENAME_TABLE', 'TRUNCATE')"
+        } else {
+            ""
+        };
+
+        let query = format!(
             "WITH moved AS (
                 DELETE FROM flashback.staging_events
                 WHERE staging_id IN (
@@ -287,9 +445,10 @@ fn flush_staging_to_delta_log() {
                 WHERE tt.rel_oid = m.rel_oid
                   AND tt.is_active
                   AND m.event_time >= tt.tracked_since
-            )",
-            &[batch_size.into()],
-        )?;
+            ){extra_filter}"
+        );
+
+        Spi::run_with_args(&query, &[batch_size.into()])?;
         Ok(())
     });
 

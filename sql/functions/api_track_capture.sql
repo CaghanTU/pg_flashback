@@ -3,6 +3,26 @@
 -- checkpoint, retention, history, DDL capture.
 -- =================================================================
 
+-- Returns the effective capture mode: 'wal' or 'trigger'.
+-- 'auto' resolves based on wal_level.
+CREATE OR REPLACE FUNCTION flashback_effective_capture_mode()
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_mode text;
+    v_wal_level text;
+BEGIN
+    v_mode := COALESCE(current_setting('pg_flashback.capture_mode', true), 'auto');
+    IF v_mode = 'wal' THEN RETURN 'wal'; END IF;
+    IF v_mode = 'trigger' THEN RETURN 'trigger'; END IF;
+    -- auto: detect wal_level
+    v_wal_level := current_setting('wal_level');
+    IF v_wal_level = 'logical' THEN RETURN 'wal'; END IF;
+    RETURN 'trigger';
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_collect_schema_def(input_rel_oid oid)
 RETURNS jsonb
 LANGUAGE sql
@@ -479,7 +499,11 @@ BEGIN
         RAISE EXCEPTION 'flashback_track: table % does not exist', target_table;
     END IF;
 
-    PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+    -- In WAL mode, DML capture comes from the logical replication slot.
+    -- Only attach triggers in trigger mode.
+    IF flashback_effective_capture_mode() = 'trigger' THEN
+        PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+    END IF;
 
     v_snapshot_name := format('base_snapshot_%s', v_rel_oid::text);
 
@@ -859,8 +883,11 @@ BEGIN
 
     IF v_rel_oid IS NULL THEN RETURN false; END IF;
 
-    IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
-        PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
+    -- Only detach triggers in trigger mode (WAL mode has no triggers to detach)
+    IF flashback_effective_capture_mode() = 'trigger' THEN
+        IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
+            PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
+        END IF;
     END IF;
 
     IF v_base_snapshot IS NOT NULL AND v_base_snapshot <> '' THEN
