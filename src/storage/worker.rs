@@ -64,6 +64,7 @@ pub fn register_worker_and_guc() {
     BackgroundWorkerBuilder::new("pg_flashback delta worker")
         .set_function("pg_flashback_delta_worker_main")
         .set_library("pg_flashback")
+        .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
         .enable_spi_access()
         .set_restart_time(Some(Duration::from_secs(1)))
         .load();
@@ -88,7 +89,8 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
 
             // Skip checkpoint and retention during active restore to avoid
             // snapshotting a partially-restored table or purging needed deltas.
-            if !crate::runtime_guard::is_restore_in_progress() {
+            // Worker is a separate process, so check advisory locks via SPI.
+            if !is_any_restore_active() {
                 run_periodic_checkpoints();
                 run_retention_purge();
             }
@@ -102,12 +104,27 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(_arg: pg_sys::Datum) {
 
     if is_capture_enabled() {
         flush_staging_to_delta_log();
-        if !crate::runtime_guard::is_restore_in_progress() {
+        if !is_any_restore_active() {
             run_periodic_checkpoints();
             run_retention_purge();
         }
     }
     log!("pg_flashback delta worker stopped");
+}
+
+/// Check if any backend is performing a flashback restore by looking for
+/// the advisory lock key used by flashback_restore (classid = 358944).
+/// This runs in the worker process (separate address space) so the
+/// process-local AtomicBool is not useful here.
+fn is_any_restore_active() -> bool {
+    let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
+        let active = Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = 358944 AND granted)",
+        )?
+        .unwrap_or(false);
+        Ok(active)
+    });
+    result.unwrap_or(false)
 }
 
 fn flush_staging_to_delta_log() {

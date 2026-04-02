@@ -296,3 +296,54 @@ extension_sql!(
     name = "flashback_storage_schema_bootstrap",
     bootstrap,
 );
+
+extension_sql!(
+    r#"
+    -- ================================================================
+    -- RBAC: dedicated admin role + least-privilege grants
+    -- ================================================================
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
+            EXECUTE 'CREATE ROLE flashback_admin NOLOGIN';
+        END IF;
+    END
+    $$;
+
+    -- Revoke default PUBLIC access on destructive / privileged functions
+    REVOKE ALL ON FUNCTION flashback_track(text)                          FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_untrack(text)                        FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_restore(text, timestamptz)           FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_restore(text[], timestamptz)         FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_checkpoint(text)                     FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_set_restore_in_progress(bool)        FROM PUBLIC;
+    REVOKE ALL ON FUNCTION flashback_apply_retention()                    FROM PUBLIC;
+
+    -- Grant admin functions to the dedicated role
+    GRANT USAGE ON SCHEMA flashback TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_track(text)                  TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_untrack(text)                TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)   TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz) TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_checkpoint(text)             TO flashback_admin;
+    GRANT EXECUTE ON FUNCTION flashback_apply_retention()            TO flashback_admin;
+
+    -- Read-only monitoring is available to pg_monitor (built-in role)
+    GRANT USAGE ON SCHEMA flashback TO pg_monitor;
+    GRANT SELECT ON flashback.pg_stat_flashback TO pg_monitor;
+    GRANT SELECT ON flashback.restore_log TO pg_monitor;
+    GRANT SELECT ON flashback.tracked_tables TO pg_monitor;
+    GRANT EXECUTE ON FUNCTION flashback_history(text, interval) TO pg_monitor;
+    GRANT EXECUTE ON FUNCTION flashback_retention_status() TO pg_monitor;
+    GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid) TO pg_monitor;
+    "#,
+    name = "flashback_rbac_grants",
+    requires = [
+        "flashback_api_track_capture",
+        "flashback_restore_planner_api",
+        "flashback_restore_replay_helpers",
+        flashback_set_restore_in_progress,
+        flashback_is_restore_in_progress,
+    ],
+    finalize,
+);

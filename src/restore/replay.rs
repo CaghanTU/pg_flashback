@@ -89,6 +89,7 @@ extension_sql!(
     )
     RETURNS void
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         row_item record;
@@ -119,6 +120,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_recreate_table_from_ddl(ddl_info jsonb)
     RETURNS jsonb
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_schema text;

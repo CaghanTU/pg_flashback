@@ -5,6 +5,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_restore(target_table text, target_time timestamptz)
     RETURNS bigint
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -331,6 +332,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_restore(tables text[], target_time timestamptz)
     RETURNS bigint
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         tbl text;
@@ -430,6 +432,7 @@ extension_sql!(
     )
     RETURNS SETOF record
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -553,5 +556,4 @@ extension_sql!(
         "flashback_storage_schema_bootstrap",
         "flashback_restore_replay_helpers"
     ],
-    finalize,
 );

@@ -255,6 +255,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_attach_capture_trigger(input_schema text, input_table text)
     RETURNS void
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     BEGIN
         -- Drop legacy per-row trigger if exists
@@ -285,6 +286,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_detach_capture_trigger(input_schema text, input_table text)
     RETURNS void
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     BEGIN
         EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_row ON %I.%I', input_schema, input_table);
@@ -297,6 +299,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_track(target_table text)
     RETURNS boolean
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -397,6 +400,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_checkpoint(target_table text)
     RETURNS bigint
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -471,6 +475,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_take_due_checkpoints()
     RETURNS integer
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         rec record;
@@ -502,6 +507,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_apply_retention()
     RETURNS integer
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         rec record;
@@ -531,7 +537,9 @@ extension_sql!(
                   AND s.captured_at < clock_timestamp() - rec.retention_interval
             LOOP
                 IF snap_rec.snapshot_table IS NOT NULL AND snap_rec.snapshot_table <> '' THEN
-                    EXECUTE format('DROP TABLE IF EXISTS %s', snap_rec.snapshot_table);
+                    IF snap_rec.snapshot_table ~ '^flashback\\.\"?[a-zA-Z0-9_]+\"?$' THEN
+                        EXECUTE format('DROP TABLE IF EXISTS %s', snap_rec.snapshot_table);
+                    END IF;
                 END IF;
 
                 DELETE FROM flashback.snapshots WHERE snapshot_id = snap_rec.snapshot_id;
@@ -587,6 +595,7 @@ extension_sql!(
         retention_warning boolean
     )
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         rec record;
@@ -625,6 +634,7 @@ extension_sql!(
         new_data jsonb
     )
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -700,6 +710,7 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION flashback_untrack(target_table text)
     RETURNS boolean
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, flashback, public
     AS $$
     DECLARE
         v_rel_oid oid;
@@ -732,6 +743,9 @@ extension_sql!(
         END IF;
 
         IF v_base_snapshot IS NOT NULL AND v_base_snapshot <> '' THEN
+            IF v_base_snapshot !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
+                RAISE EXCEPTION 'flashback_untrack: invalid snapshot ref: %', v_base_snapshot;
+            END IF;
             EXECUTE format('DROP TABLE IF EXISTS %s', v_base_snapshot);
         END IF;
 
@@ -741,6 +755,10 @@ extension_sql!(
             WHERE rel_oid = v_rel_oid
         LOOP
             IF snap_rec.snapshot_table IS NOT NULL AND snap_rec.snapshot_table <> '' THEN
+                IF snap_rec.snapshot_table !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
+                    RAISE WARNING 'flashback_untrack: skipping invalid snapshot ref: %', snap_rec.snapshot_table;
+                    CONTINUE;
+                END IF;
                 EXECUTE format('DROP TABLE IF EXISTS %s', snap_rec.snapshot_table);
             END IF;
 
@@ -840,12 +858,27 @@ extension_sql!(
             new_version := COALESCE(tracked.schema_version, 1);
         END IF;
 
-        EXECUTE format(
-            'SELECT COALESCE(jsonb_agg(to_jsonb(t)), ''[]''::jsonb) FROM %I.%I t',
-            tracked.schema_name,
-            tracked.table_name
-        )
-          INTO row_snapshot;
+        -- Guard: skip row snapshot for large tables to prevent OOM.
+        -- DDL events still get recorded (ddl_info carries the schema); the
+        -- checkpoint / base_snapshot already holds the data.
+        DECLARE
+            v_row_count bigint;
+        BEGIN
+            EXECUTE format('SELECT count(*) FROM %I.%I', tracked.schema_name, tracked.table_name)
+              INTO v_row_count;
+            IF v_row_count > 100000 THEN
+                RAISE WARNING 'pg_flashback: table %.% has % rows — skipping inline DDL snapshot (checkpoint data preserved)',
+                    tracked.schema_name, tracked.table_name, v_row_count;
+                row_snapshot := NULL;
+            ELSE
+                EXECUTE format(
+                    'SELECT COALESCE(jsonb_agg(to_jsonb(t)), ''[]''::jsonb) FROM %I.%I t',
+                    tracked.schema_name,
+                    tracked.table_name
+                )
+                  INTO row_snapshot;
+            END IF;
+        END;
 
         INSERT INTO flashback.delta_log (
             event_time,

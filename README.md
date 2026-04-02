@@ -1,52 +1,128 @@
 # pg_flashback
 
-**Table-level point-in-time restore for PostgreSQL.** No full-cluster PITR, no pg_basebackup — just restore the table you need, to the second you need.
+Table‑level point‑in‑time restore and time‑travel queries for PostgreSQL.  
+Built with Rust + pgrx (v0.16.1). Tested on PostgreSQL 15–17.
 
-```sql
--- Oops, someone ran DELETE FROM orders WHERE status = 'pending';
-SELECT flashback_restore('orders', '2026-04-01 14:30:00');
--- ↑ Table restored. 847 rows recovered. Done.
+## 1. Why This Extension?
+
+- Restores any tracked table to any past timestamp — in seconds, not hours.
+- No full‑cluster PITR, no `pg_basebackup`, no manual `pg_dump` surgery.
+- Captures INSERT / UPDATE / DELETE via triggers and DDL (TRUNCATE, DROP, ALTER) via `ProcessUtility_hook`.
+- Ships with a background worker, UNLOGGED staging table, and asynchronous JSONB pipeline for minimal write overhead.
+- Includes `flashback_query()` — query past table state without actually restoring (`SELECT AS OF` semantics).
+- Per‑table advisory locks allow concurrent restores of unrelated tables.
+- Designed for production: TOAST guard, progress reporting, restore audit log, global kill switch, and monitoring views.
+
+## 2. Architecture Overview
+
+| Component | Purpose |
+|-----------|---------|
+| AFTER Triggers (statement + row) | Capture DML events into `staging_events` (UNLOGGED) using native JSONB. |
+| `ProcessUtility_hook` | Intercepts DDL (TRUNCATE, DROP, ALTER, RENAME) and snapshots schema state. |
+| Background Worker (`flashback_worker`) | Flushes staging → `delta_log` every 75 ms; runs periodic checkpoints and retention purge. |
+| `delta_log` | Append‑only JSONB event store with composite indexes for fast restore scans. |
+| Snapshots / Checkpoints | Materialised table copies for O(1) base‑image loading. |
+| `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
+| `flashback_restore()` | Loads nearest snapshot, replays delta events to target time, restores sequences and DDL. |
+| `flashback_query()` | Reconstructs past state in a temp table and executes arbitrary queries against it. |
+
+The extension is transparent to applications. Tables work normally; capture and restore happen behind the scenes.
+
+```
+DML (INSERT / UPDATE / DELETE)
+  │
+  ▼
+AFTER triggers ──► staging_events (UNLOGGED, JSONB)
+                       │
+                       ▼  background worker (every 75 ms)
+                  delta_log (JSONB) ──► snapshots (checkpoints)
+                       │
+DDL hook ──────────────┘
+(TRUNCATE / DROP / ALTER / RENAME)
+
+flashback_restore(table, timestamp)
+  ├─ Find nearest snapshot / checkpoint
+  ├─ Recreate table from schema_versions
+  ├─ Bulk‑load base image (INSERT … SELECT)
+  ├─ Replay deltas forward to target time
+  ├─ Restore serial sequences
+  └─ Log to restore_log + RAISE NOTICE progress
 ```
 
-## Why?
+## 3. Requirements
 
-PostgreSQL has no native way to restore a single table without restoring the entire cluster. When a developer runs a bad `DELETE` or `UPDATE`, your only options today are:
+### PostgreSQL
 
-- Full cluster PITR (restore everything, extract one table)
-- Logical backups + manual surgery
-- Hope you have a recent `pg_dump`
+**Supported versions:** PostgreSQL 15, 16, or 17
 
-**pg_flashback** captures row-level changes continuously and restores any tracked table to any point in time — in seconds, not hours.
+**Required `postgresql.conf` settings:**
+```
+wal_level = logical
+shared_preload_libraries = 'pg_flashback'
+```
 
-## Quick Start
+A restart is required after changing `shared_preload_libraries`.
+
+### Rust Toolchain
+
+- Rust ≥ 1.70 (stable)
+- `cargo-pgrx 0.16.1`
 
 ```bash
-# Build & install (requires Rust + cargo-pgrx 0.16.x)
+cargo install --locked cargo-pgrx --version 0.16.1
+```
+
+## 4. Build & Install
+
+### Initialise pgrx
+
+```bash
+cargo pgrx init --pg17 /path/to/pg_config
+```
+
+*Run once per PostgreSQL major version.*
+
+### Build & Install
+
+```bash
 cargo pgrx install --no-default-features -F pg17
+```
 
-# Add to postgresql.conf
-shared_preload_libraries = 'pg_flashback'
+### Enable the Extension
 
-# Restart PostgreSQL, then:
+```bash
+# Restart PostgreSQL after adding shared_preload_libraries
+sudo systemctl restart postgresql-17
+
+# Create the extension
 psql -c "CREATE EXTENSION pg_flashback;"
 ```
+
+### Multi‑Version Build
+
+```bash
+cargo pgrx install --no-default-features -F pg16
+cargo pgrx install --no-default-features -F pg15
+```
+
+## 5. Quick Start
 
 ```sql
 -- Start tracking a table
 SELECT flashback_track('orders');
 
--- ... normal operations happen ...
+-- … normal operations happen …
 
 -- Disaster: accidental mass delete
 DELETE FROM orders WHERE created_at < '2026-01-01';
 
 -- Restore to 30 seconds ago
 SELECT flashback_restore('orders', now() - interval '30 seconds');
+-- NOTICE: flashback_restore [orders]: snapshot loaded from flashback._snap_orders_16384
+-- NOTICE: flashback_restore [orders]: replaying 847 events …
+-- NOTICE: flashback_restore [orders]: complete — 847 events applied
 
--- Verify
-SELECT count(*) FROM orders;  -- All rows back
-
--- Or just QUERY the past without restoring
+-- Or query the past WITHOUT restoring
 SELECT * FROM flashback_query(
     'orders',
     now() - interval '30 seconds',
@@ -54,209 +130,184 @@ SELECT * FROM flashback_query(
 ) AS t(id int, total numeric, status text);
 ```
 
-## Features
+## 6. Configuration (GUCs)
+
+All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf`, `ALTER SYSTEM`) or per role/database (`ALTER ROLE … SET`).
+
+| GUC | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `on` | Global kill switch. `off` stops all capture; worker idles. Superuser only. |
+| `max_row_size` | `8kB` | Rows larger than this are skipped with a WARNING (TOAST protection). |
+| `worker_interval_ms` | `75` | Background worker flush interval in milliseconds. |
+| `worker_batch_size` | `4096` | Maximum rows per worker flush cycle. |
+
+Changes take effect immediately; no restart is required after `shared_preload_libraries` is set.
+
+## 7. SQL API Cheatsheet
+
+### Tracking
+
+| Function | Description |
+|----------|-------------|
+| `flashback_track(table)` | Start tracking a table. Creates triggers, base snapshot, and schema version entry. |
+| `flashback_untrack(table)` | Stop tracking. Removes triggers and cleans up all metadata. |
+
+### Restore
+
+| Function | Description |
+|----------|-------------|
+| `flashback_restore(table, timestamptz)` | Restore a single table to a past timestamp. Returns number of events applied. |
+| `flashback_restore(tables[], timestamptz)` | Restore multiple tables in dependency order within one transaction. |
+| `flashback_query(table, timestamptz [, query])` | Query past table state without restoring. Replace `$FB_TABLE` in custom queries. Returns `SETOF record`. |
+
+### Checkpoints & Retention
+
+| Function | Description |
+|----------|-------------|
+| `flashback_checkpoint(table)` | Create a manual checkpoint (materialised snapshot). |
+| `flashback_retention_status()` | Per‑table delta counts and retention warning flags. |
+
+### Monitoring & Audit
+
+| Function / View | Description |
+|-----------------|-------------|
+| `flashback.pg_stat_flashback` | Dashboard view: tracked tables, pending events, delta storage, restore counts. |
+| `flashback_history(table, interval)` | Recent change history for a table. |
+| `flashback.restore_log` | Audit log of all restore operations (who, when, what, success/failure). |
+
+### Schema & Lock Management
+
+| Function | Description |
+|----------|-------------|
+| `flashback_collect_schema_def(oid)` | Collect full schema definition (columns, PKs, constraints, indexes, triggers, RLS). |
+| `flashback_is_restore_in_progress(oid)` | Check if a restore is running for a specific table. |
+| `flashback_set_restore_in_progress(bool)` | Set restore‑in‑progress flag (internal use by restore functions). |
+
+## 8. Write Overhead Benchmark
+
+Measured on PostgreSQL 17, single‑node:
+
+| Scenario | Without | With pg_flashback | Overhead |
+|----------|---------|-------------------|----------|
+| Bulk INSERT 100K rows | 133 ms | 261 ms | **2.0×** |
+| Single‑row UPDATE 10K | 49 ms | 132 ms | **2.7×** |
+| Mixed DML 15K ops | 37 ms | 99 ms | **2.7×** |
+| Wide table UPDATE (15 cols, 5K rows) | 11 ms | 91 ms | **8.0×** |
+
+Bulk INSERT uses statement‑level triggers with transition tables. UPDATE uses per‑row triggers. All stages use native JSONB — no `json` → `jsonb` conversion overhead.
+
+## 9. Features
 
 | Feature | Status |
 |---------|--------|
-| Single-table restore to any timestamp | ✅ |
-| Multi-table restore in one transaction | ✅ |
-| **Flashback Query (SELECT AS OF)** | ✅ |
-| Schema evolution awareness (ADD/DROP COLUMN) | ✅ |
-| DDL capture (TRUNCATE, DROP TABLE, ALTER TABLE) | ✅ |
+| Single‑table restore to any timestamp | ✅ |
+| Multi‑table restore in one transaction | ✅ |
+| Flashback Query (`SELECT AS OF`) | ✅ |
+| Schema evolution awareness (ADD / DROP / ALTER COLUMN) | ✅ |
+| DDL capture (TRUNCATE, DROP TABLE, ALTER TABLE, RENAME) | ✅ |
 | Automatic checkpoints for fast restore | ✅ |
 | Configurable retention policy | ✅ |
-| Serial/sequence restoration | ✅ |
+| Serial / sequence restoration | ✅ |
+| Trigger & RLS policy preservation during restore | ✅ |
+| Generated column awareness | ✅ |
 | Global kill switch (`pg_flashback.enabled`) | ✅ |
 | Monitoring view (`pg_stat_flashback`) | ✅ |
 | Restore audit log + progress reporting | ✅ |
 | Large row protection (TOAST guard) | ✅ |
-| Per-table concurrent restore safety | ✅ |
+| Per‑table concurrent restore safety (advisory lock) | ✅ |
 | Native JSONB pipeline (zero conversion) | ✅ |
+| Bulk snapshot restore (`INSERT … SELECT`) | ✅ |
+| Composite delta_log indexes for fast scans | ✅ |
+| FK‑aware multi‑table restore ordering | ✅ |
+| Circular FK protection (depth limit) | ✅ |
 
-## Write Overhead Benchmark
+## 10. Testing & Observability
 
-Measured on PostgreSQL 17, single-node:
+### Test Suite
 
-| Scenario | Without | With pg_flashback | Overhead |
-|----------|---------|-------------------|----------|
-| Bulk INSERT 100K rows | 133 ms | 261 ms | **2.0x** |
-| Single-row UPDATE 10K | 49 ms | 132 ms | **2.7x** |
-| Mixed DML 15K ops | 37 ms | 99 ms | **2.7x** |
-| Wide table UPDATE (15 cols, 5K rows) | 11 ms | 91 ms | **8.0x** |
+29 integration tests covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, and flashback query:
 
-Bulk INSERT uses statement-level triggers with transition tables. UPDATE uses per-row triggers. All stages use native `jsonb` — no json→jsonb conversion overhead.
-
-## Architecture
-
-```
-DML (INSERT/UPDATE/DELETE)
-  │
-  ▼
-AFTER triggers ──► staging_events (UNLOGGED, json)
-                       │
-                       ▼ (background worker, every 75ms)
-                  delta_log (jsonb) ──► snapshots (checkpoints)
-                       │
-DDL hook ──────────────┘
-(TRUNCATE/DROP/ALTER)
-
-flashback_restore(table, timestamp)
-  │
-  ├─ Find nearest snapshot/checkpoint
-  ├─ Recreate table structure from schema_versions
-  ├─ Load base image
-  ├─ Replay deltas forward to target time
-  └─ Restore serial sequences
+```bash
+cargo pgrx test pg17
+# test result: ok. 29 passed; 0 failed
 ```
 
-## API Reference
+### Monitoring Queries
 
-### Tracking
+```sql
+-- Dashboard
+SELECT * FROM flashback.pg_stat_flashback;
+
+-- Retention health
+SELECT * FROM flashback_retention_status();
+
+-- Recent restores
+SELECT * FROM flashback.restore_log ORDER BY restored_at DESC LIMIT 10;
+
+-- Active restores (any table)
+SELECT * FROM flashback_is_restore_in_progress(NULL);
+```
+
+### CI
+
+GitHub Actions pipeline runs on every push:
+- Build matrix: PostgreSQL 15, 16, 17
+- `cargo clippy` + `cargo fmt --check`
+- Full integration test suite
+
+## 11. Operations & Integration
+
+### Common Tasks
 
 ```sql
 -- Start tracking
-SELECT flashback_track('schema.table');
+SELECT flashback_track('public.orders');
 
--- Stop tracking (cleans up all metadata)
-SELECT flashback_untrack('schema.table');
+-- Check what is being tracked
+SELECT * FROM flashback.tracked_tables WHERE is_active;
+
+-- Manual checkpoint before risky migration
+SELECT flashback_checkpoint('public.orders');
+
+-- Disable capture temporarily (all tables, all sessions)
+SET pg_flashback.enabled = off;
+-- … run migration …
+SET pg_flashback.enabled = on;
+
+-- Query past state without restoring
+SELECT * FROM flashback_query('orders', now() - interval '1 hour')
+    AS t(id int, customer_id int, total numeric, status text);
+
+-- Multi‑table restore (FK‑safe ordering)
+SELECT flashback_restore(
+    ARRAY['order_items', 'orders', 'customers'],
+    now() - interval '10 minutes'
+);
 ```
 
-### Restore
+### Application Integration
 
-```sql
--- Single table
-SELECT flashback_restore('orders', '2026-04-01 14:30:00'::timestamptz);
+No application changes required. Track tables once; the extension captures changes transparently. Restore is a single SQL call from any PostgreSQL client.
 
--- Multiple tables (same transaction)
-SELECT flashback_restore(ARRAY['orders', 'order_items'], now() - interval '5 minutes');
-```
+## 12. Troubleshooting
 
-### Checkpoints & Retention
+| Symptom | Check / Fix |
+|---------|-------------|
+| Extension fails to load | Ensure `shared_preload_libraries = 'pg_flashback'` and restart PostgreSQL. |
+| Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'pg_flashback%';` |
+| Restore returns 0 events | Check that `committed_at IS NOT NULL` on delta_log rows (worker must flush staging first). |
+| Triggers not firing | Verify tracking: `SELECT * FROM flashback.tracked_tables WHERE is_active;` |
+| TOAST / large row warnings | Increase `pg_flashback.max_row_size` or accept that oversized rows are skipped. |
+| Socket connection issues (pgrx dev) | Try: `psql -h ~/.pgrx -p 28817 postgres` |
+| Feature flag conflict | Use explicit features: `cargo pgrx install --no-default-features -F pg17` |
 
-```sql
--- Manual checkpoint
-SELECT flashback_checkpoint('orders');
+## 13. Caveats & Limitations
 
--- Check retention status
-SELECT * FROM flashback_retention_status();
-```
-
-### Monitoring
-
-```sql
--- Dashboard view
-SELECT * FROM flashback.pg_stat_flashback;
-
--- Change history for a table
-SELECT * FROM flashback_history('orders', interval '1 hour');
-
--- Audit log of all restores
-SELECT * FROM flashback.restore_log;
-```
-
-### Configuration (GUCs)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `pg_flashback.enabled` | `on` | Global kill switch. `SET pg_flashback.enabled = off;` stops all capture. Superuser only. |
-| `pg_flashback.max_row_size` | `8kB` | Rows larger than this are skipped with a WARNING (TOAST protection). |
-| `pg_flashback.worker_interval_ms` | `75` | Background worker flush interval. |
-| `pg_flashback.worker_batch_size` | `4096` | Rows per worker flush cycle. |
-
-## Requirements
-
-- PostgreSQL 17
-- Rust stable + [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx) 0.16.x
-- `shared_preload_libraries = 'pg_flashback'` in postgresql.conf
-
-## Build
-
-```bash
-# Install pgrx if needed
-cargo install cargo-pgrx --version '=0.16.1'
-cargo pgrx init --pg17 /path/to/pg_config
-
-# Build & install
-cargo pgrx install --no-default-features -F pg17
-
-# Run test suite (14 tests)
-psql -f sql/senior_dba_test_suite.sql
-```
-
-## Test Suite
-
-14 production-grade tests covering:
-
-| Test | What it validates |
-|------|-------------------|
-| T1 | Large volume (5K rows) restore |
-| T2 | Column type fidelity (JSONB, boolean, numeric) |
-| T3 | FK multi-table restore with orphan check |
-| T4 | Boundary time precision (microsecond accuracy) |
-| T5 | Schema evolution (ADD/DROP COLUMN) |
-| T6 | Track/untrack/re-track lifecycle |
-| T7 | TRUNCATE + re-insert restore |
-| T8 | Serial sequence post-restore |
-| T9 | Checkpoint-based restore |
-| T10 | Sequential restores (3 points in time) |
-| T11 | NULL-heavy + JSONB data |
-| T12 | flashback_history() query |
-| T13 | Wide table (15+ columns) |
-| T14 | DO block + serial restore |
+- **Crash window:** `staging_events` is UNLOGGED for performance. Events not yet flushed to `delta_log` (up to `worker_interval_ms`, default 75 ms) are lost on a PostgreSQL crash. If you need zero‑loss guarantees, set `pg_flashback.staging_logged = on` (planned) or reduce the flush interval.
+- **DDL snapshots:** TRUNCATE and DROP events snapshot the full table contents into `delta_log.old_data` as JSONB. For very large tables this can consume significant memory. A `pg_flashback.max_ddl_snapshot_rows` guard is planned.
+- **Single database:** The background worker connects to one database. Multi‑database deployments require one `shared_preload_libraries` entry per database (planned).
+- **No extension upgrade path yet:** The extension ships as version 0.1.0. Future versions will include `ALTER EXTENSION … UPDATE` migration scripts.
 
 ## License
 
-PostgreSQL License
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for Phase 3 (enterprise) plans.
-
-Highlights:
-
-- Step 2-4: logical slot and tuple extraction pipeline
-- Step 5: async flush path
-- Step 6: single-table restore
-- Step 7: DDL restore behavior
-- Step 8: checkpoint + multi-table restore
-- Step 9: history, retention, untrack cleanup
-- Step 10: schema evolution restore
-
-## Troubleshooting
-
-### pgrx command mismatch
-
-If a command is missing, verify with:
-
-```bash
-cargo pgrx --help
-```
-
-### Feature conflicts across PostgreSQL versions
-
-Prefer explicit feature selection:
-
-```bash
-cargo pgrx install --no-default-features -F pg17
-```
-
-### Socket connection issues with pgrx-managed PostgreSQL
-
-If local connection fails, try:
-
-```bash
-psql -h ~/.pgrx -p 28817 postgres
-```
-
-### shared_preload_libraries formatting issues
-
-If extension preload fails after shell-based edits, normalize the value to a clean comma-separated list without nested quotes.
-
-### Startup crash with large shared memory setup
-
-Try starting with unlimited stack:
-
-```bash
-ulimit -s unlimited
-cargo pgrx start pg17
-```
+MIT

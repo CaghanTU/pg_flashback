@@ -28,11 +28,6 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut pg_sys::OutputPl
     capture::logical_decoding::output_plugin_init(cb);
 }
 
-#[pg_extern]
-fn hello_pg_flashback() -> &'static str {
-    "Hello, pg_flashback"
-}
-
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -52,11 +47,6 @@ mod tests {
                 run_integration_sql(include_str!($path));
             }
         };
-    }
-
-    #[pg_test]
-    fn test_hello_pg_flashback() {
-        assert_eq!("Hello, pg_flashback", crate::hello_pg_flashback());
     }
 
     sql_test!(

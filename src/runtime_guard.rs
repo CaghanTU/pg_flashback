@@ -13,6 +13,10 @@ pub fn is_restore_in_progress() -> bool {
 
 #[pg_extern]
 fn flashback_set_restore_in_progress(val: bool) -> bool {
+    // Only superusers / flashback_admin should toggle the restore flag
+    if unsafe { !pgrx::pg_sys::superuser() } {
+        pgrx::error!("flashback_set_restore_in_progress requires superuser");
+    }
     set_restore_in_progress(val);
     true
 }
