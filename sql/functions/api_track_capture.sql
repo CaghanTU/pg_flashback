@@ -135,7 +135,9 @@ AS $$
     WHERE c.oid = input_rel_oid;
 $$;
 
--- Statement-level trigger for INSERT
+-- Statement-level trigger for INSERT (regular / non-partitioned tables only)
+-- Uses REFERENCING NEW TABLE transition table for efficiency.
+-- NOT compatible with partitioned tables — use flashback_capture_insert_row_trigger instead.
 CREATE OR REPLACE FUNCTION flashback_capture_insert_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -170,6 +172,96 @@ BEGIN
     IF v_skipped > 0 THEN
         RAISE WARNING 'pg_flashback: % rows skipped (exceed max_row_size %) for %', v_skipped, v_max_size, v_table_name;
     END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+-- Per-row trigger for INSERT (partitioned tables)
+-- PostgreSQL does not support REFERENCING NEW TABLE (transition tables) on
+-- partitioned tables. This per-row variant is used automatically when
+-- flashback_attach_capture_trigger detects a partitioned parent.
+CREATE OR REPLACE FUNCTION flashback_capture_insert_row_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_table_name text;
+    v_max_size   integer;
+    v_rel_oid    oid;
+BEGIN
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+        RETURN NULL;
+    END IF;
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+
+    IF TG_NARGS > 0 THEN
+        v_table_name := TG_ARGV[0];
+    ELSE
+        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
+    END IF;
+    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
+
+    IF pg_column_size(NEW.*) > v_max_size THEN
+        RAISE WARNING 'pg_flashback: row too large (% bytes), skipping INSERT capture for %',
+            pg_column_size(NEW.*), v_table_name;
+        RETURN NULL;
+    END IF;
+
+    -- Resolve parent OID (partitioned parent, not the individual partition)
+    v_rel_oid := COALESCE(to_regclass(v_table_name), TG_RELID);
+
+    INSERT INTO flashback.staging_events
+           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
+    VALUES (clock_timestamp(), v_rel_oid, txid_current()::bigint,
+            'INSERT', v_table_name, NULL, to_jsonb(NEW));
+
+    RETURN NULL;
+END;
+$$;
+
+-- Per-row trigger for DELETE (partitioned tables)
+-- PostgreSQL does not support REFERENCING OLD TABLE (transition tables) on
+-- partitioned tables. This per-row variant is used automatically when
+-- flashback_attach_capture_trigger detects a partitioned parent.
+CREATE OR REPLACE FUNCTION flashback_capture_delete_row_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_table_name text;
+    v_max_size   integer;
+    v_rel_oid    oid;
+BEGIN
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+        RETURN NULL;
+    END IF;
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+
+    IF TG_NARGS > 0 THEN
+        v_table_name := TG_ARGV[0];
+    ELSE
+        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
+    END IF;
+    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
+
+    IF pg_column_size(OLD.*) > v_max_size THEN
+        RAISE WARNING 'pg_flashback: row too large (% bytes), skipping DELETE capture for %',
+            pg_column_size(OLD.*), v_table_name;
+        RETURN NULL;
+    END IF;
+
+    -- Resolve parent OID (partitioned parent, not the individual partition)
+    v_rel_oid := COALESCE(to_regclass(v_table_name), TG_RELID);
+
+    INSERT INTO flashback.staging_events
+           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
+    VALUES (clock_timestamp(), v_rel_oid, txid_current()::bigint,
+            'DELETE', v_table_name, to_jsonb(OLD), NULL);
 
     RETURN NULL;
 END;
@@ -300,24 +392,54 @@ RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, flashback, public
 AS $$
+DECLARE
+    v_relkind char;
+    v_qualified text := format('%I.%I', input_schema, input_table);
 BEGIN
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_row ON %I.%I', input_schema, input_table);
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_ins ON %I.%I', input_schema, input_table);
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_upd ON %I.%I', input_schema, input_table);
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_del ON %I.%I', input_schema, input_table);
 
-    EXECUTE format(
-        'CREATE TRIGGER flashback_capture_ins AFTER INSERT ON %I.%I REFERENCING NEW TABLE AS _fb_new FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_insert_trigger(%L)',
-        input_schema, input_table, format('%I.%I', input_schema, input_table)
-    );
-    EXECUTE format(
-        'CREATE TRIGGER flashback_capture_upd AFTER UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_update_trigger(%L)',
-        input_schema, input_table, format('%I.%I', input_schema, input_table)
-    );
-    EXECUTE format(
-        'CREATE TRIGGER flashback_capture_del AFTER DELETE ON %I.%I REFERENCING OLD TABLE AS _fb_old FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_delete_trigger(%L)',
-        input_schema, input_table, format('%I.%I', input_schema, input_table)
-    );
+    -- Detect partitioned table: relkind = 'p'
+    SELECT c.relkind INTO v_relkind
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = input_schema AND c.relname = input_table;
+
+    IF v_relkind = 'p' THEN
+        -- Partitioned table: PostgreSQL does NOT support REFERENCING NEW/OLD TABLE
+        -- (transition tables) on partitioned tables. Use per-row triggers instead.
+        -- PostgreSQL automatically propagates FOR EACH ROW triggers to all current
+        -- and future partitions.
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_ins AFTER INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_insert_row_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_upd AFTER UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_update_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_del AFTER DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_delete_row_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+    ELSE
+        -- Regular (non-partitioned) table: use statement-level triggers with
+        -- transition tables for efficient bulk-insert / bulk-delete capture.
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_ins AFTER INSERT ON %I.%I REFERENCING NEW TABLE AS _fb_new FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_insert_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_upd AFTER UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_update_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+        EXECUTE format(
+            'CREATE TRIGGER flashback_capture_del AFTER DELETE ON %I.%I REFERENCING OLD TABLE AS _fb_old FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_delete_trigger(%L)',
+            input_schema, input_table, v_qualified
+        );
+    END IF;
 END;
 $$;
 

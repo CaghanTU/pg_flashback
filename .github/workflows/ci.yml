@@ -2,75 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  PGRX_VERSION: "0.16.1"
 
 jobs:
-  test:
-    name: PG ${{ matrix.pg }} — ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        pg: [15, 16, 17]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-pg${{ matrix.pg }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-pg${{ matrix.pg }}-cargo-
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libreadline-dev zlib1g-dev \
-            flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils \
-            xsltproc ccache pkg-config clang
-
-      - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "=0.16.1" --locked
-
-      - name: Initialize pgrx for PG ${{ matrix.pg }}
-        run: cargo pgrx init --pg${{ matrix.pg }} download
-
-      - name: Build extension
-        run: cargo pgrx install --no-default-features -F pg${{ matrix.pg }} --release
-
-      - name: Start PostgreSQL
-        run: |
-          cargo pgrx start pg${{ matrix.pg }}
-
-      - name: Run DBA test suite
-        run: |
-          PG_PORT=$(cargo pgrx info pg${{ matrix.pg }} port 2>/dev/null || echo "288${{ matrix.pg }}")
-          PG_SOCKET=$(cargo pgrx info pg${{ matrix.pg }} socket_dir 2>/dev/null || echo "$HOME/.pgrx")
-          psql -p "$PG_PORT" -h "$PG_SOCKET" -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_flashback;"
-          psql -p "$PG_PORT" -h "$PG_SOCKET" -d postgres -f sql/senior_dba_test_suite.sql 2>&1 | tee /tmp/test_output.log
-          grep -q "ALL 14 TESTS PASSED" /tmp/test_output.log
-
-      - name: Stop PostgreSQL
-        if: always()
-        run: cargo pgrx stop pg${{ matrix.pg }} || true
-
   lint:
-    name: Clippy & Format
-    runs-on: ubuntu-latest
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -79,21 +23,91 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-lint-
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libreadline-dev zlib1g-dev \
-            flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils \
-            xsltproc ccache pkg-config clang
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang
 
       - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "=0.16.1" --locked
+        run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
 
-      - name: Initialize pgrx for PG 17
+      - name: Initialize pgrx (needed for proc-macro compilation)
         run: cargo pgrx init --pg17 download
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
-      - name: Run clippy
-        run: cargo clippy --no-default-features -F pg17 -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --no-default-features --features pg17 -- -D warnings
+
+  test:
+    name: Test (PG ${{ matrix.pg }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-pg${{ matrix.pg }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-pg${{ matrix.pg }}-
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+
+      - name: Initialize pgrx for PG ${{ matrix.pg }}
+        run: cargo pgrx init --pg${{ matrix.pg }} download
+
+      - name: Remove stale test-pgdata (prevents mutex lock errors)
+        run: rm -rf target/test-pgdata
+
+      - name: cargo pgrx test
+        run: cargo pgrx test pg${{ matrix.pg }}
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-audit-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+

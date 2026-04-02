@@ -206,6 +206,14 @@ mod tests {
         it_noop_update_skip,
         "../tests/sql/integration/noop_update_skip.sql"
     );
+    sql_test!(
+        it_native_partition_restore,
+        "../tests/sql/integration/native_partition_restore.sql"
+    );
+    sql_test!(
+        it_restore_parallel_basic,
+        "../tests/sql/integration/restore_parallel_basic.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -32,6 +32,9 @@ REVOKE ALL ON FUNCTION flashback_jsonb_concat(jsonb, jsonb)               FROM P
 REVOKE ALL ON FUNCTION flashback_collect_schema_def(oid)                  FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb) FROM PUBLIC;
+-- Per-row partition trigger functions are internal
+REVOKE ALL ON FUNCTION flashback_capture_insert_row_trigger()             FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_capture_delete_row_trigger()             FROM PUBLIC;
 
 -- ================================================================
 -- Grant admin functions to the dedicated role
@@ -49,6 +52,7 @@ GRANT EXECUTE ON FUNCTION flashback_track(text)                       TO flashba
 GRANT EXECUTE ON FUNCTION flashback_untrack(text)                     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)        TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz)      TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_checkpoint(text)                  TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_apply_retention()                 TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_set_restore_in_progress(bool)     TO flashback_admin;
@@ -124,8 +128,14 @@ COMMENT ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text)
 COMMENT ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb)
     IS '[Internal] Atomic swap: DROP original → RENAME shadow. Restores FK, triggers, RLS, ACL. Returns new OID.';
 COMMENT ON FUNCTION flashback_capture_insert_trigger()
-    IS 'Statement-level AFTER INSERT trigger — bulk-captures new rows via transition table into staging_events.';
+    IS 'Statement-level AFTER INSERT trigger — bulk-captures new rows via transition table into staging_events. Not used on partitioned tables.';
+COMMENT ON FUNCTION flashback_capture_insert_row_trigger()
+    IS '[Internal] Per-row AFTER INSERT trigger for partitioned tables — transition tables are not supported on partitioned tables.';
 COMMENT ON FUNCTION flashback_capture_update_trigger()
     IS 'Row-level AFTER UPDATE trigger — diff-only capture for PK tables (PK + changed columns), full-row for non-PK. Skips no-op updates.';
 COMMENT ON FUNCTION flashback_capture_delete_trigger()
-    IS 'Statement-level AFTER DELETE trigger — bulk-captures deleted rows via transition table into staging_events.';
+    IS 'Statement-level AFTER DELETE trigger — bulk-captures deleted rows via transition table into staging_events. Not used on partitioned tables.';
+COMMENT ON FUNCTION flashback_capture_delete_row_trigger()
+    IS '[Internal] Per-row AFTER DELETE trigger for partitioned tables — transition tables are not supported on partitioned tables.';
+COMMENT ON FUNCTION flashback_restore_parallel(text, timestamptz, int)
+    IS 'Restore a table with parallel-worker hints (max_parallel_workers_per_gather). Also emits per-partition guidance for partitioned tables.';

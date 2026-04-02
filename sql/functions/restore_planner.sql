@@ -666,3 +666,95 @@ BEGIN
     RETURN QUERY EXECUTE v_query;
 END;
 $$;
+
+-- ----------------------------------------------------------------
+-- flashback_restore_parallel
+-- ----------------------------------------------------------------
+-- Parallel-hint restore: enables PostgreSQL's parallel query workers
+-- for the batch replay CTEs, reducing restore time on large tables
+-- on multi-core hardware.
+--
+-- For partitioned tables it also prints per-partition guidance so
+-- operators know which partitions they can restore concurrently from
+-- separate sessions.
+--
+-- Parameters
+--   target_table  – table to restore (same syntax as flashback_restore)
+--   target_time   – point-in-time target
+--   num_workers   – hint for max parallel workers (1–8, default 4)
+--
+-- Returns: (restored_table text, events_applied bigint)
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_restore_parallel(
+    target_table text,
+    target_time  timestamptz,
+    num_workers  int DEFAULT 4
+)
+RETURNS TABLE(restored_table text, events_applied bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_workers    int  := LEAST(GREATEST(num_workers, 1), 8);
+    v_rel_oid    oid;
+    v_relkind    char;
+    v_schema     text;
+    v_tblname    text;
+    v_applied    bigint;
+    v_part       record;
+BEGIN
+    -- Resolve the table
+    SELECT c.oid, c.relkind, n.nspname, c.relname
+      INTO v_rel_oid, v_relkind, v_schema, v_tblname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = to_regclass(target_table);
+
+    IF v_rel_oid IS NULL THEN
+        RAISE EXCEPTION 'flashback_restore_parallel: table % not found', target_table;
+    END IF;
+
+    -- Enable parallel query for hash joins and sequential scans used by
+    -- flashback_replay_batch_pk's CTEs.  SET LOCAL so it is scoped to
+    -- the current transaction only.
+    EXECUTE format('SET LOCAL max_parallel_workers_per_gather = %s', v_workers);
+    EXECUTE format('SET LOCAL max_parallel_maintenance_workers = %s', v_workers);
+    -- Allow the leader to also execute scan work (not just coordinate)
+    SET LOCAL parallel_leader_participation = on;
+
+    -- For partitioned tables: print per-partition guidance.
+    -- Individual partitions share the same delta_log (parent rel_oid),
+    -- so the parent restore is the correct call.  However, if you want
+    -- to restore multiple partitions truly in parallel, open separate
+    -- database connections and call:
+    --   SELECT flashback_restore('schema.partition_name', target_time);
+    -- for each partition simultaneously.
+    IF v_relkind = 'p' THEN
+        RAISE NOTICE
+            'flashback_restore_parallel [%]: partitioned table detected — '
+            'all events are recorded under parent OID so the parent is restored atomically. '
+            'For per-partition parallel execution, run flashback_restore() on each partition '
+            'from separate connections (they are independent after flashback_untrack + re-track).',
+            target_table;
+
+        FOR v_part IN
+            SELECT n.nspname AS sch, ch.relname AS tbl
+            FROM pg_inherits inh
+            JOIN pg_class ch ON ch.oid = inh.inhrelid
+            JOIN pg_namespace n ON n.oid = ch.relnamespace
+            WHERE inh.inhparent = v_rel_oid
+            ORDER BY ch.relname
+        LOOP
+            RAISE NOTICE 'flashback_restore_parallel [%]:   partition → %.%',
+                target_table, v_part.sch, v_part.tbl;
+        END LOOP;
+    END IF;
+
+    -- Execute the standard restore (which already uses batch/set-based replay
+    -- and will now benefit from the parallel worker GUCs set above).
+    v_applied := flashback_restore(target_table, target_time);
+
+    RETURN QUERY SELECT target_table, v_applied;
+END;
+$$;
