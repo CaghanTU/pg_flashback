@@ -483,6 +483,22 @@ BEGIN
 
     v_snapshot_name := format('base_snapshot_%s', v_rel_oid::text);
 
+    -- Clean up any stale checkpoint snapshots for this OID (handles OID recycling)
+    DECLARE
+        stale_snap record;
+    BEGIN
+        FOR stale_snap IN
+            SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = v_rel_oid
+        LOOP
+            IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
+                EXECUTE format('DROP TABLE IF EXISTS %s', stale_snap.snapshot_table);
+            END IF;
+        END LOOP;
+        DELETE FROM flashback.snapshots WHERE rel_oid = v_rel_oid;
+        DELETE FROM flashback.delta_log WHERE rel_oid = v_rel_oid;
+        DELETE FROM flashback.staging_events WHERE rel_oid = v_rel_oid;
+    END;
+
     EXECUTE format('DROP TABLE IF EXISTS flashback.%I', v_snapshot_name);
     EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I', v_snapshot_name, v_schema_name, v_table_name);
 
