@@ -111,6 +111,8 @@ BEGIN
     DECLARE
         t_before timestamptz;
         v_cnt bigint;
+        v_has_trigger boolean;
+        v_ri_after char;
     BEGIN
         t_before := clock_timestamp();
         INSERT INTO public.it_wal_restore VALUES (1, 'a'), (2, 'b');
@@ -124,6 +126,76 @@ BEGIN
         IF v_cnt <> 0 THEN
             RAISE EXCEPTION 'WAL mode restore to before-inserts: expected 0, got %', v_cnt;
         END IF;
+
+        -- Fix 4: after WAL-mode restore, NO flashback capture trigger should be attached.
+        -- A trigger would accumulate events in staging that the worker will never flush
+        -- (worker skips staging_events in WAL mode).
+        SELECT EXISTS (
+            SELECT 1 FROM pg_trigger tg
+            JOIN pg_class c ON c.oid = tg.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relname = 'it_wal_restore'
+              AND tg.tgname LIKE 'flashback_capture_%'
+        ) INTO v_has_trigger;
+
+        IF v_has_trigger THEN
+            RAISE EXCEPTION 'WAL mode restore must not reattach capture triggers (staging is skipped in WAL mode)';
+        END IF;
+
+        -- Fix 4 (cont.): REPLICA IDENTITY FULL must be preserved after WAL-mode restore.
+        SELECT c.relreplident INTO v_ri_after
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'it_wal_restore';
+
+        IF v_ri_after <> 'f' THEN
+            RAISE EXCEPTION 'WAL mode restore must keep REPLICA IDENTITY FULL, got %', v_ri_after;
+        END IF;
+    END;
+
+    -- ----------------------------------------------------------------
+    -- 7. flashback_untrack() in WAL mode restores original REPLICA IDENTITY
+    -- ----------------------------------------------------------------
+    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
+
+    DROP TABLE IF EXISTS public.it_wal_untrack CASCADE;
+    CREATE TABLE public.it_wal_untrack (id int PRIMARY KEY, val text);
+    -- Verify the table starts with DEFAULT replica identity (relreplident = 'd')
+    DECLARE
+        v_ri_before char;
+        v_ri_untracked char;
+    BEGIN
+        SELECT c.relreplident INTO v_ri_before
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
+
+        IF v_ri_before = 'f' THEN
+            RAISE EXCEPTION 'test precondition: new table should start with DEFAULT replica identity, got FULL';
+        END IF;
+
+        PERFORM flashback_track('public.it_wal_untrack');
+
+        -- After tracking in WAL mode, must be FULL
+        SELECT c.relreplident INTO v_ri_before
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
+        IF v_ri_before <> 'f' THEN
+            RAISE EXCEPTION 'after WAL track: expected REPLICA IDENTITY FULL, got %', v_ri_before;
+        END IF;
+
+        PERFORM flashback_untrack('public.it_wal_untrack');
+
+        -- After untracking, must be restored to DEFAULT
+        SELECT c.relreplident INTO v_ri_untracked
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
+        IF v_ri_untracked = 'f' THEN
+            RAISE EXCEPTION 'after WAL untrack: REPLICA IDENTITY should be restored (not FULL), got %', v_ri_untracked;
+        END IF;
     END;
 
     -- Cleanup
@@ -131,5 +203,6 @@ BEGIN
     DROP TABLE IF EXISTS public.it_wal_behaviors_wal CASCADE;
     DROP TABLE IF EXISTS public.it_wal_behaviors_trig CASCADE;
     DROP TABLE IF EXISTS public.it_wal_restore CASCADE;
+    DROP TABLE IF EXISTS public.it_wal_untrack CASCADE;
 END;
 $tv$;

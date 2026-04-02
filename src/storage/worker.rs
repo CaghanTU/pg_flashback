@@ -512,8 +512,25 @@ fn flush_staging_to_delta_log() {
                 committed_at, schema_version, old_data, new_data
             )
             SELECT
-                m.event_time, m.event_type, m.table_name, m.rel_oid, m.source_xid,
-                clock_timestamp(),
+                -- Use the actual transaction commit timestamp when track_commit_timestamp
+                -- is enabled. This makes event_time commit-time-correct for PITR accuracy.
+                -- Without it, event_time is the trigger's clock_timestamp() at statement
+                -- execution, which can precede the actual commit for long-running transactions.
+                COALESCE(
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM pg_settings
+                        WHERE name = 'track_commit_timestamp' AND setting = 'on'
+                    ) THEN pg_xact_commit_timestamp(m.source_xid::xid) END,
+                    m.event_time
+                ) AS event_time,
+                m.event_type, m.table_name, m.rel_oid, m.source_xid,
+                COALESCE(
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM pg_settings
+                        WHERE name = 'track_commit_timestamp' AND setting = 'on'
+                    ) THEN pg_xact_commit_timestamp(m.source_xid::xid) END,
+                    clock_timestamp()
+                ) AS committed_at,
                 COALESCE((
                     SELECT sv.schema_version
                     FROM flashback.schema_versions sv

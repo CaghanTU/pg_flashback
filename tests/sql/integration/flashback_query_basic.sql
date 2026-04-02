@@ -27,9 +27,9 @@ BEGIN
         RAISE EXCEPTION 'flashback_query: expected 3 rows, got %', v_count;
     END IF;
 
-    -- Verify specific data at the old point in time
+    -- Verify specific data at the old point in time using filter_clause (WHERE predicate only)
     SELECT t.name INTO v_name
-    FROM flashback_query('public.it_fb_query', t_before, 'SELECT * FROM $FB_TABLE WHERE id = 1')
+    FROM flashback_query('public.it_fb_query', t_before, 'id = 1')
          AS t(id int, name text, price numeric);
 
     IF v_name <> 'alpha' THEN
@@ -91,6 +91,39 @@ BEGIN
     IF v_count <> 3 THEN
         RAISE EXCEPTION 'flashback_query schema-evolution check: expected 3, got %', v_count;
     END IF;
+
+    -- ── Scenario 4: filter_clause security — semicolons rejected ─────────────
+    -- Passing a semicolon in filter_clause must raise an exception.
+    DECLARE
+        v_exc boolean := false;
+    BEGIN
+        BEGIN
+            SELECT t.id INTO v_count
+            FROM flashback_query('public.it_fb_query', t_before, 'id = 1; DELETE FROM pg_class')
+                 AS t(id int, name text, price numeric) LIMIT 1;
+        EXCEPTION WHEN OTHERS THEN
+            v_exc := true;
+        END;
+        IF NOT v_exc THEN
+            RAISE EXCEPTION 'flashback_query: semicolon in filter_clause should have raised an exception';
+        END IF;
+    END;
+
+    -- ── Scenario 5: filter_clause security — DML keywords rejected ───────────
+    DECLARE
+        v_exc2 boolean := false;
+    BEGIN
+        BEGIN
+            SELECT t.id INTO v_count
+            FROM flashback_query('public.it_fb_query', t_before, 'id IN (DELETE FROM pg_class RETURNING 1)')
+                 AS t(id int, name text, price numeric) LIMIT 1;
+        EXCEPTION WHEN OTHERS THEN
+            v_exc2 := true;
+        END;
+        IF NOT v_exc2 THEN
+            RAISE EXCEPTION 'flashback_query: DELETE keyword in filter_clause should have raised an exception';
+        END IF;
+    END;
 END;
 $tv$;
 

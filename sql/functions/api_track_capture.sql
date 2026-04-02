@@ -488,6 +488,7 @@ DECLARE
     v_table_name text;
     v_snapshot_name text;
     v_tracked_since timestamptz;
+    v_replica_identity_was "char" := 'd';
 BEGIN
     SELECT c.oid, n.nspname, c.relname
       INTO v_rel_oid, v_schema_name, v_table_name
@@ -505,6 +506,11 @@ BEGIN
     -- (e.g. inside a test harness or an already-dirty transaction), the
     -- background worker will pick it up on its next cycle.
     IF flashback_effective_capture_mode() = 'wal' THEN
+        -- Capture the current replica identity BEFORE we change it so that
+        -- flashback_untrack() can restore the table to its original setting.
+        SELECT c.relreplident INTO v_replica_identity_was
+        FROM pg_class c WHERE c.oid = v_rel_oid;
+
         IF NOT EXISTS (
             SELECT 1 FROM pg_replication_slots
             WHERE slot_name = COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot')
@@ -549,12 +555,14 @@ BEGIN
 
     INSERT INTO flashback.tracked_tables (
         rel_oid, schema_name, table_name, base_snapshot_table,
-        schema_version, tracked_since, checkpoint_interval, retention_interval, is_active
+        schema_version, tracked_since, checkpoint_interval, retention_interval, is_active,
+        replica_identity_was
     )
     VALUES (
         v_rel_oid, v_schema_name, v_table_name,
         format('flashback.%I', v_snapshot_name),
-        1, now(), interval '15 minutes', interval '7 days', true
+        1, now(), interval '15 minutes', interval '7 days', true,
+        v_replica_identity_was
     )
     ON CONFLICT (rel_oid)
     DO UPDATE SET
@@ -563,7 +571,8 @@ BEGIN
         base_snapshot_table = EXCLUDED.base_snapshot_table,
         schema_version = 1,
         tracked_since = now(),
-        is_active = true;
+        is_active = true,
+        replica_identity_was = EXCLUDED.replica_identity_was;
 
     SELECT tracked_since INTO v_tracked_since
     FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
@@ -908,6 +917,28 @@ BEGIN
     IF flashback_effective_capture_mode() = 'trigger' THEN
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
             PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
+        END IF;
+    ELSE
+        -- WAL mode: restore the table's original REPLICA IDENTITY.
+        -- flashback_track() forced it to FULL; leaving it there permanently
+        -- causes write amplification and changes logical decoding behaviour
+        -- for the application after the table is untracked.
+        IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
+            DECLARE
+                v_original_ri "char";
+                v_ri_clause   text;
+            BEGIN
+                SELECT tt.replica_identity_was INTO v_original_ri
+                FROM flashback.tracked_tables tt WHERE tt.rel_oid = v_rel_oid;
+
+                v_ri_clause := CASE COALESCE(v_original_ri, 'd')
+                    WHEN 'f' THEN 'FULL'
+                    WHEN 'n' THEN 'NOTHING'
+                    ELSE 'DEFAULT'   -- 'd' or 'i' (INDEX form requires index name; fall back to DEFAULT)
+                END;
+                EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
+                    v_schema_name, v_table_name, v_ri_clause);
+            END;
         END IF;
     END IF;
 

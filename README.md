@@ -136,10 +136,11 @@ SELECT flashback_restore('orders', now() - interval '30 seconds');
 SELECT * FROM flashback_restore_parallel('orders', now() - interval '30 seconds', 4);
 
 -- Or query the past WITHOUT restoring
+-- filter_clause is a WHERE predicate (not a full query) — prevents SECURITY DEFINER misuse
 SELECT * FROM flashback_query(
     'orders',
     now() - interval '30 seconds',
-    'SELECT * FROM $FB_TABLE WHERE total > 100'
+    'total > 100'   -- WHERE condition only; semicolons and DML keywords are rejected
 ) AS t(id int, total numeric, status text);
 ```
 
@@ -179,7 +180,7 @@ All GUCs except those marked *Restart* take effect immediately via `SIGHUP` relo
 | `flashback_restore(table, timestamptz)` | `bigint` | Restore a single table to a past timestamp. Returns number of events applied. |
 | `flashback_restore(tables[], timestamptz)` | `bigint` | Restore multiple tables in FK dependency order within one transaction. |
 | `flashback_restore_parallel(table, timestamptz [, num_workers])` | `TABLE(restored_table text, events_applied bigint)` | Restore with parallel query hints. Default `num_workers = 4`. |
-| `flashback_query(table, timestamptz [, query])` | `SETOF record` | Query past table state without restoring. Replace `$FB_TABLE` in custom queries. |
+| `flashback_query(table, timestamptz [, filter_clause])` | `SETOF record` | Query past table state without restoring. `filter_clause` is a `WHERE` predicate (e.g. `'id = 5 AND status = ''active'''`). Semicolons and DML/DDL keywords are rejected to prevent SECURITY DEFINER escalation. |
 
 ### Checkpoints & Retention
 

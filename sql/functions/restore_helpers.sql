@@ -820,13 +820,59 @@ DECLARE
     v_trig      record;
     v_pol       record;
     v_con       record;
+    v_orig_oid  oid;
+    v_incoming_fks  jsonb := '[]'::jsonb;
+    v_dependent_views jsonb := '[]'::jsonb;
+    v_dep  record;
+    v_ifk  record;
 BEGIN
     -- Save ACL and owner from original table (before DROP)
-    SELECT c.relacl, c.relowner::regrole
-      INTO v_saved_acl, v_owner
+    SELECT c.relacl, c.relowner::regrole, c.oid
+      INTO v_saved_acl, v_owner, v_orig_oid
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = p_orig_schema AND c.relname = p_orig_table;
+
+    -- ── Collect dependent objects BEFORE the CASCADE drop ─────────
+    -- Incoming FKs: other tables' constraints that reference this table.
+    -- DROP TABLE CASCADE would silently remove them; we recreate them after rename.
+    IF v_orig_oid IS NOT NULL THEN
+        SELECT COALESCE(jsonb_agg(
+            jsonb_build_object(
+                'conname', con.conname,
+                'schema',  n2.nspname,
+                'table',   c2.relname,
+                'def',     pg_get_constraintdef(con.oid)
+            ) ORDER BY con.conname
+        ), '[]'::jsonb)
+          INTO v_incoming_fks
+        FROM pg_constraint con
+        JOIN pg_class c2 ON c2.oid = con.conrelid
+        JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+        WHERE con.confrelid = v_orig_oid
+          AND con.conrelid  <> v_orig_oid   -- exclude self-referential FKs (handled via ddl_info)
+          AND con.contype = 'f';
+
+        -- Dependent views and materialized views (deptype='n' = normal dependency).
+        -- We log their definitions so they can be manually recreated after the swap.
+        SELECT COALESCE(jsonb_agg(
+            jsonb_build_object(
+                'schema',  n3.nspname,
+                'name',    c3.relname,
+                'kind',    c3.relkind,
+                'def',     pg_get_viewdef(c3.oid)
+            ) ORDER BY n3.nspname, c3.relname
+        ), '[]'::jsonb)
+          INTO v_dependent_views
+        FROM pg_depend d
+        JOIN pg_class c3 ON c3.oid = d.objid
+        JOIN pg_namespace n3 ON n3.oid = c3.relnamespace
+        WHERE d.refobjid  = v_orig_oid
+          AND d.classid    = 'pg_class'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND c3.relkind   IN ('v', 'm')
+          AND d.deptype    = 'n';
+    END IF;
 
     -- ── Brief exclusive lock window ────────────────────────────
     EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', p_orig_schema, p_orig_table);
@@ -912,6 +958,22 @@ BEGIN
 
     v_new_oid := to_regclass(format('%I.%I', p_orig_schema, p_orig_table))::oid;
 
+    -- ── Warn about CASCADE-dropped dependent views ─────────────────
+    -- Views and matviews that depended on the original table were removed by
+    -- DROP TABLE ... CASCADE above and cannot be automatically recreated because
+    -- their definitions may reference columns, types, or other objects that
+    -- have changed. The captured definitions are logged here so that a DBA
+    -- can manually recreate them.
+    FOR v_dep IN
+        SELECT d->>'schema' AS sch, d->>'name' AS nm,
+               d->>'kind'   AS knd, d->>'def'  AS def
+        FROM jsonb_array_elements(v_dependent_views) d
+    LOOP
+        RAISE WARNING 'flashback: CASCADE drop removed % %.% — recreate manually. Definition: %',
+            CASE WHEN v_dep.knd = 'm' THEN 'materialized view' ELSE 'view' END,
+            v_dep.sch, v_dep.nm, v_dep.def;
+    END LOOP;
+
     -- Add FK constraints (deferred from shadow creation)
     FOR v_con IN
         SELECT con->>'name' AS name, con->>'def' AS def
@@ -996,6 +1058,25 @@ BEGIN
             END LOOP;
         END;
     END IF;
+
+    -- ── Restore incoming FK constraints from other tables ──────────
+    -- These were silently dropped by DROP TABLE ... CASCADE above.
+    -- Re-adding them here restores referential integrity for dependent tables.
+    FOR v_ifk IN
+        SELECT ifk->>'conname' AS conname,
+               ifk->>'schema'  AS sch,
+               ifk->>'table'   AS tbl,
+               ifk->>'def'     AS def
+        FROM jsonb_array_elements(v_incoming_fks) ifk
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+                v_ifk.sch, v_ifk.tbl, v_ifk.conname, v_ifk.def);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: incoming FK %.% on %.% could not be restored: %',
+                v_ifk.sch, v_ifk.conname, v_ifk.sch, v_ifk.tbl, SQLERRM;
+        END;
+    END LOOP;
 
     RETURN v_new_oid;
 END;

@@ -409,8 +409,17 @@ BEGIN
         END LOOP;
     END IF;
 
-    -- Re-attach capture triggers on the restored table
-    PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+    -- Re-attach capture after the swap
+    -- In trigger mode: install the statement-level triggers on the restored table.
+    -- In WAL mode: do NOT attach triggers (staging_events is skipped by the worker
+    -- in WAL mode, so any trigger-captured rows would accumulate and never reach
+    -- delta_log). Instead, re-assert REPLICA IDENTITY FULL because the shadow swap
+    -- creates a new OID and the table relation is fresh.
+    IF flashback_effective_capture_mode() = 'trigger' THEN
+        PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+    ELSE
+        EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
+    END IF;
 
     -- Post-restore checkpoint
     DECLARE
@@ -563,6 +572,14 @@ $$;
 -- (from schema_versions), not LIKE the current live table. This means
 -- schema evolution (ADD/DROP/ALTER COLUMN) is reflected correctly.
 --
+-- Parameters:
+--   target_table  – tracked table name (schema.table or bare name)
+--   target_time   – point in time to query
+--   filter_clause – optional WHERE condition (e.g. 'id = 5 AND status = ''active''').
+--                   ONLY a boolean predicate — NOT a full SQL query.
+--                   The condition is appended as: SELECT * FROM <temp> WHERE <filter_clause>
+--                   Semicolons and DML/DDL keywords are rejected for safety.
+--
 -- Limitations:
 --   • ALTER events in the replay range are replayed as data events only
 --     (column set is fixed at target_time schema). Columns that were
@@ -571,11 +588,13 @@ $$;
 --   • DROP TABLE events: if the table was dropped before target_time,
 --     the function returns 0 rows with a NOTICE (the table did not exist
 --     at that point in time).
+--   • filter_clause is passed to EXECUTE — callers should not interpolate
+--     untrusted user input directly into filter_clause without parameterisation.
 -- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION flashback_query(
-    target_table text,
-    target_time  timestamptz,
-    query        text DEFAULT NULL
+    target_table  text,
+    target_time   timestamptz,
+    filter_clause text DEFAULT NULL
 )
 RETURNS SETOF record
 LANGUAGE plpgsql
@@ -771,8 +790,16 @@ BEGIN
         END IF;
     END LOOP;
 
-    IF query IS NOT NULL THEN
-        v_query := replace(query, '$FB_TABLE', quote_ident(v_tmp));
+    IF filter_clause IS NOT NULL THEN
+        -- Safety: reject semicolons (statement stacking) and DML/DDL keywords at
+        -- the statement level. filter_clause is a WHERE predicate, not a full query.
+        IF filter_clause ~ ';' THEN
+            RAISE EXCEPTION 'flashback_query: filter_clause must not contain semicolons';
+        END IF;
+        IF filter_clause ~* '\m(INSERT|UPDATE|DELETE|TRUNCATE|DROP|CREATE|ALTER|CALL|DO)\M' THEN
+            RAISE EXCEPTION 'flashback_query: filter_clause must not contain DML or DDL keywords';
+        END IF;
+        v_query := format('SELECT * FROM %I WHERE %s', v_tmp, filter_clause);
     ELSE
         v_query := format('SELECT * FROM %I', v_tmp);
     END IF;
