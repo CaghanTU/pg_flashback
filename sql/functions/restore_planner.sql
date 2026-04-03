@@ -598,7 +598,7 @@ CREATE OR REPLACE FUNCTION flashback_query(
 )
 RETURNS SETOF record
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE

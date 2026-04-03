@@ -489,6 +489,7 @@ DECLARE
     v_snapshot_name text;
     v_tracked_since timestamptz;
     v_replica_identity_was "char" := 'd';
+    v_replica_identity_index text := NULL;
 BEGIN
     SELECT c.oid, n.nspname, c.relname
       INTO v_rel_oid, v_schema_name, v_table_name
@@ -511,6 +512,16 @@ BEGIN
         SELECT c.relreplident INTO v_replica_identity_was
         FROM pg_class c WHERE c.oid = v_rel_oid;
 
+        -- If the table uses REPLICA IDENTITY USING INDEX, remember which index
+        -- so untrack can restore it exactly.
+        IF v_replica_identity_was = 'i' THEN
+            SELECT ic.relname INTO v_replica_identity_index
+            FROM pg_index i
+            JOIN pg_class ic ON ic.oid = i.indexrelid
+            WHERE i.indrelid = v_rel_oid
+              AND i.indisreplident;
+        END IF;
+
         IF NOT EXISTS (
             SELECT 1 FROM pg_replication_slots
             WHERE slot_name = COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot')
@@ -530,6 +541,19 @@ BEGIN
         EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
     ELSE
         PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
+
+        -- Warn if track_commit_timestamp is off. In trigger mode, event_time is the
+        -- trigger's clock_timestamp() at statement execution, NOT the transaction
+        -- commit time. A long-running transaction can therefore appear in the PITR
+        -- window before it actually committed. Enable track_commit_timestamp = on
+        -- in postgresql.conf for commit-time-correct PITR in trigger mode.
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_settings
+            WHERE name = 'track_commit_timestamp' AND setting = 'on'
+        ) THEN
+            RAISE NOTICE 'pg_flashback (%): track_commit_timestamp is off. In trigger mode, event_time is statement-level clock_timestamp(), not transaction commit time. Long-running transactions may appear in the PITR window before they committed. Set track_commit_timestamp = on for commit-time-correct PITR.',
+                target_table;
+        END IF;
     END IF;
 
     v_snapshot_name := format('base_snapshot_%s', v_rel_oid::text);
@@ -556,13 +580,13 @@ BEGIN
     INSERT INTO flashback.tracked_tables (
         rel_oid, schema_name, table_name, base_snapshot_table,
         schema_version, tracked_since, checkpoint_interval, retention_interval, is_active,
-        replica_identity_was
+        replica_identity_was, replica_identity_index
     )
     VALUES (
         v_rel_oid, v_schema_name, v_table_name,
         format('flashback.%I', v_snapshot_name),
         1, now(), interval '15 minutes', interval '7 days', true,
-        v_replica_identity_was
+        v_replica_identity_was, v_replica_identity_index
     )
     ON CONFLICT (rel_oid)
     DO UPDATE SET
@@ -572,7 +596,8 @@ BEGIN
         schema_version = 1,
         tracked_since = now(),
         is_active = true,
-        replica_identity_was = EXCLUDED.replica_identity_was;
+        replica_identity_was = EXCLUDED.replica_identity_was,
+        replica_identity_index = EXCLUDED.replica_identity_index;
 
     SELECT tracked_since INTO v_tracked_since
     FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
@@ -925,16 +950,23 @@ BEGIN
         -- for the application after the table is untracked.
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
             DECLARE
-                v_original_ri "char";
-                v_ri_clause   text;
+                v_original_ri    "char";
+                v_original_ri_idx text;
+                v_ri_clause      text;
             BEGIN
-                SELECT tt.replica_identity_was INTO v_original_ri
+                SELECT tt.replica_identity_was, tt.replica_identity_index
+                  INTO v_original_ri, v_original_ri_idx
                 FROM flashback.tracked_tables tt WHERE tt.rel_oid = v_rel_oid;
 
                 v_ri_clause := CASE COALESCE(v_original_ri, 'd')
                     WHEN 'f' THEN 'FULL'
                     WHEN 'n' THEN 'NOTHING'
-                    ELSE 'DEFAULT'   -- 'd' or 'i' (INDEX form requires index name; fall back to DEFAULT)
+                    WHEN 'i' THEN
+                        CASE WHEN v_original_ri_idx IS NOT NULL
+                             THEN 'USING INDEX ' || quote_ident(v_original_ri_idx)
+                             ELSE 'DEFAULT'   -- index name unknown; fall back
+                        END
+                    ELSE 'DEFAULT'
                 END;
                 EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
                     v_schema_name, v_table_name, v_ri_clause);

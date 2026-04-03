@@ -958,21 +958,34 @@ BEGIN
 
     v_new_oid := to_regclass(format('%I.%I', p_orig_schema, p_orig_table))::oid;
 
-    -- ── Warn about CASCADE-dropped dependent views ─────────────────
-    -- Views and matviews that depended on the original table were removed by
-    -- DROP TABLE ... CASCADE above and cannot be automatically recreated because
-    -- their definitions may reference columns, types, or other objects that
-    -- have changed. The captured definitions are logged here so that a DBA
-    -- can manually recreate them.
-    FOR v_dep IN
-        SELECT d->>'schema' AS sch, d->>'name' AS nm,
-               d->>'kind'   AS knd, d->>'def'  AS def
-        FROM jsonb_array_elements(v_dependent_views) d
-    LOOP
-        RAISE WARNING 'flashback: CASCADE drop removed % %.% — recreate manually. Definition: %',
-            CASE WHEN v_dep.knd = 'm' THEN 'materialized view' ELSE 'view' END,
-            v_dep.sch, v_dep.nm, v_dep.def;
-    END LOOP;
+    -- ── Attempt to recreate CASCADE-dropped dependent views ────────
+    -- Views and matviews were removed by DROP TABLE ... CASCADE above.
+    -- We attempt to recreate them in dependency order (innermost views last,
+    -- so we sort by schema+name which is a reasonable proxy when nesting is shallow).
+    -- If recreation fails (e.g. column type or name changed during restore),
+    -- we emit a RAISE WARNING with the view definition so a DBA can recreate manually.
+    IF jsonb_array_length(v_dependent_views) > 0 THEN
+        FOR v_dep IN
+            SELECT d->>'schema' AS sch, d->>'name' AS nm,
+                   d->>'kind'   AS knd, d->>'def'  AS def
+            FROM jsonb_array_elements(v_dependent_views) d
+            ORDER BY d->>'schema', d->>'name'
+        LOOP
+            BEGIN
+                IF v_dep.knd = 'm' THEN
+                    EXECUTE format('CREATE MATERIALIZED VIEW %I.%I AS %s WITH NO DATA',
+                        v_dep.sch, v_dep.nm, v_dep.def);
+                ELSE
+                    EXECUTE format('CREATE VIEW %I.%I AS %s',
+                        v_dep.sch, v_dep.nm, v_dep.def);
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                RAISE WARNING 'flashback: could not recreate % %.% after restore (%): recreate manually. Definition: %',
+                    CASE WHEN v_dep.knd = 'm' THEN 'materialized view' ELSE 'view' END,
+                    v_dep.sch, v_dep.nm, SQLERRM, v_dep.def;
+            END;
+        END LOOP;
+    END IF;
 
     -- Add FK constraints (deferred from shadow creation)
     FOR v_con IN

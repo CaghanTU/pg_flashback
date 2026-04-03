@@ -90,7 +90,7 @@ COMMENT ON FUNCTION flashback_restore(text, timestamptz)
 COMMENT ON FUNCTION flashback_restore(text[], timestamptz)
     IS 'Restore multiple tables to a point-in-time, ordered by FK dependency (parents first).';
 COMMENT ON FUNCTION flashback_query(text, timestamptz, text)
-    IS 'Reconstruct table state at a past timestamp in a temp table and run an arbitrary query against it (SELECT AS OF).';
+    IS 'Reconstruct table state at a past timestamp in a temp table and return rows matching an optional WHERE predicate (SELECT AS OF). Runs as SECURITY INVOKER — filter_clause executes with the caller''s privileges, not the extension owner''s.';
 COMMENT ON FUNCTION flashback_checkpoint(text)
     IS 'Create an on-demand point-in-time snapshot (checkpoint) of a tracked table. Returns snapshot_id.';
 COMMENT ON FUNCTION flashback_apply_retention()

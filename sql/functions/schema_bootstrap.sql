@@ -176,6 +176,20 @@ BEGIN
 END
 $$;
 
+-- When the original REPLICA IDENTITY was USING INDEX, store the index name here
+-- so flashback_untrack() can restore it exactly. NULL when not applicable.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'replica_identity_index'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables ADD COLUMN replica_identity_index text;
+    END IF;
+END
+$$;
+
 DO $$
 BEGIN
     IF to_regclass('flashback.snapshots') IS NULL THEN
