@@ -54,6 +54,7 @@ flashback_restore(table, timestamp)
   ├─ Replay deltas filtered by event_time ≤ target (partition-pruned via committed_at)
   ├─ Batch/net-effect path for PK tables; row-by-row for tables without PK
   ├─ Atomic swap: DROP original → RENAME shadow (brief exclusive lock)
+  ├─ Recreate dependent views/matviews (owner, reloptions, indexes, populate; ACL via NOTICE)
   ├─ Restore serial sequences
   └─ Log to restore_log + RAISE NOTICE progress
 ```
@@ -136,7 +137,7 @@ SELECT flashback_restore('orders', now() - interval '30 seconds');
 SELECT * FROM flashback_restore_parallel('orders', now() - interval '30 seconds', 4);
 
 -- Or query the past WITHOUT restoring
--- filter_clause is a WHERE predicate (not a full query) — prevents SECURITY DEFINER misuse
+-- filter_clause is a WHERE predicate (not a full query) — SQL injection guard
 SELECT * FROM flashback_query(
     'orders',
     now() - interval '30 seconds',
@@ -180,7 +181,7 @@ All GUCs except those marked *Restart* take effect immediately via `SIGHUP` relo
 | `flashback_restore(table, timestamptz)` | `bigint` | Restore a single table to a past timestamp. Returns number of events applied. |
 | `flashback_restore(tables[], timestamptz)` | `bigint` | Restore multiple tables in FK dependency order within one transaction. |
 | `flashback_restore_parallel(table, timestamptz [, num_workers])` | `TABLE(restored_table text, events_applied bigint)` | Restore with parallel query hints. Default `num_workers = 4`. |
-| `flashback_query(table, timestamptz [, filter_clause])` | `SETOF record` | Query past table state without restoring. `filter_clause` is a `WHERE` predicate (e.g. `'id = 5 AND status = ''active'''`). Semicolons and DML/DDL keywords are rejected to prevent SECURITY DEFINER escalation. |
+| `flashback_query(table, timestamptz [, filter_clause])` | `SETOF record` | Query past table state without restoring. `filter_clause` is a `WHERE` predicate (e.g. `'id = 5 AND status = ''active'''`). Runs as **SECURITY INVOKER** (caller's privileges). Semicolons and DML/DDL keywords are rejected to prevent SQL injection. |
 
 ### Checkpoints & Retention
 
@@ -297,6 +298,8 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 | **`capture_mode` GUC** (`auto` / `wal` / `trigger`) | ✅ |
 | **delta_log time‑partitioned** (monthly, auto‑managed) | ✅ |
 | **Slot / memory GUCs** (`slot_name`, `restore_work_mem`, `index_build_work_mem`) | ✅ |
+| **REPLICA IDENTITY preservation** (`FULL` / `DEFAULT` / `USING INDEX` round-trip) | ✅ |
+| **Dependent view/matview recreation** (owner, reloptions, indexes, populate) | ✅ |
 
 ## 11. Testing & Observability
 
