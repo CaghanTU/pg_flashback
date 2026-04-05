@@ -41,6 +41,7 @@ Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 15, 16, 17, and 18.
 The extension is transparent to applications. Tables work normally; capture and restore happen behind the scenes.
 
 ```
+── Trigger mode ──────────────────────────────────────────────────────────
 DML (INSERT / UPDATE / DELETE)
   │
   ▼
@@ -48,9 +49,22 @@ AFTER triggers ──► staging_events (UNLOGGED, JSONB, diff-only UPDATE)
                        │
                        ▼  background worker (every 75 ms)
                   delta_log (JSONB, lz4 compressed) ──► snapshots (checkpoints)
-                       │
+                       ▲
+── WAL mode ────────────┼────────────────────────────────────────────────
+DML (INSERT / UPDATE / DELETE)
+  │
+  ▼
+WAL (wal_level=logical)
+  │
+  ▼
+logical replication slot (pg_flashback_slot)
+  │
+  ▼  background worker reads slot (every 75 ms)
+  └──────────────────────────────────────────►  delta_log (direct, no staging)
+                       ▲
+── Both modes ──────────┼────────────────────────────────────────────────
 DDL hook ──────────────┘
-(TRUNCATE / DROP / ALTER / RENAME / SET SCHEMA — OID-based auto-reattach)
+(TRUNCATE / DROP / ALTER / RENAME / SET SCHEMA — always via staging_events)
 
 flashback_restore(table, timestamp)
   ├─ Find nearest snapshot / checkpoint
