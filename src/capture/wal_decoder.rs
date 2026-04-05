@@ -238,9 +238,7 @@ unsafe extern "C-unwind" fn fb_decode_message(
         return;
     }
 
-    let prefix_str = unsafe { CStr::from_ptr(prefix) }
-        .to_str()
-        .unwrap_or("");
+    let prefix_str = unsafe { CStr::from_ptr(prefix) }.to_str().unwrap_or("");
 
     if prefix_str != "pg_flashback" {
         return;
@@ -269,8 +267,7 @@ unsafe extern "C-unwind" fn fb_decode_shutdown(_ctx: *mut LogicalDecodingContext
 unsafe fn heap_tuple_to_json(
     tuple: HeapTuple,
     tupdesc: TupleDesc,
-    #[cfg_attr(not(feature = "pg18"), allow(unused_variables))]
-    reloid: pg_sys::Oid,
+    #[cfg_attr(not(feature = "pg18"), allow(unused_variables))] reloid: pg_sys::Oid,
 ) -> std::string::String {
     let td = unsafe { &*tupdesc };
     let natts = td.natts as usize;
@@ -291,9 +288,7 @@ unsafe fn heap_tuple_to_json(
         // dropped-column check, and catalog functions for name + type OID.
         // PG15/16/17: attrs flexible array has full FormData_pg_attribute.
         #[cfg(feature = "pg18")]
-        let attisdropped = unsafe {
-            td.compact_attrs.as_slice(natts)[i].attisdropped
-        };
+        let attisdropped = unsafe { td.compact_attrs.as_slice(natts)[i].attisdropped };
         #[cfg(not(feature = "pg18"))]
         let attisdropped = unsafe { (*td.attrs.as_ptr().add(i)).attisdropped };
 
@@ -350,9 +345,7 @@ unsafe fn heap_tuple_to_json(
                 getTypeOutputInfo(atttypid, &mut typoutput, &mut typvarlena);
             }
             let val_cstr = unsafe { OidOutputFunctionCall(typoutput, values[i]) };
-            let val_str = unsafe { CStr::from_ptr(val_cstr) }
-                .to_str()
-                .unwrap_or("");
+            let val_str = unsafe { CStr::from_ptr(val_cstr) }.to_str().unwrap_or("");
 
             if is_numeric_type(atttypid) {
                 if atttypid == pg_sys::BOOLOID {

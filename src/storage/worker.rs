@@ -13,19 +13,16 @@ static ENABLED_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// Comma-separated list of databases. Each gets its own background worker.
 /// When set, overrides the single `target_database` GUC.
-static TARGET_DATABASES_GUC: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static TARGET_DATABASES_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// Maximum background workers to register (Postmaster context, requires restart).
 static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
 /// Capture mode: 'wal' (WAL-based via logical decoding), 'trigger' (legacy trigger-based),
 /// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
-static CAPTURE_MODE_GUC: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static CAPTURE_MODE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// Logical replication slot name. Allows multiple pg_flashback instances on the same cluster.
 static SLOT_NAME_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// work_mem override for snapshot bulk load during flashback_restore.
-static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// maintenance_work_mem override for deferred index builds during flashback_restore.
 static INDEX_BUILD_WORK_MEM_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
@@ -313,9 +310,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             run_retention_purge();
         }
     }
-    log!(
-        "pg_flashback delta worker {worker_index} stopped (database: {db_name})"
-    );
+    log!("pg_flashback delta worker {worker_index} stopped (database: {db_name})");
 }
 
 /// Check if any backend is performing a flashback restore by looking for
@@ -496,8 +491,7 @@ fn flush_staging_to_delta_log() {
             return Ok(());
         }
 
-        let query =
-            "WITH moved AS (
+        let query = "WITH moved AS (
                 DELETE FROM flashback.staging_events
                 WHERE staging_id IN (
                     SELECT staging_id
