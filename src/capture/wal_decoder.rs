@@ -243,7 +243,7 @@ unsafe extern "C-unwind" fn fb_decode_message(
     }
 
     // The message payload is the DDL event JSON — emit it as-is
-    let msg_bytes = unsafe { std::slice::from_raw_parts(message, message_size) };
+    let msg_bytes = unsafe { std::slice::from_raw_parts(message.cast::<u8>(), message_size) };
     let msg_str = std::str::from_utf8(msg_bytes).unwrap_or("{}");
 
     let c_msg = std::ffi::CString::new(msg_str).unwrap_or_default();
