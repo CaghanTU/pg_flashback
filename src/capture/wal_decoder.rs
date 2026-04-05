@@ -210,10 +210,8 @@ unsafe extern "C-unwind" fn fb_decode_commit(
     let xid = txn_ref.xid;
     let commit_time = txn_ref.xact_time.commit_time;
 
-    let json = format!(
-        "{{\"commit\":{xid},\"lsn\":\"{lsn}\",\"commit_time\":{commit_time}}}",
-        lsn = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xFFFFFFFF)
-    );
+    let lsn_str = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xFFFFFFFF);
+    let json = format!("{{\"commit\":{xid},\"lsn\":\"{lsn_str}\",\"commit_time\":{commit_time}}}");
     let c_json = std::ffi::CString::new(json).unwrap_or_default();
     unsafe {
         OutputPluginPrepareWrite(ctx, true);
@@ -245,8 +243,7 @@ unsafe extern "C-unwind" fn fb_decode_message(
     }
 
     // The message payload is the DDL event JSON — emit it as-is
-    let msg_bytes =
-        unsafe { std::slice::from_raw_parts(message as *const u8, message_size as usize) };
+    let msg_bytes = unsafe { std::slice::from_raw_parts(message, message_size) };
     let msg_str = std::str::from_utf8(msg_bytes).unwrap_or("{}");
 
     let c_msg = std::ffi::CString::new(msg_str).unwrap_or_default();

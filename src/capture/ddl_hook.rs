@@ -16,7 +16,7 @@ struct UtilityTarget {
 pub fn install_process_utility_hook() {
     unsafe {
         if let Some(current_hook) = pg_sys::ProcessUtility_hook {
-            if current_hook as usize == tv_process_utility_hook as usize {
+            if current_hook as usize == tv_process_utility_hook as *const () as usize {
                 return;
             }
         }

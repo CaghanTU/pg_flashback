@@ -542,7 +542,7 @@ fn flush_staging_to_delta_log() {
                   AND m.event_time >= tt.tracked_since
             )";
 
-        Spi::run_with_args(&query, &[batch_size.into()])?;
+        Spi::run_with_args(query, &[batch_size.into()])?;
         Ok(())
     });
 
