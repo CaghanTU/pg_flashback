@@ -854,13 +854,36 @@ BEGIN
           AND con.contype = 'f';
 
         -- Dependent views and materialized views (deptype='n' = normal dependency).
-        -- We log their definitions so they can be manually recreated after the swap.
+        -- Capture enough metadata to faithfully recreate them after the swap:
+        --   def        – the view body (pg_get_viewdef)
+        --   owner      – role name so OWNER TO can be reapplied
+        --   options    – reloptions (security_barrier, check_option, etc.)
+        --   acl        – serialised aclitem[] for GRANT replay
+        --   indexes    – matview index definitions (pg_get_indexdef) so we can
+        --                rebuild them; ignored for plain views
+        --   populate   – true when the matview is currently populated
         SELECT COALESCE(jsonb_agg(
             jsonb_build_object(
-                'schema',  n3.nspname,
-                'name',    c3.relname,
-                'kind',    c3.relkind,
-                'def',     pg_get_viewdef(c3.oid)
+                'schema',   n3.nspname,
+                'name',     c3.relname,
+                'kind',     c3.relkind,
+                'def',      pg_get_viewdef(c3.oid),
+                'owner',    (SELECT rolname FROM pg_roles WHERE oid = c3.relowner),
+                'options',  COALESCE(to_jsonb(c3.reloptions), 'null'::jsonb),
+                'acl',      COALESCE(to_jsonb(c3.relacl::text[]), '[]'::jsonb),
+                'indexes',  COALESCE((
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'def',   pg_get_indexdef(i.indexrelid),
+                            'valid', i.indisvalid
+                        )
+                    )
+                    FROM pg_index i
+                    WHERE i.indrelid = c3.oid
+                ), '[]'::jsonb),
+                'populate', CASE WHEN c3.relkind = 'm'
+                                 THEN (c3.relispopulated)
+                                 ELSE NULL END
             ) ORDER BY n3.nspname, c3.relname
         ), '[]'::jsonb)
           INTO v_dependent_views
@@ -960,18 +983,31 @@ BEGIN
 
     -- ── Attempt to recreate CASCADE-dropped dependent views ────────
     -- Views and matviews were removed by DROP TABLE ... CASCADE above.
-    -- We attempt to recreate them in dependency order (innermost views last,
-    -- so we sort by schema+name which is a reasonable proxy when nesting is shallow).
-    -- If recreation fails (e.g. column type or name changed during restore),
-    -- we emit a RAISE WARNING with the view definition so a DBA can recreate manually.
+    -- We attempt to recreate them in dependency order (sorted by schema+name,
+    -- a reasonable proxy for shallow nesting). After recreation we replay:
+    --   • OWNER TO            – from captured relowner
+    --   • view options        – security_barrier, check_option etc. via reloptions
+    --   • GRANT statements    – from captured aclitem[]
+    -- For materialized views we also:
+    --   • Recreate indexes    – from pg_get_indexdef snapshots
+    --   • REFRESH             – only when the matview was populated before the swap
+    -- If any step fails the error is logged and we continue with remaining views.
     IF jsonb_array_length(v_dependent_views) > 0 THEN
         FOR v_dep IN
-            SELECT d->>'schema' AS sch, d->>'name' AS nm,
-                   d->>'kind'   AS knd, d->>'def'  AS def
+            SELECT d->>'schema'  AS sch,
+                   d->>'name'    AS nm,
+                   d->>'kind'    AS knd,
+                   d->>'def'     AS def,
+                   d->>'owner'   AS owner,
+                   d->'options'  AS options,
+                   d->'acl'      AS acl,
+                   d->'indexes'  AS indexes,
+                   COALESCE((d->>'populate')::boolean, false) AS populate
             FROM jsonb_array_elements(v_dependent_views) d
             ORDER BY d->>'schema', d->>'name'
         LOOP
             BEGIN
+                -- 1. Create the view / matview body
                 IF v_dep.knd = 'm' THEN
                     EXECUTE format('CREATE MATERIALIZED VIEW %I.%I AS %s WITH NO DATA',
                         v_dep.sch, v_dep.nm, v_dep.def);
@@ -979,6 +1015,80 @@ BEGIN
                     EXECUTE format('CREATE VIEW %I.%I AS %s',
                         v_dep.sch, v_dep.nm, v_dep.def);
                 END IF;
+
+                -- 2. Restore owner
+                IF v_dep.owner IS NOT NULL THEN
+                    BEGIN
+                        EXECUTE format('ALTER %s %I.%I OWNER TO %I',
+                            CASE WHEN v_dep.knd = 'm' THEN 'MATERIALIZED VIEW' ELSE 'VIEW' END,
+                            v_dep.sch, v_dep.nm, v_dep.owner);
+                    EXCEPTION WHEN OTHERS THEN
+                        RAISE WARNING 'flashback: could not restore owner % for %.%: %',
+                            v_dep.owner, v_dep.sch, v_dep.nm, SQLERRM;
+                    END;
+                END IF;
+
+                -- 3. Restore reloptions (security_barrier, check_option, etc.)
+                IF v_dep.knd = 'v' AND v_dep.options IS NOT NULL AND v_dep.options <> 'null'::jsonb THEN
+                    DECLARE
+                        v_opt text;
+                    BEGIN
+                        FOR v_opt IN
+                            SELECT jsonb_array_elements_text(v_dep.options)
+                        LOOP
+                            BEGIN
+                                EXECUTE format('ALTER VIEW %I.%I SET (%s)',
+                                    v_dep.sch, v_dep.nm, v_opt);
+                            EXCEPTION WHEN OTHERS THEN
+                                RAISE WARNING 'flashback: view option % on %.% failed: %',
+                                    v_opt, v_dep.sch, v_dep.nm, SQLERRM;
+                            END;
+                        END LOOP;
+                    END;
+                END IF;
+
+                -- 4. Restore grants
+                -- GRANTs on a freshly created view cannot be replayed from the old
+                -- aclitem[] snapshot without parsing privilege codes, which varies by
+                -- PostgreSQL version. We emit a NOTICE so the DBA can replay manually.
+                IF v_dep.acl IS NOT NULL AND jsonb_array_length(v_dep.acl) > 0 THEN
+                    RAISE NOTICE 'flashback: %.% ACL not automatically restored — original: %',
+                        v_dep.sch, v_dep.nm, v_dep.acl;
+                END IF;
+
+                -- 5. Recreate matview indexes
+                IF v_dep.knd = 'm' AND v_dep.indexes IS NOT NULL
+                   AND jsonb_array_length(v_dep.indexes) > 0 THEN
+                    DECLARE
+                        v_idx_rec record;
+                        v_idx_def text;
+                    BEGIN
+                        FOR v_idx_rec IN
+                            SELECT idx->>'def' AS def
+                            FROM jsonb_array_elements(v_dep.indexes) idx
+                            WHERE (idx->>'valid')::boolean
+                        LOOP
+                            BEGIN
+                                EXECUTE v_idx_rec.def;
+                            EXCEPTION WHEN OTHERS THEN
+                                RAISE WARNING 'flashback: matview index recreate for %.% failed: %',
+                                    v_dep.sch, v_dep.nm, SQLERRM;
+                            END;
+                        END LOOP;
+                    END;
+                END IF;
+
+                -- 6. Populate matview if it was populated before the cascade drop
+                IF v_dep.knd = 'm' AND v_dep.populate THEN
+                    BEGIN
+                        EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I',
+                            v_dep.sch, v_dep.nm);
+                    EXCEPTION WHEN OTHERS THEN
+                        RAISE WARNING 'flashback: REFRESH MATERIALIZED VIEW %.% failed: %',
+                            v_dep.sch, v_dep.nm, SQLERRM;
+                    END;
+                END IF;
+
             EXCEPTION WHEN OTHERS THEN
                 RAISE WARNING 'flashback: could not recreate % %.% after restore (%): recreate manually. Definition: %',
                     CASE WHEN v_dep.knd = 'm' THEN 'materialized view' ELSE 'view' END,
