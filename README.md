@@ -26,7 +26,7 @@ Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 15, 16, 17, and 18.
 ## 2. Architecture Overview
 
 | Component | Purpose |
-|-----------|------▸|
+|-----------|---------|
 | AFTER Triggers (statement + row) | Capture DML events into `staging_events` (UNLOGGED) using native JSONB. Partitioned tables use per‑row triggers automatically. |
 | `ProcessUtility_hook` | Intercepts DDL (TRUNCATE, DROP, ALTER, RENAME) and snapshots schema state. |
 | Background Worker (`flashback_worker`) | Flushes staging → `delta_log` every 75 ms; runs periodic checkpoints and retention purge. Supports multi‑DB via `target_databases` GUC. |
