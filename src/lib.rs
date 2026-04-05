@@ -223,6 +223,74 @@ mod tests {
         it_wal_mode_behaviors,
         "../tests/sql/integration/wal_mode_behaviors.sql"
     );
+    sql_test!(
+        it_dependent_view_acl_restore,
+        "../tests/sql/integration/dependent_view_acl_restore.sql"
+    );
+    sql_test!(
+        it_view_options_restore,
+        "../tests/sql/integration/view_options_restore.sql"
+    );
+    sql_test!(
+        it_matview_full_restore,
+        "../tests/sql/integration/matview_full_restore.sql"
+    );
+    sql_test!(
+        it_generated_column_restore,
+        "../tests/sql/integration/generated_column_restore.sql"
+    );
+    sql_test!(
+        it_non_public_schema_restore,
+        "../tests/sql/integration/non_public_schema_restore.sql"
+    );
+    sql_test!(
+        it_composite_pk_restore,
+        "../tests/sql/integration/composite_pk_restore.sql"
+    );
+    sql_test!(
+        it_sequence_restore,
+        "../tests/sql/integration/sequence_restore.sql"
+    );
+    sql_test!(
+        it_rls_policy_restore,
+        "../tests/sql/integration/rls_policy_restore.sql"
+    );
+    sql_test!(
+        it_untrack_retrack_restore,
+        "../tests/sql/integration/untrack_retrack_restore.sql"
+    );
+    sql_test!(
+        it_dependent_view_chain_restore,
+        "../tests/sql/integration/dependent_view_chain_restore.sql"
+    );
+    sql_test!(
+        it_staging_events_logged,
+        "../tests/sql/integration/staging_events_logged.sql"
+    );
+    sql_test!(
+        it_leaf_partition_trigger_type,
+        "../tests/sql/integration/leaf_partition_trigger_type.sql"
+    );
+    sql_test!(
+        it_leaf_partition_restore_reattach,
+        "../tests/sql/integration/leaf_partition_restore_reattach.sql"
+    );
+    sql_test!(
+        it_recover_deleted_rows,
+        "../tests/sql/integration/recover_deleted_rows.sql"
+    );
+    sql_test!(
+        it_restore_dropped_table,
+        "../tests/sql/integration/restore_dropped_table.sql"
+    );
+    sql_test!(
+        it_inherits_restore_children_survive,
+        "../tests/sql/integration/inherits_restore_children_survive.sql"
+    );
+    sql_test!(
+        it_set_schema_tracking,
+        "../tests/sql/integration/set_schema_tracking.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

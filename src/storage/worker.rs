@@ -520,7 +520,7 @@ fn flush_staging_to_delta_log() {
                     CASE WHEN EXISTS (
                         SELECT 1 FROM pg_settings
                         WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                    ) THEN pg_xact_commit_timestamp(m.source_xid::xid) END,
+                    ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
                     m.event_time
                 ) AS event_time,
                 m.event_type, m.table_name, m.rel_oid, m.source_xid,
@@ -528,7 +528,7 @@ fn flush_staging_to_delta_log() {
                     CASE WHEN EXISTS (
                         SELECT 1 FROM pg_settings
                         WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                    ) THEN pg_xact_commit_timestamp(m.source_xid::xid) END,
+                    ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
                     clock_timestamp()
                 ) AS committed_at,
                 COALESCE((

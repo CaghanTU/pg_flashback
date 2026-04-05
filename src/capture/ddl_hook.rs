@@ -207,6 +207,10 @@ unsafe fn is_table_related_utility(pstmt: *mut pg_sys::PlannedStmt) -> bool {
             (*stmt).renameType == pg_sys::ObjectType::OBJECT_COLUMN
                 || (*stmt).renameType == pg_sys::ObjectType::OBJECT_TABLE
         }
+        pg_sys::NodeTag::T_AlterObjectSchemaStmt => {
+            let stmt = utility_stmt as *mut pg_sys::AlterObjectSchemaStmt;
+            (*stmt).objectType == pg_sys::ObjectType::OBJECT_TABLE
+        }
         _ => false,
     }
 }
@@ -328,6 +332,26 @@ unsafe fn parse_post_utility_targets(
                 return None;
             }
 
+            let schema = c_ptr_to_option_string((*relation).schemaname);
+            Some(("ALTER", vec![UtilityTarget { schema, table }]))
+        }
+        pg_sys::NodeTag::T_AlterObjectSchemaStmt => {
+            // SET SCHEMA: relation holds the OLD schema/table name.
+            // After execution the table lives in the new schema.
+            // We fire ALTER post-execution so flashback_capture_ddl_event
+            // can detect the rename via OID lookup.
+            let stmt = utility_stmt as *mut pg_sys::AlterObjectSchemaStmt;
+            if (*stmt).objectType != pg_sys::ObjectType::OBJECT_TABLE {
+                return None;
+            }
+            let relation = (*stmt).relation;
+            if relation.is_null() {
+                return None;
+            }
+            let table = c_ptr_to_option_string((*relation).relname).unwrap_or_default();
+            if table.is_empty() {
+                return None;
+            }
             let schema = c_ptr_to_option_string((*relation).schemaname);
             Some(("ALTER", vec![UtilityTarget { schema, table }]))
         }

@@ -7,8 +7,19 @@ set -euo pipefail
 
 PORT="${1:-28817}"
 SOCKDIR="${2:-$HOME/.pgrx}"
-PSQL="/usr/local/pgsql-17/bin/psql -h $SOCKDIR -p $PORT -d postgres -v ON_ERROR_STOP=on"
-PGBENCH="/usr/local/pgsql-17/bin/pgbench -h $SOCKDIR -p $PORT -d postgres"
+
+# Detect psql/pgbench: prefer pgrx-installed PG17, fall back to PATH
+_PGRX_BIN="$HOME/.pgrx/17.*/pgrx-install/bin"
+_RESOLVED=$(echo $_PGRX_BIN 2>/dev/null | tr ' ' '\n' | head -1)
+if [[ -d "$_RESOLVED" ]]; then
+  PSQL_BIN="$_RESOLVED/psql"
+  PGBENCH_BIN="$_RESOLVED/pgbench"
+else
+  PSQL_BIN="$(command -v psql)"
+  PGBENCH_BIN="$(command -v pgbench || true)"
+fi
+PSQL="$PSQL_BIN -h $SOCKDIR -p $PORT -d postgres -v ON_ERROR_STOP=on"
+PGBENCH="$PGBENCH_BIN -h $SOCKDIR -p $PORT -d postgres"
 
 echo "═══════════════════════════════════════════════════"
 echo "  pg_flashback — Write Overhead Benchmark"

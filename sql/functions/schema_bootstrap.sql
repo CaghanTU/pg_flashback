@@ -187,6 +187,16 @@ BEGIN
     ) THEN
         ALTER TABLE flashback.tracked_tables ADD COLUMN replica_identity_index text;
     END IF;
+
+    -- retention_cutoff: latest timestamp up to which retention has deleted events.
+    -- flashback_restore raises an error if target_time < retention_cutoff.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'retention_cutoff'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables ADD COLUMN retention_cutoff TIMESTAMPTZ;
+    END IF;
 END
 $$;
 
@@ -259,7 +269,7 @@ $$;
 DO $$
 BEGIN
     IF to_regclass('flashback.staging_events') IS NULL THEN
-        EXECUTE 'CREATE UNLOGGED TABLE flashback.staging_events (
+        EXECUTE 'CREATE TABLE flashback.staging_events (
             staging_id  BIGSERIAL PRIMARY KEY,
             event_time  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             rel_oid     OID NOT NULL,

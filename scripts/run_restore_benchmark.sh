@@ -8,7 +8,16 @@ set -euo pipefail
 
 PORT="${1:-28817}"
 SOCKDIR="${2:-$HOME/.pgrx}"
-PSQL="/usr/local/pgsql-17/bin/psql -h $SOCKDIR -p $PORT -d postgres -v ON_ERROR_STOP=on"
+
+# Detect psql: prefer pgrx-installed PG17, fall back to PATH
+_PGRX_BIN="$HOME/.pgrx/17.*/pgrx-install/bin"
+_RESOLVED=$(echo $_PGRX_BIN 2>/dev/null | tr ' ' '\n' | head -1)
+if [[ -d "$_RESOLVED" ]]; then
+  PSQL_BIN="$_RESOLVED/psql"
+else
+  PSQL_BIN="$(command -v psql)"
+fi
+PSQL="$PSQL_BIN -h $SOCKDIR -p $PORT -d postgres -v ON_ERROR_STOP=on"
 
 echo "═══════════════════════════════════════════════════════"
 echo "  pg_flashback — Restore Performance Benchmark"

@@ -51,28 +51,28 @@ DECLARE
 BEGIN
     v_restore_start := clock_timestamp();
 
-    -- Serialize concurrent restores with an advisory lock.
-    PERFORM pg_advisory_xact_lock(358944::integer, to_regclass(target_table)::oid::integer);
-
     PERFORM flashback_set_restore_in_progress(true);
 
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
         INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND (
+    WHERE (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
       )
     ORDER BY
+        tt.is_active DESC,  -- prefer active entries if both exist
         (tt.rel_oid = to_regclass(target_table)::oid) DESC,
         (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
         tt.tracked_since DESC
     LIMIT 1;
 
+    -- Serialize concurrent restores with an advisory lock (use rel_oid found above).
+    PERFORM pg_advisory_xact_lock(358944::integer, v_rel_oid::integer);
+
     IF v_rel_oid IS NULL THEN
-        RAISE EXCEPTION 'flashback_restore: table % is not tracked', target_table;
+        RAISE EXCEPTION 'flashback_restore: table % is not tracked (was it ever tracked, or was retention already applied?)', target_table;
     END IF;
 
     IF target_time < v_tracked_since THEN
@@ -143,6 +143,25 @@ BEGIN
         RAISE EXCEPTION 'flashback_restore: no base snapshot/checkpoint found for %', target_table;
     END IF;
 
+    -- ── Retention gap guard ──────────────────────────────────────
+    -- If retention has deleted events that would be needed for replay,
+    -- the restore result would be silently wrong (snapshot is older than expected).
+    -- flashback_apply_retention advances tracked_tables.retention_cutoff whenever
+    -- it deletes events. If target_time <= retention_cutoff the data is gone.
+    DECLARE v_retention_cutoff timestamptz;
+    BEGIN
+        SELECT tt.retention_cutoff INTO v_retention_cutoff
+        FROM flashback.tracked_tables tt
+        WHERE tt.rel_oid = v_rel_oid;
+
+        IF v_retention_cutoff IS NOT NULL AND target_time <= v_retention_cutoff THEN
+            RAISE EXCEPTION
+                'flashback_restore: target_time % is within the expired retention window for % (retention cutoff: %). '
+                'Events up to this point have been deleted. Use flashback_retention_status() to check the available restore window.',
+                target_time, target_table, v_retention_cutoff;
+        END IF;
+    END;
+
     -- ────────────────────────────────────────────────────────────
     -- Phase 1: Create shadow table (original table is untouched)
     -- ────────────────────────────────────────────────────────────
@@ -171,10 +190,30 @@ BEGIN
         COALESCE(NULLIF(current_setting('pg_flashback.restore_work_mem', true), ''), '256MB'),
         true);
 
-    EXECUTE format(
-        'INSERT INTO %I.%I SELECT * FROM %s',
-        v_shadow_schema, v_shadow_name, v_start_table
-    );
+    DECLARE
+        v_col_list text;
+    BEGIN
+        -- Build explicit column list excluding generated columns.
+        -- INSERT ... SELECT * fails when the shadow table has GENERATED ALWAYS AS
+        -- columns because PostgreSQL forbids providing a value for generated cols.
+        SELECT string_agg(format('%I', attname), ', ' ORDER BY attnum)
+          INTO v_col_list
+        FROM pg_attribute
+        WHERE attrelid = to_regclass(format('%I.%I', v_shadow_schema, v_shadow_name))
+          AND attnum > 0
+          AND NOT attisdropped
+          AND attgenerated = '';   -- skip GENERATED ALWAYS AS columns
+
+        IF v_col_list IS NULL THEN
+            -- fallback: no generated cols, just use *
+            v_col_list := '*';
+        END IF;
+
+        EXECUTE format(
+            'INSERT INTO %I.%I (%s) SELECT %s FROM %s',
+            v_shadow_schema, v_shadow_name, v_col_list, v_col_list, v_start_table
+        );
+    END;
     RAISE NOTICE 'flashback_restore [%]: snapshot loaded into shadow from %',
         target_table, v_start_table;
 
@@ -348,6 +387,11 @@ BEGIN
         UPDATE flashback.schema_versions SET rel_oid = current_rel_oid WHERE rel_oid = v_rel_oid;
         v_rel_oid := current_rel_oid;
     END IF;
+
+    -- Re-activate tracking if table was deactivated due to DROP TABLE
+    UPDATE flashback.tracked_tables
+       SET is_active = true, rel_oid = current_rel_oid
+     WHERE rel_oid = v_rel_oid AND NOT is_active;
 
     -- ────────────────────────────────────────────────────────────
     -- Phase 5: Restore serial defaults (after swap — table has original name)
@@ -624,20 +668,20 @@ BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND (
+    WHERE (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
       )
     ORDER BY
+        tt.is_active DESC,  -- prefer active entries if both exist
         (tt.rel_oid = to_regclass(target_table)::oid) DESC,
         (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
         tt.tracked_since DESC
     LIMIT 1;
 
     IF v_rel_oid IS NULL THEN
-        RAISE EXCEPTION 'flashback_query: table % is not tracked', target_table;
+        RAISE EXCEPTION 'flashback_query: table % is not tracked (was it ever tracked, or was retention already applied?)', target_table;
     END IF;
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_query: target_time % is before tracked_since %', target_time, v_tracked_since;
@@ -897,5 +941,238 @@ BEGIN
     v_applied := flashback_restore(target_table, target_time);
 
     RETURN QUERY SELECT target_table, v_applied;
+END;
+$$;
+
+-- ----------------------------------------------------------------
+-- flashback_recover_deleted
+-- ----------------------------------------------------------------
+-- Simple, non-destructive recovery of accidentally deleted rows.
+-- Finds rows that existed at target_time but are missing now, and
+-- re-inserts only those rows into the live table.
+--
+-- Unlike flashback_restore(), this does NOT touch rows that still
+-- exist — it only adds back what was deleted.
+--
+-- Requirements: table must have a primary key (to identify deletions).
+--
+-- Usage:
+--   SELECT flashback_recover_deleted('orders', now() - interval '5 minutes');
+--   -- Returns: 10  (rows recovered)
+-- ----------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_recover_deleted(
+    target_table text,
+    target_time  timestamptz
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel_oid             oid;
+    v_schema_name         text;
+    v_table_name          text;
+    v_base_snapshot_table text;
+    v_tracked_since       timestamptz;
+    v_start_at            timestamptz;
+    v_start_table         text;
+    v_target_schema_def   jsonb;
+    v_col_defs            text;
+    v_pk_cols             text[];
+    v_tmp                 text;
+    rec                   record;
+    pred                  text;
+    cols                  text;
+    vals                  text;
+    v_set_clause          text;
+    v_pk_pred             text;
+    v_pk_condition        text;
+    v_col_list            text;
+    recovered             bigint := 0;
+BEGIN
+    SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
+      INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
+    FROM flashback.tracked_tables tt
+    WHERE tt.is_active
+      AND (
+          tt.rel_oid = to_regclass(target_table)::oid
+          OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
+          OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
+      )
+    ORDER BY
+        (tt.rel_oid = to_regclass(target_table)::oid) DESC,
+        (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
+        tt.tracked_since DESC
+    LIMIT 1;
+
+    IF v_rel_oid IS NULL THEN
+        RAISE EXCEPTION 'flashback_recover_deleted: table % is not tracked', target_table;
+    END IF;
+    IF target_time < v_tracked_since THEN
+        RAISE EXCEPTION 'flashback_recover_deleted: target_time % is before tracked_since %',
+            target_time, v_tracked_since;
+    END IF;
+
+    -- PK is required to identify which rows are "deleted" vs "modified"
+    SELECT array_agg(a.attname ORDER BY k.ord)
+      INTO v_pk_cols
+    FROM pg_index i
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+    WHERE i.indrelid = v_rel_oid AND i.indisprimary;
+
+    IF v_pk_cols IS NULL THEN
+        RAISE EXCEPTION
+            'flashback_recover_deleted: table % has no primary key. '
+            'Cannot safely identify deleted rows. Use flashback_restore() instead.',
+            target_table;
+    END IF;
+
+    -- Historical schema at target_time (for temp table column definitions)
+    SELECT jsonb_build_object(
+               'schema', v_schema_name,
+               'table',  v_table_name,
+               'columns', COALESCE(sv.columns, '[]'::jsonb),
+               'primary_key', COALESCE(sv.primary_key, '[]'::jsonb)
+           )
+      INTO v_target_schema_def
+    FROM flashback.schema_versions sv
+    WHERE sv.rel_oid = v_rel_oid
+      AND sv.applied_at <= target_time
+    ORDER BY sv.schema_version DESC
+    LIMIT 1;
+
+    IF v_target_schema_def IS NULL THEN
+        v_target_schema_def := COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
+    END IF;
+
+    SELECT string_agg(
+               format('%I %s%s',
+                   col->>'name',
+                   col->>'type',
+                   CASE WHEN COALESCE((col->>'not_null')::boolean, false) THEN ' NOT NULL' ELSE '' END
+               ),
+               ', ' ORDER BY ord
+           )
+      INTO v_col_defs
+    FROM jsonb_array_elements(v_target_schema_def->'columns') WITH ORDINALITY AS t(col, ord)
+    WHERE col->>'name' IS NOT NULL
+      AND col->>'generated' IS DISTINCT FROM 'always';
+
+    -- Nearest snapshot at or before target_time
+    SELECT s.captured_at, s.snapshot_table
+      INTO v_start_at, v_start_table
+    FROM flashback.snapshots s
+    WHERE s.rel_oid = v_rel_oid AND s.captured_at <= target_time
+    ORDER BY s.captured_at DESC LIMIT 1;
+
+    IF v_start_table IS NULL OR v_start_table = '' THEN
+        v_start_table := v_base_snapshot_table;
+        v_start_at    := v_tracked_since;
+    END IF;
+    IF v_start_table IS NULL THEN
+        RAISE EXCEPTION 'flashback_recover_deleted: no snapshot found for %', target_table;
+    END IF;
+
+    -- Build temp table with the historical state at target_time
+    v_tmp := '_fb_recover_' || pg_backend_pid()::text
+             || '_' || extract(epoch FROM clock_timestamp())::bigint::text;
+
+    IF v_col_defs IS NOT NULL AND v_col_defs <> '' THEN
+        EXECUTE format('CREATE TEMP TABLE %I (%s) ON COMMIT DROP', v_tmp, v_col_defs);
+    ELSE
+        EXECUTE format('CREATE TEMP TABLE %I (LIKE %I.%I) ON COMMIT DROP',
+            v_tmp, v_schema_name, v_table_name);
+    END IF;
+
+    EXECUTE format('INSERT INTO %I SELECT * FROM %s', v_tmp, v_start_table);
+
+    -- Replay delta events up to target_time (same logic as flashback_query)
+    FOR rec IN
+        SELECT d.event_type, d.old_data, d.new_data
+        FROM flashback.delta_log d
+        WHERE d.rel_oid   = v_rel_oid
+          AND d.committed_at IS NOT NULL
+          AND d.committed_at > v_start_at
+          AND d.event_time  <= target_time
+        ORDER BY d.event_id ASC
+    LOOP
+        IF rec.event_type = 'DROP' THEN
+            EXECUTE format('TRUNCATE %I', v_tmp);
+            EXIT;
+        ELSIF rec.event_type = 'TRUNCATE' THEN
+            EXECUTE format('TRUNCATE %I', v_tmp);
+        ELSIF rec.event_type = 'INSERT' THEN
+            SELECT col_list, val_list INTO cols, vals
+            FROM flashback_build_insert_parts(v_rel_oid, rec.new_data);
+            IF cols IS NOT NULL AND cols <> '' THEN
+                EXECUTE format('INSERT INTO %I (%s) VALUES (%s)', v_tmp, cols, vals);
+            END IF;
+        ELSIF rec.event_type = 'DELETE' THEN
+            pred := flashback_build_predicate(v_rel_oid, rec.old_data);
+            IF pred IS NOT NULL AND pred <> '' THEN
+                EXECUTE format(
+                    'DELETE FROM %I WHERE (tableoid, ctid) IN '
+                    '(SELECT tableoid, ctid FROM %I WHERE %s LIMIT 1)',
+                    v_tmp, v_tmp, pred);
+            END IF;
+        ELSIF rec.event_type = 'UPDATE' THEN
+            SELECT us.set_clause, us.pk_predicate INTO v_set_clause, v_pk_pred
+            FROM flashback_build_update_set(v_rel_oid, rec.new_data) us;
+            IF v_set_clause IS NOT NULL AND v_set_clause <> ''
+               AND v_pk_pred IS NOT NULL AND v_pk_pred <> '' THEN
+                EXECUTE format('UPDATE %I SET %s WHERE %s', v_tmp, v_set_clause, v_pk_pred);
+            ELSE
+                pred := flashback_build_predicate(v_rel_oid, rec.old_data);
+                IF pred IS NOT NULL AND pred <> '' THEN
+                    EXECUTE format(
+                        'DELETE FROM %I WHERE (tableoid, ctid) IN '
+                        '(SELECT tableoid, ctid FROM %I WHERE %s LIMIT 1)',
+                        v_tmp, v_tmp, pred);
+                END IF;
+                SELECT col_list, val_list INTO cols, vals
+                FROM flashback_build_insert_parts(v_rel_oid, rec.new_data);
+                IF cols IS NOT NULL AND cols <> '' THEN
+                    EXECUTE format('INSERT INTO %I (%s) VALUES (%s)', v_tmp, cols, vals);
+                END IF;
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- PK-based NOT EXISTS condition to find deleted rows only
+    SELECT string_agg(
+               format('live.%I = tmp.%I', col, col),
+               ' AND '
+           )
+      INTO v_pk_condition
+    FROM unnest(v_pk_cols) AS col;
+
+    -- Column list for INSERT (exclude generated-always columns)
+    SELECT string_agg(format('%I', attname), ', ' ORDER BY attnum)
+      INTO v_col_list
+    FROM pg_attribute
+    WHERE attrelid = v_rel_oid
+      AND attnum > 0
+      AND NOT attisdropped
+      AND attgenerated = '';
+
+    -- Re-insert only rows that no longer exist in the live table
+    EXECUTE format(
+        'INSERT INTO %I.%I (%s) '
+        'SELECT %s FROM %I tmp '
+        'WHERE NOT EXISTS ('
+        '    SELECT 1 FROM %I.%I live WHERE %s'
+        ')',
+        v_schema_name, v_table_name, v_col_list,
+        v_col_list, v_tmp,
+        v_schema_name, v_table_name, v_pk_condition
+    );
+    GET DIAGNOSTICS recovered = ROW_COUNT;
+
+    RAISE NOTICE 'flashback_recover_deleted [%]: % deleted row(s) recovered from point %',
+        target_table, recovered, target_time;
+
+    RETURN recovered;
 END;
 $$;

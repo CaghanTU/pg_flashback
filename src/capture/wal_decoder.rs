@@ -103,16 +103,27 @@ unsafe extern "C-unwind" fn fb_decode_change(
         .to_owned();
 
     let tupdesc = rel.rd_att;
+    let reloid: pg_sys::Oid = rd_rel.oid;
     let tp = unsafe { change_ref.data.tp };
 
+    // PG15/PG16: oldtuple/newtuple are *mut ReorderBufferTupleBuf; extract inner HeapTupleData.
+    // PG17+: they are already HeapTuple (*mut HeapTupleData).
     let old_json = if (op == "UPDATE" || op == "DELETE") && !tp.oldtuple.is_null() {
-        Some(unsafe { heap_tuple_to_json(tp.oldtuple, tupdesc) })
+        #[cfg(any(feature = "pg15", feature = "pg16"))]
+        let ht: HeapTuple = unsafe { &raw mut (*tp.oldtuple).tuple };
+        #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+        let ht: HeapTuple = tp.oldtuple;
+        Some(unsafe { heap_tuple_to_json(ht, tupdesc, reloid) })
     } else {
         None
     };
 
     let new_json = if (op == "INSERT" || op == "UPDATE") && !tp.newtuple.is_null() {
-        Some(unsafe { heap_tuple_to_json(tp.newtuple, tupdesc) })
+        #[cfg(any(feature = "pg15", feature = "pg16"))]
+        let ht: HeapTuple = unsafe { &raw mut (*tp.newtuple).tuple };
+        #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+        let ht: HeapTuple = tp.newtuple;
+        Some(unsafe { heap_tuple_to_json(ht, tupdesc, reloid) })
     } else {
         None
     };
@@ -255,7 +266,12 @@ unsafe extern "C-unwind" fn fb_decode_shutdown(_ctx: *mut LogicalDecodingContext
 
 // ─── Utility: HeapTuple → JSON string ───────────────────────────────
 
-unsafe fn heap_tuple_to_json(tuple: HeapTuple, tupdesc: TupleDesc) -> std::string::String {
+unsafe fn heap_tuple_to_json(
+    tuple: HeapTuple,
+    tupdesc: TupleDesc,
+    #[cfg_attr(not(feature = "pg18"), allow(unused_variables))]
+    reloid: pg_sys::Oid,
+) -> std::string::String {
     let td = unsafe { &*tupdesc };
     let natts = td.natts as usize;
 
@@ -271,17 +287,50 @@ unsafe fn heap_tuple_to_json(tuple: HeapTuple, tupdesc: TupleDesc) -> std::strin
     let mut first = true;
 
     for i in 0..natts {
-        let attr = unsafe { &*td.attrs.as_ptr().add(i) };
+        // PG18: TupleDescData no longer embeds Form_pg_attribute — use compact_attrs for
+        // dropped-column check, and catalog functions for name + type OID.
+        // PG15/16/17: attrs flexible array has full FormData_pg_attribute.
+        #[cfg(feature = "pg18")]
+        let attisdropped = unsafe {
+            td.compact_attrs.as_slice(natts)[i].attisdropped
+        };
+        #[cfg(not(feature = "pg18"))]
+        let attisdropped = unsafe { (*td.attrs.as_ptr().add(i)).attisdropped };
 
-        if attr.attisdropped {
+        if attisdropped {
             continue;
         }
 
-        let col_name = unsafe {
-            CStr::from_ptr(attr.attname.data.as_ptr())
-                .to_str()
-                .unwrap_or("?")
+        #[cfg(feature = "pg18")]
+        let (col_name_owned, atttypid) = {
+            let attnum = (i + 1) as pg_sys::AttrNumber;
+            let name_ptr = unsafe { pg_sys::get_attname(reloid, attnum, false) };
+            let name = if name_ptr.is_null() {
+                "?".to_owned()
+            } else {
+                let s = unsafe { CStr::from_ptr(name_ptr) }
+                    .to_str()
+                    .unwrap_or("?")
+                    .to_owned();
+                unsafe { pfree(name_ptr as *mut _) };
+                s
+            };
+            let typid = unsafe { pg_sys::get_atttype(reloid, attnum) };
+            (name, typid)
         };
+        #[cfg(not(feature = "pg18"))]
+        let (col_name_owned, atttypid) = {
+            let attr = unsafe { &*td.attrs.as_ptr().add(i) };
+            let name = unsafe {
+                CStr::from_ptr(attr.attname.data.as_ptr())
+                    .to_str()
+                    .unwrap_or("?")
+                    .to_owned()
+            };
+            (name, attr.atttypid)
+        };
+
+        let col_name: &str = &col_name_owned;
 
         if !first {
             json.push(',');
@@ -298,15 +347,15 @@ unsafe fn heap_tuple_to_json(tuple: HeapTuple, tupdesc: TupleDesc) -> std::strin
             let mut typoutput: Oid = pg_sys::InvalidOid;
             let mut typvarlena: bool = false;
             unsafe {
-                getTypeOutputInfo(attr.atttypid, &mut typoutput, &mut typvarlena);
+                getTypeOutputInfo(atttypid, &mut typoutput, &mut typvarlena);
             }
             let val_cstr = unsafe { OidOutputFunctionCall(typoutput, values[i]) };
             let val_str = unsafe { CStr::from_ptr(val_cstr) }
                 .to_str()
                 .unwrap_or("");
 
-            if is_numeric_type(attr.atttypid) {
-                if attr.atttypid == pg_sys::BOOLOID {
+            if is_numeric_type(atttypid) {
+                if atttypid == pg_sys::BOOLOID {
                     json.push_str(if val_str == "t" { "true" } else { "false" });
                 } else {
                     json.push_str(val_str);

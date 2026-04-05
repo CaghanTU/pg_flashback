@@ -19,6 +19,7 @@ REVOKE ALL ON FUNCTION flashback_untrack(text)                        FROM PUBLI
 REVOKE ALL ON FUNCTION flashback_restore(text, timestamptz)           FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_restore(text[], timestamptz)         FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_checkpoint(text)                     FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_flush_staging(integer)               FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_set_restore_in_progress(bool)        FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_apply_retention()                    FROM PUBLIC;
 
@@ -54,6 +55,7 @@ GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)        TO flashba
 GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz)      TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_checkpoint(text)                  TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_flush_staging(integer)            TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_apply_retention()                 TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_set_restore_in_progress(bool)     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_attach_capture_trigger(text, text) TO flashback_admin;
@@ -109,6 +111,8 @@ COMMENT ON FUNCTION flashback_detach_capture_trigger(text, text)
     IS 'Remove all capture triggers from a table. Called internally by flashback_untrack.';
 COMMENT ON FUNCTION flashback_take_due_checkpoints()
     IS 'Auto-checkpoint all tracked tables whose checkpoint_interval has elapsed. Called by the background worker.';
+COMMENT ON FUNCTION flashback_flush_staging(integer)
+    IS 'Manually flush staging_events to delta_log. Normally done by the background worker. Useful when the worker is not running (e.g. testing or recovery). Returns number of events promoted.';
 COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)
     IS 'Record a DDL event (ALTER/DROP/TRUNCATE) with a full schema snapshot into delta_log.';
 COMMENT ON FUNCTION flashback_collect_schema_def(oid)

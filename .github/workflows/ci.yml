@@ -57,7 +57,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["16", "17"]
+        pg: ["15", "16", "17", "18"]
 
     steps:
       - uses: actions/checkout@v4

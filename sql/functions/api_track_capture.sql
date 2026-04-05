@@ -39,7 +39,8 @@ AS $$
                     'typmod', a.atttypmod,
                     'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
                     'not_null', a.attnotnull,
-                    'default_expr', pg_get_expr(d.adbin, d.adrelid)
+                    'default_expr', pg_get_expr(d.adbin, d.adrelid),
+                    'generated', a.attgenerated
                 )
                 ORDER BY a.attnum
             )
@@ -421,11 +422,29 @@ BEGIN
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_upd ON %I.%I', input_schema, input_table);
     EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_del ON %I.%I', input_schema, input_table);
 
-    -- Detect partitioned table: relkind = 'p'
+    -- Detect partitioned table (parent 'p') OR leaf partition ('r' with partition parent).
+    -- Transition tables (REFERENCING NEW/OLD TABLE) are not supported on either.
     SELECT c.relkind INTO v_relkind
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = input_schema AND c.relname = input_table;
+
+    -- Treat a leaf partition the same as a partitioned parent: use FOR EACH ROW.
+    IF v_relkind = 'r' THEN
+        SELECT relkind INTO v_relkind
+        FROM pg_class
+        WHERE oid = (
+            SELECT i.inhparent FROM pg_inherits i
+            JOIN pg_class c ON c.oid = i.inhrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = input_schema AND c.relname = input_table
+            LIMIT 1
+        );
+        -- if parent is 'p' (partitioned), use 'p' path; otherwise revert to 'r'
+        IF v_relkind IS DISTINCT FROM 'p' THEN
+            v_relkind := 'r';
+        END IF;
+    END IF;
 
     IF v_relkind = 'p' THEN
         -- Partitioned table: PostgreSQL does NOT support REFERENCING NEW/OLD TABLE
@@ -561,7 +580,38 @@ BEGIN
     -- Clean up any stale checkpoint snapshots for this OID (handles OID recycling)
     DECLARE
         stale_snap record;
+        old_oid    oid;
     BEGIN
+        -- Handle DROP+recreate without flashback_untrack: table has same name but new OID.
+        -- Remove the old tracked_tables row (and its data) so the INSERT below succeeds.
+        SELECT rel_oid INTO old_oid
+        FROM flashback.tracked_tables
+        WHERE schema_name = v_schema_name AND table_name = v_table_name
+          AND rel_oid <> v_rel_oid
+        LIMIT 1;
+
+        IF old_oid IS NOT NULL THEN
+            -- Drop checkpoint snapshot tables for the old OID
+            FOR stale_snap IN
+                SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = old_oid
+            LOOP
+                IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
+                    EXECUTE format('DROP TABLE IF EXISTS %s', stale_snap.snapshot_table);
+                END IF;
+            END LOOP;
+            DECLARE old_snap_name text := format('base_snapshot_%s', old_oid::text);
+            BEGIN
+                EXECUTE format('DROP TABLE IF EXISTS flashback.%I', old_snap_name);
+            END;
+            DELETE FROM flashback.snapshots         WHERE rel_oid = old_oid;
+            DELETE FROM flashback.delta_log         WHERE rel_oid = old_oid;
+            DELETE FROM flashback.staging_events    WHERE rel_oid = old_oid;
+            DELETE FROM flashback.schema_versions   WHERE rel_oid = old_oid;
+            DELETE FROM flashback.tracked_tables    WHERE rel_oid = old_oid;
+            RAISE NOTICE 'pg_flashback (%): stale tracking entry for old OID % removed (table was dropped+recreated without flashback_untrack)',
+                target_table, old_oid;
+        END IF;
+
         FOR stale_snap IN
             SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = v_rel_oid
         LOOP
@@ -711,6 +761,17 @@ BEGIN
         FROM flashback.tracked_tables tt
         WHERE tt.is_active
     LOOP
+        -- Guard: relation may have been dropped without flashback_untrack().
+        -- Auto-deactivate stale entries to prevent worker crash loops.
+        IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = rec.rel_oid) THEN
+            UPDATE flashback.tracked_tables
+               SET is_active = false
+             WHERE rel_oid = rec.rel_oid;
+            RAISE WARNING 'pg_flashback: relation with OID % (%.%) no longer exists. Deactivating tracking entry. Run flashback_untrack() to clean up.',
+                rec.rel_oid, rec.schema_name, rec.table_name;
+            CONTINUE;
+        END IF;
+
         SELECT max(s.captured_at) INTO v_last_snapshot_at
         FROM flashback.snapshots s WHERE s.rel_oid = rec.rel_oid;
 
@@ -723,6 +784,78 @@ BEGIN
     END LOOP;
 
     RETURN v_taken;
+END;
+$$;
+
+-- Manually flush staging_events -> delta_log.
+-- Normally done by the background worker. Call this if the worker is not
+-- running (e.g. in testing environments or after worker downtime) to make
+-- trigger-captured events visible to flashback_restore/flashback_query.
+-- Returns the total number of events promoted.
+CREATE OR REPLACE FUNCTION flashback_flush_staging(batch_size integer DEFAULT 1000)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_total   integer := 0;
+    v_moved   integer;
+BEGIN
+    LOOP
+        WITH moved AS (
+            DELETE FROM flashback.staging_events
+            WHERE staging_id IN (
+                SELECT staging_id
+                FROM flashback.staging_events
+                ORDER BY staging_id
+                LIMIT batch_size
+            )
+            RETURNING *
+        )
+        INSERT INTO flashback.delta_log (
+            event_time, event_type, table_name, rel_oid, source_xid,
+            committed_at, schema_version, old_data, new_data
+        )
+        SELECT
+            COALESCE(
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM pg_settings
+                    WHERE name = 'track_commit_timestamp' AND setting = 'on'
+                ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
+                m.event_time
+            ),
+            m.event_type, m.table_name, m.rel_oid, m.source_xid,
+            COALESCE(
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM pg_settings
+                    WHERE name = 'track_commit_timestamp' AND setting = 'on'
+                ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
+                clock_timestamp()
+            ),
+            COALESCE((
+                SELECT sv.schema_version
+                FROM flashback.schema_versions sv
+                WHERE sv.rel_oid = m.rel_oid
+                  AND sv.applied_at <= m.event_time
+                ORDER BY sv.schema_version DESC
+                LIMIT 1
+            ), 1),
+            m.old_data, m.new_data
+        FROM moved m
+        WHERE EXISTS (
+            SELECT 1 FROM flashback.tracked_tables tt
+            WHERE tt.rel_oid = m.rel_oid
+              AND tt.is_active
+              AND m.event_time >= tt.tracked_since
+        );
+
+        GET DIAGNOSTICS v_moved = ROW_COUNT;
+        v_total := v_total + v_moved;
+        EXIT WHEN v_moved < batch_size;
+    END LOOP;
+
+    RETURN v_total;
 END;
 $$;
 
@@ -751,6 +884,17 @@ BEGIN
           AND d.committed_at < clock_timestamp() - rec.retention_interval;
         GET DIAGNOSTICS v_rows = ROW_COUNT;
         v_deleted := v_deleted + v_rows;
+
+        -- Record the retention cutoff so flashback_restore can detect expired windows.
+        -- Only advance the cutoff — never go backward.
+        IF v_rows > 0 THEN
+            UPDATE flashback.tracked_tables
+               SET retention_cutoff = GREATEST(
+                   retention_cutoff,
+                   clock_timestamp() - rec.retention_interval
+               )
+             WHERE rel_oid = rec.rel_oid;
+        END IF;
 
         FOR snap_rec IN
             SELECT snapshot_id, snapshot_table
@@ -1020,24 +1164,77 @@ DECLARE
     new_version bigint;
     ddl_event_time timestamptz;
     ddl_event_lsn pg_lsn;
+    v_actual_schema text;
+    v_actual_table  text;
 BEGIN
     IF input_table IS NULL OR input_table = '' THEN RETURN; END IF;
 
+    -- After RENAME TABLE the hook fires with the NEW name.
+    -- tracked_tables still has the OLD name but same OID.
+    -- Try new name first; fall back to OID-based lookup.
     IF input_schema IS NULL OR input_schema = '' THEN
         SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
           INTO tracked
         FROM flashback.tracked_tables tt
-        WHERE tt.table_name = input_table AND tt.is_active
-        ORDER BY tt.tracked_since DESC LIMIT 1;
+        WHERE tt.table_name = input_table
+        ORDER BY tt.is_active DESC, tt.tracked_since DESC LIMIT 1;
     ELSE
         SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
           INTO tracked
         FROM flashback.tracked_tables tt
-        WHERE tt.schema_name = input_schema AND tt.table_name = input_table AND tt.is_active
+        WHERE tt.schema_name = input_schema AND tt.table_name = input_table
         LIMIT 1;
     END IF;
 
+    -- If not found by name, try by OID (handles RENAME TABLE: new name passed,
+    -- tracked_tables still has old name, but OID is stable).
+    IF tracked.rel_oid IS NULL THEN
+        DECLARE v_oid oid;
+        BEGIN
+            IF input_schema IS NOT NULL AND input_schema <> '' THEN
+                v_oid := to_regclass(format('%I.%I', input_schema, input_table));
+            ELSE
+                v_oid := to_regclass(input_table);
+            END IF;
+            IF v_oid IS NOT NULL THEN
+                SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
+                  INTO tracked
+                FROM flashback.tracked_tables tt
+                WHERE tt.rel_oid = v_oid
+                ORDER BY tt.is_active DESC LIMIT 1;
+            END IF;
+        END;
+    END IF;
+
     IF tracked.rel_oid IS NULL THEN RETURN; END IF;
+
+    -- Resolve current (post-DDL) actual name from catalog
+    SELECT n.nspname, c.relname
+      INTO v_actual_schema, v_actual_table
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = tracked.rel_oid;
+
+    -- RENAME TABLE / SET SCHEMA: update tracked_tables with the new name
+    IF v_actual_schema IS NOT NULL AND v_actual_table IS NOT NULL
+       AND (v_actual_schema <> tracked.schema_name OR v_actual_table <> tracked.table_name)
+    THEN
+        UPDATE flashback.tracked_tables
+           SET schema_name = v_actual_schema,
+               table_name  = v_actual_table
+         WHERE rel_oid = tracked.rel_oid;
+
+        RAISE NOTICE 'pg_flashback: table renamed/moved from %.% to %.% — tracking updated',
+            tracked.schema_name, tracked.table_name, v_actual_schema, v_actual_table;
+
+        -- Recreate triggers with updated table-name argument
+        PERFORM flashback_detach_capture_trigger(v_actual_schema, v_actual_table);
+        PERFORM flashback_attach_capture_trigger(v_actual_schema, v_actual_table);
+
+        -- Use new name for the rest of this function
+        tracked.schema_name := v_actual_schema;
+        tracked.table_name  := v_actual_table;
+    END IF;
 
     ddl_event_time := clock_timestamp();
     ddl_event_lsn := pg_current_wal_lsn();

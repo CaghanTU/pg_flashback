@@ -507,6 +507,10 @@ BEGIN
                 ELSE ''
             END,
             CASE
+                -- GENERATED ALWAYS AS (expr) STORED
+                WHEN col->>'generated' = 's'
+                     AND col->>'default_expr' IS NOT NULL
+                THEN format(' GENERATED ALWAYS AS (%s) STORED', col->>'default_expr')
                 WHEN col ? 'default_expr'
                      AND col->>'default_expr' IS NOT NULL
                      AND col->>'default_expr' <> ''
@@ -823,8 +827,12 @@ DECLARE
     v_orig_oid  oid;
     v_incoming_fks  jsonb := '[]'::jsonb;
     v_dependent_views jsonb := '[]'::jsonb;
+    v_inherit_children jsonb := '[]'::jsonb;  -- classical INHERITS children (not partitions)
     v_dep  record;
     v_ifk  record;
+    v_heir record;
+    v_partition_parent text;   -- parent table qualified name if target is a leaf partition
+    v_partition_bound  text;   -- partition bound expression (FOR VALUES ...)
 BEGIN
     -- Save ACL and owner from original table (before DROP)
     SELECT c.relacl, c.relowner::regrole, c.oid
@@ -833,10 +841,46 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = p_orig_schema AND c.relname = p_orig_table;
 
+    -- ── Capture partition parent info BEFORE the DROP ──────────────
+    -- If the target table is a leaf partition we must re-ATTACH it after the
+    -- shadow rename, otherwise the parent partitioned table loses the partition.
+    IF v_orig_oid IS NOT NULL THEN
+        SELECT format('%I.%I', pn.nspname, pc.relname),
+               pg_get_expr(child.relpartbound, child.oid)
+          INTO v_partition_parent, v_partition_bound
+        FROM pg_inherits i
+        JOIN pg_class  child  ON child.oid  = i.inhrelid
+        JOIN pg_class  pc     ON pc.oid     = i.inhparent
+        JOIN pg_namespace pn  ON pn.oid     = pc.relnamespace
+        WHERE i.inhrelid = v_orig_oid
+          AND pc.relkind = 'p'   -- parent must be a partitioned table
+        LIMIT 1;
+    END IF;
+
     -- ── Collect dependent objects BEFORE the CASCADE drop ─────────
     -- Incoming FKs: other tables' constraints that reference this table.
     -- DROP TABLE CASCADE would silently remove them; we recreate them after rename.
     IF v_orig_oid IS NOT NULL THEN
+
+        -- Classical INHERITS children: tables that INHERIT from this table
+        -- (NOT partition-based — those have a partitioned parent with relkind='p').
+        -- DROP TABLE CASCADE would destroy them; we re-attach via ALTER TABLE INHERIT.
+        SELECT COALESCE(jsonb_agg(
+            jsonb_build_object(
+                'schema', cn.nspname,
+                'table',  cc.relname
+            ) ORDER BY cn.nspname, cc.relname
+        ), '[]'::jsonb)
+          INTO v_inherit_children
+        FROM pg_inherits i
+        JOIN pg_class  cc ON cc.oid  = i.inhrelid
+        JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+        WHERE i.inhparent = v_orig_oid
+          AND NOT EXISTS (
+              -- Exclude partition children (their parent has relkind='p')
+              SELECT 1 FROM pg_class pp WHERE pp.oid = v_orig_oid AND pp.relkind = 'p'
+          );
+
         SELECT COALESCE(jsonb_agg(
             jsonb_build_object(
                 'conname', con.conname,
@@ -896,15 +940,60 @@ BEGIN
             ) ORDER BY n3.nspname, c3.relname
         ), '[]'::jsonb)
           INTO v_dependent_views
-        FROM pg_depend d
-        JOIN pg_class c3 ON c3.oid = d.objid
-        JOIN pg_namespace n3 ON n3.oid = c3.relnamespace
-        WHERE d.refobjid  = v_orig_oid
-          AND d.classid    = 'pg_class'::regclass
-          AND d.refclassid = 'pg_class'::regclass
-          AND c3.relkind   IN ('v', 'm')
-          AND d.deptype    = 'n';
+        FROM (
+            -- Views/matviews depend on tables via their rewrite rules, not directly.
+            -- Use a recursive CTE to capture chained views (view2→view1→table).
+            -- Seed: views/matviews whose rewrite rule directly references v_orig_oid.
+            -- Recurse: views whose rule references any already-found view.
+            WITH RECURSIVE dep_views(view_oid) AS (
+                -- Base: direct dependents of the original table
+                SELECT DISTINCT rw.ev_class AS view_oid
+                FROM pg_depend d
+                JOIN pg_rewrite rw ON rw.oid = d.objid
+                                   AND d.classid = 'pg_rewrite'::regclass
+                JOIN pg_class cv ON cv.oid = rw.ev_class
+                WHERE d.refobjid   = v_orig_oid
+                  AND d.refclassid = 'pg_class'::regclass
+                  AND cv.relkind   IN ('v', 'm')
+                  AND d.deptype    = 'n'
+                  AND rw.ev_class <> v_orig_oid
+
+                UNION
+
+                -- Recursive: views that depend on any already-found view
+                SELECT DISTINCT rw2.ev_class
+                FROM dep_views dv
+                JOIN pg_depend d2 ON d2.refobjid   = dv.view_oid
+                                  AND d2.refclassid = 'pg_class'::regclass
+                                  AND d2.deptype    = 'n'
+                JOIN pg_rewrite rw2 ON rw2.oid = d2.objid
+                                    AND d2.classid = 'pg_rewrite'::regclass
+                JOIN pg_class cv2 ON cv2.oid = rw2.ev_class
+                WHERE cv2.relkind IN ('v', 'm')
+                  AND rw2.ev_class <> dv.view_oid
+            )
+            SELECT DISTINCT view_oid
+            FROM dep_views
+        ) subq
+        JOIN pg_class c3 ON c3.oid = subq.view_oid
+        JOIN pg_namespace n3 ON n3.oid = c3.relnamespace;
     END IF;
+
+    -- ── Detach classical INHERITS children BEFORE DROP ───────────
+    -- DROP TABLE CASCADE would destroy them; detach first so DROP doesn't cascade.
+    FOR v_heir IN
+        SELECT r->>'schema' AS cschema, r->>'table' AS ctable
+        FROM jsonb_array_elements(v_inherit_children) AS t(r)
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I NO INHERIT %I.%I',
+                v_heir.cschema, v_heir.ctable,
+                p_orig_schema, p_orig_table);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: could not detach INHERITS child %.% from parent %.%: %',
+                v_heir.cschema, v_heir.ctable, p_orig_schema, p_orig_table, SQLERRM;
+        END;
+    END LOOP;
 
     -- ── Brief exclusive lock window ────────────────────────────
     EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', p_orig_schema, p_orig_table);
@@ -915,6 +1004,40 @@ BEGIN
     END IF;
     EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
         p_orig_schema, p_shadow_table, p_orig_table);
+
+    -- ── Re-attach classical INHERITS children ────────────────────
+    -- DROP TABLE CASCADE removed the INHERITS relationship.
+    -- Re-establish it with the renamed table as the new parent.
+    FOR v_heir IN
+        SELECT r->>'schema' AS cschema, r->>'table' AS ctable
+        FROM jsonb_array_elements(v_inherit_children) AS t(r)
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I INHERIT %I.%I',
+                v_heir.cschema, v_heir.ctable,
+                p_orig_schema, p_orig_table);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: could not re-attach INHERITS child %.% to parent %.%: %',
+                v_heir.cschema, v_heir.ctable, p_orig_schema, p_orig_table, SQLERRM;
+        END;
+    END LOOP;
+
+    -- ── Re-attach as partition if original was a leaf partition ───
+    -- DROP TABLE CASCADE removes the partition from its parent's tree.
+    -- After rename we must ATTACH it back with the original bound expression.
+    -- The shadow table was a plain table (not a partition), so any transition
+    -- table triggers installed on it are compatible — we use ROW triggers.
+    IF v_partition_parent IS NOT NULL AND v_partition_bound IS NOT NULL THEN
+        BEGIN
+            EXECUTE format('ALTER TABLE %s ATTACH PARTITION %I.%I %s',
+                v_partition_parent,
+                p_orig_schema, p_orig_table,
+                v_partition_bound);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: could not re-attach % to partition tree (%): %',
+                p_orig_table, v_partition_parent, SQLERRM;
+        END;
+    END IF;
 
     -- Rename shadow-prefixed PK constraint back to original name
     DECLARE
@@ -1019,7 +1142,8 @@ BEGIN
                 -- 1. Create the view / matview body
                 IF v_dep.knd = 'm' THEN
                     EXECUTE format('CREATE MATERIALIZED VIEW %I.%I AS %s WITH NO DATA',
-                        v_dep.sch, v_dep.nm, v_dep.def);
+                        v_dep.sch, v_dep.nm,
+                        rtrim(v_dep.def, ' ;'));
                 ELSE
                     EXECUTE format('CREATE VIEW %I.%I AS %s',
                         v_dep.sch, v_dep.nm, v_dep.def);
