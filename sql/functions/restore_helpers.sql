@@ -870,7 +870,16 @@ BEGIN
                 'def',      pg_get_viewdef(c3.oid),
                 'owner',    (SELECT rolname FROM pg_roles WHERE oid = c3.relowner),
                 'options',  COALESCE(to_jsonb(c3.reloptions), 'null'::jsonb),
-                'acl',      COALESCE(to_jsonb(c3.relacl::text[]), '[]'::jsonb),
+                'acl',      COALESCE((
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'grantee',      CASE WHEN ae.grantee = 0 THEN 'PUBLIC'
+                                             ELSE (SELECT rolname FROM pg_roles WHERE oid = ae.grantee)
+                                        END,
+                        'privilege',    ae.privilege_type,
+                        'is_grantable', ae.is_grantable
+                    ))
+                    FROM aclexplode(c3.relacl) AS ae(grantor, grantee, privilege_type, is_grantable)
+                ), '[]'::jsonb),
                 'indexes',  COALESCE((
                     SELECT jsonb_agg(
                         jsonb_build_object(
@@ -1047,13 +1056,37 @@ BEGIN
                     END;
                 END IF;
 
-                -- 4. Restore grants
-                -- GRANTs on a freshly created view cannot be replayed from the old
-                -- aclitem[] snapshot without parsing privilege codes, which varies by
-                -- PostgreSQL version. We emit a NOTICE so the DBA can replay manually.
+                -- 4. Restore grants from aclexplode() snapshot
                 IF v_dep.acl IS NOT NULL AND jsonb_array_length(v_dep.acl) > 0 THEN
-                    RAISE NOTICE 'flashback: %.% ACL not automatically restored — original: %',
-                        v_dep.sch, v_dep.nm, v_dep.acl;
+                    DECLARE
+                        v_acl_rec record;
+                    BEGIN
+                        FOR v_acl_rec IN
+                            SELECT a->>'grantee'             AS grantee,
+                                   a->>'privilege'           AS privilege,
+                                   (a->>'is_grantable')::boolean AS is_grantable
+                            FROM jsonb_array_elements(v_dep.acl) a
+                        LOOP
+                            BEGIN
+                                IF v_acl_rec.grantee = 'PUBLIC' THEN
+                                    EXECUTE format('GRANT %s ON %I.%I TO PUBLIC%s',
+                                        v_acl_rec.privilege, v_dep.sch, v_dep.nm,
+                                        CASE WHEN v_acl_rec.is_grantable
+                                             THEN ' WITH GRANT OPTION' ELSE '' END);
+                                ELSE
+                                    EXECUTE format('GRANT %s ON %I.%I TO %I%s',
+                                        v_acl_rec.privilege, v_dep.sch, v_dep.nm,
+                                        v_acl_rec.grantee,
+                                        CASE WHEN v_acl_rec.is_grantable
+                                             THEN ' WITH GRANT OPTION' ELSE '' END);
+                                END IF;
+                            EXCEPTION WHEN OTHERS THEN
+                                RAISE WARNING 'flashback: GRANT % on %.% to % failed: %',
+                                    v_acl_rec.privilege, v_dep.sch, v_dep.nm,
+                                    v_acl_rec.grantee, SQLERRM;
+                            END;
+                        END LOOP;
+                    END;
                 END IF;
 
                 -- 5. Recreate matview indexes
