@@ -1,12 +1,21 @@
 # Backup-backed recovery architecture
 
-Status: implemented first-release contract (result format 3)
+Status: **helper/result contract implemented (format 3); coverage-generation
+integration and post-restore re-anchor pending**
 
-The backup profile is the large-database path. It does not copy the tracked
-table into extension-owned snapshots and it does not duplicate row changes in
-`delta_log`. PostgreSQL physical recovery reconstructs the database; the
-helper extracts only the requested table; the extension validates and swaps
-that table into production.
+The backup profile is the path for tables that cannot satisfy the local
+profile's capacity, change-rate, write-stall or RTO budget. It does not copy
+the tracked table into extension-owned snapshots and it does not duplicate row
+changes in `delta_log`. PostgreSQL physical recovery reconstructs the database;
+the helper extracts only the requested table; the extension validates and
+swaps that table into production.
+
+Profile admission follows [`STORAGE_POLICY.md`](STORAGE_POLICY.md); table size
+alone does not select this path.
+
+The helper's successful result proves private recovery and artifact integrity.
+It does not prove that production tracking has a valid post-swap coverage
+generation. That extension/controller integration remains a release gate.
 
 This is not a fork or reimplementation of pgBackRest. pgBackRest remains an
 external executable and owns backup, archive and classic restore semantics.
@@ -29,7 +38,14 @@ sequenceDiagram
     O->>E: import into flashback_import
     O->>E: accept manifest + finalize
     E->>E: verify imported schema/rows; transactional swap
+    E->>E: write pending swap-XID and unanchored gap
+    O->>R: start a new full strictly after resolved swap commit
+    O->>R: complete and verify that full backup
+    O->>E: activate generation at verified full-backup stop boundary
 ```
+
+The final three coverage steps describe the required first-release protocol;
+they are not wired by the current finalizer yet.
 
 ## Recovery profiles
 
@@ -41,6 +57,10 @@ sequenceDiagram
 `flashback_track(text)` selects `local_delta`. The explicit
 `flashback_track_backup(text, text)` API selects `backup` and binds the table to
 an operator-owned helper profile.
+
+Both profiles target ordinary LOGGED, non-partitioned tables in the first
+release. Existing local-profile partitioned-table demos are not part of this
+contract.
 
 ## Trust boundary
 
@@ -60,6 +80,23 @@ directly. The finalizer independently verifies all of the following:
 - recovered and imported row fingerprints;
 - original table OID, including same-name replacement detection;
 - recovered owner, grantee role existence and table privilege types.
+
+After those checks, a backup-profile swap does **not** create an
+extension-owned row snapshot. It must durably open a
+`post_restore_unanchored` gap with a pending swap-XID marker. A post-commit
+resolver may attach the real COMMIT LSN, seal the predecessor at that exclusive
+coordinate and leave the successor `building`; a pre-commit LSN is not
+substituted and resolving it does not close the gap. The resulting zero-active
+state is intentional, and admission must not fall back to the predecessor.
+Until coverage integration lands, the current finalizer's success is not a
+claim of continued recoverability.
+
+Initial backup tracking uses the same fail-closed anchoring discipline. It
+first commits and resolves a durable LOGGED tracking marker, then requires a
+new full backup whose start LSN is strictly after that marker commit.
+Only the verified stop boundary of that qualifying backup activates the first
+generation. Existing or already-running backups cannot be adopted as the
+initial anchor.
 
 ## Helper commands
 
@@ -129,7 +166,7 @@ side. `scripts/pgbackrest_with_flashback_lock.sh` is the reference wrapper.
 The same-stanza deployment is preferred: keep the normal long-retention
 repository, and add a local short-retention repository key configured without
 compression, bundle or block storage for snapshot-direct. Classic restore is
-the safe fallback when the selected full backup is not a directly startable
+the compatibility fallback when the selected full backup is not a directly startable
 plain tree.
 
 ## Result contract (format 3)
@@ -158,6 +195,11 @@ format and version.
   or use cluster PITR.
 - Time/XID targets, differential/incremental closure and remote/object-store
   snapshot-direct are future work.
+- A production swap starts an unanchored interval. Backup coverage resumes only
+  after a new completed full backup whose start LSN is strictly after
+  the resolved swap commit is verified and activated at its stop anchor. Later
+  WAL alone, an overlapping backup and the pre-swap backup range do not
+  re-anchor the first-release model.
 
 The authoritative operator procedure and recovery steps are in
 [`BACKUP_RESTORE_RUNBOOK.md`](BACKUP_RESTORE_RUNBOOK.md).

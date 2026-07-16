@@ -114,15 +114,20 @@ table export, consistently dominates required RTO.
 This fast path should be advertised as **backup-backed table flashback**, not as
 trade-off-free recovery:
 
-- fastest supported path: plain pgBackRest repository + CoW snapshot provider;
-- portable fallback: classic pgBackRest restore;
-- immediate DROP path: the separate pg_recyclebin project;
+- measured fast-path candidate: plain pgBackRest repository + CoW snapshot
+  provider;
+- compatibility candidate: classic pgBackRest restore;
 - no backup/snapshot/WAL means no guaranteed recovery.
 
-The existing pg_flashback full-table base snapshot and periodic checkpoint
-strategy is still unsuitable for large tables. A later integration change must
-add a backup-backed tracking profile that does not create those full local table
-copies.
+The backup stop boundary is a verified physical-backup anchor, not the exact
+write-locked local-base boundary used by `local_delta`; the PoC validates the
+physical recovery path and must not blur those two proofs.
+
+The legacy pg_flashback full-table base snapshot and periodic checkpoint
+strategy is unsuitable outside a tightly measured local budget. The
+backup-backed tracking profile and recovery helper now exist; the remaining
+release work is to enforce the adopted coverage-generation policy across both
+profiles.
 
 The preferred deployment is an additional local, short-retention, plain
 repository key in the same pgBackRest stanza. It is an acceleration tier
@@ -136,17 +141,33 @@ The helper planner fails with `target_before_oldest_backup`
 when no completed full backup precedes the requested LSN; it never silently
 chooses an invalid base.
 
-## Unclosed risks before product integration
+## Historical risks recorded at PoC time
 
-- incremental/differential backup sets and hardlink closure
-- concurrent backup while the helper selects/clones a backup set
-- retention/expire between request acceptance and private clone creation
-- tablespaces and symlink mapping
-- encrypted repositories
-- required extension/shared-library availability in the temporary instance
-- PostgreSQL major-version binary selection
-- cancellation, quotas and crash-safe cleanup
-- importing very large tables and minimizing the final production swap window
-- a production-like high-WAL benchmark on larger external storage
+This was the open-risk list on the 2026-07-16 PoC baseline, before the helper
+and controller integration landed. It is evidence of what the benchmark did
+not prove, not the current release checklist.
 
-These are integration gates, not reasons to discard the measured snapshot path.
+Repository backup/expire coordination, PostgreSQL binary selection, private
+startup without extension preload, cancellation and crash cleanup were later
+implemented and exercised by the helper E2E. The current helper contract is in
+[`RECOVERY_HELPER_DESIGN.md`](RECOVERY_HELPER_DESIGN.md).
+
+The following remain rejected, deferred or gated:
+
+- incremental/differential backup-set selection and hardlink closure;
+- tablespaces, symlinked relation storage and direct snapshot access to a
+  non-plain/encrypted repository;
+- aggregate work-root quota plus successful-artifact expiry/GC;
+- importing very large tables and minimizing the final production swap window;
+- a production-like high-WAL benchmark on larger external storage;
+- coverage-generation integration, including the backup-profile post-restore
+  unanchored gap, intentional zero-active state, and re-anchor only at the stop
+  boundary of a new verified full backup whose start LSN is strictly
+  after the resolved swap commit;
+- initial backup tracking activation only after a durable tracking marker is
+  resolved and a new verified full backup starts strictly after
+  that marker, rather than adopting a pre-existing or overlapping backup.
+
+The authoritative current gates are
+[`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) and
+[`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).

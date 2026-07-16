@@ -303,6 +303,14 @@ mod tests {
         it_backup_profile_contract,
         "../tests/sql/integration/backup_profile_contract.sql"
     );
+    sql_test!(
+        it_coverage_schema_contract,
+        "../tests/sql/integration/coverage_schema_contract.sql"
+    );
+    sql_test!(
+        it_lsn_target_adversarial,
+        "../tests/sql/integration/lsn_target_adversarial.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

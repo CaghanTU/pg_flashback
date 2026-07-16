@@ -1,12 +1,21 @@
 # Backup-backed table restore runbook
 
-This runbook is for large tables where keeping a second in-database copy and a
-complete row-delta history is not acceptable. The backup profile adds table
+Status: **helper/result workflow implemented; coverage-generation integration
+and post-restore re-anchor are pending**
+
+This is the helper qualification procedure, not a release-qualified production
+runbook. The current controller can recover, validate, import and swap an
+artifact, but it does not yet establish or invalidate the adopted coverage
+generation atomically.
+
+This runbook is for tables that cannot satisfy the local profile's capacity,
+change-rate, write-stall or RTO budget. The backup profile adds table
 selection, DDL recovery markers, validation, extraction and a controlled
 production swap on top of pgBackRest. It does not replace the organization's
 normal backup or disaster-recovery policy.
 
-Read [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) before operating this path.
+Read [`STORAGE_POLICY.md`](STORAGE_POLICY.md) and
+[`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) before operating this path.
 
 ## 1. Prerequisites
 
@@ -22,10 +31,10 @@ Read [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) before operating this path.
 - A database login that is a member of both `flashback_admin` and
   `flashback_recovery_agent` for the reference controller.
 
-The first release supports ordinary logged tables only. Do not use this path
-for partitioned/foreign/unlogged tables, tablespaces, a table renamed across
-the target, or a dropped table whose incoming foreign keys/dependent views
-must be recreated automatically.
+The first release targets ordinary LOGGED, non-partitioned tables only. Do not
+use this path for partitioned/foreign/unlogged tables, tablespaces, a table
+renamed across the target, or a dropped table whose incoming foreign
+keys/dependent views must be recreated automatically.
 
 ## 2. Repository layout
 
@@ -137,10 +146,26 @@ snapshot or DML capture triggers:
 SELECT flashback_track_backup('public.orders', 'app_repo2');
 ```
 
-After a successful full backup, read its stop LSN from
-`pgbackrest info --output=json`. Periodically force an archive switch, wait for
-`pgbackrest check` to succeed, and record the range actually verified by the
-controller:
+`flashback_track_backup()` and `flashback_set_backup_coverage()` below are the
+current legacy controller contract. They do not create a
+`coverage_generations` row and therefore do not by themselves prove an
+admissible target. Generation integration is a release gate.
+
+The release-qualified initial-tracking protocol must first commit a durable
+LOGGED tracking marker and resolve its real commit coordinate. Tracking remains
+unanchored with zero active generations until pgBackRest completes a **new
+full backup whose start LSN is strictly after that resolved marker
+commit**. A backup that already existed or was in progress when tracking began
+does not qualify even if it stops afterward. Once verified under the repository
+lock, that full backup's stop boundary becomes the first physical-backup anchor
+and initial `valid_through_lsn`.
+
+After that qualifying full backup, read its start and stop LSNs from
+`pgbackrest info --output=json`. The reported `lsn.start` is established only
+after pgBackRest's backup-start checkpoint completes. Verify the ordering above
+and persist the stop anchor. Periodically force an archive switch, wait for
+`pgbackrest check` to
+succeed, and record the range actually verified by the controller:
 
 ```sql
 SELECT flashback_set_backup_coverage(
@@ -154,9 +179,10 @@ Coverage metadata is an admission-control assertion, not a substitute for the
 helper's real backup/WAL checks. Never advance `coverage_end_lsn` beyond WAL
 that has actually reached the configured repository.
 
-DDL disaster-point markers follow the tracked table's retention interval
-(seven days by default). Select and record the target LSN before that metadata
-expires; physical backup/WAL retention alone does not keep the marker catalog.
+DDL disaster-point metadata may be retired only when generation-aware coverage
+proves that no advertised target needs it. The current seven-day age-based
+marker behavior is legacy and is not release-qualified; physical backup/WAL
+retention alone does not prove that the marker catalog is complete.
 
 ## 6. Recover after DROP/TRUNCATE/ALTER
 
@@ -200,6 +226,32 @@ Set a connection-level `lock_timeout` for the operator role if production
 policy requires a bounded wait for the final `ACCESS EXCLUSIVE` lock. A
 same-name table with a different OID is never overwritten; finalization fails
 and leaves the unrelated table unchanged.
+
+### Post-restore coverage (required, not wired)
+
+The backup profile never creates a local row snapshot after the swap. Doing so
+would silently turn it into `local_delta` and defeat the profile's storage
+contract.
+
+For the first release, backup finalization must instead atomically write a
+durable pending swap-XID marker, mark the tracking lifecycle `unanchored`, and
+open a persistent `post_restore_unanchored` gap. Its pre-commit LSN is not the
+swap's COMMIT LSN; a post-commit resolver may fill the real commit coordinate,
+seal the predecessor at that exclusive coordinate, and leave the successor
+`building`, but the gap remains open. Zero active generations is intentional in
+this state. The swap may be complete, but new targets are rejected while that
+gap is open; admission must not fall back to the predecessor. The current
+finalizer does not yet write this state, so its successful return is functional
+evidence only.
+
+Re-anchor is allowed only after pgBackRest completes a **new full backup whose
+start LSN is strictly after the resolved production-swap
+commit**. A backup already running during the swap does not qualify merely
+because its stop boundary is later. The controller verifies that full backup
+and its archived-WAL coverage, then activates the new backup generation at the
+verified stop boundary. Activation closes the open gap's upper endpoint; it
+never makes targets inside the gap valid. Reusing the old backup range or
+merely observing later archived WAL is not a first-release re-anchor.
 
 ## 7. Manual/resume protocol
 

@@ -76,14 +76,14 @@ BEGIN
              JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
              WHERE tt.table_name IN ('rb_orders','rb_mixed','rb_parallel')
     LOOP
-        EXECUTE format('DROP TABLE IF EXISTS %s', r.snapshot_table);
+        PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table));
     END LOOP;
     -- Also drop base_snapshot tables
     FOR r IN SELECT base_snapshot_table
              FROM flashback.tracked_tables
              WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel')
     LOOP
-        EXECUTE format('DROP TABLE IF EXISTS %s', r.base_snapshot_table);
+        PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
     END LOOP;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
@@ -121,9 +121,9 @@ BEGIN
     FOR r IN SELECT s.snapshot_table FROM flashback.snapshots s
              JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
              WHERE tt.table_name = 'rb_orders'
-    LOOP EXECUTE format('DROP TABLE IF EXISTS %s', r.snapshot_table); END LOOP;
+    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table)); END LOOP;
     FOR r IN SELECT base_snapshot_table FROM flashback.tracked_tables WHERE table_name = 'rb_orders'
-    LOOP EXECUTE format('DROP TABLE IF EXISTS %s', r.base_snapshot_table); END LOOP;
+    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table)); END LOOP;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 DELETE FROM flashback.delta_log WHERE table_name = 'public.rb_orders';

@@ -246,7 +246,9 @@ BEGIN
     END IF;
 
     DROP TABLE public.it_backup_identity;
-    EXECUTE format('DROP TABLE flashback_import.%I', v_artifact_table);
+    PERFORM flashback_drop_payload_table(
+        to_regclass(format('flashback_import.%I', v_artifact_table))
+    );
     PERFORM flashback_untrack('it_backup_identity');
 END;
 $$;

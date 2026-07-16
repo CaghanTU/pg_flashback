@@ -11,6 +11,11 @@ required item is checked against the exact commit being released.
       `CHANGELOG.md` and the tag agree on the semantic version.
 - [ ] `docs/RELEASE_SCOPE.md` describes the actually tested PostgreSQL,
       pgBackRest, repository and table topologies.
+- [ ] `docs/STORAGE_POLICY.md`, `docs/COVERAGE_MODEL.md`, README and runtime
+      behavior agree; no scaffold-only feature is described as enforced.
+- [ ] T-01/A remains closed in the release scope: qualified local capture is
+      WAL-only, COMMIT LSN is primitive and trigger capture is labeled
+      legacy/experimental.
 - [ ] README claims and benchmark links are reproducible and do not imply that
       snapshot-direct removes WAL replay cost.
 
@@ -53,13 +58,77 @@ rm -rf target/test-pgdata && cargo pgrx test pg17
 rm -rf target/test-pgdata && cargo pgrx test pg18
 ```
 
-- [ ] PostgreSQL 15: 65/65.
-- [ ] PostgreSQL 16: 65/65.
-- [ ] PostgreSQL 17: 65/65.
-- [ ] PostgreSQL 18: 65/65.
+- [ ] PostgreSQL 15: 68/68.
+- [ ] PostgreSQL 16: 68/68.
+- [ ] PostgreSQL 17: 68/68.
+- [ ] PostgreSQL 18: 68/68.
 - [ ] The real WAL/worker E2E passes: `scripts/run_wal_e2e.sh`.
 
-## 4. Backup-backed release qualification
+## 4. Coverage correctness qualification
+
+- [ ] RB-01 through RB-11 have regression or qualification evidence against
+      the release commit.
+- [ ] Track and maintenance boundaries use the exact lock protocol and reject
+      a caller transaction that already performed writes.
+- [ ] Concurrent first-track calls serialize on one deterministic pre-identity
+      bootstrap key and cannot allocate separate stable tracking identities.
+- [ ] Track/re-anchor takes its final relation-lock strength from the outset
+      (`SHARE ROW EXCLUSIVE` minimum, stronger when required), and capture
+      trigger or replica-identity/stream setup occurs under that same lock.
+- [ ] The exact-base scan demonstrably acquires a fresh MVCC snapshot after the
+      relation lock: a writer that commits while lock acquisition waits appears
+      in the base; old/RR/serializable/imported snapshots are rejected.
+- [ ] Generation applicability is half-open and distinct from the inclusive
+      capture watermark; at a handoff coordinate only the successor is
+      selected.
+- [ ] Only `active` and `sealed` generations are admitted. `building`
+      (including a pending/unanchored successor) is never selected, while a
+      broken stream still serves targets no later than its frozen watermark.
+- [ ] WAL backlog crossing a boundary is routed to the correct generation;
+      payload carries commit LSN separately from change LSN and legacy trigger
+      rows never enter a qualified generation.
+- [ ] Sealing freezes ownership and applicability, but backlog already bound to
+      the predecessor may advance its watermark monotonically no farther than
+      `superseded_before`; retirement is impossible until that drain is proven.
+- [ ] Protected DDL metadata is promoted only with its real WAL COMMIT record;
+      untrusted logical-message bodies cannot forge DDL or DML history.
+- [ ] T-01/A is adversarially tested: trigger mode is unqualified,
+      same-microsecond commits and timestamp/LSN inversion cannot admit an
+      ambiguous target, and XID is never used as commit order.
+- [ ] Restore/query/deleted-row recovery expose and exercise direct COMMIT-LSN
+      APIs. Legacy `timestamptz` entry points reject qualified use; the
+      fail-closed resolver maps a human time to one proven prefix and per-event
+      `commit_time <= target_time` filtering is never accepted as equivalent.
+- [ ] Restore, query-as-of and deleted-row recovery pin one immutable
+      generation and reject every persistent gap.
+- [ ] Retention racing those APIs cannot remove required payload and retires
+      only whole sealed generations.
+- [ ] Slot loss/recreate/external advance and capture disablement are durable
+      and fail closed; qualified WAL decoding never uses the legacy trigger
+      row-size skip.
+- [ ] Local restore preflight, in-swap base/pending marker, post-commit real
+      commit-time and (in WAL mode) COMMIT-LSN resolution, and successor
+      activation are tested. The SQL result/NOTICE explicitly reports pending
+      coverage, a higher-level workflow waits for healthy activation, and the
+      first release rejects a skip-base request.
+- [ ] Local swap rollback, crash after commit but before activation, duplicate
+      resolver retry and DML committed during the pending window all preserve
+      exactly-once activation and successor payload routing.
+- [ ] Whole-generation payload retirement leaves durable audit tombstones and
+      cannot cascade-delete generation, gap or lineage metadata; interruption
+      before/during/after deletion resumes from committed `retiring` intent,
+      concurrent retriers serialize, and admission rejects the payload.
+- [ ] A populated-installation upgrade has measured lock, rewrite, disk/WAL
+      and downtime bounds and a maintenance runbook. A real `pg_dump`/restore
+      round trip proves that no tracking, payload or coverage state is silently
+      transported and that the restored database requires fresh tracking.
+- [ ] The extension version is bumped and a versioned update script migrates an
+      installed release. Re-running base SQL or drop/create is not an upgrade
+      strategy; drop/create would now delete extension-owned recovery payload.
+- [ ] Capture drain remains within its latency/WAL-lag SLO while maintenance is
+      blocked on another table.
+
+## 5. Backup-backed release qualification
 
 Use the exact PostgreSQL and pgBackRest versions named in
 `docs/RELEASE_SCOPE.md`:
@@ -71,6 +140,32 @@ scripts/run_recovery_helper_e2e.sh
 - [ ] All 27 checks pass, including snapshot-direct and classic recovered-data
       fingerprint equality, a real post-DROP extension request and final
       production swap.
+- [ ] Every backup-profile swap commits a LOGGED pending/unanchored state and
+      opens a durable gap; it does not create a local row snapshot, and both
+      the result and `flashback_health()` report the required next full backup.
+- [ ] Initial backup tracking commits and resolves a durable LOGGED marker,
+      then remains at zero active generations until a new completed full whose
+      start LSN is strictly after that marker activates at its verified
+      stop anchor; pre-existing and overlapping backups are rejected.
+- [ ] The active backup generation pins one immutable anchor containing
+      repository/stanza/label, FULL type, system identifier, timeline,
+      manifest reference/SHA-256 and marker/start/stop LSNs; its
+      boundary is the same anchor's stop LSN and cross-lifecycle references
+      fail.
+- [ ] WAL/backup LSNs are admitted only within their recorded physical
+      timeline; a timeline mismatch or promotion freezes coverage and opens a
+      gap rather than comparing bare LSNs across timelines.
+- [ ] Only a new post-swap completed and verified full backup activates the
+      successor at its stop boundary. Its start LSN is strictly after
+      the resolved swap commit; failed/partial/differential/incremental or
+      overlapping backups do not qualify, and `[swap commit, backup stop)`
+      remains rejected.
+- [ ] Resolving a backup swap seals the predecessor and leaves the successor
+      `building`; zero active generations is preserved while the gap is open,
+      with no admission fallback to the predecessor.
+- [ ] The backup generation's persisted physical-WAL `valid_through_lsn`
+      advances only across a contiguous, revalidated archive range while the
+      repository shared lock is held; expire cannot race that proof.
 - [ ] Old target, missing WAL, backup/expire race, cancellation, timeout,
       process crash, server-start failure, quota, request/profile conflict,
       corrupt cache and controller failure paths fail closed.
@@ -78,7 +173,7 @@ scripts/run_recovery_helper_e2e.sh
       cluster remains after handled failures.
 - [ ] The machine-readable E2E summary is archived as release evidence.
 
-## 5. Package verification
+## 6. Package verification
 
 - [ ] `cargo pgrx package` succeeds for PostgreSQL 15, 16, 17 and 18.
 - [ ] The helper builds in release mode with `--locked`.
@@ -88,7 +183,7 @@ scripts/run_recovery_helper_e2e.sh
 - [ ] Install each extension package and helper artifact on a clean supported
       Linux host before publishing.
 
-## 6. Publication
+## 7. Publication
 
 - [ ] Create a signed `vX.Y.Z` tag only after CI passes on the release commit.
 - [ ] Confirm the tag workflow creates a **draft** GitHub Release and all

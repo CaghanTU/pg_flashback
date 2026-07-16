@@ -1,51 +1,243 @@
--- Test: RBAC enforcement — flashback_admin can operate, PUBLIC cannot
+-- RBAC contract: extension routines are deny-by-default, and only the explicit
+-- API allowlist is granted to delegated roles.
 DO $tv$
-DECLARE v_restored boolean := false;
+DECLARE
+    v_public_routines text;
+    v_allowlist_diff text;
+    v_api record;
 BEGIN
-    -- Verify flashback_admin role exists
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
         RAISE EXCEPTION 'flashback_admin role does not exist';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_recovery_agent') THEN
+        RAISE EXCEPTION 'flashback_recovery_agent role does not exist';
+    END IF;
 
-    -- Verify admin functions are revoked from PUBLIC
-    -- flashback_restore should not be executable by PUBLIC
-    DECLARE
-        v_has_public_execute boolean;
-    BEGIN
-        SELECT has_function_privilege('public', 'flashback_restore(text, timestamptz)', 'EXECUTE')
-          INTO v_has_public_execute;
-        -- This should be false since we REVOKE ALL FROM PUBLIC
-        -- But note: has_function_privilege for 'public' checks PUBLIC pseudo-role
-    EXCEPTION WHEN OTHERS THEN
-        -- If role 'public' can't be used, that's fine
-        v_has_public_execute := false;
-    END;
+    -- Default PostgreSQL routine ACLs include PUBLIC EXECUTE. The extension's
+    -- finalize SQL must remove it from every production routine, including new
+    -- SECURITY DEFINER helpers that are not in a hand-maintained name list.
+    SELECT string_agg(
+               format('%I.%I(%s)',
+                   n.nspname,
+                   p.proname,
+                   pg_get_function_identity_arguments(p.oid)),
+               ', ' ORDER BY p.oid::regprocedure::text
+           )
+      INTO v_public_routines
+    FROM pg_depend d
+    JOIN pg_extension e
+      ON e.oid = d.refobjid
+     AND d.refclassid = 'pg_extension'::regclass
+    JOIN pg_proc p
+      ON d.classid = 'pg_proc'::regclass
+     AND p.oid = d.objid
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(p.proacl, acldefault('f', p.proowner))
+    ) AS routine_acl
+    WHERE e.extname = 'pg_flashback'
+      AND d.deptype = 'e'
+      -- pgrx test wrappers are extension members in the `tests` schema, but
+      -- are not shipped production routines. The control file pins production
+      -- routines to `public`.
+      AND n.nspname = 'public'
+      AND routine_acl.grantee = 0
+      AND routine_acl.privilege_type = 'EXECUTE';
 
-    -- Verify SECURITY DEFINER is set on core functions
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_proc p
+    IF v_public_routines IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC can execute pg_flashback routines: %',
+            v_public_routines;
+    END IF;
+
+    IF NOT has_schema_privilege('flashback_admin', 'flashback', 'USAGE') THEN
+        RAISE EXCEPTION 'flashback_admin lacks USAGE on flashback schema';
+    END IF;
+    IF has_schema_privilege('flashback_admin', 'flashback', 'CREATE') THEN
+        RAISE EXCEPTION
+            'flashback_admin has CREATE on flashback schema; SECURITY DEFINER helper shadowing is possible';
+    END IF;
+
+    IF has_table_privilege('public', 'flashback.pending_wal_events', 'INSERT')
+       OR has_table_privilege('public', 'flashback.pending_wal_events', 'UPDATE')
+       OR has_table_privilege('public', 'flashback.pending_wal_events', 'DELETE')
+    THEN
+        RAISE EXCEPTION 'PUBLIC can forge protected pending WAL events';
+    END IF;
+
+    -- Compare direct delegated-role ACLs with the complete allowlist. This
+    -- catches both an accidentally exposed new helper and a stale grant that
+    -- survives an extension upgrade after an API is removed.
+    WITH allowed(grantee, signature) AS (
+        VALUES
+            ('flashback_admin', 'public.flashback_track(text)'),
+            ('flashback_admin', 'public.flashback_untrack(text)'),
+            ('flashback_admin', 'public.flashback_restore(text,timestamp with time zone)'),
+            ('flashback_admin', 'public.flashback_restore(text[],timestamp with time zone)'),
+            ('flashback_admin', 'public.flashback_restore_lsn(text,pg_lsn)'),
+            ('flashback_admin', 'public.flashback_restore_lsn(text[],pg_lsn)'),
+            ('flashback_admin', 'public.flashback_restore_parallel(text,timestamp with time zone,integer)'),
+            ('flashback_admin', 'public.flashback_recover_deleted(text,timestamp with time zone)'),
+            ('flashback_admin', 'public.flashback_recover_deleted_lsn(text,pg_lsn)'),
+            ('flashback_admin', 'public.flashback_checkpoint(text)'),
+            ('flashback_admin', 'public.flashback_reanchor(text)'),
+            ('flashback_admin', 'public.flashback_flush_staging(integer)'),
+            ('flashback_admin', 'public.flashback_consume_wal(integer)'),
+            ('flashback_admin', 'public.flashback_apply_retention()'),
+            ('flashback_admin', 'public.flashback_set_restore_in_progress(boolean)'),
+            ('flashback_admin', 'public.flashback_attach_capture_trigger(text,text)'),
+            ('flashback_admin', 'public.flashback_detach_capture_trigger(text,text)'),
+            ('flashback_admin', 'public.flashback_query(text,timestamp with time zone,text)'),
+            ('flashback_admin', 'public.flashback_query_lsn(text,pg_lsn,text)'),
+            ('flashback_admin', 'public.flashback_resolve_target(text,timestamp with time zone)'),
+            ('flashback_admin', 'public.flashback_health()'),
+            ('flashback_admin', 'public.flashback_history(text,interval)'),
+            ('flashback_admin', 'public.flashback_retention_status()'),
+            ('flashback_admin', 'public.flashback_is_restore_in_progress(oid)'),
+            ('flashback_admin', 'public.flashback_track_backup(text,text)'),
+            ('flashback_admin', 'public.flashback_set_backup_coverage(text,pg_lsn,pg_lsn)'),
+            ('flashback_admin', 'public.flashback_backup_disaster_points(text,interval)'),
+            ('flashback_admin', 'public.flashback_prepare_backup_restore(text,pg_lsn)'),
+            ('flashback_admin', 'public.flashback_finalize_backup_restore(text)'),
+            ('flashback_admin', 'public.flashback_fail_backup_restore(text,text,boolean)'),
+            ('flashback_admin', 'public.flashback_adopt_existing_payload_tables()'),
+            ('flashback_recovery_agent', 'public.flashback_claim_backup_restore(text)'),
+            ('flashback_recovery_agent', 'public.flashback_accept_backup_restore(text,jsonb)'),
+            ('flashback_recovery_agent', 'public.flashback_fail_backup_restore(text,text,boolean)'),
+            ('pg_monitor', 'public.flashback_history(text,interval)'),
+            ('pg_monitor', 'public.flashback_retention_status()'),
+            ('pg_monitor', 'public.flashback_is_restore_in_progress(oid)'),
+            ('pg_monitor', 'public.flashback_health()')
+    ), actual AS (
+        SELECT pg_get_userbyid(routine_acl.grantee) AS grantee,
+               format('%I.%I(%s)',
+                   n.nspname,
+                   p.proname,
+                   replace(oidvectortypes(p.proargtypes), ', ', ',')) AS signature
+        FROM pg_depend d
+        JOIN pg_extension e
+          ON e.oid = d.refobjid
+         AND d.refclassid = 'pg_extension'::regclass
+        JOIN pg_proc p
+          ON d.classid = 'pg_proc'::regclass
+         AND p.oid = d.objid
         JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE p.proname = 'flashback_restore'
-          AND p.prosecdef = true
-        LIMIT 1
-    ) THEN
-        RAISE EXCEPTION 'flashback_restore is not SECURITY DEFINER';
+        CROSS JOIN LATERAL aclexplode(p.proacl) AS routine_acl
+        WHERE e.extname = 'pg_flashback'
+          AND d.deptype = 'e'
+          AND routine_acl.privilege_type = 'EXECUTE'
+          AND routine_acl.grantee IN (
+              'flashback_admin'::regrole,
+              'flashback_recovery_agent'::regrole,
+              'pg_monitor'::regrole
+          )
+    ), acl_diff AS (
+        SELECT 'unexpected'::text AS issue, grantee, signature
+        FROM (SELECT * FROM actual EXCEPT SELECT * FROM allowed) unexpected
+        UNION ALL
+        SELECT 'missing'::text AS issue, grantee, signature
+        FROM (SELECT * FROM allowed EXCEPT SELECT * FROM actual) missing
+    )
+    SELECT string_agg(
+               format('%s %s: %s', issue, grantee, signature),
+               '; ' ORDER BY issue, grantee, signature
+           )
+      INTO v_allowlist_diff
+    FROM acl_diff;
+
+    IF v_allowlist_diff IS NOT NULL THEN
+        RAISE EXCEPTION 'delegated routine ACL differs from allowlist: %',
+            v_allowlist_diff;
     END IF;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_proc p
-        WHERE p.proname = 'flashback_checkpoint'
-          AND p.prosecdef = true
+    -- Positive API allowlist for the delegated administrator. Keep destructive
+    -- and data-revealing entry points here so an accidental missing grant fails
+    -- closed during packaging.
+    FOR v_api IN
+        SELECT *
+        FROM (VALUES
+            ('public.flashback_track(text)'),
+            ('public.flashback_untrack(text)'),
+            ('public.flashback_restore(text,timestamp with time zone)'),
+            ('public.flashback_restore(text[],timestamp with time zone)'),
+            ('public.flashback_restore_lsn(text,pg_lsn)'),
+            ('public.flashback_restore_lsn(text[],pg_lsn)'),
+            ('public.flashback_restore_parallel(text,timestamp with time zone,integer)'),
+            ('public.flashback_recover_deleted(text,timestamp with time zone)'),
+            ('public.flashback_recover_deleted_lsn(text,pg_lsn)'),
+            ('public.flashback_checkpoint(text)'),
+            ('public.flashback_reanchor(text)'),
+            ('public.flashback_query(text,timestamp with time zone,text)'),
+            ('public.flashback_query_lsn(text,pg_lsn,text)'),
+            ('public.flashback_resolve_target(text,timestamp with time zone)'),
+            ('public.flashback_health()'),
+            ('public.flashback_history(text,interval)'),
+            ('public.flashback_track_backup(text,text)'),
+            ('public.flashback_prepare_backup_restore(text,pg_lsn)'),
+            ('public.flashback_finalize_backup_restore(text)'),
+            ('public.flashback_adopt_existing_payload_tables()')
+        ) AS expected(signature)
+    LOOP
+        IF NOT has_function_privilege(
+            'flashback_admin', v_api.signature, 'EXECUTE'
+        ) THEN
+            RAISE EXCEPTION 'flashback_admin lacks EXECUTE on %', v_api.signature;
+        END IF;
+    END LOOP;
+
+    IF NOT has_function_privilege(
+        'flashback_recovery_agent',
+        'public.flashback_claim_backup_restore(text)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'flashback_recovery_agent',
+        'public.flashback_accept_backup_restore(text,jsonb)',
+        'EXECUTE'
     ) THEN
-        RAISE EXCEPTION 'flashback_checkpoint is not SECURITY DEFINER';
+        RAISE EXCEPTION 'flashback_recovery_agent lacks its helper API allowlist';
     END IF;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_proc p
-        WHERE p.proname = 'flashback_track'
-          AND p.prosecdef = true
+    IF has_function_privilege(
+        'flashback_recovery_agent',
+        'public.flashback_restore(text,timestamp with time zone)',
+        'EXECUTE'
     ) THEN
-        RAISE EXCEPTION 'flashback_track is not SECURITY DEFINER';
+        RAISE EXCEPTION 'flashback_recovery_agent can execute production restore';
+    END IF;
+
+    IF NOT has_function_privilege(
+        'pg_monitor', 'public.flashback_history(text,interval)', 'EXECUTE'
+    ) OR has_function_privilege(
+        'pg_monitor',
+        'public.flashback_restore(text,timestamp with time zone)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'pg_monitor routine allowlist is incorrect';
+    END IF;
+
+    -- Mutating public APIs execute as the extension owner; the ACL checks above
+    -- are meaningful only if these core entry points retain SECURITY DEFINER.
+    IF EXISTS (
+        SELECT expected.proname
+        FROM (VALUES
+            ('flashback_track'),
+            ('flashback_checkpoint'),
+            ('flashback_reanchor'),
+            ('flashback_restore'),
+            ('flashback_restore_lsn'),
+            ('flashback_restore_parallel'),
+            ('flashback_recover_deleted'),
+            ('flashback_recover_deleted_lsn')
+        ) AS expected(proname)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.proname = expected.proname
+              AND p.prosecdef
+        )
+    ) THEN
+        RAISE EXCEPTION 'a mutating flashback API lost SECURITY DEFINER';
     END IF;
 END;
 $tv$;

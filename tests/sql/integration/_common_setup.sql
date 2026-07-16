@@ -1,8 +1,22 @@
-TRUNCATE flashback.delta_log;
-TRUNCATE flashback.snapshots RESTART IDENTITY;
-TRUNCATE flashback.tracked_tables;
-TRUNCATE flashback.schema_versions RESTART IDENTITY;
-TRUNCATE flashback.backup_restore_requests;
+-- Keep FK-related coverage metadata in one TRUNCATE set. The coverage tables
+-- are inert scaffolding today, but separate parent/child truncates would fail
+-- as soon as a schema-contract test inserts a generation.
+TRUNCATE
+    flashback.pending_wal_events,
+    flashback.coverage_gaps,
+    flashback.coverage_generations,
+    flashback.backup_anchors,
+    flashback.capture_commits,
+    flashback.capture_streams,
+    flashback.delta_log,
+    flashback.snapshots,
+    flashback.tracked_tables,
+    flashback.tracking_lifecycles,
+    flashback.schema_versions,
+    flashback.backup_restore_requests,
+    flashback.staging_events,
+    flashback.restore_log
+RESTART IDENTITY;
 
 CREATE OR REPLACE FUNCTION flashback_test_capture_dml_trigger()
 RETURNS trigger

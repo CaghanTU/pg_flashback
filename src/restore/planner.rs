@@ -5,6 +5,20 @@ extension_sql_file!(
     name = "flashback_restore_planner_api",
     requires = [
         "flashback_storage_schema_bootstrap",
-        "flashback_restore_replay_helpers"
+        "flashback_payload_ownership_helpers",
+        "flashback_restore_replay_helpers",
+        "flashback_coverage_runtime"
+    ],
+);
+
+extension_sql_file!(
+    "../../sql/functions/restore_lsn.sql",
+    name = "flashback_restore_lsn_api",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_payload_ownership_helpers",
+        "flashback_restore_replay_helpers",
+        "flashback_coverage_runtime",
+        "flashback_restore_planner_api"
     ],
 );

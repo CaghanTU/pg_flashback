@@ -3,31 +3,54 @@
 [![CI](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml/badge.svg)](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml)
 
 Table-level point-in-time recovery and time-travel queries for PostgreSQL.
-Small/medium tables can use local snapshots and row deltas; large tables can
-use a pgBackRest-backed external recovery helper without duplicating all row
-data inside the database. Built with Rust + pgrx 0.16.1 and tested on
-PostgreSQL 15, 16, 17 and 18.
+The adopted design has a preflighted local snapshot/delta profile and a
+pgBackRest-backed profile for tables that do not fit the local capacity,
+change-rate, write-stall or RTO budget. Profile choice is not a size-only
+heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
+
+> **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
+> qualified, but the project as a whole is still pre-release. Generation-aware
+> retention, capture/maintenance worker isolation, backup-profile coverage
+> finalization and versioned upgrade packaging remain release gates. Read the binding
+> [storage policy](docs/STORAGE_POLICY.md),
+> [coverage design](docs/COVERAGE_MODEL.md) and
+> [release scope](docs/RELEASE_SCOPE.md) before evaluating the project.
+> The first-release target is an ordinary LOGGED, non-partitioned table;
+> broader legacy demos are not release-qualified merely because they run.
 
 ## 1. Why This Extension?
 
-- Restores a tracked table to a point inside its verified retention window;
-  runtime depends on the chosen profile, retained WAL and table size.
-- Hides full-cluster PITR and table extraction behind a validated workflow; no
-  manual `pg_dump` surgery against a production cluster.
-- **Dual capture modes:** WAL (async, near-zero overhead) or trigger (no `wal_level` requirement).
-- In WAL mode, DML capture carries essentially zero write overhead — changes are consumed asynchronously by the background worker from the logical replication slot.
+- The correctness-qualified local path restores only a target COMMIT LSN that
+  belongs to exactly one verified coverage generation and lies at or before
+  its proven capture watermark.
+- The backup helper hides full-cluster PITR and table extraction behind a
+  validated workflow; no manual `pg_dump` surgery against production.
+- **WAL-only qualified local capture:** PostgreSQL logical decoding supplies a
+  total COMMIT-LSN order. Explicit trigger mode remains available only as a
+  legacy/experimental compatibility path and creates no qualified generation.
+- WAL decoding is asynchronous, but it is not free: `REPLICA IDENTITY FULL`
+  increases UPDATE/DELETE WAL volume and the worker stores captured history.
 - **Diff‑only UPDATE capture** — stores only PK columns + changed columns per UPDATE, reducing delta storage by up to 40× on wide tables.
 - DDL captured (TRUNCATE, DROP, ALTER) via `ProcessUtility_hook`.
-- Includes `flashback_query()` — query past table state without restoring (`SELECT AS OF` semantics). Uses historical schema from `schema_versions`; handles DROP events.
-- **Non-destructive row recovery** — `flashback_recover_deleted()` re-inserts only missing rows without touching surviving data. Safe for partial-delete accidents.
-- **DROP TABLE recovery** — `flashback_restore()` can reconstruct a dropped table from delta history alone.
+- Includes `flashback_query_lsn()` — query an admitted past table state without
+  restoring. It uses the historical schema from `schema_versions` and handles
+  DROP events.
+- **Non-destructive row recovery** — `flashback_recover_deleted_lsn()`
+  re-inserts only rows missing now, after the same generation admission used by
+  restore/query.
+- **DROP TABLE recovery** — the WAL-local LSN path captures trusted DDL through
+  protected pending metadata and reconstructs a dropped table from one proven
+  generation.
 - **SET SCHEMA and RENAME TABLE** are auto-tracked: OID-based lookup detects the change and recreates the capture trigger under the new name/schema.
 - **Classical table inheritance preserved** during restore: child tables are detached before the DROP and re-attached after shadow rename.
 - Per‑table advisory locks allow concurrent restores of unrelated tables.
 - **Multi‑database worker** — single extension install can track tables across multiple databases simultaneously.
-- **Native partitioned table support** — automatically uses per‑row triggers on partitioned tables (PostgreSQL does not support transition tables on partitioned tables).
-- Designed for production: TOAST guard, progress reporting, restore audit log, global kill switch, and monitoring views.
-- **Backup profile for large tables:** no base-table copy and no row-delta
+- **Partitioned-table implementation demo** — the current code uses per-row
+  triggers, but partitioned targets are outside the first-release contract.
+- Includes a TOAST size limit, progress reporting, restore audit log, capture
+  switch and monitoring views; their coverage-safe failure semantics are still
+  release blockers.
+- **Backup profile for local-budget-ineligible tables:** no base-table copy and no row-delta
   duplication; native PostgreSQL PITR runs in a private cluster and returns a
   validated one-table artifact through snapshot-direct or classic pgBackRest
   restore.
@@ -36,30 +59,36 @@ PostgreSQL 15, 16, 17 and 18.
 
 | Component | Purpose |
 |-----------|---------|
-| AFTER Triggers (statement + row) | Capture DML events into `staging_events` (UNLOGGED) using native JSONB. Partitioned tables use per‑row triggers automatically. |
-| `ProcessUtility_hook` | Intercepts DDL (TRUNCATE, DROP, ALTER, RENAME) and snapshots schema state. |
-| Background Worker (`flashback_worker`) | Flushes staging → `delta_log` every 75 ms; runs periodic checkpoints and retention purge. Supports multi‑DB via `target_databases` GUC. |
-| `delta_log` | Append‑only JSONB event store. Partitioned by `committed_at` (monthly range). lz4 compression where available. Composite indexes for fast restore scans. |
-| Snapshots / Checkpoints | Materialised table copies for O(1) base‑image loading. |
+| Logical decoder | Filters by tracked relation OID, decodes DML, and records transaction COMMIT LSN separately from row-change LSN. Client-supplied logical-message bodies are never trusted. |
+| AFTER Triggers (statement + row) | Legacy/experimental compatibility capture into LOGGED `staging_events`; it does not create qualified local coverage. |
+| `ProcessUtility_hook` | Intercepts DDL and writes authoritative TRUNCATE/DROP/ALTER metadata to a protected LOGGED pending table in the user's transaction. |
+| Background Worker (`flashback_worker`) | Consumes the logical slot, promotes complete commits, resolves pending generation boundaries and advances the inclusive watermark. Capture/maintenance worker isolation remains a release gate. |
+| `delta_log` | Generation/stream-bound JSONB event store, partitioned by `committed_at`; qualified events carry row-change and transaction COMMIT LSNs. |
+| Coverage generations | Exact locked base + one immutable WAL stream epoch + an inclusive complete-commit watermark. Slot discontinuity freezes the old frontier and opens a durable gap; `flashback_reanchor()` creates a new exact base. |
 | `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
-| `flashback_restore()` | Loads nearest snapshot, replays delta events to target time, restores sequences and DDL. PK tables use batch (set‑based) replay; non‑PK uses row‑by‑row. Works on dropped tables. |
-| `flashback_recover_deleted()` | Non-destructive: re-inserts only rows missing at the current time. Survivors untouched. Requires a PK. |
+| `flashback_restore_lsn()` | Admits one COMMIT-LSN prefix, materializes it, swaps atomically, then leaves a successor base pending until its real commit record is consumed. |
+| `flashback_query_lsn()` / `flashback_recover_deleted_lsn()` | Read or recover from the same admitted immutable generation without nearest-snapshot fallback. |
 | `flashback_restore_parallel()` | Restore with parallel query hints (`max_parallel_workers_per_gather`). Emits per‑partition guidance for partitioned tables. |
-| `flashback_query()` | Reconstructs past state in a temp table and executes arbitrary queries against it. |
+| `flashback_query_lsn()` | Reconstructs one admitted COMMIT-LSN state in a temporary table; caller-side filtering remains SECURITY INVOKER. |
 | `pg-flashback-recovery` | External backup-profile executor: pgBackRest selection, private native PITR, validation, extraction and crash-safe cleanup. |
 | Backup restore controller | Verifies the artifact checksum, imports into `flashback_import` and asks the extension to perform the validated transactional swap. |
 
-The extension is transparent to applications. Tables work normally; capture and restore happen behind the scenes.
+Local capture does not require DML statement rewrites, but deployment,
+preflight, maintenance and recovery remain explicit operator responsibilities.
+The backup profile additionally requires the external controller.
+
+The diagram keeps the trigger path visible for compatibility, but only the WAL
+path creates correctness-qualified coverage.
 
 ```
 ── Trigger mode ──────────────────────────────────────────────────────────
 DML (INSERT / UPDATE / DELETE)
   │
   ▼
-AFTER triggers ──► staging_events (UNLOGGED, JSONB, diff-only UPDATE)
+AFTER triggers ──► staging_events (LOGGED, JSONB, diff-only UPDATE)
                        │
                        ▼  background worker (every 75 ms)
-                  delta_log (JSONB, lz4 compressed) ──► snapshots (checkpoints)
+                  delta_log (JSONB, lz4 compressed)
                        ▲
 ── WAL mode ────────────┼────────────────────────────────────────────────
 DML (INSERT / UPDATE / DELETE)
@@ -75,13 +104,14 @@ logical replication slot (pg_flashback_<dbname>)
                        ▲
 ── Both modes ──────────┼────────────────────────────────────────────────
 DDL hook ──────────────┘
-(TRUNCATE / DROP / ALTER / RENAME / SET SCHEMA — always via staging_events)
+(Trigger DDL uses staging; qualified WAL DDL uses protected
+`pending_wal_events` and is promoted only with its trusted COMMIT record.)
 
-flashback_restore(table, timestamp)
+Legacy compatibility flashback_restore(table, timestamp)
   ├─ Find nearest snapshot / checkpoint
   ├─ Recreate table from schema_versions (shadow table, crash-safe)
   ├─ Bulk-load base image (INSERT … SELECT)
-  ├─ Replay deltas filtered by event_time ≤ target (partition-pruned via committed_at)
+  ├─ Replay deltas filtered by event_time ≤ target (legacy; not a proven WAL prefix)
   ├─ Batch/net-effect path for PK tables; row-by-row for tables without PK
   ├─ Atomic swap: detach INHERITS children → DROP original → RENAME shadow → re-attach children (brief exclusive lock)
   ├─ Recreate dependent views/matviews (owner, reloptions, indexes, populate; ACL via NOTICE)
@@ -89,22 +119,46 @@ flashback_restore(table, timestamp)
   └─ Log to restore_log + RAISE NOTICE progress
 ```
 
+The local profile is WAL-only by policy decision T-01/A. Its primitive target
+is a transaction COMMIT LSN. `flashback_resolve_target()` is only a convenience
+planner: it pins a closed frontier and returns one LSN if the observed
+timestamp mapping describes exactly one contiguous WAL prefix. Equal-time
+collisions, clock inversions, gaps, incomplete frontiers and multiple matching
+generations are rejected. Execution always uses the returned LSN; it never
+filters individual events by timestamp.
+
+A restore creates the successor base under the swap transaction, but that
+generation remains `building` until the worker observes the transaction's real
+COMMIT record. Until then `flashback_health()` reports `pending` and no new
+target is admitted. Slot loss or unexplained external advancement freezes the
+last proven watermark, opens a durable gap and requires `flashback_reanchor()`;
+the missing interval never becomes valid retroactively.
+
 ## 3. Requirements
 
 ### PostgreSQL
 
-**Tested versions:** PostgreSQL 15, 16, 17, 18 (65/65 tests pass on all four, verified locally; CI runs the same matrix)
+**Tested versions:** PostgreSQL 15, 16, 17, 18 (68/68 tests pass on all four,
+verified locally; CI runs the same matrix)
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
 
-**End-to-end verified (manual):** Both capture modes tested with 1 000+ row tables, mass-delete/update disaster scenarios, and full restore — trigger mode: ~58 ms restore, WAL mode: ~82 ms restore, 0 data integrity errors.
+**Legacy smoke evidence:** both capture modes completed limited 1,000+ row
+mass-delete/update scenarios (trigger restore ~58 ms, WAL restore ~82 ms). Those
+runs validate functional paths only; they are not coverage/correctness
+qualification and do not supersede the lifecycle audit's silent-wrong-result
+reproductions.
 
 **Required `postgresql.conf` settings:**
 ```
-wal_level = logical
 shared_preload_libraries = 'pg_flashback'
+
+# WAL mode only:
+wal_level = logical
+
 ```
 
-A restart is required after changing `shared_preload_libraries`.
+A restart is required after changing `shared_preload_libraries` or `wal_level`.
+The qualified WAL-local profile does not depend on `track_commit_timestamp`.
 
 ### Rust Toolchain
 
@@ -172,35 +226,44 @@ cargo pgrx install --no-default-features -F pg17
 
 ## 5. Quick Start
 
+Configure this database in `pg_flashback.target_databases`, restart PostgreSQL,
+and run each statement below in normal psql autocommit mode. Tracking must be
+the first write in a dedicated READ COMMITTED transaction.
+
 ```sql
--- Start tracking a table
-SELECT flashback_track('orders');
+SELECT flashback_track('public.orders');
+
+-- Wait until the worker resolves the initial boundary COMMIT record.
+SELECT * FROM flashback_health();
 
 -- … normal operations happen …
 
 -- Disaster: accidental mass delete
+SELECT clock_timestamp() AS before_delete \gset
 DELETE FROM orders WHERE created_at < '2026-01-01';
 
--- Restore to 30 seconds ago
-SELECT flashback_restore('orders', now() - interval '30 seconds');
--- NOTICE: flashback_restore [orders]: snapshot loaded into shadow from flashback.snap_16384_42
--- NOTICE: flashback_restore [orders]: using batch replay (PK table, no DDL events)
--- NOTICE: flashback_restore [orders]: 847 events → 847 unique PKs
--- NOTICE: flashback_restore [orders]: complete — 847 events applied, duration 00:00:00.182
+-- Once the delete COMMIT has been consumed, resolve the human timestamp to
+-- one proven WAL prefix. Collision/inversion/incomplete evidence is rejected.
+SELECT resolved_lsn AS target_lsn
+FROM flashback_resolve_target(
+    'public.orders', :'before_delete'::timestamptz
+) \gset
 
--- Or use parallel restore hint on large tables
-SELECT * FROM flashback_restore_parallel('orders', now() - interval '30 seconds', 4);
+-- Inspect past state without changing the live table.
+SELECT *
+FROM flashback_query_lsn(
+    'public.orders', :'target_lsn'::pg_lsn, NULL
+) AS t(id bigint, total numeric, status text)
+WHERE total > 100;
 
--- Or query the past WITHOUT restoring
--- filter_clause is a WHERE predicate (not a full query) — SQL injection guard
-SELECT * FROM flashback_query(
-    'orders',
-    now() - interval '30 seconds',
-    'total > 100'   -- WHERE condition only; semicolons and DML keywords are rejected
-) AS t(id int, total numeric, status text);
+-- Or atomically restore the table to that exact COMMIT-LSN prefix.
+SELECT flashback_restore_lsn('public.orders', :'target_lsn'::pg_lsn);
+
+-- The successor is pending until the worker consumes the restore COMMIT.
+SELECT * FROM flashback_health();
 ```
 
-### Large tables: backup profile
+### Backup-helper functional demo
 
 The backup profile avoids the initial table copy and continuous row-delta
 duplication. It records DDL markers while pgBackRest remains responsible for
@@ -228,6 +291,19 @@ scripts/pg_flashback_backup_restore.sh \
 This path has a deliberately narrower first-release support contract. Read
 the [operator runbook](docs/BACKUP_RESTORE_RUNBOOK.md) and
 [supported scope](docs/RELEASE_SCOPE.md) before enabling it.
+The helper/result contract is implemented, but coverage-generation integration
+is still pending; this is not yet an end-to-end release-qualified procedure.
+Release-qualified initial backup tracking must first commit and resolve a
+durable tracking marker, then remain unanchored until a new full backup whose
+start LSN is strictly after that marker activates at its verified stop
+anchor. It cannot adopt a pre-existing or already-running backup.
+After a backup-profile production swap, pg_flashback must create no local row
+snapshot. The adopted protocol records a pending swap transaction/unanchored
+gap, seals the predecessor after resolving the swap commit and deliberately has
+zero active generations. New targets remain rejected until a new completed
+full backup whose start LSN is strictly after that resolved commit is
+verified and activated at its stop boundary. The current finalizer does not
+wire that protocol yet.
 
 ## 6. Configuration (GUCs)
 
@@ -235,19 +311,21 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 
 | GUC | Default | Reload | Description |
 |-----|---------|--------|-------------|
-| `enabled` | `on` | SIGHUP | Global kill switch. `off` stops all capture; worker idles. Superuser only. |
-| `capture_mode` | `auto` | SIGHUP | Capture backend: `auto` (WAL if `wal_level=logical`, else trigger), `wal`, or `trigger`. |
-| `slot_name` | `pg_flashback_<dbname>` | Suset | Logical replication slot name. Defaults to a per-database name (slots are database-specific and slot names cluster-wide unique). Override only for single-database installs. |
+| `enabled` | `on` | SIGHUP | `off` stops capture, but the current runtime does not persist the required coverage break. Do not toggle it while tables are tracked. |
+| `capture_mode` | `auto` | SIGHUP | `auto` selects WAL only when `wal_level=logical`; it never silently downgrades qualified tracking to triggers. Explicit `trigger` is legacy/experimental. Do not change mode while qualified lifecycles are active: synchronous break recording remains a release gate. |
+| `slot_name` | `pg_flashback_<dbname>` | Suset | Per-database logical slot name. Slot loss, replacement, identity change or unexplained external advancement freezes the old epoch, opens a gap and requires re-anchor. |
 | `restore_work_mem` | `256MB` | Suset | `work_mem` override for snapshot bulk load during `flashback_restore`. Higher values speed up large table restores. |
 | `index_build_work_mem` | `512MB` | Suset | `maintenance_work_mem` override for deferred index builds on the shadow table during restore. |
-| `max_row_size` | `64kB` | SIGHUP | Rows larger than this are skipped with a WARNING (TOAST protection). |
+| `max_row_size` | `64kB` | SIGHUP | Legacy trigger-capture limit. The qualified decoder path does not silently skip events through this GUC. |
 | `worker_interval_ms` | `75` | SIGHUP | Background worker flush interval in milliseconds. |
 | `worker_batch_size` | `4096` | SIGHUP | Maximum rows per worker flush cycle. |
 | `target_database` | `postgres` | Restart | Database the background worker connects to (single‑DB mode). Overridden by `target_databases`. |
 | `target_databases` | *(unset)* | Restart | Comma-separated list of databases for multi‑DB mode. Each database gets its own worker. Example: `'app,analytics,audit'`. |
 | `max_workers` | `4` | Restart | Maximum number of background workers registered at startup. Extra workers beyond the database count exit gracefully. |
 
-All GUCs except those marked *Restart* take effect immediately via `SIGHUP` reload.
+All GUCs except those marked *Restart* take effect via `SIGHUP`. Do not toggle
+`enabled` while qualified tables are active: synchronous disable/enable gap
+recording remains a release gate.
 
 ## 7. SQL API Reference
 
@@ -255,39 +333,46 @@ All GUCs except those marked *Restart* take effect immediately via `SIGHUP` relo
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_track(table)` | `boolean` | Start tracking a table. Creates triggers (partition‑aware), base snapshot, and schema version entry. |
-| `flashback_untrack(table)` | `void` | Stop tracking. Removes triggers and cleans up all metadata. |
-| `flashback_track_backup(table, helper_profile)` | `boolean` | Enable metadata-only backup tracking: no row snapshot or DML deltas. Ordinary tables only in the first release. |
-| `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Record the backup/WAL range verified by the external controller. |
+| `flashback_track(table)` | `boolean` | In WAL/auto-logical mode, creates a dedicated lifecycle, verified stream binding and exact locked base. Must be the first write in a dedicated READ COMMITTED transaction and the database must have a configured worker. Explicit trigger mode creates legacy state only. |
+| `flashback_reanchor(table)` | `bigint` | After a broken stream, creates a new exact base on the current WAL epoch. The intervening gap remains permanently rejected. The new generation activates only when its real COMMIT record is consumed. |
+| `flashback_untrack(table)` | `void` | Stop tracking and restore the original replica identity. Retires the lifecycle; retracking allocates a new identity. |
+| `flashback_track_backup(table, helper_profile)` | `boolean` | Enable legacy metadata-only backup tracking: no row snapshot or DML deltas. Ordinary LOGGED, non-partitioned tables only. |
+| `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Record the legacy controller assertion; it does not yet create a verified coverage generation. |
 | `flashback_backup_disaster_points(table [, lookback])` | `SETOF record` | List DDL disaster markers and pre-DDL target LSNs. |
 
 ### Restore
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_restore(table, timestamptz)` | `bigint` | Restore a single table to a past timestamp. Returns number of events applied. |
-| `flashback_restore(tables[], timestamptz)` | `bigint` | Restore multiple tables in FK dependency order within one transaction. |
-| `flashback_restore_parallel(table, timestamptz [, num_workers])` | `TABLE(restored_table text, events_applied bigint)` | Restore with parallel query hints. Default `num_workers = 4`. |
-| `flashback_query(table, timestamptz [, filter_clause])` | `SETOF record` | Query past table state without restoring. `filter_clause` is a `WHERE` predicate (e.g. `'id = 5 AND status = ''active'''`). Runs as **SECURITY INVOKER** (caller's privileges). Semicolons and DML/DDL keywords are rejected to prevent SQL injection. |
+| `flashback_restore_lsn(table, pg_lsn)` | `bigint` | Correctness-qualified single-table restore. Pins one generation, replays one contiguous COMMIT-LSN prefix and creates a pending post-restore successor base. |
+| `flashback_restore_lsn(tables[], pg_lsn)` | `bigint` | Multi-table qualified restore. Acquires stable lifecycle locks in ID order, orders FK parents before children and rejects cycles. |
+| `flashback_resolve_target(table, timestamptz)` | `SETOF record` | Convenience planner returning one `resolved_lsn` only when the timestamp is a unique, complete WAL-prefix cut inside one pinned frontier. Collisions/inversions fail closed. |
+| `flashback_restore(table, timestamptz)` | `bigint` | Legacy compatibility API; explicitly rejects a correctness-qualified WAL lifecycle. Resolve the timestamp and call `flashback_restore_lsn()` instead. |
+| `flashback_restore(tables[], timestamptz)` | `bigint` | Legacy FK-ordered timestamp API; outside the qualified contract. |
+| `flashback_restore_parallel(table, timestamptz [, num_workers])` | `TABLE(restored_table text, events_applied bigint)` | Legacy timestamp restore with parallel-query hints; outside the WAL-first release contract. |
+| `flashback_query_lsn(table, pg_lsn, NULL)` | `SETOF record` | Qualified read-only materialization. Apply filters in the caller's outer query; the SECURITY DEFINER function rejects a non-NULL free-form filter. |
+| `flashback_query(table, timestamptz [, filter_clause])` | `SETOF record` | Legacy compatibility API; rejects correctness-qualified WAL lifecycles. |
 
 ### Recovery
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_recover_deleted(table, timestamptz)` | `bigint` | Non-destructive: re-inserts only rows that existed at `timestamptz` and are missing now. Surviving rows are untouched. Table must have a primary key. Returns count of recovered rows. |
+| `flashback_recover_deleted_lsn(table, pg_lsn)` | `bigint` | Qualified PK-based recovery that inserts only rows missing from the live table. |
+| `flashback_recover_deleted(table, timestamptz)` | `bigint` | Legacy compatibility API; rejects correctness-qualified WAL lifecycles. |
 
 ### Checkpoints & Retention
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_checkpoint(table)` | `bigint` | Create a manual checkpoint (materialised snapshot). Returns snapshot_id. |
-| `flashback_retention_status()` | `SETOF record` | Per‑table delta counts, restorable window, and retention warning flags. |
+| `flashback_checkpoint(table)` | `bigint` | Legacy trigger checkpoint; explicitly rejected for qualified WAL generations. Use controlled `flashback_reanchor()` for a new local boundary. |
+| `flashback_retention_status()` | `SETOF record` | Legacy age/storage status; it is not generation/gap-aware coverage health. |
 
 ### Monitoring & Audit
 
 | Function / View | Description |
 |-----------------|-------------|
 | `flashback.pg_stat_flashback` | Dashboard view: tracked tables, pending events, delta storage, restore counts. |
+| `flashback_health()` | Generation/stream health, watermark, pending boundary and open-gap projection for every active lifecycle. |
 | `flashback_history(table, interval)` | Recent change history for a table. |
 | `flashback.restore_log` | Audit log of all restore operations (who, when, what, success/failure). |
 
@@ -300,6 +385,10 @@ All GUCs except those marked *Restart* take effect immediately via `SIGHUP` relo
 | `flashback_set_restore_in_progress(bool)` | Set restore‑in‑progress flag (internal use; superuser only). |
 
 ## 8. Restore Performance
+
+These numbers are legacy replay microbenchmarks. They measure execution speed
+after a base/event set has been chosen; they do not validate that the chosen
+set is complete, race-free or admissible under the adopted coverage model.
 
 Measured on PostgreSQL 17, single‑node, batch replay path (PK tables):
 
@@ -335,7 +424,14 @@ Measured on PostgreSQL 17, single‑node (median of 3 runs each):
 | Wide table UPDATE (15 cols, 5K rows) | 17 ms | 314 ms (+18×) | **25 ms (+50%)** |
 | pgbench concurrent (8 clients, TPS) | 26 501 | 14 049 (−47%) | **25 873 (−2%)** |
 
-WAL mode carries near-zero foreground write overhead because capture is fully asynchronous — the background worker reads the logical replication slot after the transaction commits. The remaining WAL mode overhead (~2–23%) reflects increased WAL volume from `wal_level=logical` (full column images) and any `synchronous_commit` interaction; it is not paid by the DML transaction itself. Trigger mode overhead scales with row count and column width because row-level triggers execute synchronously inside every DML transaction.
+WAL decoding removes synchronous row-trigger work from the application
+transaction, but it is not zero-overhead. The foreground figures above are
+historical microbenchmarks, not a capacity guarantee. In the current real WAL
+E2E workload, changing the same UPDATE/DELETE table from default replica
+identity to `REPLICA IDENTITY FULL` raised application WAL from about 4.69 MiB
+to 6.79 MiB (1.45×); including worker/delta writes, tracked total WAL was about
+12.6 MiB (2.69× the default-identity application baseline). Measure the real
+row width and update/delete mix before choosing the local profile.
 
 ### Methodology
 
@@ -349,23 +445,28 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 
 ## 10. Features
 
+`✅` below means that the functional code path exists. It does not make a
+recovery API release-qualified; all past-state reads/restores remain subject to
+the generation-admission gates called out explicitly below.
+
 | Feature | Status |
 |---------|--------|
-| Single‑table restore to any timestamp | ✅ |
-| Multi‑table restore in one transaction | ✅ |
-| Flashback Query (`SELECT AS OF`) | ✅ |
+| Single-table restore to a verified generation target | ✅ WAL-local COMMIT-LSN path |
+| Release-qualified local COMMIT-LSN target API | ✅ T-01/A implemented |
+| Multi‑table restore in one transaction | ✅ COMMIT-LSN path |
+| Flashback Query (`SELECT AS OF`) | ✅ COMMIT-LSN path; timestamp API legacy |
 | Schema evolution awareness (ADD / DROP / ALTER COLUMN) | ✅ |
 | DDL capture (TRUNCATE, DROP TABLE, ALTER TABLE, RENAME) | ✅ |
-| Automatic checkpoints for fast restore | ✅ |
-| Configurable retention policy | ✅ |
+| Automatic periodic full checkpoints | ❌ rejected by adopted policy |
+| Generation-aware retention | 🚧 legacy age-based purge is not release-safe |
 | Serial / sequence restoration | ✅ |
 | Trigger & RLS policy preservation during restore | ✅ |
 | Generated column awareness | ✅ |
-| Global kill switch (`pg_flashback.enabled`) | ✅ |
+| Coverage-safe capture disable/enable | 🚧 synchronous `enabled` transition gap remains a release gate |
 | Monitoring view (`pg_stat_flashback`) | ✅ |
 | Restore audit log + progress reporting | ✅ |
-| Large row protection (TOAST guard) | ✅ |
-| Per‑table concurrent restore safety (advisory lock) | ✅ |
+| Large row coverage invalidation | ✅ qualified WAL decoder does not use the legacy trigger size-skip path |
+| Common per-tracking coverage lock | ✅ WAL lifecycle/restore/re-anchor paths |
 | Native JSONB pipeline (zero conversion) | ✅ |
 | Bulk snapshot restore (`INSERT … SELECT`) | ✅ |
 | Composite delta_log indexes for fast scans | ✅ |
@@ -375,12 +476,13 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 | **Batch / net‑effect restore replay** | ✅ |
 | **lz4 compression on delta_log** (where available) | ✅ |
 | **Multi‑database worker** (`target_databases` GUC) | ✅ |
-| **Native partitioned table support** (per‑row triggers) | ✅ |
+| **Partitioned-table path** (per-row triggers) | legacy demo; ❌ first release |
 | **Parallel restore hints** (`flashback_restore_parallel`) | ✅ |
-| **WAL capture mode** (async, near-zero write overhead) | ✅ |
-| **`capture_mode` GUC** (`auto` / `wal` / `trigger`) | ✅ |
+| **WAL capture mode** (async; measured WAL amplification) | ✅ |
+| **Coverage-safe `capture_mode` changes** | 🚧 synchronous break + new epoch before mode switch remains a release gate |
 | **delta_log time‑partitioned** (monthly, auto‑managed) | ✅ |
-| **Slot / memory GUCs** (`slot_name`, `restore_work_mem`, `index_build_work_mem`) | ✅ |
+| **Slot lifecycle changes** (`slot_name`) | ✅ slot loss/replacement/external advancement freeze epoch and open a gap |
+| **Restore/index memory GUCs** | ✅ |
 | **REPLICA IDENTITY preservation** (`FULL` / `DEFAULT` / `USING INDEX` round-trip) | ✅ |
 | **Dependent view/matview recreation** (owner, reloptions, indexes, populate) | ✅ |
 | **Non-destructive row recovery** (`flashback_recover_deleted` — re-inserts only missing rows, survivors untouched) | ✅ |
@@ -388,30 +490,39 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 | **RENAME TABLE auto-tracking** (OID-based; capture trigger recreated transparently) | ✅ |
 | **DROP TABLE recovery** (`flashback_restore` reconstructs a dropped table from delta history) | ✅ |
 | **Classical INHERITS child preservation** (children detached before DROP, re-attached after swap) | ✅ |
-| **Backup-backed large-table recovery** (pgBackRest + private native PITR + validated table swap) | ✅ — constrained first-release scope |
+| **Backup-backed recovery profile** (pgBackRest + private native PITR + validated table swap) | ✅ helper path; coverage integration still gated |
 
 ## 11. Testing & Observability
 
 ### Test Suite
 
-62 integration tests (plus 3 decoder unit tests) covering DML, DDL, schema evolution, multi-table FK, checkpoints, edge cases, flashback query, partitioned tables, diff-only UPDATE, batch replay, RBAC, WAL capture mode, the backup-profile contract, SET SCHEMA tracking, classical INHERITS preservation, and non-destructive row recovery behaviors:
+64 PostgreSQL tests plus 4 decoder unit tests cover DML, DDL, schema
+evolution, multi-table FK, checkpoints, edge cases, query/recovery, RBAC,
+generation/stream contracts, timestamp collision/inversion, frozen frontiers,
+persistent gaps and WAL-mode behavior:
 
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
-cargo pgrx test pg15  # test result: ok. 65 passed; 0 failed
-cargo pgrx test pg16  # test result: ok. 65 passed; 0 failed
-cargo pgrx test pg17  # test result: ok. 65 passed; 0 failed
-cargo pgrx test pg18  # test result: ok. 65 passed; 0 failed
+cargo pgrx test pg15  # test result: ok. 68 passed; 0 failed
+cargo pgrx test pg16  # test result: ok. 68 passed; 0 failed
+cargo pgrx test pg17  # test result: ok. 68 passed; 0 failed
+cargo pgrx test pg18  # test result: ok. 68 passed; 0 failed
 ```
 
 ### Monitoring Queries
+
+The retention function reports legacy age/storage state only; it is not proof
+of recoverability. `flashback_health()` is the coverage view.
 
 ```sql
 -- Dashboard
 SELECT * FROM flashback.pg_stat_flashback;
 
--- Retention health
+-- Qualified generation, stream, watermark and gap health
+SELECT * FROM flashback_health();
+
+-- Legacy retention/storage status (not coverage health)
 SELECT * FROM flashback_retention_status();
 
 -- Recent restores
@@ -435,7 +546,7 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (65 tests each, verified locally on all four; CI runs the same matrix on every push)
+- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (68 tests each, verified locally on all four; CI runs the same matrix on every push)
 - **Security audit**: `cargo audit`
 - **Recovery E2E**: 27 real pgBackRest/native-PITR success and fail-closed checks
 - **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release
@@ -467,9 +578,10 @@ Restore performance benchmark (10K → 1M rows):
 ./scripts/run_restore_benchmark.sh
 ```
 
-### Backup-backed large-database recovery
+### Backup-backed recovery
 
-The large-database path selects a completed pgBackRest full backup, uses an XFS
+This profile is selected when local capacity, change rate, write-stall or RTO
+budgets do not fit. It selects a completed pgBackRest full backup, uses an XFS
 reflink clone when the real capability probe succeeds (or a safe classic
 restore fallback), runs native PostgreSQL LSN recovery, validates/extracts one
 ordinary table and completes a checksum-verified extension shadow swap.
@@ -510,6 +622,9 @@ import/swap:
 
 ### Common Tasks
 
+These commands exercise the WAL-local APIs in a development instance. Resolve
+human time to LSN first; use the returned LSN for every operation.
+
 ```sql
 -- Start tracking
 SELECT flashback_track('public.orders');
@@ -517,31 +632,34 @@ SELECT flashback_track('public.orders');
 -- Check what is being tracked
 SELECT * FROM flashback.tracked_tables WHERE is_active;
 
--- Manual checkpoint before risky migration
-SELECT flashback_checkpoint('public.orders');
-
--- Disable capture temporarily (all tables, all sessions)
-SET pg_flashback.enabled = off;
--- … run migration …
-SET pg_flashback.enabled = on;
+-- Resolve one unique timestamp cut and use its COMMIT LSN
+SELECT resolved_lsn AS target_lsn
+FROM flashback_resolve_target('public.orders', now() - interval '1 hour') \gset
 
 -- Query past state without restoring
-SELECT * FROM flashback_query('orders', now() - interval '1 hour')
+SELECT * FROM flashback_query_lsn(
+    'public.orders', :'target_lsn'::pg_lsn, NULL
+)
     AS t(id int, customer_id int, total numeric, status text);
 
 -- Multi‑table restore (FK‑safe ordering)
-SELECT flashback_restore(
+SELECT flashback_restore_lsn(
     ARRAY['order_items', 'orders', 'customers'],
-    now() - interval '10 minutes'
+    :'target_lsn'::pg_lsn
 );
-
--- Parallel restore for large tables (uses PostgreSQL parallel query internally)
-SELECT * FROM flashback_restore_parallel('orders', now() - interval '30 minutes', 4);
 ```
 
-### Partitioned Tables
+`flashback_checkpoint()` rejects qualified WAL generations. Use
+`flashback_reanchor()` only as a controlled exact boundary. Slot identity
+changes freeze the old epoch and require re-anchor. Do not change
+`capture_mode` or toggle `pg_flashback.enabled` while tracking is active because
+synchronous mode/disable transition gaps remain release gates.
 
-pg_flashback natively supports partitioned tables. `flashback_track` automatically detects partitioned parents and attaches per‑row triggers (instead of the statement‑level transition‑table triggers used for regular tables):
+### Partitioned tables (legacy functional demo)
+
+The implementation can attach per-row triggers to partitioned parents. This is
+useful test evidence, but partitioned targets are not release-qualified; the
+first-release contract is an ordinary LOGGED, non-partitioned table.
 
 ```sql
 CREATE TABLE events (
@@ -561,7 +679,7 @@ SELECT flashback_track('public.events');
 -- Normal DML on any partition is captured
 INSERT INTO events (region, ts, payload) VALUES ('EU', now(), '{}');
 
--- Restore the parent (all partitions restored atomically)
+-- Legacy restore behavior demo; not a first-release-supported target
 SELECT flashback_restore('public.events', now() - interval '5 minutes');
 ```
 
@@ -578,19 +696,26 @@ Each database gets its own background worker process. Extra workers beyond the d
 
 ### Application Integration
 
-No application changes are required. Local-delta restore is a SQL call. The
-backup profile is intentionally operator-driven through the reference
-controller because PostgreSQL extensions do not launch privileged operating-
-system recovery processes.
+Supported local capture is intended not to require DML statement rewrites, but
+it does require PostgreSQL configuration, admission preflight and maintenance.
+The backup profile is operator-driven through the reference controller because
+PostgreSQL extensions do not launch privileged operating-system recovery
+processes.
 
 ## 14. Troubleshooting
 
-### ⚠️ Critical Production Caveats
+### ⚠️ Development and release blockers
 
-These are silent or hard-to-diagnose issues that can surprise you in production. Read before deploying.
+Do not deploy this branch as a correctness-guaranteed recovery system. These
+items explain current behavior and remaining release gates.
 
 **1. WAL slot disk accumulation**
-In WAL mode the replication slot retains WAL segments until the background worker consumes them. If the worker crashes, is disabled (`pg_flashback.enabled = off`), or falls behind on a write-heavy cluster, unread WAL accumulates and **can fill disk**. PostgreSQL will not delete it automatically.
+In WAL mode the replication slot retains WAL segments until the background
+worker consumes them. If the worker crashes, is disabled
+(`pg_flashback.enabled = off`), or falls behind on a write-heavy cluster,
+unread WAL accumulates and **can fill disk**. Disabling also breaks coverage;
+the current runtime does not persist that break. PostgreSQL will not delete
+retained slot WAL automatically.
 
 ```sql
 -- Monitor slot lag
@@ -605,31 +730,46 @@ Set a hard cap in `postgresql.conf` to prevent runaway growth:
 max_slot_wal_keep_size = 10GB   -- adjust to your disk headroom
 ```
 
-**2. `staging_events` is UNLOGGED — crash window in trigger mode**
-In trigger mode, DML captured by triggers writes to `staging_events` (an
-UNLOGGED table). Events not yet flushed to `delta_log` are **lost on a
-PostgreSQL crash or hard reboot**. With an idle worker the nominal window is
-about `worker_interval_ms` (default 75 ms), but the worker runs WAL consumption,
-checkpoint and retention work serially. A slow checkpoint, recovery batch or
-lock wait extends the crash window by that operation's full duration. WAL mode
-has no DML crash window (events are durable in the replication slot at commit
-time); use it when DML durability matters.
+This cap bounds disk exposure by allowing PostgreSQL to invalidate a lagging
+slot. Invalidation is data loss for capture, not automatic recovery. The WAL
+runtime freezes the old stream watermark and opens a persistent gap when the
+missing/replaced/externally advanced slot is observed; restore beyond that
+frontier is rejected until `flashback_reanchor()` establishes a new boundary.
+
+**2. Capture visibility can be delayed by maintenance head-of-line blocking**
+`staging_events` is LOGGED, so committed trigger events survive a PostgreSQL
+crash. However, the current worker serializes WAL consumption, staging flush,
+checkpoint and retention work. A slow checkpoint or lock wait can delay when
+events become visible in `delta_log`, and in WAL mode it can grow slot lag.
+Separating capture drain from maintenance is a release gate.
 
 **3. `flashback_restore` exclusive lock can pause under a long-running query**
 The atomic shadow swap (`DROP original → RENAME shadow`) requires an `AccessExclusiveLock`. If there is a long-running `SELECT`, `VACUUM`, or open transaction on the table at restore time, the lock acquisition will block — and will in turn block all subsequent reads/writes behind it. Always restore during a low-traffic window or set a `lock_timeout` in your session first:
 ```sql
 SET lock_timeout = '5s';
-SELECT flashback_restore('orders', now() - interval '10 minutes');
+SELECT flashback_restore_lsn('orders', '0/8F12340'::pg_lsn);
 ```
 
 **4. `flashback_track()` on a large table is expensive**
-`flashback_track()` takes an immediate full-table snapshot. On a table with millions of rows this is a large `INSERT … SELECT` into `flashback.snapshots` and will hold a `ShareLock` for its duration. For large ordinary tables, use the backup profile when its support contract fits; otherwise run local tracking during off-peak hours.
+`flashback_track()` takes an immediate full-table snapshot. The current local
+path takes the exact-base write lock, but automated capacity/write-stall
+admission is not implemented yet. Do not select a profile from size alone: use
+the backup profile when local headroom, observed change rate, write-stall or
+RTO budgets do not fit.
 
 **5. `wal_level = logical` is cluster-wide**
-Setting `wal_level = logical` affects **all databases** on the cluster — not just the one using pg_flashback. It increases WAL volume by ~20–40% (full column images) and requires a PostgreSQL restart. On managed PostgreSQL services (AWS RDS, Google Cloud SQL, Azure Flexible Server) where `wal_level` cannot be raised, use `capture_mode = 'trigger'` instead. The `auto` default detects this and falls back automatically.
+Setting `wal_level = logical` affects **all databases** on the cluster — not
+just the one using pg_flashback. It increases WAL volume and requires a
+PostgreSQL restart. Trigger mode avoids that requirement but is explicitly
+legacy/experimental and creates no correctness-qualified generation.
 
 **6. Sequence restore can cause PK conflicts after restoring to an older state**
-When `flashback_restore` replays a table to an older timestamp, `max(id)` in the restored data may be lower than the current sequence value. The sequence is rewound to match. This means the **next `INSERT` after restore reuses IDs** that were assigned after the restore point, causing a potential PK conflict if those rows still exist elsewhere (e.g. in a referencing FK table that was not restored). Always restore all FK-related tables together using the array form, or run `flashback_checkpoint()` on all related tables first.
+When `flashback_restore_lsn` replays a table to an older state, `max(id)` in
+the restored data may be lower than the current sequence value. The sequence is
+rewound to match, so the next `INSERT` can reuse IDs still referenced elsewhere.
+The legacy manual checkpoint is not a safe workaround. Related-table recovery
+must be admitted and coordinated as one verified operation, or handled with
+cluster-level recovery.
 
 ---
 
@@ -639,39 +779,58 @@ When `flashback_restore` replays a table to an older timestamp, `max(id)` in the
 |---------|-------------|
 | Extension fails to load | Ensure `shared_preload_libraries = 'pg_flashback'` and restart PostgreSQL. |
 | Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'pg_flashback%';` |
-| Restore returns 0 events | Worker must have flushed staging_events to delta_log. Check `SELECT count(*) FROM flashback.staging_events;` — should be 0 after the worker cycle. In WAL mode, check that the replication slot exists and the worker is running. |
+| Restore/query target rejected or appears stale | Inspect `flashback_health()`, the per-database worker and the logical slot. A pending boundary must resolve before use; a broken stream requires re-anchor. |
 | WAL capture not working | Confirm `wal_level = logical` and replication slot exists: `SELECT slot_name FROM pg_replication_slots;`. Run `flashback_track()` to create the slot. |
 | Slot creation error in `flashback_track` | Occurs when called inside a transaction that already has writes. The call fails closed; retry it in a fresh transaction or create the slot manually as shown in the error HINT. |
-| Triggers not firing on partitioned table | Ensure per‑row triggers are attached: `SELECT * FROM pg_triggers WHERE tgrelid = 'your_table'::regclass;`. Re-run `flashback_track()`. |
-| TOAST / large row warnings | Increase `pg_flashback.max_row_size` or accept that oversized rows are skipped. Note: rows silently skipped at capture time will be missing after restore — check NOTICE output. |
-| UNLOGGED table silently skipped (WAL mode) | UNLOGGED tables do not generate WAL; they are skipped in WAL mode with no error. Switch to `capture_mode = 'trigger'` or use a regular (logged) table. |
-| Restore missing rows after `max_row_size` trim | Any row exceeding `pg_flashback.max_row_size` at capture time is skipped with a WARNING. Raise the GUC before tracking if you have wide JSONB/text columns. |
-| Retention window expired error | `flashback_restore` raises an error when the target timestamp predates the oldest event in `delta_log`. Run `flashback_retention_status()` to see the restorable window. Add checkpoints more frequently to extend effective coverage without growing `delta_log`. |
+| Partitioned-table trigger behavior | This is legacy functional behavior, not a first-release-supported topology. Do not treat re-running `flashback_track()` as release qualification. |
+| TOAST / large row warnings | These come from the legacy trigger path. They are not accepted coverage evidence; use the qualified WAL path or stop/re-anchor before trusting legacy history. |
+| UNLOGGED table skipped in WAL mode | UNLOGGED targets are outside the first-release contract in either capture mode. Use an ordinary LOGGED table; switching to trigger does not make the topology supported. |
+| Restore missing rows after `max_row_size` trim | The table used legacy trigger capture; that path is outside correctness claims. Qualified WAL capture does not use this size-skip GUC. |
+| Retention window expired/error | Legacy age-based retention is not the adopted contract. Do not add automatic checkpoints; generation-aware retention must preserve a complete boundary/replay chain or block cleanup. |
 | Dependent view ACLs not restored | ACL grants on views cannot be restored automatically; a NOTICE lists affected views. Re-grant manually after restore. |
 | Test mutex conflict | Run `rm -rf target/test-pgdata` before `cargo pgrx test`. |
 | Socket connection issues (pgrx dev) | Try: `psql -h ~/.pgrx -p 28817 postgres` |
 
 ## 15. Caveats & Limitations
 
-- **WAL crash window:** In WAL mode, DML events are durable in the replication
-  slot from the moment the transaction commits — no staging crash window. DDL
-  events still flow through `staging_events` (UNLOGGED). Their nominal idle
-  crash window is `worker_interval_ms` (default 75 ms), but serial worker work
-  or lock waits can extend it by the full consume/checkpoint/retention duration.
-- **Trigger crash window:** `staging_events` is UNLOGGED. Events not yet flushed to `delta_log` are lost on a PostgreSQL crash. Use WAL mode for stricter DML durability.
-- **WAL mode requirement:** `wal_level = logical` must be set cluster-wide before enabling WAL capture. `capture_mode = 'auto'` falls back to trigger mode when `wal_level < logical`.
-- **Trigger-mode PITR accuracy — requires `track_commit_timestamp = on`:** In trigger mode, `event_time` is set to `clock_timestamp()` at statement execution inside the trigger, not at transaction commit. A long-running transaction that starts at T₀ and commits at T₁ will have `event_time ≈ T₀`, so `flashback_restore` and `flashback_query` may replay it even when the target timestamp is between T₀ and T₁. To get commit-time-correct PITR in trigger mode, add `track_commit_timestamp = on` to `postgresql.conf` (restart required). The background worker will then use `pg_xact_commit_timestamp()` for both `event_time` and `committed_at`. `flashback_track()` emits a NOTICE when trigger mode is active and `track_commit_timestamp` is off. WAL mode is always commit-time-correct regardless of this setting.
-- **Long-running transaction visibility:** Logical decoding delivers changes in commit order, not statement order. Events from transactions that start before but commit after a target restore timestamp may land in a later partition window. For practical workloads (OLTP, < 1-minute transactions) this is not observable; for long-running batch transactions spanning multiple minutes, committed_at can diverge from event_time by the batch duration.
-- **Large DDL snapshot cost:** TRUNCATE and DROP events inline the full table contents into `delta_log.old_data` as JSONB. On tables > ~100K rows this creates a large ephemeral write. Consider taking a manual `flashback_checkpoint()` before planned large-scale truncations to contain this cost.
-- **Non-PK table restore ceiling:** Row-by-row replay path (tables without a primary key) processes ~50–80K events/s vs ~400–550K events/s on the batch path. Restoring > 500K events on a no-PK table will be noticeably slow. Adding a surrogate PK or using `flashback_checkpoint()` before large operations is strongly recommended.
-- **Partitioned table INSERT/DELETE capture:** Per-row triggers fire on each partition individually. This is correct but carries higher per-row overhead than statement-level bulk triggers on regular tables. For very high-throughput partitioned workloads, prefer WAL mode.
-- **Replication & HA topologies:** pg_flashback is tested on single-node PostgreSQL. On streaming replication standbys the extension is typically not active (no shared_preload_libraries on replicas by default). Logical replication subscribers are not supported as capture sources. pg_flashback should work on Patroni/repmgr primaries; behaviour after failover (slot continuity) has not been tested and manual slot recreation may be required.
-- **pg_upgrade / major version:** Extension data is JSONB and schema-version-tracked. pg_upgrade is supported but requires reinstalling the extension binary for the new major version and re-running `CREATE EXTENSION` or `pg_restore` of the schema.
-- **Backup-profile scope:** The first release supports local POSIX repositories,
-  completed full backups, LSN targets and ordinary logged tables without
-  tablespaces. Rename/schema moves across the target, HA/failover, remote
-  repositories, partitions, incoming foreign-key reconstruction and dependent
-  view reconstruction are rejected or documented as manual work. See
+- **Capture durability and lag:** `staging_events` is LOGGED. WAL DML is durable
+  in its logical slot at commit. Current serial worker maintenance can still
+  delay visibility and increase slot lag; it does not create an UNLOGGED
+  staging crash window.
+- **WAL mode requirement:** `wal_level = logical` must be set cluster-wide.
+  `capture_mode = 'auto'` never falls back to a qualified trigger generation;
+  tracking fails closed when logical WAL is unavailable.
+- **Trigger mode:** explicit trigger capture is retained only for legacy tests
+  and compatibility. Statement timestamps and `track_commit_timestamp` do not
+  provide a proven total order, so trigger history is not admitted by the LSN
+  APIs.
+- **Long-running transactions:** no workload-duration assumption converts
+  statement time into commit time. Targets are accepted only from proven
+  commit-coordinate coverage.
+- **Large DDL snapshot cost:** TRUNCATE and DROP events may inline table contents
+  into `delta_log.old_data`. Do not use an automatic/manual checkpoint as an
+  unpreflighted workaround; choose the backup profile or an explicit exact
+  maintenance boundary when the local budget does not fit.
+- **Non-PK table restore ceiling:** Row-by-row replay is materially slower than
+  the PK batch path. Adding a surrogate PK or choosing the backup profile is
+  preferred; periodic full checkpoints are not the adopted workaround.
+- **Partitioned tables:** Per-row trigger code exists as legacy functional
+  evidence, but partitioned targets are outside the first-release contract in
+  either capture mode. Switching to WAL does not make them supported.
+- **Replication & HA topologies:** HA/failover and logical-subscriber capture
+  are outside the first-release contract. Slot loss/recreation after failover
+  creates a permanent coverage gap and requires an exact local-base re-anchor;
+  manually recreating a slot never resumes old coverage.
+- **pg_upgrade / major version:** Cross-major qualification is not complete.
+  After schema migration, legacy tracking rows are unanchored until an explicit
+  profile-specific generation anchor is established; reinstalling binaries or
+  replaying schema alone does not prove coverage.
+- **Backup-profile scope:** The first release targets local POSIX repositories,
+  completed full backups, LSN targets and ordinary LOGGED, non-partitioned
+  tables without tablespaces. Rename/schema moves across the target,
+  HA/failover, managed services, remote repositories, partitions, incoming
+  foreign-key reconstruction and dependent-view reconstruction are rejected.
+  See
   [RELEASE_SCOPE.md](docs/RELEASE_SCOPE.md).
 - **Backup/expire coordination:** Snapshot-direct reads a completed backup tree
   directly. Every backup/expire job for that repository must use the supplied

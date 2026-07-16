@@ -448,6 +448,7 @@ DECLARE
     v_artifact_schema text;
     v_artifact_table text;
     v_artifact_sha text;
+    v_artifact_oid oid;
 BEGIN
     SELECT * INTO v_request
     FROM flashback.backup_restore_requests
@@ -494,6 +495,17 @@ BEGIN
     THEN
         RAISE EXCEPTION 'flashback_accept_backup_restore: invalid artifact manifest';
     END IF;
+
+    v_artifact_oid := to_regclass(format('%I.%I', v_artifact_schema, v_artifact_table));
+    IF v_artifact_oid IS NULL THEN
+        RAISE EXCEPTION
+            'flashback_accept_backup_restore: imported artifact table %.% does not exist',
+            v_artifact_schema, v_artifact_table;
+    END IF;
+    -- An accepted artifact is extension payload, not an application table.
+    -- Membership prevents a logical dump taken while the request is waiting
+    -- for finalize from exporting a meaningless orphan relation.
+    PERFORM public.flashback_own_payload_table(v_artifact_oid::regclass);
 
     UPDATE flashback.backup_restore_requests
        SET status = 'artifact_ready',
@@ -625,6 +637,10 @@ BEGIN
     END IF;
 
     BEGIN
+        -- The validated artifact is about to become the application's live
+        -- table. Release extension membership in the same transaction before
+        -- the rename; rollback restores membership if finalization fails.
+        PERFORM public.flashback_release_payload_table(v_shadow_oid::regclass);
         PERFORM flashback_set_restore_in_progress(true);
         v_new_oid := flashback_finalize_shadow_swap(
             v_request.schema_name,

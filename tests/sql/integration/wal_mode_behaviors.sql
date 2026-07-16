@@ -1,8 +1,9 @@
 -- Test: WAL capture mode behaviors (harness-testable subset)
 --
--- The pgrx harness runs each test inside ONE write-dirty transaction, and
--- logical slot creation refuses such transactions — so a successful WAL-mode
--- flashback_track() is impossible here BY DESIGN (fail-closed). This file
+-- The pgrx harness runs each test inside ONE write-dirty transaction, while
+-- correctness-qualified WAL tracking requires a dedicated transaction with no
+-- prior write — so a successful WAL-mode flashback_track() is impossible here
+-- BY DESIGN (fail-closed). This file
 -- therefore verifies:
 --   1. flashback_effective_capture_mode() returns 'wal' when wal_level=logical
 --      and capture_mode='auto' (the default).
@@ -75,8 +76,8 @@ BEGIN
     END IF;
 
     -- ----------------------------------------------------------------
-    -- 5. Fail-closed: WAL-mode track must raise when the slot is missing
-    --    and cannot be created inside a write-dirty transaction.
+    -- 5. Fail-closed: WAL-mode track must reject the harness's write-dirty
+    --    transaction before it attempts slot or lifecycle mutation.
     -- ----------------------------------------------------------------
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
 
@@ -95,13 +96,13 @@ BEGIN
         BEGIN
             PERFORM flashback_track('public.it_wal_failclosed');
         EXCEPTION WHEN OTHERS THEN
-            IF SQLERRM NOT LIKE '%replication slot%' THEN
+            IF SQLERRM NOT LIKE '%dedicated transaction%' THEN
                 RAISE;
             END IF;
             v_raised := true;
         END;
         IF NOT v_raised THEN
-            RAISE EXCEPTION 'flashback_track in WAL mode must fail closed when the slot cannot be created';
+            RAISE EXCEPTION 'flashback_track in WAL mode must fail closed outside a dedicated transaction';
         END IF;
         -- Fail-closed means nothing was persisted either
         IF EXISTS (

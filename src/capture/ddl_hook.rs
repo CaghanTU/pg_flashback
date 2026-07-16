@@ -7,6 +7,37 @@ use std::os::raw::c_void;
 
 static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 
+struct SecurityContextGuard {
+    user_id: pg_sys::Oid,
+    security_context: i32,
+}
+
+impl SecurityContextGuard {
+    fn switch_to(user_id: pg_sys::Oid) -> Self {
+        let mut previous_user = pg_sys::InvalidOid;
+        let mut previous_context = 0;
+        unsafe {
+            pg_sys::GetUserIdAndSecContext(&mut previous_user, &mut previous_context);
+            pg_sys::SetUserIdAndSecContext(
+                user_id,
+                previous_context | pg_sys::SECURITY_LOCAL_USERID_CHANGE as i32,
+            );
+        }
+        Self {
+            user_id: previous_user,
+            security_context: previous_context,
+        }
+    }
+}
+
+impl Drop for SecurityContextGuard {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::SetUserIdAndSecContext(self.user_id, self.security_context);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UtilityTarget {
     schema: Option<String>,
@@ -112,8 +143,8 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
-                log!(
-                    "pg_flashback DDL_CAPTURE_ERROR stage=pre event_type={} error={err:?}",
+                error!(
+                    "pg_flashback: DDL capture failed closed before {}: {err}",
                     event_type
                 );
             }
@@ -123,9 +154,7 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
             // before execution; native recovery to a post-ALTER LSN cannot
             // reconstruct the pre-disaster definition.
             if let Err(err) = capture_backup_marker_for_targets("ALTER", &targets) {
-                log!(
-                    "pg_flashback DDL_CAPTURE_ERROR stage=pre-marker event_type=ALTER error={err:?}"
-                );
+                error!("pg_flashback: backup ALTER marker failed closed: {err}");
             }
         }
     }
@@ -160,8 +189,8 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
     {
         if let Some((event_type, targets)) = parse_post_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
-                log!(
-                    "pg_flashback DDL_CAPTURE_ERROR stage=post event_type={} error={err:?}",
+                error!(
+                    "pg_flashback: DDL capture failed closed after {}: {err}",
                     event_type
                 );
             }
@@ -354,6 +383,12 @@ unsafe fn parse_post_utility_targets(
 }
 
 fn capture_ddl_for_targets(event_type: &str, targets: &[UtilityTarget]) -> Result<(), SpiError> {
+    let extension_owner = Spi::get_one::<pg_sys::Oid>(
+        "SELECT extowner FROM pg_extension WHERE extname = 'pg_flashback'",
+    )?
+    .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
+    let _security_context = SecurityContextGuard::switch_to(extension_owner);
+
     for target in targets {
         let schema = target.schema.as_deref().unwrap_or("");
         Spi::run_with_args(
@@ -373,6 +408,12 @@ fn capture_backup_marker_for_targets(
     event_type: &str,
     targets: &[UtilityTarget],
 ) -> Result<(), SpiError> {
+    let extension_owner = Spi::get_one::<pg_sys::Oid>(
+        "SELECT extowner FROM pg_extension WHERE extname = 'pg_flashback'",
+    )?
+    .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
+    let _security_context = SecurityContextGuard::switch_to(extension_owner);
+
     for target in targets {
         let schema = target.schema.as_deref().unwrap_or("");
         Spi::run_with_args(
