@@ -82,7 +82,7 @@ flashback_restore(table, timestamp)
 
 ### PostgreSQL
 
-**Tested versions:** PostgreSQL 15, 16, 17, 18 (64/64 tests pass on all four, verified locally; CI runs the same matrix)  
+**Tested versions:** PostgreSQL 15, 16, 17, 18 (64/64 tests pass on all four, verified locally; CI runs the same matrix)
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
 
 **End-to-end verified (manual):** Both capture modes tested with 1 000+ row tables, mass-delete/update disaster scenarios, and full restore — trigger mode: ~58 ms restore, WAL mode: ~82 ms restore, 0 data integrity errors.
@@ -399,6 +399,23 @@ Restore performance benchmark (10K → 1M rows):
 ./scripts/run_restore_benchmark.sh
 ```
 
+### Experimental large-database recovery
+
+The large-database PoC compares a conventional pgBackRest restore with an XFS
+reflink clone of a plain pgBackRest backup followed by native PostgreSQL PITR.
+It is an experimental recovery engine and is not wired into the extension API
+yet.
+
+- [PoC design and reproduction guide](docs/LARGE_DB_POC.md)
+- [Measured results and architecture decision](docs/LARGE_DB_POC_RESULTS.md)
+- [Machine-readable benchmark summary](docs/benchmarks/large-db-poc-20260716.json)
+
+Run a 500 MiB local comparison:
+
+```bash
+./scripts/run_large_db_restore_poc.sh 500
+```
+
 ## 13. Operations & Integration
 
 ### Common Tasks
@@ -524,7 +541,7 @@ When `flashback_restore` replays a table to an older timestamp, `max(id)` in the
 | Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'pg_flashback%';` |
 | Restore returns 0 events | Worker must have flushed staging_events to delta_log. Check `SELECT count(*) FROM flashback.staging_events;` — should be 0 after the worker cycle. In WAL mode, check that the replication slot exists and the worker is running. |
 | WAL capture not working | Confirm `wal_level = logical` and replication slot exists: `SELECT slot_name FROM pg_replication_slots;`. Run `flashback_track()` to create the slot. |
-| Slot creation error in `flashback_track` | Occurs when called inside a transaction that already has writes. Worker will retry slot creation on its next cycle. |
+| Slot creation error in `flashback_track` | Occurs when called inside a transaction that already has writes. The call fails closed; retry it in a fresh transaction or create the slot manually as shown in the error HINT. |
 | Triggers not firing on partitioned table | Ensure per‑row triggers are attached: `SELECT * FROM pg_triggers WHERE tgrelid = 'your_table'::regclass;`. Re-run `flashback_track()`. |
 | TOAST / large row warnings | Increase `pg_flashback.max_row_size` or accept that oversized rows are skipped. Note: rows silently skipped at capture time will be missing after restore — check NOTICE output. |
 | UNLOGGED table silently skipped (WAL mode) | UNLOGGED tables do not generate WAL; they are skipped in WAL mode with no error. Switch to `capture_mode = 'trigger'` or use a regular (logged) table. |
