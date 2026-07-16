@@ -191,6 +191,10 @@ configured database/worker count (up to eight workers).
 - DDL by a role without flashback metadata privileges failed closed rather than
   silently bypassing capture. This is safe but is an operational restriction:
   tracked-table DDL needs documented privileges.
+- A real concurrent DML/DDL run serialized correctly: `ALTER TABLE` waited
+  2,998 ms on the long UPDATE transaction's relation lock. Restoring to the
+  2.491 ms interval between DML commit and ALTER application returned value
+  `B` with the pre-ALTER schema (the new column was absent), as expected.
 
 ## 4. Policy candidates (decision not yet made)
 
