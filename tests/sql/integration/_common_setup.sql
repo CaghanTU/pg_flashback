@@ -2,6 +2,7 @@ TRUNCATE flashback.delta_log;
 TRUNCATE flashback.snapshots RESTART IDENTITY;
 TRUNCATE flashback.tracked_tables;
 TRUNCATE flashback.schema_versions RESTART IDENTITY;
+TRUNCATE flashback.backup_restore_requests;
 
 CREATE OR REPLACE FUNCTION flashback_test_capture_dml_trigger()
 RETURNS trigger

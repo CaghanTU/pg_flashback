@@ -117,6 +117,16 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
                     event_type
                 );
             }
+        } else if let Some(("ALTER", targets)) = parse_post_utility_targets(pstmt) {
+            // ALTER is normally captured after execution so the new schema can
+            // be versioned. The backup profile additionally needs an LSN from
+            // before execution; native recovery to a post-ALTER LSN cannot
+            // reconstruct the pre-disaster definition.
+            if let Err(err) = capture_backup_marker_for_targets("ALTER", &targets) {
+                log!(
+                    "pg_flashback DDL_CAPTURE_ERROR stage=pre-marker event_type=ALTER error={err:?}"
+                );
+            }
         }
     }
 
@@ -348,6 +358,25 @@ fn capture_ddl_for_targets(event_type: &str, targets: &[UtilityTarget]) -> Resul
         let schema = target.schema.as_deref().unwrap_or("");
         Spi::run_with_args(
             "SELECT public.flashback_capture_ddl_event($1, NULLIF($2, ''), $3)",
+            &[
+                event_type.into(),
+                schema.into(),
+                target.table.as_str().into(),
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn capture_backup_marker_for_targets(
+    event_type: &str,
+    targets: &[UtilityTarget],
+) -> Result<(), SpiError> {
+    for target in targets {
+        let schema = target.schema.as_deref().unwrap_or("");
+        Spi::run_with_args(
+            "SELECT public.flashback_capture_backup_ddl_marker($1, NULLIF($2, ''), $3)",
             &[
                 event_type.into(),
                 schema.into(),

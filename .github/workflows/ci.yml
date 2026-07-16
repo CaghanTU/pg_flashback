@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -18,8 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
 
@@ -37,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev libclang-dev clang
+            build-essential pkg-config libssl-dev libclang-dev clang shellcheck
 
       - name: Install cargo-pgrx
         run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
@@ -49,7 +56,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --no-default-features --features pg17 -- -D warnings
+        run: cargo clippy --locked --no-default-features --features pg17 -- -D warnings
 
       - name: Recovery helper fmt
         run: cargo fmt --manifest-path tools/pg_flashback_recovery/Cargo.toml --all -- --check
@@ -59,6 +66,14 @@ jobs:
 
       - name: Recovery helper tests
         run: cargo test --locked --manifest-path tools/pg_flashback_recovery/Cargo.toml
+
+      - name: Shell syntax and ShellCheck
+        run: |
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+
+      - name: Whitespace check
+        run: git diff --check
 
   test:
     name: Test (PG ${{ matrix.pg }})
@@ -71,8 +86,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
 
       - name: Install system dependencies
         run: |
@@ -118,4 +133,92 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit
-        run: cargo audit
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file tools/pg_flashback_recovery/Cargo.lock
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check dependency licenses and sources
+        run: |
+          cargo deny check licenses sources
+          cargo deny --manifest-path tools/pg_flashback_recovery/Cargo.toml \
+            check licenses sources
+
+  recovery-e2e:
+    name: Recovery E2E (PG17 + pgBackRest 2.53.1)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Install build and XFS dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang curl \
+            meson ninja-build libxml2-dev libpq-dev zlib1g-dev liblz4-dev \
+            libzstd-dev libbz2-dev libyaml-dev libssh2-1-dev xfsprogs jq
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tools/pg_flashback_recovery/target
+          key: ${{ runner.os }}-recovery-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-recovery-e2e-
+
+      - name: Install cargo-pgrx and PostgreSQL 17
+        run: |
+          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          cargo pgrx init --pg17 download
+
+      - name: Build exact pgBackRest qualification version
+        run: |
+          curl -fsSL \
+            https://github.com/pgbackrest/pgbackrest/archive/refs/tags/release/2.53.1.tar.gz \
+            | tar -xz -C /tmp
+          meson setup -Dbuildtype=release /tmp/pgbackrest-build \
+            /tmp/pgbackrest-release-2.53.1
+          ninja -C /tmp/pgbackrest-build src/pgbackrest
+          /tmp/pgbackrest-build/src/pgbackrest version
+
+      - name: Create reflink-capable qualification filesystem
+        run: |
+          sudo truncate -s 6G /tmp/pg-flashback-e2e.xfs
+          sudo mkfs.xfs -f -m reflink=1 /tmp/pg-flashback-e2e.xfs
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /mnt/pg-flashback-e2e
+          sudo mount -o loop /tmp/pg-flashback-e2e.xfs /mnt/pg-flashback-e2e
+          sudo chown "$(id -u):$(id -g)" /mnt/pg-flashback-e2e
+          mkdir -p /mnt/pg-flashback-e2e/work
+
+      - name: Run real backup recovery suite
+        env:
+          PGFB_HELPER_E2E_BASE: /mnt/pg-flashback-e2e/work
+          PGFB_POC_PGBACKREST: /tmp/pgbackrest-build/src/pgbackrest
+        run: |
+          export PGFB_POC_PG_BIN
+          PGFB_POC_PG_BIN="$(dirname "$(cargo pgrx info pg-config 17)")"
+          scripts/run_recovery_helper_e2e.sh
+
+      - name: Upload qualification summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-e2e-summary
+          path: /mnt/pg-flashback-e2e/work/results/*.json
+          if-no-files-found: warn
+
+      - name: Unmount qualification filesystem
+        if: always()
+        run: |
+          sudo umount /mnt/pg-flashback-e2e || true
+          sudo rm -f /tmp/pg-flashback-e2e.xfs

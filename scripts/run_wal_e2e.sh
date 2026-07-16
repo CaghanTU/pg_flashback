@@ -1,4 +1,6 @@
 #!/bin/bash
+# ShellCheck cannot see that cleanup is entered through the EXIT trap.
+# shellcheck disable=SC2317
 # pg_flashback — WAL mode + background worker end-to-end verification.
 #
 # The pgrx test harness runs every test inside ONE transaction, and logical

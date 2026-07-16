@@ -482,6 +482,7 @@ fn flush_staging_to_delta_log() {
                 SELECT 1 FROM flashback.tracked_tables tt
                 WHERE tt.rel_oid = m.rel_oid
                   AND tt.is_active
+                  AND tt.recovery_profile = 'local_delta'
                   AND m.event_time >= tt.tracked_since
             )
             -- event_id assignment must follow capture order: replay's

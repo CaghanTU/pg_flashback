@@ -13,5 +13,6 @@
     "inclusive": true
   },
   "expected_schema_version": 7,
+  "expected_schema_sha256": null,
   "expected_fingerprint": null
 }

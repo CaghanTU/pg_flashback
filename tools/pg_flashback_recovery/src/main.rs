@@ -4,12 +4,15 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use pg_flashback_recovery::error::RecoveryError;
 use pg_flashback_recovery::model::{ErrorResponse, RecoveryConfig, RestoreRequest};
-use pg_flashback_recovery::{build_plan, load_json, restore_table, run_probe};
+use pg_flashback_recovery::{
+    build_plan, load_json, load_recovery_config, restore_table, run_probe,
+};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(name = "pg-flashback-recovery")]
-#[command(about = "Fail-closed planner for backup-backed pg_flashback table recovery")]
+#[command(version)]
+#[command(about = "Backup-backed pg_flashback table recovery helper")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,7 +32,7 @@ enum Commands {
         #[arg(long)]
         request: PathBuf,
     },
-    /// Execute table recovery (disabled until phase-1 safety gates pass).
+    /// Recover, validate and extract one table into a custom-format dump.
     RestoreTable {
         #[arg(long)]
         config: PathBuf,
@@ -57,16 +60,16 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
     match cli.command {
         Commands::Probe { config } => {
-            let config: RecoveryConfig = load_json(&config)?;
+            let config: RecoveryConfig = load_recovery_config(&config)?;
             to_value(run_probe(&config)?)
         }
         Commands::Plan { config, request } => {
-            let config: RecoveryConfig = load_json(&config)?;
+            let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: RestoreRequest = load_json(&request)?;
             to_value(build_plan(&config, &request)?)
         }
         Commands::RestoreTable { config, request } => {
-            let config: RecoveryConfig = load_json(&config)?;
+            let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: RestoreRequest = load_json(&request)?;
             to_value(restore_table(&config, &request)?)
         }

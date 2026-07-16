@@ -538,6 +538,15 @@ BEGIN
         RAISE EXCEPTION 'flashback_track: table % does not exist', target_table;
     END IF;
 
+    IF EXISTS (
+        SELECT 1 FROM flashback.tracked_tables
+        WHERE rel_oid = v_rel_oid
+          AND is_active
+          AND recovery_profile = 'backup'
+    ) THEN
+        RAISE EXCEPTION 'flashback_track: table is already tracked with the backup profile; untrack it first';
+    END IF;
+
     -- The background worker only serves the databases listed in
     -- pg_flashback.target_databases / target_database. If this database is
     -- not covered, captured events are never flushed (trigger mode) nor
@@ -684,13 +693,16 @@ BEGIN
 
     INSERT INTO flashback.tracked_tables (
         rel_oid, schema_name, table_name, base_snapshot_table,
-        schema_version, tracked_since, checkpoint_interval, retention_interval, is_active,
+        schema_version, recovery_profile, helper_profile,
+        coverage_start_lsn, coverage_end_lsn,
+        tracked_since, checkpoint_interval, retention_interval, is_active,
         replica_identity_was, replica_identity_index
     )
     VALUES (
         v_rel_oid, v_schema_name, v_table_name,
         format('flashback.%I', v_snapshot_name),
-        1, now(), interval '15 minutes', interval '7 days', true,
+        1, 'local_delta', NULL, NULL, NULL,
+        now(), interval '15 minutes', interval '7 days', true,
         v_replica_identity_was, v_replica_identity_index
     )
     ON CONFLICT (rel_oid)
@@ -699,6 +711,10 @@ BEGIN
         table_name = EXCLUDED.table_name,
         base_snapshot_table = EXCLUDED.base_snapshot_table,
         schema_version = 1,
+        recovery_profile = 'local_delta',
+        helper_profile = NULL,
+        coverage_start_lsn = NULL,
+        coverage_end_lsn = NULL,
         tracked_since = now(),
         is_active = true,
         replica_identity_was = EXCLUDED.replica_identity_was,
@@ -710,7 +726,8 @@ BEGIN
     DELETE FROM flashback.schema_versions WHERE rel_oid = v_rel_oid;
 
     INSERT INTO flashback.schema_versions (
-        rel_oid, schema_version, applied_at, applied_lsn, columns, primary_key, constraints
+        rel_oid, schema_version, applied_at, applied_lsn, columns, primary_key, constraints,
+        helper_schema_sha256
     )
     SELECT
         v_rel_oid, 1,
@@ -726,7 +743,8 @@ BEGIN
             'triggers', COALESCE(schema_def -> 'triggers', '[]'::jsonb),
             'rls_policies', COALESCE(schema_def -> 'rls_policies', '[]'::jsonb),
             'rls_enabled', COALESCE((schema_def -> 'rls_enabled')::boolean, false)
-        )
+        ),
+        flashback_helper_schema_sha256(v_rel_oid)
     FROM (
         SELECT COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb) AS schema_def
     ) s;
@@ -753,6 +771,7 @@ BEGIN
       INTO v_rel_oid, v_schema_name, v_table_name
     FROM flashback.tracked_tables tt
     WHERE tt.is_active
+      AND tt.recovery_profile = 'local_delta'
       AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
@@ -815,6 +834,7 @@ BEGIN
         SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.checkpoint_interval
         FROM flashback.tracked_tables tt
         WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
     LOOP
         -- Guard: relation may have been dropped without flashback_untrack().
         -- Auto-deactivate stale entries to prevent worker crash loops.
@@ -902,6 +922,7 @@ BEGIN
             SELECT 1 FROM flashback.tracked_tables tt
             WHERE tt.rel_oid = m.rel_oid
               AND tt.is_active
+              AND tt.recovery_profile = 'local_delta'
               AND m.event_time >= tt.tracked_since
         )
         -- event_id assignment must follow capture order: replay's net-effect
@@ -997,6 +1018,10 @@ BEGIN
             SELECT 1 FROM flashback.tracked_tables tt
             WHERE tt.rel_oid = p.rel_oid
               AND tt.is_active
+              AND (
+                  tt.recovery_profile = 'local_delta'
+                  OR p.event_type IN ('TRUNCATE', 'DROP', 'ALTER')
+              )
         )
         ORDER BY p.ord
         RETURNING 1
@@ -1025,7 +1050,8 @@ DECLARE
 BEGIN
     FOR rec IN
         SELECT rel_oid, retention_interval
-        FROM flashback.tracked_tables WHERE is_active
+        FROM flashback.tracked_tables
+        WHERE is_active
     LOOP
         DELETE FROM flashback.delta_log d
         WHERE d.rel_oid = rec.rel_oid
@@ -1061,7 +1087,8 @@ BEGIN
 
     SELECT min(clock_timestamp() - retention_interval)
       INTO v_min_cutoff
-    FROM flashback.tracked_tables WHERE is_active;
+    FROM flashback.tracked_tables
+    WHERE is_active;
 
     IF v_min_cutoff IS NOT NULL AND to_regclass('flashback.delta_log') IS NOT NULL THEN
         FOR v_part IN
@@ -1216,10 +1243,11 @@ DECLARE
     v_schema_name text;
     v_table_name text;
     v_base_snapshot text;
+    v_recovery_profile text;
     snap_rec record;
 BEGIN
-    SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table
-      INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot
+    SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.recovery_profile
+      INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot, v_recovery_profile
     FROM flashback.tracked_tables tt
     WHERE tt.is_active
       AND (
@@ -1235,12 +1263,13 @@ BEGIN
 
     IF v_rel_oid IS NULL THEN RETURN false; END IF;
 
-    -- Only detach triggers in trigger mode (WAL mode has no triggers to detach)
-    IF flashback_effective_capture_mode() = 'trigger' THEN
+    -- The backup profile never changes replica identity or installs DML
+    -- triggers, so only local_delta needs capture teardown.
+    IF v_recovery_profile = 'local_delta' AND flashback_effective_capture_mode() = 'trigger' THEN
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
             PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
         END IF;
-    ELSE
+    ELSIF v_recovery_profile = 'local_delta' THEN
         -- WAL mode: restore the table's original REPLICA IDENTITY.
         -- flashback_track() forced it to FULL; leaving it there permanently
         -- causes write amplification and changes logical decoding behaviour
@@ -1301,6 +1330,56 @@ BEGIN
 END;
 $$;
 
+-- Capture the recovery boundary before ALTER runs. Local-delta tracking keeps
+-- its existing post-ALTER event; backup tracking needs this separate pre-DDL
+-- LSN because physical recovery cannot undo an ALTER that has already replayed.
+CREATE OR REPLACE FUNCTION flashback_capture_backup_ddl_marker(
+    event_type text,
+    input_schema text,
+    input_table text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_target text;
+    v_rel_oid oid;
+    v_tracked record;
+BEGIN
+    IF upper(event_type) <> 'ALTER' THEN
+        RETURN;
+    END IF;
+    v_target := CASE
+        WHEN input_schema IS NULL OR input_schema = '' THEN format('%I', input_table)
+        ELSE format('%I.%I', input_schema, input_table)
+    END;
+    v_rel_oid := flashback_resolve_tracked_backup(v_target);
+    IF v_rel_oid IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT rel_oid, schema_name, table_name, schema_version
+      INTO v_tracked
+    FROM flashback.tracked_tables
+    WHERE rel_oid = v_rel_oid
+      AND is_active
+      AND recovery_profile = 'backup';
+
+    INSERT INTO flashback.delta_log (
+        event_time, event_type, table_name, rel_oid, source_xid,
+        committed_at, lsn, schema_version, old_data, new_data, ddl_info
+    ) VALUES (
+        clock_timestamp(), 'ALTER',
+        format('%I.%I', v_tracked.schema_name, v_tracked.table_name),
+        v_tracked.rel_oid, txid_current()::bigint,
+        clock_timestamp(), pg_current_wal_insert_lsn(), v_tracked.schema_version,
+        NULL, NULL, COALESCE(flashback_collect_schema_def(v_tracked.rel_oid), '{}'::jsonb)
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_capture_ddl_event(
     event_type text,
     input_schema text,
@@ -1326,13 +1405,13 @@ BEGIN
     -- tracked_tables still has the OLD name but same OID.
     -- Try new name first; fall back to OID-based lookup.
     IF input_schema IS NULL OR input_schema = '' THEN
-        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
+        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
           INTO tracked
         FROM flashback.tracked_tables tt
         WHERE tt.table_name = input_table
         ORDER BY tt.is_active DESC, tt.tracked_since DESC LIMIT 1;
     ELSE
-        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
+        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
           INTO tracked
         FROM flashback.tracked_tables tt
         WHERE tt.schema_name = input_schema AND tt.table_name = input_table
@@ -1350,7 +1429,7 @@ BEGIN
                 v_oid := to_regclass(input_table);
             END IF;
             IF v_oid IS NOT NULL THEN
-                SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version
+                SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
                   INTO tracked
                 FROM flashback.tracked_tables tt
                 WHERE tt.rel_oid = v_oid
@@ -1381,8 +1460,10 @@ BEGIN
             tracked.schema_name, tracked.table_name, v_actual_schema, v_actual_table;
 
         -- Recreate triggers with updated table-name argument
-        PERFORM flashback_detach_capture_trigger(v_actual_schema, v_actual_table);
-        PERFORM flashback_attach_capture_trigger(v_actual_schema, v_actual_table);
+        IF tracked.recovery_profile = 'local_delta' THEN
+            PERFORM flashback_detach_capture_trigger(v_actual_schema, v_actual_table);
+            PERFORM flashback_attach_capture_trigger(v_actual_schema, v_actual_table);
+        END IF;
 
         -- Use new name for the rest of this function
         tracked.schema_name := v_actual_schema;
@@ -1390,7 +1471,10 @@ BEGIN
     END IF;
 
     ddl_event_time := clock_timestamp();
-    ddl_event_lsn := pg_current_wal_lsn();
+    -- Use the insertion position, not pg_current_wal_lsn() (the write
+    -- position). The write position may lag and cannot order the pre-DDL
+    -- marker against the catalog WAL generated by ALTER.
+    ddl_event_lsn := pg_current_wal_insert_lsn();
 
     IF upper(event_type) = 'ALTER' THEN
         ddl_info := COALESCE(flashback_collect_schema_def(tracked.rel_oid), '{}'::jsonb);
@@ -1402,7 +1486,7 @@ BEGIN
 
         INSERT INTO flashback.schema_versions (
             rel_oid, schema_version, applied_at, applied_lsn,
-            columns, primary_key, constraints
+            columns, primary_key, constraints, helper_schema_sha256
         )
         SELECT
             tracked.rel_oid, new_version, ddl_event_time, ddl_event_lsn,
@@ -1416,15 +1500,26 @@ BEGIN
                 'triggers', COALESCE(ddl_info -> 'triggers', '[]'::jsonb),
                 'rls_policies', COALESCE(ddl_info -> 'rls_policies', '[]'::jsonb),
                 'rls_enabled', COALESCE((ddl_info -> 'rls_enabled')::boolean, false)
-            );
+            ),
+            flashback_helper_schema_sha256(tracked.rel_oid);
     ELSE
         ddl_info := COALESCE(flashback_collect_schema_def(tracked.rel_oid), '{}'::jsonb);
         new_version := COALESCE(tracked.schema_version, 1);
     END IF;
 
-    DECLARE
-        v_row_count bigint;
-    BEGIN
+    -- Backup ALTER already has a pre-execution disaster marker. The post hook
+    -- is still required to store the new schema version, but a second ALTER
+    -- row here would expose an unsafe post-DDL LSN to operators.
+    IF tracked.recovery_profile = 'backup' AND upper(event_type) = 'ALTER' THEN
+        RETURN;
+    END IF;
+
+    IF tracked.recovery_profile = 'backup' THEN
+        row_snapshot := NULL;
+    ELSE
+        DECLARE
+            v_row_count bigint;
+        BEGIN
         -- Bounded count: stop scanning at 100001 rows so a DDL statement on
         -- a huge table never pays a full-table scan just to decide that the
         -- inline snapshot must be skipped anyway.
@@ -1442,11 +1537,12 @@ BEGIN
                 tracked.schema_name, tracked.table_name
             ) INTO row_snapshot;
         END IF;
-    END;
+        END;
+    END IF;
 
     -- In WAL mode: emit DDL event as a WAL message (same pipeline as DML).
     -- In trigger mode: direct delta_log INSERT (legacy path).
-    IF flashback_effective_capture_mode() = 'wal' THEN
+    IF tracked.recovery_profile = 'local_delta' AND flashback_effective_capture_mode() = 'wal' THEN
         PERFORM pg_logical_emit_message(
             true,   -- transactional: tied to current transaction
             'pg_flashback',
@@ -1464,12 +1560,12 @@ BEGIN
     ELSE
         INSERT INTO flashback.delta_log (
             event_time, event_type, table_name, rel_oid, source_xid,
-            committed_at, schema_version, old_data, new_data, ddl_info
+            committed_at, lsn, schema_version, old_data, new_data, ddl_info
         )
         VALUES (
             ddl_event_time, upper(event_type),
             format('%I.%I', tracked.schema_name, tracked.table_name),
-            tracked.rel_oid, txid_current()::bigint, clock_timestamp(),
+            tracked.rel_oid, txid_current()::bigint, clock_timestamp(), ddl_event_lsn,
             new_version, row_snapshot, NULL, ddl_info
         );
     END IF;

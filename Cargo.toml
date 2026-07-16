@@ -2,6 +2,10 @@
 name = "pg_flashback"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/CaghanTU/pg_flashback"
+description = "Table-level point-in-time recovery for PostgreSQL"
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -21,6 +25,7 @@ pg_test = []
 [dependencies]
 pgrx = "=0.16.1"
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

@@ -1,0 +1,19 @@
+{
+  "run_id": "20260716T091129Z-122553",
+  "status": "ok",
+  "checks_passed": 27,
+  "source": {
+    "commit": "be114d55880a877df062c6f3911574540c7c50e6",
+    "dirty": true,
+    "platform": "Linux aarch64"
+  },
+  "versions": {
+    "postgres": "postgres (PostgreSQL) 17.3",
+    "pgbackrest": "pgBackRest 2.53.1",
+    "helper": "pg-flashback-recovery 0.1.0"
+  },
+  "artifacts": {
+    "snapshot_sha256": "42dd79de2f56739da0737c8cafdd5998fd38f0af023394c3db97997638163c95",
+    "classic_sha256": "c997e8f3f3491767f51766653700b6f96170587950993d35be478535e61510d1"
+  }
+}

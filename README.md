@@ -2,13 +2,18 @@
 
 [![CI](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml/badge.svg)](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml)
 
-Table‑level point‑in‑time restore and time‑travel queries for PostgreSQL.  
-Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 15, 16, 17, and 18.
+Table-level point-in-time recovery and time-travel queries for PostgreSQL.
+Small/medium tables can use local snapshots and row deltas; large tables can
+use a pgBackRest-backed external recovery helper without duplicating all row
+data inside the database. Built with Rust + pgrx 0.16.1 and tested on
+PostgreSQL 15, 16, 17 and 18.
 
 ## 1. Why This Extension?
 
-- Restores any tracked table to any past timestamp — in seconds, not hours.
-- No full‑cluster PITR, no `pg_basebackup`, no manual `pg_dump` surgery.
+- Restores a tracked table to a point inside its verified retention window;
+  runtime depends on the chosen profile, retained WAL and table size.
+- Hides full-cluster PITR and table extraction behind a validated workflow; no
+  manual `pg_dump` surgery against a production cluster.
 - **Dual capture modes:** WAL (async, near-zero overhead) or trigger (no `wal_level` requirement).
 - In WAL mode, DML capture carries essentially zero write overhead — changes are consumed asynchronously by the background worker from the logical replication slot.
 - **Diff‑only UPDATE capture** — stores only PK columns + changed columns per UPDATE, reducing delta storage by up to 40× on wide tables.
@@ -22,6 +27,10 @@ Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 15, 16, 17, and 18.
 - **Multi‑database worker** — single extension install can track tables across multiple databases simultaneously.
 - **Native partitioned table support** — automatically uses per‑row triggers on partitioned tables (PostgreSQL does not support transition tables on partitioned tables).
 - Designed for production: TOAST guard, progress reporting, restore audit log, global kill switch, and monitoring views.
+- **Backup profile for large tables:** no base-table copy and no row-delta
+  duplication; native PostgreSQL PITR runs in a private cluster and returns a
+  validated one-table artifact through snapshot-direct or classic pgBackRest
+  restore.
 
 ## 2. Architecture Overview
 
@@ -37,6 +46,8 @@ Built with Rust + pgrx (v0.16.1). CI-tested on PostgreSQL 15, 16, 17, and 18.
 | `flashback_recover_deleted()` | Non-destructive: re-inserts only rows missing at the current time. Survivors untouched. Requires a PK. |
 | `flashback_restore_parallel()` | Restore with parallel query hints (`max_parallel_workers_per_gather`). Emits per‑partition guidance for partitioned tables. |
 | `flashback_query()` | Reconstructs past state in a temp table and executes arbitrary queries against it. |
+| `pg-flashback-recovery` | External backup-profile executor: pgBackRest selection, private native PITR, validation, extraction and crash-safe cleanup. |
+| Backup restore controller | Verifies the artifact checksum, imports into `flashback_import` and asks the extension to perform the validated transactional swap. |
 
 The extension is transparent to applications. Tables work normally; capture and restore happen behind the scenes.
 
@@ -82,7 +93,7 @@ flashback_restore(table, timestamp)
 
 ### PostgreSQL
 
-**Tested versions:** PostgreSQL 15, 16, 17, 18 (64/64 tests pass on all four, verified locally; CI runs the same matrix)
+**Tested versions:** PostgreSQL 15, 16, 17, 18 (65/65 tests pass on all four, verified locally; CI runs the same matrix)
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
 
 **End-to-end verified (manual):** Both capture modes tested with 1 000+ row tables, mass-delete/update disaster scenarios, and full restore — trigger mode: ~58 ms restore, WAL mode: ~82 ms restore, 0 data integrity errors.
@@ -97,7 +108,7 @@ A restart is required after changing `shared_preload_libraries`.
 
 ### Rust Toolchain
 
-- Rust ≥ 1.70 (stable)
+- Rust ≥ 1.85 (stable; required by the locked dependency set)
 - `cargo-pgrx 0.16.1`
 
 ```bash
@@ -119,6 +130,29 @@ cargo pgrx init --pg17 /path/to/pg_config
 ```bash
 cargo pgrx install --no-default-features -F pg17
 ```
+
+Build the backup recovery helper separately:
+
+```bash
+cargo build --release --locked \
+  --manifest-path tools/pg_flashback_recovery/Cargo.toml
+```
+
+### Install a tagged binary archive
+
+The PostgreSQL-major release archives use a prefix-independent layout. Check
+that `PG_MAJOR` matches the target server, then install the three extension
+files into the directories reported by that server's `pg_config`:
+
+```bash
+test "$(cat PG_MAJOR)" = "$(pg_config --version | awk '{print $2}' | cut -d. -f1)"
+sudo install -m 0755 lib/pg_flashback.so "$(pg_config --pkglibdir)/pg_flashback.so"
+sudo install -m 0644 share/extension/pg_flashback.control \
+  share/extension/pg_flashback--*.sql "$(pg_config --sharedir)/extension/"
+```
+
+Prebuilt release archives target x86_64 Linux. Other Linux architectures can
+build the same tagged source with the commands above.
 
 ### Enable the Extension
 
@@ -166,6 +200,35 @@ SELECT * FROM flashback_query(
 ) AS t(id int, total numeric, status text);
 ```
 
+### Large tables: backup profile
+
+The backup profile avoids the initial table copy and continuous row-delta
+duplication. It records DDL markers while pgBackRest remains responsible for
+physical backups and archived WAL:
+
+```sql
+SELECT flashback_track_backup('public.orders', 'app_repo2');
+
+-- After a DROP/TRUNCATE/ALTER, choose the pre-DDL LSN marker.
+SELECT *
+FROM flashback_backup_disaster_points('public.orders', interval '2 hours');
+```
+
+The operating-system controller then performs native PITR in a private
+cluster, imports one validated artifact and asks the extension to swap it:
+
+```bash
+scripts/pg_flashback_backup_restore.sh \
+  --config /etc/pg_flashback/app_repo2.json \
+  --dbname appdb \
+  --table public.orders \
+  --target-lsn 0/8F12340
+```
+
+This path has a deliberately narrower first-release support contract. Read
+the [operator runbook](docs/BACKUP_RESTORE_RUNBOOK.md) and
+[supported scope](docs/RELEASE_SCOPE.md) before enabling it.
+
 ## 6. Configuration (GUCs)
 
 All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf`, `ALTER SYSTEM`) or per role/database (`ALTER ROLE … SET`).
@@ -194,6 +257,9 @@ All GUCs except those marked *Restart* take effect immediately via `SIGHUP` relo
 |----------|---------|-------------|
 | `flashback_track(table)` | `boolean` | Start tracking a table. Creates triggers (partition‑aware), base snapshot, and schema version entry. |
 | `flashback_untrack(table)` | `void` | Stop tracking. Removes triggers and cleans up all metadata. |
+| `flashback_track_backup(table, helper_profile)` | `boolean` | Enable metadata-only backup tracking: no row snapshot or DML deltas. Ordinary tables only in the first release. |
+| `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Record the backup/WAL range verified by the external controller. |
+| `flashback_backup_disaster_points(table [, lookback])` | `SETOF record` | List DDL disaster markers and pre-DDL target LSNs. |
 
 ### Restore
 
@@ -322,20 +388,21 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 | **RENAME TABLE auto-tracking** (OID-based; capture trigger recreated transparently) | ✅ |
 | **DROP TABLE recovery** (`flashback_restore` reconstructs a dropped table from delta history) | ✅ |
 | **Classical INHERITS child preservation** (children detached before DROP, re-attached after swap) | ✅ |
+| **Backup-backed large-table recovery** (pgBackRest + private native PITR + validated table swap) | ✅ — constrained first-release scope |
 
 ## 11. Testing & Observability
 
 ### Test Suite
 
-61 integration tests (plus 3 decoder unit tests) covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, flashback query, partitioned tables, diff‑only UPDATE, batch replay, RBAC, WAL capture mode, SET SCHEMA tracking, classical INHERITS preservation, and non-destructive row recovery behaviors:
+62 integration tests (plus 3 decoder unit tests) covering DML, DDL, schema evolution, multi-table FK, checkpoints, edge cases, flashback query, partitioned tables, diff-only UPDATE, batch replay, RBAC, WAL capture mode, the backup-profile contract, SET SCHEMA tracking, classical INHERITS preservation, and non-destructive row recovery behaviors:
 
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
-cargo pgrx test pg15  # test result: ok. 64 passed; 0 failed
-cargo pgrx test pg16  # test result: ok. 64 passed; 0 failed
-cargo pgrx test pg17  # test result: ok. 64 passed; 0 failed
-cargo pgrx test pg18  # test result: ok. 64 passed; 0 failed
+cargo pgrx test pg15  # test result: ok. 65 passed; 0 failed
+cargo pgrx test pg16  # test result: ok. 65 passed; 0 failed
+cargo pgrx test pg17  # test result: ok. 65 passed; 0 failed
+cargo pgrx test pg18  # test result: ok. 65 passed; 0 failed
 ```
 
 ### Monitoring Queries
@@ -368,9 +435,10 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (64 tests each, verified locally on all four; CI runs the same matrix on every push)
+- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (65 tests each, verified locally on all four; CI runs the same matrix on every push)
 - **Security audit**: `cargo audit`
-- **Release workflow**: on `v*.*.*` tags, builds and publishes GitHub Releases
+- **Recovery E2E**: 27 real pgBackRest/native-PITR success and fail-closed checks
+- **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release
 
 Local:
 ```bash
@@ -399,17 +467,20 @@ Restore performance benchmark (10K → 1M rows):
 ./scripts/run_restore_benchmark.sh
 ```
 
-### Experimental large-database recovery
+### Backup-backed large-database recovery
 
-The large-database PoC compares a conventional pgBackRest restore with an XFS
-reflink clone of a plain pgBackRest backup followed by native PostgreSQL PITR.
-It is an experimental recovery engine and is not wired into the extension API
-yet.
+The large-database path selects a completed pgBackRest full backup, uses an XFS
+reflink clone when the real capability probe succeeds (or a safe classic
+restore fallback), runs native PostgreSQL LSN recovery, validates/extracts one
+ordinary table and completes a checksum-verified extension shadow swap.
 
 - [PoC design and reproduction guide](docs/LARGE_DB_POC.md)
 - [Measured results and architecture decision](docs/LARGE_DB_POC_RESULTS.md)
 - [Machine-readable benchmark summary](docs/benchmarks/large-db-poc-20260716.json)
+- [Machine-readable recovery qualification](docs/qualification/recovery-e2e-pg17-pgbackrest-2.53.1.json)
 - [External recovery helper contract](docs/RECOVERY_HELPER_DESIGN.md)
+- [Backup restore operator runbook](docs/BACKUP_RESTORE_RUNBOOK.md)
+- [First-release support contract](docs/RELEASE_SCOPE.md)
 
 Run a 500 MiB local comparison:
 
@@ -417,13 +488,22 @@ Run a 500 MiB local comparison:
 ./scripts/run_large_db_restore_poc.sh 500
 ```
 
-The phase-1 helper exposes fail-closed capability probing and backup planning;
-restore execution remains disabled until its lifecycle safety gates have E2E
-coverage:
+Probe the configured repository and snapshot capability before enabling a
+profile:
 
 ```bash
 cargo run --manifest-path tools/pg_flashback_recovery/Cargo.toml -- \
   probe --config tools/pg_flashback_recovery/examples/helper.json
+```
+
+The real E2E suite exercises snapshot-direct, classic fallback, missing WAL,
+old targets, backup/expire races, cancellation, SIGKILL reconciliation,
+timeouts, quota, identity/schema/fingerprint mismatch, artifact corruption and
+controller failure cleanup, the real pre-DROP marker and final extension
+import/swap:
+
+```bash
+./scripts/run_recovery_helper_e2e.sh
 ```
 
 ## 13. Operations & Integration
@@ -498,7 +578,10 @@ Each database gets its own background worker process. Extra workers beyond the d
 
 ### Application Integration
 
-No application changes required. Track tables once; the extension captures changes transparently. Restore is a single SQL call from any PostgreSQL client.
+No application changes are required. Local-delta restore is a SQL call. The
+backup profile is intentionally operator-driven through the reference
+controller because PostgreSQL extensions do not launch privileged operating-
+system recovery processes.
 
 ## 14. Troubleshooting
 
@@ -533,7 +616,7 @@ SELECT flashback_restore('orders', now() - interval '10 minutes');
 ```
 
 **4. `flashback_track()` on a large table is expensive**
-`flashback_track()` takes an immediate full-table snapshot. On a table with millions of rows this is a large `INSERT … SELECT` into `flashback.snapshots` and will hold a `ShareLock` for its duration. For large tables, run it during off-peak hours or use `pg_flashback.restore_work_mem` to speed up the snapshot.
+`flashback_track()` takes an immediate full-table snapshot. On a table with millions of rows this is a large `INSERT … SELECT` into `flashback.snapshots` and will hold a `ShareLock` for its duration. For large ordinary tables, use the backup profile when its support contract fits; otherwise run local tracking during off-peak hours.
 
 **5. `wal_level = logical` is cluster-wide**
 Setting `wal_level = logical` affects **all databases** on the cluster — not just the one using pg_flashback. It increases WAL volume by ~20–40% (full column images) and requires a PostgreSQL restart. On managed PostgreSQL services (AWS RDS, Google Cloud SQL, Azure Flexible Server) where `wal_level` cannot be raised, use `capture_mode = 'trigger'` instead. The `auto` default detects this and falls back automatically.
@@ -573,3 +656,19 @@ When `flashback_restore` replays a table to an older timestamp, `max(id)` in the
 - **Partitioned table INSERT/DELETE capture:** Per-row triggers fire on each partition individually. This is correct but carries higher per-row overhead than statement-level bulk triggers on regular tables. For very high-throughput partitioned workloads, prefer WAL mode.
 - **Replication & HA topologies:** pg_flashback is tested on single-node PostgreSQL. On streaming replication standbys the extension is typically not active (no shared_preload_libraries on replicas by default). Logical replication subscribers are not supported as capture sources. pg_flashback should work on Patroni/repmgr primaries; behaviour after failover (slot continuity) has not been tested and manual slot recreation may be required.
 - **pg_upgrade / major version:** Extension data is JSONB and schema-version-tracked. pg_upgrade is supported but requires reinstalling the extension binary for the new major version and re-running `CREATE EXTENSION` or `pg_restore` of the schema.
+- **Backup-profile scope:** The first release supports local POSIX repositories,
+  completed full backups, LSN targets and ordinary logged tables without
+  tablespaces. Rename/schema moves across the target, HA/failover, remote
+  repositories, partitions, incoming foreign-key reconstruction and dependent
+  view reconstruction are rejected or documented as manual work. See
+  [RELEASE_SCOPE.md](docs/RELEASE_SCOPE.md).
+- **Backup/expire coordination:** Snapshot-direct reads a completed backup tree
+  directly. Every backup/expire job for that repository must use the supplied
+  exclusive lock wrapper; otherwise the helper refuses to claim race safety.
+
+## 16. License
+
+pg_flashback is released under the [MIT License](LICENSE). pgBackRest remains
+an external MIT-licensed program; its source is neither embedded nor linked.
+Rust dependency and external-tool notices are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

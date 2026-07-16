@@ -9,6 +9,7 @@ SIZE_MB="${1:-64}"
 TARGET_PERCENT="${PGFB_POC_TARGET_PERCENT:-20}"
 CHURN_PERCENT="${PGFB_POC_CHURN_PERCENT:-0}"
 KEEP="${PGFB_POC_KEEP:-0}"
+EXTENSION_ENABLED="${PGFB_POC_EXTENSION:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,9 +45,6 @@ PG_CTL="$PG_BIN/pg_ctl"
 PSQL="$PG_BIN/psql"
 PG_DUMP="$PG_BIN/pg_dump"
 
-PRIMARY_STARTED=0
-CLASSIC_STARTED=0
-SNAPSHOT_STARTED=0
 RUN_COMPLETE=0
 
 log() {
@@ -199,13 +197,26 @@ write_result() {
     jq -n \
         --arg run_id "$RUN_ID" \
         --arg status "ok" \
-        --arg pg_version "$($PG_BIN/postgres --version)" \
+        --arg pg_version "$("$PG_BIN/postgres" --version)" \
         --arg pgbackrest_version "$($PGBACKREST version)" \
         --arg backup_label "$BACKUP_LABEL" \
         --arg target_time "$TARGET_TIME" \
+        --arg target_lsn "$TARGET_LSN" \
+        --arg alter_marker_lsn "$ALTER_MARKER_LSN" \
+        --arg alter_applied_lsn "$ALTER_APPLIED_LSN" \
+        --arg drop_marker_lsn "$DROP_MARKER_LSN" \
+        --arg after_drop_lsn "$AFTER_DROP_LSN" \
+        --arg target_rel_oid "$TARGET_REL_OID" \
+        --arg helper_fingerprint "$HELPER_FINGERPRINT" \
+        --arg quoted_table_rel_oid "$QUOTED_TABLE_REL_OID" \
+        --arg quoted_table_fingerprint "$QUOTED_TABLE_FINGERPRINT" \
         --arg expected_fingerprint "$EXPECTED_FINGERPRINT" \
         --arg classic_fingerprint "$CLASSIC_FINGERPRINT" \
         --arg snapshot_fingerprint "$SNAPSHOT_FINGERPRINT" \
+        --argjson extension_enabled "$EXTENSION_ENABLED" \
+        --argjson extension_alter_request "$EXTENSION_ALTER_REQUEST" \
+        --argjson extension_target_request "$EXTENSION_TARGET_REQUEST" \
+        --argjson extension_quoted_request "$EXTENSION_QUOTED_REQUEST" \
         --argjson requested_size_mb "$SIZE_MB" \
         --argjson target_percent "$TARGET_PERCENT" \
         --argjson churn_percent "$CHURN_PERCENT" \
@@ -242,12 +253,31 @@ write_result() {
             backup: {
                 label: $backup_label,
                 target_time: $target_time,
+                target_lsn: $target_lsn,
+                alter_marker_lsn: $alter_marker_lsn,
+                alter_applied_lsn: $alter_applied_lsn,
+                drop_marker_lsn: $drop_marker_lsn,
+                after_drop_lsn: $after_drop_lsn,
+                target_rel_oid: ($target_rel_oid | tonumber),
+                quoted_table_rel_oid: ($quoted_table_rel_oid | tonumber),
                 duration_ms: $backup_ms,
                 repository_bytes_after_backup: $backup_repo_bytes,
                 repository_bytes_after_wal: $final_repo_bytes
             },
             dataset: {database_bytes: $database_bytes, target_table_bytes: $target_table_bytes},
-            correctness: {expected: $expected_fingerprint, classic: $classic_fingerprint, snapshot: $snapshot_fingerprint},
+            correctness: {
+                expected: $expected_fingerprint,
+                helper_fingerprint: $helper_fingerprint,
+                quoted_table_fingerprint: $quoted_table_fingerprint,
+                classic: $classic_fingerprint,
+                snapshot: $snapshot_fingerprint
+            },
+            extension: {
+                enabled: ($extension_enabled == 1),
+                alter_request: $extension_alter_request,
+                target_request: $extension_target_request,
+                quoted_request: $extension_quoted_request
+            },
             classic: {
                 restore_ms: $classic_restore_ms,
                 recovery_ms: $classic_recovery_ms,
@@ -277,6 +307,8 @@ write_result() {
 (( TARGET_PERCENT >= 1 && TARGET_PERCENT <= 90 )) || die "target percent must be between 1 and 90"
 [[ "$CHURN_PERCENT" =~ ^[0-9]+$ ]] || die "churn percent must be an integer"
 (( CHURN_PERCENT >= 0 && CHURN_PERCENT <= 100 )) || die "churn percent must be between 0 and 100"
+[[ "$EXTENSION_ENABLED" == "0" || "$EXTENSION_ENABLED" == "1" ]] \
+    || die "PGFB_POC_EXTENSION must be 0 or 1"
 
 require_executable "$INITDB"
 require_executable "$PG_CTL"
@@ -311,6 +343,13 @@ max_wal_size = '2GB'
 log_min_messages = warning
 EOF
 
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    cat >> "$PRIMARY_DIR/postgresql.conf" <<EOF
+shared_preload_libraries = 'pg_flashback'
+pg_flashback.capture_mode = 'trigger'
+EOF
+fi
+
 cat > "$PGBACKREST_CONFIG" <<EOF
 [global]
 repo1-path=$REPO_DIR
@@ -336,11 +375,10 @@ EOF
 log "starting isolated primary with archiving disabled during data load"
 "$PG_CTL" -D "$PRIMARY_DIR" -l "$LOG_DIR/primary.log" \
     -o "-c archive_mode=off" start -w -t 60 > /dev/null
-PRIMARY_STARTED=1
 
 "$PSQL" -X -v ON_ERROR_STOP=1 -qAt -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d postgres \
     -c "CREATE DATABASE $DB_NAME;"
-primary_sql "CREATE TABLE target_table(id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL); CREATE TABLE noise_table(id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL);" > /dev/null
+primary_sql "CREATE ROLE pgfb_poc_owner NOLOGIN; CREATE ROLE pgfb_poc_reader NOLOGIN; CREATE TABLE target_table(id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL); ALTER TABLE target_table OWNER TO pgfb_poc_owner; GRANT SELECT ON target_table TO pgfb_poc_reader; CREATE TABLE noise_table(id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL); CREATE SCHEMA \"odd schema\"; CREATE TABLE \"odd schema\".\"we\"\"ird\"(id integer PRIMARY KEY, note text NOT NULL); INSERT INTO \"odd schema\".\"we\"\"ird\" VALUES (1, 'quoted'), (2, 'identifier');" > /dev/null
 
 TOTAL_ROWS=$(( SIZE_MB * 1024 * 1024 / 1000 ))
 TARGET_ROWS=$(( TOTAL_ROWS * TARGET_PERCENT / 100 ))
@@ -354,16 +392,18 @@ primary_sql "VACUUM (ANALYZE) target_table;" > /dev/null
 primary_sql "VACUUM (ANALYZE) noise_table;" > /dev/null
 primary_sql "CHECKPOINT;" > /dev/null
 
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    primary_sql "CREATE EXTENSION pg_flashback; SELECT flashback_track_backup('public.target_table', 'e2e_snapshot'); SELECT flashback_track_backup('\"odd schema\".\"we\"\"ird\"', 'e2e_snapshot');" > /dev/null
+fi
+
 DATABASE_BYTES=$(primary_sql "SELECT pg_database_size(current_database());")
 TARGET_TABLE_BYTES=$(primary_sql "SELECT pg_total_relation_size('public.target_table');")
 log "actual database=$(numfmt --to=iec-i --suffix=B "$DATABASE_BYTES") target_table=$(numfmt --to=iec-i --suffix=B "$TARGET_TABLE_BYTES")"
 
 stop_cluster "$PRIMARY_DIR"
-PRIMARY_STARTED=0
 
 log "restarting primary with WAL archiving enabled"
 "$PG_CTL" -D "$PRIMARY_DIR" -l "$LOG_DIR/primary.log" start -w -t 60 > /dev/null
-PRIMARY_STARTED=1
 pgbr stanza-create
 pgbr check
 
@@ -373,6 +413,7 @@ pgbr backup --type=full
 t1=$(now_ns)
 BACKUP_MS=$(elapsed_ms "$t0" "$t1")
 BACKUP_LABEL=$(pgbr info --output=json | jq -r '.[0].backup | sort_by(.timestamp.stop) | last.label')
+BACKUP_STOP_LSN=$(pgbr info --output=json | jq -r '.[0].backup | sort_by(.timestamp.stop) | last.lsn.stop')
 [[ -n "$BACKUP_LABEL" && "$BACKUP_LABEL" != "null" ]] || die "could not determine backup label"
 
 BACKUP_DATA_DIR="$REPO_DIR/backup/$STANZA/$BACKUP_LABEL/pg_data"
@@ -386,19 +427,53 @@ if (( CHURN_ROWS > 0 )); then
     log "generating unrelated post-backup WAL by updating $CHURN_ROWS noise rows"
     churn_noise_rows "$CHURN_ROWS"
 fi
+ALTER_MARKER_LSN=""
+ALTER_APPLIED_LSN=""
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    primary_sql "ALTER TABLE target_table ADD COLUMN recovery_note text NOT NULL DEFAULT 'base';" > /dev/null
+    ALTER_MARKER_LSN=$(primary_sql "SELECT target_lsn FROM flashback_backup_disaster_points('public.target_table', interval '1 hour') WHERE event_type = 'ALTER' ORDER BY event_time DESC LIMIT 1;")
+    ALTER_APPLIED_LSN=$(primary_sql "SELECT applied_lsn FROM flashback.schema_versions WHERE rel_oid = 'public.target_table'::regclass AND schema_version = 2;")
+    [[ -n "$ALTER_MARKER_LSN" && -n "$ALTER_APPLIED_LSN" ]] \
+        || die "ALTER did not produce both pre-DDL marker and post-DDL schema LSN"
+    [[ "$(primary_sql "SELECT '$ALTER_MARKER_LSN'::pg_lsn < '$ALTER_APPLIED_LSN'::pg_lsn;")" == "t" ]] \
+        || die "ALTER disaster marker is not before the applied schema LSN"
+fi
 UPDATE_LIMIT=$TARGET_ROWS
 (( UPDATE_LIMIT > 1000 )) && UPDATE_LIMIT=1000
 primary_sql "UPDATE target_table SET marker='updated', payload=decode(repeat(md5(random()::text || id::text), 57), 'hex') WHERE id <= $UPDATE_LIMIT;" > /dev/null
 primary_sql "INSERT INTO target_table(marker, payload) VALUES ('sentinel', decode(repeat(md5(random()::text), 57), 'hex'));" > /dev/null
 TARGET_TIME=$(primary_sql "SELECT clock_timestamp();")
+TARGET_LSN=$(primary_sql "SELECT pg_current_wal_insert_lsn();")
+TARGET_REL_OID=$(primary_sql "SELECT 'public.target_table'::regclass::oid;")
+QUOTED_TABLE_REL_OID=$(primary_sql "SELECT '\"odd schema\".\"we\"\"ird\"'::regclass::oid;")
 EXPECTED_FINGERPRINT=$(primary_fingerprint)
+HELPER_FINGERPRINT=$(primary_sql "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM public.target_table AS t;")
+QUOTED_TABLE_FINGERPRINT=$(primary_sql "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM \"odd schema\".\"we\"\"ird\" AS t;")
+EXTENSION_TARGET_REQUEST=null
+EXTENSION_QUOTED_REQUEST=null
+EXTENSION_ALTER_REQUEST=null
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    primary_sql "SELECT flashback_set_backup_coverage('public.target_table', '$BACKUP_STOP_LSN'::pg_lsn, '$TARGET_LSN'::pg_lsn); SELECT flashback_set_backup_coverage('\"odd schema\".\"we\"\"ird\"', '$BACKUP_STOP_LSN'::pg_lsn, '$TARGET_LSN'::pg_lsn);" > /dev/null
+fi
 sleep 2
-primary_sql "DROP TABLE target_table; SELECT pg_switch_wal();" > /dev/null
+primary_sql "DROP TABLE target_table;" > /dev/null
+DROP_MARKER_LSN="$TARGET_LSN"
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    DROP_MARKER_LSN=$(primary_sql "SELECT target_lsn FROM flashback_backup_disaster_points('public.target_table', interval '1 hour') WHERE event_type = 'DROP' ORDER BY event_time DESC LIMIT 1;")
+    [[ -n "$DROP_MARKER_LSN" ]] || die "DROP marker did not expose an LSN"
+fi
+AFTER_DROP_LSN=$(primary_sql "SELECT pg_current_wal_insert_lsn();")
+primary_sql "SELECT pg_switch_wal();" > /dev/null
 sleep 3
 pgbr check
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    primary_sql "SELECT flashback_set_backup_coverage('public.target_table', '$BACKUP_STOP_LSN'::pg_lsn, '$AFTER_DROP_LSN'::pg_lsn); SELECT flashback_set_backup_coverage('\"odd schema\".\"we\"\"ird\"', '$BACKUP_STOP_LSN'::pg_lsn, '$AFTER_DROP_LSN'::pg_lsn);" > /dev/null
+    EXTENSION_TARGET_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
+    EXTENSION_QUOTED_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('\"odd schema\".\"we\"\"ird\"', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
+    EXTENSION_ALTER_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$ALTER_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
+fi
 
 stop_cluster "$PRIMARY_DIR"
-PRIMARY_STARTED=0
 FINAL_REPO_BYTES=$(dir_apparent_bytes "$REPO_DIR")
 
 log "classic path: full pgBackRest restore"
@@ -415,7 +490,6 @@ CLASSIC_ALLOCATED_BYTES=$((classic_fs_after_restore - classic_fs_before))
 
 t0=$(now_ns)
 start_recovery_cluster "$CLASSIC_DIR" "$CLASSIC_PORT" "$LOG_DIR/classic.log"
-CLASSIC_STARTED=1
 wait_for_promotion "$CLASSIC_PORT" "classic restore"
 t1=$(now_ns)
 CLASSIC_RECOVERY_MS=$(elapsed_ms "$t0" "$t1")
@@ -436,7 +510,6 @@ CLASSIC_EXTRACT_MS=$(elapsed_ms "$t0" "$t1")
 CLASSIC_DUMP_BYTES=$(stat -c %s "$DUMP_DIR/classic.dump")
 CLASSIC_TOTAL_RTO_MS=$((CLASSIC_RESTORE_MS + CLASSIC_RECOVERY_MS + CLASSIC_EXTRACT_MS))
 stop_cluster "$CLASSIC_DIR"
-CLASSIC_STARTED=0
 
 log "snapshot path: XFS reflink clone of repository backup"
 snapshot_fs_before=$(fs_used_bytes)
@@ -460,7 +533,6 @@ SNAPSHOT_CLONE_ALLOCATED_BYTES=$((snapshot_fs_after_clone - snapshot_fs_before))
 
 t0=$(now_ns)
 start_recovery_cluster "$SNAPSHOT_DIR" "$SNAPSHOT_PORT" "$LOG_DIR/snapshot.log"
-SNAPSHOT_STARTED=1
 wait_for_promotion "$SNAPSHOT_PORT" "snapshot-direct restore"
 t1=$(now_ns)
 SNAPSHOT_RECOVERY_MS=$(elapsed_ms "$t0" "$t1")

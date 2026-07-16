@@ -4,8 +4,6 @@
 /tools/pg_flashback_recovery/target/
 *.iml
 **/*.rs.bk
-Cargo.lock
-!/tools/pg_flashback_recovery/Cargo.lock
 tests/pg_regress/results
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out

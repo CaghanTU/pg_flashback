@@ -129,14 +129,63 @@ BEGIN
             rel_oid              OID PRIMARY KEY,
             schema_name          TEXT NOT NULL,
             table_name           TEXT NOT NULL,
-            base_snapshot_table  TEXT NOT NULL,
+            base_snapshot_table  TEXT,
             schema_version       BIGINT NOT NULL DEFAULT 1,
+            recovery_profile     TEXT NOT NULL DEFAULT ''local_delta'',
+            helper_profile       TEXT,
+            coverage_start_lsn   PG_LSN,
+            coverage_end_lsn     PG_LSN,
             tracked_since        TIMESTAMPTZ NOT NULL DEFAULT now(),
             checkpoint_interval  INTERVAL NOT NULL DEFAULT interval ''15 minutes'',
             retention_interval   INTERVAL NOT NULL DEFAULT interval ''7 days'',
             is_active            BOOLEAN NOT NULL DEFAULT true,
             UNIQUE(schema_name, table_name)
         )';
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    ALTER TABLE flashback.tracked_tables ALTER COLUMN base_snapshot_table DROP NOT NULL;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'recovery_profile'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables
+            ADD COLUMN recovery_profile TEXT NOT NULL DEFAULT 'local_delta';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'helper_profile'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables ADD COLUMN helper_profile TEXT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'coverage_start_lsn'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables ADD COLUMN coverage_start_lsn PG_LSN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'tracked_tables'
+          AND column_name = 'coverage_end_lsn'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables ADD COLUMN coverage_end_lsn PG_LSN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.tracked_tables'::regclass
+          AND conname = 'tracked_tables_recovery_profile_check'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables
+            ADD CONSTRAINT tracked_tables_recovery_profile_check
+            CHECK (recovery_profile IN ('local_delta', 'backup'));
     END IF;
 END
 $$;
@@ -240,11 +289,63 @@ BEGIN
             columns         JSONB NOT NULL,
             primary_key     JSONB NOT NULL DEFAULT ''[]''::jsonb,
             constraints     JSONB NOT NULL DEFAULT ''{}''::jsonb,
+            helper_schema_sha256 TEXT,
             UNIQUE(rel_oid, schema_version)
         )';
     END IF;
 END
 $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'schema_versions'
+          AND column_name = 'helper_schema_sha256'
+    ) THEN
+        ALTER TABLE flashback.schema_versions ADD COLUMN helper_schema_sha256 TEXT;
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'flashback_import') THEN
+        EXECUTE 'CREATE SCHEMA flashback_import';
+    END IF;
+    IF to_regclass('flashback.backup_restore_request_seq') IS NULL THEN
+        EXECUTE 'CREATE SEQUENCE flashback.backup_restore_request_seq';
+    END IF;
+    IF to_regclass('flashback.backup_restore_requests') IS NULL THEN
+        EXECUTE 'CREATE TABLE flashback.backup_restore_requests (
+            request_id              TEXT PRIMARY KEY,
+            rel_oid                 OID NOT NULL,
+            schema_name             TEXT NOT NULL,
+            table_name              TEXT NOT NULL,
+            target_lsn              PG_LSN NOT NULL,
+            expected_schema_version BIGINT NOT NULL,
+            expected_schema_sha256  TEXT,
+            helper_profile          TEXT NOT NULL,
+            request_json            JSONB NOT NULL,
+            status                  TEXT NOT NULL DEFAULT ''pending'',
+            result_json             JSONB,
+            artifact_schema         TEXT,
+            artifact_table          TEXT,
+            artifact_sha256         TEXT,
+            requested_by            NAME NOT NULL DEFAULT current_user,
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            updated_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            completed_at            TIMESTAMPTZ,
+            error_message           TEXT,
+            CONSTRAINT backup_restore_status_check
+                CHECK (status IN (''pending'', ''running'', ''artifact_ready'', ''completed'', ''failed'', ''cancelled''))
+        )';
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS backup_restore_requests_status_created_idx
+    ON flashback.backup_restore_requests (status, created_at);
 
 DO $$
 BEGIN

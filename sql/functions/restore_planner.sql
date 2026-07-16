@@ -56,7 +56,8 @@ BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
         INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE (
+    WHERE tt.recovery_profile = 'local_delta'
+      AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
@@ -668,7 +669,8 @@ BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE (
+    WHERE tt.recovery_profile = 'local_delta'
+      AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
@@ -995,6 +997,7 @@ BEGIN
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
     WHERE tt.is_active
+      AND tt.recovery_profile = 'local_delta'
       AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table

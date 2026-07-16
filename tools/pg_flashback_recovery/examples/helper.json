@@ -8,7 +8,12 @@
   "repository_key": 1,
   "stanza": "app_flashback",
   "work_root": "/var/lib/pg_flashback/recovery",
+  "socket_root": "/run/pg_flashback",
+  "recovery_port": 28919,
+  "recovery_user": "postgres",
   "snapshot_provider": "xfs_reflink",
   "expire_lock_path": "/run/lock/pg_flashback/app_flashback.lock",
-  "max_work_bytes": 536870912000
+  "max_work_bytes": 536870912000,
+  "command_timeout_seconds": 3600,
+  "recovery_timeout_seconds": 3600
 }

@@ -299,6 +299,10 @@ mod tests {
         it_trigger_pipeline_restore,
         "../tests/sql/integration/trigger_pipeline_restore.sql"
     );
+    sql_test!(
+        it_backup_profile_contract,
+        "../tests/sql/integration/backup_profile_contract.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -132,7 +132,7 @@ the same stanza avoids creating a second WAL archive pipeline. A separate
 stanza is only appropriate when a tested dual archive-push wrapper provides
 clear partial-failure semantics.
 
-The phase-1 helper planner already fails with `target_before_oldest_backup`
+The helper planner fails with `target_before_oldest_backup`
 when no completed full backup precedes the requested LSN; it never silently
 chooses an invalid base.
 

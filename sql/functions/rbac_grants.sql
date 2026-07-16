@@ -8,6 +8,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
         EXECUTE 'CREATE ROLE flashback_admin NOLOGIN';
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_recovery_agent') THEN
+        EXECUTE 'CREATE ROLE flashback_recovery_agent NOLOGIN';
+    END IF;
 END
 $$;
 
@@ -23,6 +26,14 @@ REVOKE ALL ON FUNCTION flashback_flush_staging(integer)               FROM PUBLI
 REVOKE ALL ON FUNCTION flashback_consume_wal(integer)                 FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_set_restore_in_progress(bool)        FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_apply_retention()                    FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_track_backup(text, text)             FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_set_backup_coverage(text, pg_lsn, pg_lsn) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_backup_disaster_points(text, interval) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_prepare_backup_restore(text, pg_lsn) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_claim_backup_restore(text)           FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_accept_backup_restore(text, jsonb)   FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_finalize_backup_restore(text)        FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_fail_backup_restore(text, text, boolean) FROM PUBLIC;
 
 -- Internal helper functions: revoke from PUBLIC and flashback_admin
 -- These are called internally by restore functions only.
@@ -34,6 +45,10 @@ REVOKE ALL ON FUNCTION flashback_jsonb_concat(jsonb, jsonb)               FROM P
 REVOKE ALL ON FUNCTION flashback_collect_schema_def(oid)                  FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_helper_schema_contract(oid)          FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_helper_schema_sha256(oid)            FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_resolve_tracked_backup(text)         FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_sha256(text)                          FROM PUBLIC;
 -- Per-row partition trigger functions are internal
 REVOKE ALL ON FUNCTION flashback_capture_insert_row_trigger()             FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_capture_delete_row_trigger()             FROM PUBLIC;
@@ -48,6 +63,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO flashback_admin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
     GRANT USAGE, SELECT ON SEQUENCES TO flashback_admin;
+REVOKE ALL ON SCHEMA flashback_import FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_admin;
+GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_recovery_agent;
 
 -- Public API (for flashback_admin only)
 GRANT EXECUTE ON FUNCTION flashback_track(text)                       TO flashback_admin;
@@ -66,6 +84,16 @@ GRANT EXECUTE ON FUNCTION flashback_query(text, timestamptz, text)    TO flashba
 GRANT EXECUTE ON FUNCTION flashback_history(text, interval)           TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_retention_status()                TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)       TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_track_backup(text, text)          TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_set_backup_coverage(text, pg_lsn, pg_lsn) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_backup_disaster_points(text, interval) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_prepare_backup_restore(text, pg_lsn) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_finalize_backup_restore(text)     TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_fail_backup_restore(text, text, boolean) TO flashback_admin;
+
+GRANT EXECUTE ON FUNCTION flashback_claim_backup_restore(text)        TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_accept_backup_restore(text, jsonb) TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_fail_backup_restore(text, text, boolean) TO flashback_recovery_agent;
 
 -- NOTE: Internal helpers (build_predicate, build_insert_parts,
 -- collect_schema_def, recreate_table_from_ddl, finalize_shadow_swap)
@@ -78,6 +106,7 @@ GRANT SELECT ON flashback.pg_stat_flashback TO pg_monitor;
 GRANT SELECT ON flashback.pg_stat_flashback_tables TO pg_monitor;
 GRANT SELECT ON flashback.restore_log TO pg_monitor;
 GRANT SELECT ON flashback.tracked_tables TO pg_monitor;
+GRANT SELECT ON flashback.backup_restore_requests TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_history(text, interval)        TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)    TO pg_monitor;
@@ -117,6 +146,10 @@ COMMENT ON FUNCTION flashback_flush_staging(integer)
     IS 'Manually flush staging_events to delta_log. Normally done by the background worker. Useful when the worker is not running (e.g. testing or recovery). Returns number of events promoted.';
 COMMENT ON FUNCTION flashback_consume_wal(integer)
     IS 'Consume decoded changes from this database''s logical replication slot into delta_log, stamped with real commit time and LSN. Normally called by the background worker. Returns number of events inserted.';
+COMMENT ON FUNCTION flashback_backup_disaster_points(text, interval)
+    IS 'List backup-profile DDL markers and safe pre-DDL target LSNs for operator-selected recovery.';
+COMMENT ON FUNCTION flashback_capture_backup_ddl_marker(text, text, text)
+    IS 'Internal ProcessUtility hook entry point that records a backup-profile pre-ALTER recovery LSN.';
 COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)
     IS 'Record a DDL event (ALTER/DROP/TRUNCATE) with a full schema snapshot into delta_log.';
 COMMENT ON FUNCTION flashback_collect_schema_def(oid)

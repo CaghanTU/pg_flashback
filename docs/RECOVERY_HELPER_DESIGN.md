@@ -1,68 +1,67 @@
-# External recovery helper design
+# Backup-backed recovery architecture
 
-- Status: phase-1 contract and planning skeleton
-- Scope: backup-backed table recovery for large databases
+Status: implemented first-release contract (result format 3)
 
-## Decision
+The backup profile is the large-database path. It does not copy the tracked
+table into extension-owned snapshots and it does not duplicate row changes in
+`delta_log`. PostgreSQL physical recovery reconstructs the database; the
+helper extracts only the requested table; the extension validates and swaps
+that table into production.
 
-Large-table recovery runs outside the PostgreSQL backend. The extension owns
-policy and the final table swap; a least-privileged helper owns temporary
-cluster materialization, native PostgreSQL recovery and table extraction.
-
-The helper is a second binary in this repository, not a second product or a
-fork of pgBackRest. It never implements WAL redo itself.
+This is not a fork or reimplementation of pgBackRest. pgBackRest remains an
+external executable and owns backup, archive and classic restore semantics.
 
 ```mermaid
 sequenceDiagram
-    participant U as Operator/API
+    participant O as Operator/controller
     participant E as pg_flashback extension
     participant H as Recovery helper
-    participant B as Plain pgBackRest stanza
+    participant R as pgBackRest repository
     participant T as Temporary PostgreSQL
 
-    U->>E: restore table at target
-    E->>E: authorize, resolve table and target
-    E->>H: immutable JSON request
-    H->>B: probe and select eligible backup
-    H->>B: pin/coordinate, then CoW clone or classic restore
-    H->>T: native PITR (LSN/time/xid)
-    H->>T: validate and extract target table
-    H-->>E: result manifest + artifact
-    E->>E: load shadow, validate, controlled swap
-    E-->>U: audit result
+    O->>E: prepare + claim immutable request
+    O->>H: restore-table(config, request)
+    H->>R: select and revalidate full backup under shared lock
+    H->>R: reflink clone or classic restore
+    H->>T: native LSN PITR
+    H->>T: verify OID, schema, rows, owner and ACL
+    H-->>O: custom dump + result manifest + SHA-256
+    O->>E: import into flashback_import
+    O->>E: accept manifest + finalize
+    E->>E: verify imported schema/rows; transactional swap
 ```
 
-## Tracking profiles
+## Recovery profiles
 
-The profiles must remain explicit because they make different storage and RTO
-promises.
-
-| Profile | Base/checkpoint tables | Row DML delta | DDL metadata | Recovery source |
-|---|---|---|---|---|
-| `local_delta` | yes | yes | yes | existing in-database replay |
+| Profile | Row snapshots | Row deltas | DDL markers | Recovery source |
+|---|---:|---:|---:|---|
+| `local_delta` | yes | yes | yes | in-database snapshot + replay |
 | `backup` | no | no | yes | physical backup + archived WAL |
-| `hybrid` (future) | no | selected/short-window | yes | helper, with optional local acceleration |
 
-The `backup` profile deliberately does **not** keep complete row deltas. Native
-physical recovery already replays those changes; duplicating every row image in
-`delta_log` would recreate the write and storage cost this profile is meant to
-avoid. It records schema history, DDL/disaster markers, recovery coverage and
-audit metadata only.
+`flashback_track(text)` selects `local_delta`. The explicit
+`flashback_track_backup(text, text)` API selects `backup` and binds the table to
+an operator-owned helper profile.
 
-The existing one-argument `flashback_track(text)` remains `local_delta` for
-backward compatibility. A later SQL migration should add an explicit overload
-or dedicated API for the backup profile. That migration also needs to make
-`tracked_tables.base_snapshot_table` nullable and add at least:
+## Trust boundary
 
-- `recovery_profile` (`local_delta` or `backup`);
-- approved helper profile/stanza name and repository key;
-- first covered backup time/LSN;
-- latest verified archive time/LSN;
-- last capability-probe result and timestamp.
+The extension never starts an operating-system process. The helper never
+connects to or mutates production. The reference controller is the narrow
+bridge: it invokes the helper, checks the artifact digest, imports into the
+restricted `flashback_import` schema and asks the extension to finalize.
 
-## Command surface
+The recovery service role is trusted. It can claim requests, submit manifests
+and create import tables, but it cannot call the internal swap primitive
+directly. The finalizer independently verifies all of the following:
 
-The initial CLI is `pg-flashback-recovery`.
+- immutable request equality and configured helper profile;
+- result format, completion and cleanup flags;
+- deterministic import table name;
+- recovered and imported structural schema hashes;
+- recovered and imported row fingerprints;
+- original table OID, including same-name replacement detection;
+- recovered owner, grantee role existence and table privilege types.
+
+## Helper commands
 
 ```text
 pg-flashback-recovery probe --config helper.json
@@ -70,212 +69,95 @@ pg-flashback-recovery plan --config helper.json --request request.json
 pg-flashback-recovery restore-table --config helper.json --request request.json
 ```
 
-- `probe` performs non-destructive binary/repository checks, ensures the work
-  root and coordination lock can be opened, and runs a disposable CoW clone
-  test under `work_root`.
-- `plan` does not create or start a PostgreSQL cluster. Its capability probe
-  may create the configured work-root/lock paths. It selects the newest
-  eligible full backup at or before the target and returns the chosen engine
-  and exact phases as JSON.
-- `restore-table` is present but fails closed in the phase-1 skeleton. It must
-  not execute until pinning, quotas, cancellation and crash cleanup are covered
-  by end-to-end tests.
+Successful output is JSON on stdout. Failures are JSON on stderr with a stable
+`code`. Requests never contain executable paths, repository credentials or
+arbitrary pgBackRest options; those are available only in the operator-owned
+configuration.
 
-All successful output is JSON on stdout. Structured errors are JSON on stderr
-and carry a stable error code. Secrets are never accepted in the request and
-must remain in the pgBackRest configuration/credential provider.
+## Planning and execution
 
-## Configuration contract
+1. Validate absolute, non-overlapping, non-symlink configuration roots.
+2. Probe the exact pgBackRest and PostgreSQL tools and perform a real reflink
+   test when snapshot-direct is requested.
+3. Read `pgbackrest info --output=json` and select the newest completed full
+   backup whose stop LSN is not later than the target.
+4. Acquire the request lock and bind the request ID immutably to both request
+   JSON and helper profile.
+5. Acquire the single-execution work-root lock and reconcile any abandoned
+   process group, PostgreSQL cluster or socket from a previous crash.
+6. Acquire the shared external repository lock, re-read the backup catalog and
+   confirm the selected label still exists.
+7. Materialize a private cluster using either an XFS reflink clone or a normal
+   `pgbackrest restore` fallback.
+8. Keep the repository lock through promotion so archived WAL cannot be
+   expired while recovery still needs it.
+9. Start the matching PostgreSQL 15–18 binaries on a private mode-0700 Unix
+   socket, with network listeners and preload libraries disabled and
+   `data_directory` forced to the private clone.
+10. Recover to the exact LSN, verify the original relation OID and ordinary
+    table kind, calculate structural SHA-256 and a generic row fingerprint,
+    and read target-time owner/ACL metadata.
+11. Move the table inside the temporary cluster to the deterministic
+    `flashback_import.r_<request hash>` name and create a custom-format dump.
+12. Stop PostgreSQL, remove pgdata/socket data, fsync the durable result and
+    return only after cleanup is complete.
 
-Configuration is operator-owned and maps a logical helper profile to one
-approved stanza **and repository key**. A restore request cannot supply
-executable paths, repository paths, ports or arbitrary pgBackRest options.
+The artifact remains below `work_root/<request_id>/target-table.dump` so an
+identical retry can return the checksum-verified cached result. A different
+request or profile using the same ID fails with `request_conflict`.
 
-```json
-{
-  "profile": "flashback_plain",
-  "pgbackrest_bin": "/usr/local/bin/pgbackrest",
-  "pgbackrest_config": "/etc/pgbackrest/pgbackrest-flashback.conf",
-  "pg_bin_dir": "/usr/local/pgsql-17/bin",
-  "cp_bin": "/usr/bin/cp",
-  "repository_path": "/var/lib/pgbackrest-flashback",
-  "repository_key": 1,
-  "stanza": "app_flashback",
-  "work_root": "/var/lib/pg_flashback/recovery",
-  "snapshot_provider": "xfs_reflink",
-  "expire_lock_path": "/run/lock/pg_flashback/app_flashback.lock",
-  "max_work_bytes": 536870912000
-}
-```
+## Crash and cancellation model
 
-The fast path currently supports a local POSIX repository whose chosen backup
-contains a directly readable `pg_data` tree. Snapshot eligibility is proved
-from the backup tree and an actual `cp --reflink=always` test; it is never
-inferred only from filesystem type.
+Every child command runs in its own process group. `SIGINT`, `SIGTERM` and
+command timeouts terminate the group, stop temporary PostgreSQL and remove
+materialized data. Before spawning a child, the helper durably records its
+process group and Linux `/proc` start ticks; this prevents PID-reuse mistakes
+during crash reconciliation. A hard-killed helper is reconciled by the next
+execution under the global lock.
 
-## Restore request contract
+State/result writes use fsync plus atomic rename. Work, socket and contract
+directories are mode 0700; files are mode 0600; symlink runtime paths and
+parent traversal are rejected.
 
-The extension/controller creates the request. The helper validates every field
-and derives all working/output paths from `request_id` and `work_root`.
+## Repository coordination
 
-```json
-{
-  "request_id": "fb-20260716-000001",
-  "database": "appdb",
-  "table": {"schema": "public", "name": "orders", "rel_oid": 16384},
-  "target": {
-    "kind": "lsn",
-    "value": "0/16B6C50",
-    "observed_at_unix_seconds": 1784180000,
-    "inclusive": true
-  },
-  "expected_schema_version": 7,
-  "expected_fingerprint": null
-}
-```
+pgBackRest's own locks do not cover a direct filesystem clone. Scheduled
+`backup` and `expire` operations for the recovery repository must therefore
+take the exclusive side of `expire_lock_path`. The helper takes the shared
+side. `scripts/pgbackrest_with_flashback_lock.sh` is the reference wrapper.
 
-`target.kind` is one of:
+The same-stanza deployment is preferred: keep the normal long-retention
+repository, and add a local short-retention repository key configured without
+compression, bundle or block storage for snapshot-direct. Classic restore is
+the safe fallback when the selected full backup is not a directly startable
+plain tree.
 
-- `lsn`: precise known point; normally sourced from commit-LSN metadata;
-- `time`: operator-selected wall-clock target;
-- `xid`: DDL disaster transaction, normally with `inclusive=false` to stop
-  before the DROP/TRUNCATE transaction commits.
+## Result contract (format 3)
 
-The first skeleton plans LSN targets. Time/XID execution remains in the
-contract so the implementation cannot accidentally force DROP recovery through
-an imprecise “one millisecond earlier” convention.
+The result includes the immutable request, profile, engine, selected backup,
+tool versions, row count, structural hashes, row fingerprint, target-time
+owner/ACL, deterministic artifact identity and SHA-256, phase durations and
+`cleanup_complete=true`.
 
-## Planning rules
+Result format changes are explicit. The extension currently requires format
+3 or newer; the helper only reuses cached results from its exact current
+format and version.
 
-1. Reject an invalid request, non-absolute operator path, missing binary, busy
-   repository or unhealthy stanza.
-2. Read `pgbackrest info --output=json` using a fixed argument vector.
-3. For phase 1, consider completed **full** backups only. Differential and
-   incremental closure is an explicit later gate.
-4. Select the newest backup whose stop LSN is not later than the target LSN.
-5. If none exists, return `target_before_oldest_backup`; never silently select
-   the oldest backup.
-6. Prefer `snapshot_direct` only when a direct backup tree, CoW probe and expire
-   coordination are all valid; otherwise plan `classic_restore`.
-7. Re-check the selected label and repository lock after acquiring execution
-   coordination. Planning alone never reserves a backup.
+## Deliberate first-release limits
 
-## Backup/expire coordination
+- LSN targets and completed full backups only.
+- Local POSIX repositories; snapshot-direct requires an actual XFS reflink
+  probe and a plain directly startable backup tree.
+- Ordinary tables only; no partitions, foreign tables, materialized views,
+  unlogged tables, tablespaces or symlinked relation storage.
+- The schema/name and OID at the target must match the tracked identity.
+  RENAME or SET SCHEMA across the recovery point is not supported yet.
+- When a table was dropped, objects owned by other relations—such as incoming
+  foreign keys and dependent views—are not present in a table-only dump and
+  are not recreated by the backup profile. Recover related objects manually
+  or use cluster PITR.
+- Time/XID targets, differential/incremental closure and remote/object-store
+  snapshot-direct are future work.
 
-pgBackRest serializes `backup` and `expire` with its internal backup lock, but
-the helper's direct filesystem clone is not a pgBackRest command and therefore
-does not automatically participate in that lock.
-
-For production, the dedicated flashback stanza must route scheduled backup and
-expire commands through an operator wrapper that takes an exclusive `flock` on
-`expire_lock_path`. The helper executor takes a shared lock from selection
-through creation of its private pinned/CoW tree. A lock-status check before the
-operation is useful but is not an atomic replacement for this coordination.
-
-Backup annotations are audit metadata, not retention pins. Until an atomic pin
-mechanism is implemented and tested, snapshot execution fails closed when the
-external lock contract is not configured.
-
-After the shared lock is held, the executor will:
-
-1. re-read `pgbackrest info` and confirm the selected label still exists;
-2. create a private reflink tree under the request work directory;
-3. verify required manifest/control files;
-4. release the shared repository lock only after the private tree is complete.
-
-An expire after this point may remove repository names, but it cannot remove
-the private CoW extents needed by the running recovery.
-
-## Separate plain recovery repository
-
-The fast path must not force an organization to replace its normal compressed,
-encrypted or object-store backup policy. The deployment pattern is:
-
-- normal pgBackRest repository: long retention and disaster recovery;
-- an additional repository key in the **same stanza**: local, short-retention,
-  plain backup sets on snapshot-capable storage;
-- backup jobs scheduled independently per repository, with the flashback-tier
-  backup command using no compression, bundling or block incremental storage;
-- WAL retention that keeps continuous coverage for every advertised flashback
-  target in the selected recovery repository.
-
-pgBackRest repository options such as hardlink, bundle and block are keyed by
-repository, while backup compression can be set on the flashback-tier backup
-invocation. Keeping the same stanza also avoids inventing a second archive
-pipeline for the same PostgreSQL cluster.
-
-If operational constraints require a separate stanza, the deployment must add
-and test a dual archive-push wrapper, including partial failure and backpressure
-semantics. A second stanza is therefore a supported future topology, not the
-default recommendation.
-
-This additional repository is an acceleration tier, not the only backup. Its
-capacity and retention are part of the product contract and monitoring surface.
-
-## Execution lifecycle and cleanup
-
-Each request owns one directory and one state manifest. State transitions are
-append/fsync/rename durable:
-
-```text
-accepted -> planned -> materializing -> recovering -> extracting
-         -> validating -> ready_for_import -> completed
-                                      \-> failed -> cleaning -> cleaned
-```
-
-Required guarantees:
-
-- request IDs are idempotency keys;
-- all child processes run without a shell and in their own process group;
-- cancellation terminates the process group, then stops temporary PostgreSQL;
-- ports/socket directories are allocated per request;
-- cleanup is retryable and only removes paths below the configured work root;
-- startup reconciliation cleans abandoned non-terminal requests;
-- byte, runtime and concurrency quotas are checked before materialization and
-  while WAL replay grows the clone;
-- no artifact is returned until fingerprint/schema validation succeeds.
-
-## Extraction and import
-
-The correctness baseline remains `pg_dump` custom format. The next optimization
-benchmark should compare:
-
-1. custom-format `pg_dump`/`pg_restore`;
-2. parallel directory-format dump/restore;
-3. binary `COPY` streamed from the temporary table into an extension-created
-   production shadow table.
-
-Binary COPY is promising because extraction dominates low-WAL RTO, but it must
-not become the default before generated columns, TOAST, user-defined types,
-partitioning, row security, cross-version behavior and cancellation are covered
-by tests. Relation-level WAL filtering remains out of scope.
-
-## Result contract
-
-The executor returns a result manifest containing:
-
-- request/profile IDs and selected engine;
-- selected backup label and target kind/value;
-- PostgreSQL and pgBackRest versions;
-- recovered database/table identity and schema version;
-- row count/fingerprint and artifact checksum;
-- materialize, WAL recovery, extraction and total durations;
-- allocated bytes and peak work-directory bytes;
-- cleanup status and structured warnings.
-
-The extension must revalidate the manifest before loading the shadow table. The
-helper never performs the final production DROP/RENAME itself.
-
-## Delivery gates
-
-The executor can be enabled only after tests cover:
-
-- full, differential and incremental backup closure;
-- concurrent backup and expire races;
-- target older than all backups and missing WAL;
-- tablespaces and symlink escape prevention;
-- encrypted/remote repository fallback;
-- PostgreSQL major binary and extension/shared-library matching;
-- quota exhaustion during replay;
-- SIGINT/SIGTERM/kill recovery and restart reconciliation;
-- large import, constraints and minimal-lock final swap.
+The authoritative operator procedure and recovery steps are in
+[`BACKUP_RESTORE_RUNBOOK.md`](BACKUP_RESTORE_RUNBOOK.md).

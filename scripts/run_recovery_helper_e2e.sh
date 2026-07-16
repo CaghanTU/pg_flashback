@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# Exercise the real pgBackRest -> native PostgreSQL PITR -> table extraction
+# path. The test uses isolated clusters/repository/socket paths and proves both
+# success and fail-closed cleanup behavior.
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+KEEP="${PGFB_HELPER_E2E_KEEP:-0}"
+INSTALL_EXTENSION="${PGFB_HELPER_E2E_INSTALL_EXTENSION:-1}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+E2E_BASE="${PGFB_HELPER_E2E_BASE:-$REPO_ROOT/target/recovery-helper-e2e}"
+POC_BASE="$E2E_BASE/poc-$RUN_ID"
+RESULT_DIR="$E2E_BASE/results"
+SUMMARY_JSON="$RESULT_DIR/$RUN_ID.json"
+POC_OUTPUT="$POC_BASE/poc-output.log"
+
+PG_BIN="${PGFB_POC_PG_BIN:-/usr/local/pgsql-17/bin}"
+PGBACKREST="${PGFB_POC_PGBACKREST:-/usr/local/bin/pgbackrest}"
+PORT_BASE=$((30000 + ($$ % 20000)))
+PRIMARY_PORT="$PORT_BASE"
+CLASSIC_PORT=$((PORT_BASE + 1))
+SNAPSHOT_PORT=$((PORT_BASE + 2))
+HELPER_PORT=$((PORT_BASE + 3))
+VERIFY_PORT=$((PORT_BASE + 4))
+SOCKET_ROOT="/tmp/pgfb-he2e-$$"
+VERIFY_SOCKET="/tmp/pgfb-hv2e-$$"
+
+HELPER_MANIFEST="$REPO_ROOT/tools/pg_flashback_recovery/Cargo.toml"
+HELPER="$REPO_ROOT/tools/pg_flashback_recovery/target/debug/pg-flashback-recovery"
+PG_CTL="$PG_BIN/pg_ctl"
+PSQL="$PG_BIN/psql"
+PG_RESTORE="$PG_BIN/pg_restore"
+
+RUN_ROOT=""
+WORK_ROOT=""
+EXPIRE_LOCK=""
+PRIMARY_STARTED=0
+ACTIVE_HELPER_PID=""
+RUN_COMPLETE=0
+PASSED=0
+
+log() {
+    printf '[recovery-helper-e2e] %s %s\n' "$(date +%H:%M:%S)" "$*"
+}
+
+die() {
+    log "FAIL: $*"
+    exit 1
+}
+
+require_executable() {
+    [[ -x "$1" ]] || die "required executable not found: $1"
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    set +e
+    if [[ -n "$ACTIVE_HELPER_PID" ]]; then
+        kill -TERM "$ACTIVE_HELPER_PID" > /dev/null 2>&1 || true
+        wait "$ACTIVE_HELPER_PID" > /dev/null 2>&1 || true
+    fi
+    if [[ "$PRIMARY_STARTED" == "1" && -n "$RUN_ROOT" ]]; then
+        "$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null 2>&1 || true
+    fi
+    rm -rf -- "$SOCKET_ROOT" "$VERIFY_SOCKET"
+    if [[ "$RUN_COMPLETE" == "1" && "$KEEP" != "1" ]]; then
+        rm -rf -- "$POC_BASE"
+        log "bulky E2E data removed; summary kept at $SUMMARY_JSON"
+    elif [[ "$KEEP" == "1" || "$rc" != "0" ]]; then
+        log "E2E artifacts kept at $POC_BASE"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+pass() {
+    PASSED=$((PASSED + 1))
+    log "PASS[$PASSED]: $1"
+}
+
+write_config() {
+    local path="$1"
+    local profile="$2"
+    local provider="$3"
+    local port="$4"
+    local cp_bin="$5"
+    local command_timeout="$6"
+    local recovery_timeout="$7"
+    local max_work_bytes="$8"
+    jq -n \
+        --arg profile "$profile" \
+        --arg pgbackrest "$PGBACKREST" \
+        --arg pgbackrest_config "$RUN_ROOT/pgbackrest.conf" \
+        --arg pg_bin_dir "$PG_BIN" \
+        --arg cp_bin "$cp_bin" \
+        --arg repository_path "$RUN_ROOT/repo" \
+        --arg stanza "large_db_poc" \
+        --arg work_root "$WORK_ROOT" \
+        --arg socket_root "$SOCKET_ROOT" \
+        --arg recovery_user "$(id -un)" \
+        --arg provider "$provider" \
+        --arg expire_lock "$EXPIRE_LOCK" \
+        --argjson port "$port" \
+        --argjson command_timeout "$command_timeout" \
+        --argjson recovery_timeout "$recovery_timeout" \
+        --argjson max_work_bytes "$max_work_bytes" \
+        '{
+          profile: $profile,
+          pgbackrest_bin: $pgbackrest,
+          pgbackrest_config: $pgbackrest_config,
+          pg_bin_dir: $pg_bin_dir,
+          cp_bin: $cp_bin,
+          repository_path: $repository_path,
+          repository_key: 1,
+          stanza: $stanza,
+          work_root: $work_root,
+          socket_root: $socket_root,
+          recovery_port: $port,
+          recovery_user: $recovery_user,
+          snapshot_provider: $provider,
+          expire_lock_path: $expire_lock,
+          max_work_bytes: $max_work_bytes,
+          command_timeout_seconds: $command_timeout,
+          recovery_timeout_seconds: $recovery_timeout
+        }' > "$path"
+}
+
+write_request() {
+    local path="$1"
+    local request_id="$2"
+    local schema="$3"
+    local table="$4"
+    local rel_oid="$5"
+    local target_lsn="$6"
+    local expected_schema="$7"
+    local expected_fingerprint="$8"
+    jq -n \
+        --arg request_id "$request_id" \
+        --arg schema "$schema" \
+        --arg table "$table" \
+        --arg target_lsn "$target_lsn" \
+        --arg expected_schema "$expected_schema" \
+        --arg expected_fingerprint "$expected_fingerprint" \
+        --argjson rel_oid "$rel_oid" \
+        --argjson observed_at "$(date +%s)" \
+        '{
+          request_id: $request_id,
+          database: "pocdb",
+          table: {schema: $schema, name: $table, rel_oid: $rel_oid},
+          target: {kind: "lsn", value: $target_lsn, observed_at_unix_seconds: $observed_at, inclusive: true},
+          expected_schema_version: 1,
+          expected_schema_sha256: (if $expected_schema == "" then null else $expected_schema end),
+          expected_fingerprint: (if $expected_fingerprint == "" then null else $expected_fingerprint end)
+        }' > "$path"
+}
+
+expect_error() {
+    local expected_code="$1"
+    local config="$2"
+    local request="$3"
+    local output
+    output="$RUN_ROOT/$(basename "$request").error.json"
+    local rc
+    set +e
+    "$HELPER" restore-table --config "$config" --request "$request" > /dev/null 2> "$output"
+    rc=$?
+    set -e
+    [[ "$rc" != "0" ]] || die "expected $expected_code but command succeeded"
+    [[ "$(jq -r '.code' "$output")" == "$expected_code" ]] \
+        || die "expected $expected_code, got $(cat "$output")"
+}
+
+assert_request_clean() {
+    local request_id="$1"
+    [[ ! -e "$WORK_ROOT/$request_id/pgdata" ]] || die "$request_id left pgdata behind"
+    [[ ! -e "$WORK_ROOT/$request_id/target-table.dump" ]] \
+        || die "$request_id returned an artifact on a failed request"
+    if [[ -d "$SOCKET_ROOT" ]]; then
+        [[ -z "$(find "$SOCKET_ROOT" -mindepth 1 -print -quit)" ]] \
+            || die "$request_id left a socket directory behind"
+    fi
+}
+
+require_executable "$PGBACKREST"
+require_executable "$PG_CTL"
+require_executable "$PSQL"
+require_executable "$PG_RESTORE"
+require_executable "$(command -v jq)"
+require_executable "$(command -v flock)"
+require_executable "$(command -v sha256sum)"
+mkdir -p "$POC_BASE" "$RESULT_DIR"
+
+log "building recovery helper"
+cargo build --locked --manifest-path "$HELPER_MANIFEST"
+require_executable "$HELPER"
+if [[ "$INSTALL_EXTENSION" == "1" ]]; then
+    log "installing the current pg_flashback extension into the isolated PostgreSQL major"
+    cargo pgrx install \
+        --manifest-path "$REPO_ROOT/Cargo.toml" \
+        --pg-config "$PG_BIN/pg_config" \
+        --no-default-features \
+        --features pg17
+fi
+
+log "creating an isolated real pgBackRest repository and DROP timeline"
+PGFB_POC_KEEP=1 \
+PGFB_POC_EXTENSION=1 \
+PGFB_POC_BASE="$POC_BASE" \
+PGFB_POC_PRIMARY_PORT="$PRIMARY_PORT" \
+PGFB_POC_CLASSIC_PORT="$CLASSIC_PORT" \
+PGFB_POC_SNAPSHOT_PORT="$SNAPSHOT_PORT" \
+"$SCRIPT_DIR/run_large_db_restore_poc.sh" 32 | tee "$POC_OUTPUT"
+
+POC_RESULT="$(awk '/result: / {print $NF}' "$POC_OUTPUT" | tail -1)"
+[[ -f "$POC_RESULT" ]] || die "could not locate PoC result JSON"
+RUN_ID_FROM_POC="$(jq -r '.run_id' "$POC_RESULT")"
+RUN_ROOT="$POC_BASE/runs/$RUN_ID_FROM_POC"
+WORK_ROOT="$RUN_ROOT/helper-work"
+EXPIRE_LOCK="$RUN_ROOT/expire.lock"
+mkdir -p "$SOCKET_ROOT"
+chmod 700 "$SOCKET_ROOT"
+
+TARGET_LSN="$(jq -r '.backup.target_lsn' "$POC_RESULT")"
+ALTER_MARKER_LSN="$(jq -r '.backup.alter_marker_lsn' "$POC_RESULT")"
+ALTER_APPLIED_LSN="$(jq -r '.backup.alter_applied_lsn' "$POC_RESULT")"
+DROP_MARKER_LSN="$(jq -r '.backup.drop_marker_lsn' "$POC_RESULT")"
+AFTER_DROP_LSN="$(jq -r '.backup.after_drop_lsn' "$POC_RESULT")"
+TARGET_OID="$(jq -r '.backup.target_rel_oid' "$POC_RESULT")"
+TARGET_FINGERPRINT="$(jq -r '.correctness.helper_fingerprint' "$POC_RESULT")"
+QUOTED_FINGERPRINT="$(jq -r '.correctness.quoted_table_fingerprint' "$POC_RESULT")"
+[[ "$(jq -r '.extension.enabled' "$POC_RESULT")" == "true" ]] \
+    || die "PoC did not enable the extension-backed request contract"
+
+SNAPSHOT_CONFIG="$RUN_ROOT/helper-snapshot.json"
+CLASSIC_CONFIG="$RUN_ROOT/helper-classic.json"
+SHORT_CONFIG="$RUN_ROOT/helper-short.json"
+write_config "$SNAPSHOT_CONFIG" "e2e_snapshot" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 60 120 536870912
+write_config "$CLASSIC_CONFIG" "e2e_classic" "disabled" "$HELPER_PORT" "/usr/bin/cp" 60 120 536870912
+write_config "$SHORT_CONFIG" "e2e_short" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 10 2 536870912
+
+PROBE_JSON="$RUN_ROOT/probe.json"
+"$HELPER" probe --config "$SNAPSHOT_CONFIG" > "$PROBE_JSON"
+[[ "$(jq -r '.snapshot_direct_eligible' "$PROBE_JSON")" == "true" ]] \
+    || die "snapshot-direct probe is not eligible"
+pass "capability probe validates binaries, repository, lock and reflink"
+
+SUCCESS_REQUEST="$RUN_ROOT/request-success.json"
+jq '.extension.target_request' "$POC_RESULT" > "$SUCCESS_REQUEST"
+SUCCESS_REQUEST_ID="$(jq -r '.request_id' "$SUCCESS_REQUEST")"
+[[ "$(jq -r '.target.value' "$SUCCESS_REQUEST")" == "$DROP_MARKER_LSN" ]] \
+    || die "extension request did not use the durable pre-DROP marker LSN"
+PLAN_JSON="$RUN_ROOT/plan.json"
+"$HELPER" plan --config "$SNAPSHOT_CONFIG" --request "$SUCCESS_REQUEST" > "$PLAN_JSON"
+[[ "$(jq -r '.engine' "$PLAN_JSON")" == "snapshot_direct" ]] || die "snapshot plan chose the wrong engine"
+pass "planner pins the newest eligible full backup"
+
+SUCCESS_JSON="$RUN_ROOT/snapshot-success.json"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$SUCCESS_REQUEST" > "$SUCCESS_JSON"
+[[ "$(jq -r '.status' "$SUCCESS_JSON")" == "completed" ]]
+[[ "$(jq -r '.engine' "$SUCCESS_JSON")" == "snapshot_direct" ]]
+[[ "$(jq -r '.recovered_fingerprint' "$SUCCESS_JSON")" == "$TARGET_FINGERPRINT" ]]
+[[ "$(jq -r '.recovered_owner' "$SUCCESS_JSON")" == "pgfb_poc_owner" ]]
+[[ "$(jq -r '.recovered_acl[] | select(.grantee == "pgfb_poc_reader" and .privilege == "SELECT") | .is_grantable' "$SUCCESS_JSON")" == "false" ]]
+[[ "$(jq -r '.recovered_schema_sha256 | length' "$SUCCESS_JSON")" == "64" ]]
+[[ "$(jq -r '.cleanup_complete' "$SUCCESS_JSON")" == "true" ]]
+SUCCESS_ARTIFACT="$(jq -r '.artifact_path' "$SUCCESS_JSON")"
+SUCCESS_ARTIFACT_TABLE="$(jq -r '.artifact_table' "$SUCCESS_JSON")"
+[[ -s "$SUCCESS_ARTIFACT" ]] || die "snapshot success artifact is missing"
+[[ "$(sha256sum "$SUCCESS_ARTIFACT" | awk '{print $1}')" == "$(jq -r '.artifact_sha256' "$SUCCESS_JSON")" ]]
+[[ ! -e "$WORK_ROOT/$SUCCESS_REQUEST_ID/pgdata" ]]
+pass "snapshot-direct recovers the pre-DROP table and cleans temporary PostgreSQL"
+
+IDEMPOTENT_JSON="$RUN_ROOT/idempotent.json"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$SUCCESS_REQUEST" > "$IDEMPOTENT_JSON"
+[[ "$(jq -r '.artifact_sha256' "$IDEMPOTENT_JSON")" == "$(jq -r '.artifact_sha256' "$SUCCESS_JSON")" ]]
+pass "same request ID returns the durable validated result"
+
+ALTER_REQUEST="$RUN_ROOT/request-pre-alter.json"
+jq '.extension.alter_request' "$POC_RESULT" > "$ALTER_REQUEST"
+[[ "$(jq -r '.target.value' "$ALTER_REQUEST")" == "$ALTER_MARKER_LSN" ]]
+[[ "$ALTER_MARKER_LSN" != "$ALTER_APPLIED_LSN" ]]
+ALTER_JSON="$RUN_ROOT/pre-alter-success.json"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$ALTER_REQUEST" > "$ALTER_JSON"
+[[ "$(jq -r '.status' "$ALTER_JSON")" == "completed" ]]
+[[ "$(jq -r '.recovered_schema_sha256' "$ALTER_JSON")" == "$(jq -r '.expected_schema_sha256' "$ALTER_REQUEST")" ]]
+pass "pre-ALTER marker recovers the old schema before the post-DDL schema LSN"
+
+CLASSIC_REQUEST="$RUN_ROOT/request-classic.json"
+write_request "$CLASSIC_REQUEST" "e2e-classic-success" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" "$TARGET_FINGERPRINT"
+CLASSIC_JSON="$RUN_ROOT/classic-success.json"
+"$HELPER" restore-table --config "$CLASSIC_CONFIG" --request "$CLASSIC_REQUEST" > "$CLASSIC_JSON"
+[[ "$(jq -r '.engine' "$CLASSIC_JSON")" == "classic_restore" ]]
+[[ "$(jq -r '.recovered_fingerprint' "$CLASSIC_JSON")" == "$TARGET_FINGERPRINT" ]]
+pass "classic pgBackRest fallback produces the same recovered table"
+
+QUOTED_REQUEST="$RUN_ROOT/request-quoted.json"
+jq '.extension.quoted_request' "$POC_RESULT" > "$QUOTED_REQUEST"
+QUOTED_JSON="$RUN_ROOT/quoted-success.json"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$QUOTED_REQUEST" > "$QUOTED_JSON"
+[[ "$(jq -r '.recovered_fingerprint' "$QUOTED_JSON")" == "$QUOTED_FINGERPRINT" ]]
+QUOTED_ARTIFACT="$(jq -r '.artifact_path' "$QUOTED_JSON")"
+QUOTED_ARTIFACT_TABLE="$(jq -r '.artifact_table' "$QUOTED_JSON")"
+pass "quoted schema/table identifiers remain data, not executable SQL"
+
+TOO_OLD_REQUEST="$RUN_ROOT/request-too-old.json"
+write_request "$TOO_OLD_REQUEST" "e2e-too-old" "public" "target_table" "$TARGET_OID" "0/1" "" ""
+expect_error "target_before_oldest_backup" "$SNAPSHOT_CONFIG" "$TOO_OLD_REQUEST"
+pass "target older than retained coverage fails closed"
+
+AFTER_DROP_REQUEST="$RUN_ROOT/request-after-drop.json"
+write_request "$AFTER_DROP_REQUEST" "e2e-after-drop" "public" "target_table" "$TARGET_OID" "$AFTER_DROP_LSN" "" ""
+expect_error "table_not_found" "$SNAPSHOT_CONFIG" "$AFTER_DROP_REQUEST"
+assert_request_clean "e2e-after-drop"
+pass "target after DROP does not return an unrelated artifact"
+
+WRONG_OID_REQUEST="$RUN_ROOT/request-wrong-oid.json"
+write_request "$WRONG_OID_REQUEST" "e2e-wrong-oid" "public" "target_table" 999999 "$TARGET_LSN" "" ""
+expect_error "table_identity_mismatch" "$SNAPSHOT_CONFIG" "$WRONG_OID_REQUEST"
+assert_request_clean "e2e-wrong-oid"
+pass "OID mismatch fails closed and cleans"
+
+WRONG_SCHEMA_REQUEST="$RUN_ROOT/request-wrong-schema.json"
+write_request "$WRONG_SCHEMA_REQUEST" "e2e-wrong-schema" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ""
+expect_error "schema_fingerprint_mismatch" "$SNAPSHOT_CONFIG" "$WRONG_SCHEMA_REQUEST"
+assert_request_clean "e2e-wrong-schema"
+pass "schema mismatch fails closed and cleans"
+
+WRONG_FP_REQUEST="$RUN_ROOT/request-wrong-fingerprint.json"
+write_request "$WRONG_FP_REQUEST" "e2e-wrong-fingerprint" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" "wrong"
+expect_error "fingerprint_mismatch" "$SNAPSHOT_CONFIG" "$WRONG_FP_REQUEST"
+assert_request_clean "e2e-wrong-fingerprint"
+pass "row fingerprint mismatch fails closed and cleans"
+
+MISSING_WAL_REQUEST="$RUN_ROOT/request-missing-wal.json"
+write_request "$MISSING_WAL_REQUEST" "e2e-missing-wal" "public" "target_table" "$TARGET_OID" "0/F0000000" "" ""
+expect_error "recovery_target_unreachable" "$SHORT_CONFIG" "$MISSING_WAL_REQUEST"
+assert_request_clean "e2e-missing-wal"
+pass "missing WAL has a stable error and idempotent cleanup"
+
+REPO_BUSY_REQUEST="$RUN_ROOT/request-repo-busy.json"
+write_request "$REPO_BUSY_REQUEST" "e2e-repo-busy" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+flock -x "$EXPIRE_LOCK" -c 'sleep 3' &
+LOCK_PID=$!
+sleep 0.2
+expect_error "repository_busy" "$SNAPSHOT_CONFIG" "$REPO_BUSY_REQUEST"
+wait "$LOCK_PID"
+assert_request_clean "e2e-repo-busy"
+pass "backup/expire exclusive lock blocks recovery materialization"
+
+SLOW_CP="$RUN_ROOT/slow-cp.sh"
+cat > "$SLOW_CP" <<'SLOW_CP_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+for argument in "$@"; do
+    if [[ "$argument" == *".reflink-probe-"* ]]; then
+        exec /usr/bin/cp "$@"
+    fi
+done
+sleep 30
+exec /usr/bin/cp "$@"
+SLOW_CP_EOF
+chmod 700 "$SLOW_CP"
+SLOW_CONFIG="$RUN_ROOT/helper-slow.json"
+write_config "$SLOW_CONFIG" "e2e_slow" "xfs_reflink" "$HELPER_PORT" "$SLOW_CP" 60 120 536870912
+CANCEL_ONE="$RUN_ROOT/request-cancel-one.json"
+CANCEL_TWO="$RUN_ROOT/request-cancel-two.json"
+write_request "$CANCEL_ONE" "e2e-cancel-one" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+write_request "$CANCEL_TWO" "e2e-cancel-two" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+"$HELPER" restore-table --config "$SLOW_CONFIG" --request "$CANCEL_ONE" > "$RUN_ROOT/cancel.out" 2> "$RUN_ROOT/cancel.err" &
+ACTIVE_HELPER_PID=$!
+for _ in $(seq 1 200); do
+    phase="$(jq -r '.phase // empty' "$WORK_ROOT/e2e-cancel-one/state.json" 2>/dev/null || true)"
+    [[ "$phase" == "materializing" ]] && break
+    sleep 0.05
+done
+[[ "${phase:-}" == "materializing" ]] || die "cancel test never reached materializing"
+if flock -x -n "$EXPIRE_LOCK" -c true; then
+    die "expire lock was not pinned during materialization"
+fi
+expect_error "recovery_busy" "$SLOW_CONFIG" "$CANCEL_TWO"
+kill -TERM "$ACTIVE_HELPER_PID"
+set +e
+wait "$ACTIVE_HELPER_PID"
+CANCEL_RC=$?
+set -e
+ACTIVE_HELPER_PID=""
+[[ "$CANCEL_RC" != "0" ]]
+[[ "$(jq -r '.code' "$RUN_ROOT/cancel.err")" == "cancelled" ]]
+assert_request_clean "e2e-cancel-one"
+pass "profile concurrency, repository pinning and SIGTERM cleanup are enforced"
+
+CRASH_REQUEST="$RUN_ROOT/request-crash.json"
+write_request "$CRASH_REQUEST" "e2e-crash-reconcile" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" "$TARGET_FINGERPRINT"
+"$HELPER" restore-table --config "$SLOW_CONFIG" --request "$CRASH_REQUEST" > "$RUN_ROOT/crash.out" 2> "$RUN_ROOT/crash.err" &
+ACTIVE_HELPER_PID=$!
+for _ in $(seq 1 200); do
+    phase="$(jq -r '.phase // empty' "$WORK_ROOT/e2e-crash-reconcile/state.json" 2>/dev/null || true)"
+    [[ "$phase" == "materializing" && -f "$WORK_ROOT/e2e-crash-reconcile/active-process.json" ]] && break
+    sleep 0.05
+done
+[[ -f "$WORK_ROOT/e2e-crash-reconcile/active-process.json" ]] \
+    || die "crash test did not persist the active process identity"
+ORPHAN_GROUP="$(jq -r '.process_group' "$WORK_ROOT/e2e-crash-reconcile/active-process.json")"
+kill -KILL "$ACTIVE_HELPER_PID"
+set +e
+wait "$ACTIVE_HELPER_PID"
+CRASH_RC=$?
+set -e
+ACTIVE_HELPER_PID=""
+[[ "$CRASH_RC" != "0" ]]
+kill -0 -- "-$ORPHAN_GROUP" 2>/dev/null || die "crash test did not leave a child process to reconcile"
+CRASH_RECOVERED_JSON="$RUN_ROOT/crash-recovered.json"
+CRASH_RETRY_CONFIG="$RUN_ROOT/helper-crash-retry.json"
+jq --arg cp_bin "/usr/bin/cp" '.cp_bin = $cp_bin' "$SLOW_CONFIG" > "$CRASH_RETRY_CONFIG"
+"$HELPER" restore-table --config "$CRASH_RETRY_CONFIG" --request "$CRASH_REQUEST" > "$CRASH_RECOVERED_JSON"
+[[ "$(jq -r '.status' "$CRASH_RECOVERED_JSON")" == "completed" ]]
+kill -0 -- "-$ORPHAN_GROUP" 2>/dev/null && die "startup reconciliation left the orphan process group alive"
+[[ ! -e "$WORK_ROOT/e2e-crash-reconcile/active-process.json" ]]
+[[ ! -e "$WORK_ROOT/e2e-crash-reconcile/pgdata" ]]
+pass "SIGKILL crash is reconciled on the next execution without an orphan process or cluster"
+
+TIMEOUT_CONFIG="$RUN_ROOT/helper-command-timeout.json"
+write_config "$TIMEOUT_CONFIG" "e2e_timeout" "xfs_reflink" "$HELPER_PORT" "$SLOW_CP" 1 120 536870912
+TIMEOUT_REQUEST="$RUN_ROOT/request-command-timeout.json"
+write_request "$TIMEOUT_REQUEST" "e2e-command-timeout" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+expect_error "command_timeout" "$TIMEOUT_CONFIG" "$TIMEOUT_REQUEST"
+assert_request_clean "e2e-command-timeout"
+pass "child command timeout kills its process group and cleans"
+
+FAILING_PG_BIN="$RUN_ROOT/failing-pg-bin"
+mkdir -p "$FAILING_PG_BIN"
+ln -s "$PG_BIN/postgres" "$FAILING_PG_BIN/postgres"
+ln -s "$PG_BIN/psql" "$FAILING_PG_BIN/psql"
+ln -s "$PG_BIN/pg_dump" "$FAILING_PG_BIN/pg_dump"
+cat > "$FAILING_PG_BIN/pg_ctl" <<FAILING_PG_CTL_EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "\${1:-}" == "--version" ]]; then
+    exec "$PG_BIN/pg_ctl" --version
+fi
+exit 42
+FAILING_PG_CTL_EOF
+chmod 700 "$FAILING_PG_BIN/pg_ctl"
+START_FAILURE_CONFIG="$RUN_ROOT/helper-start-failure.json"
+write_config "$START_FAILURE_CONFIG" "e2e_start_failure" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 10 120 536870912
+jq --arg pg_bin_dir "$FAILING_PG_BIN" '.pg_bin_dir = $pg_bin_dir' "$START_FAILURE_CONFIG" > "$START_FAILURE_CONFIG.tmp"
+mv "$START_FAILURE_CONFIG.tmp" "$START_FAILURE_CONFIG"
+START_FAILURE_REQUEST="$RUN_ROOT/request-start-failure.json"
+write_request "$START_FAILURE_REQUEST" "e2e-start-failure" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+expect_error "command_failed" "$START_FAILURE_CONFIG" "$START_FAILURE_REQUEST"
+assert_request_clean "e2e-start-failure"
+pass "temporary PostgreSQL start failure preserves the original error and cleans"
+
+QUOTA_CONFIG="$RUN_ROOT/helper-quota.json"
+write_config "$QUOTA_CONFIG" "e2e_quota" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 10 120 1048576
+QUOTA_REQUEST="$RUN_ROOT/request-quota.json"
+write_request "$QUOTA_REQUEST" "e2e-quota" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+expect_error "work_quota_exceeded" "$QUOTA_CONFIG" "$QUOTA_REQUEST"
+pass "backup larger than the configured work quota is rejected before materialization"
+
+CONFLICT_REQUEST="$RUN_ROOT/request-conflict.json"
+jq '.expected_fingerprint = "conflict"' "$SUCCESS_REQUEST" > "$CONFLICT_REQUEST"
+expect_error "request_conflict" "$SNAPSHOT_CONFIG" "$CONFLICT_REQUEST"
+pass "request IDs cannot be reused for a different contract"
+
+CONFLICT_PROFILE_CONFIG="$RUN_ROOT/helper-conflict-profile.json"
+jq '.profile = "different_profile"' "$SNAPSHOT_CONFIG" > "$CONFLICT_PROFILE_CONFIG"
+expect_error "request_conflict" "$CONFLICT_PROFILE_CONFIG" "$SUCCESS_REQUEST"
+pass "request IDs are immutably bound to the helper profile"
+
+UNSAFE_PATH_CONFIG="$RUN_ROOT/helper-unsafe-path.json"
+jq --arg work_root "$RUN_ROOT/repo/../helper-work" '.work_root = $work_root' \
+    "$SNAPSHOT_CONFIG" > "$UNSAFE_PATH_CONFIG"
+UNSAFE_PATH_REQUEST="$RUN_ROOT/request-unsafe-path.json"
+write_request "$UNSAFE_PATH_REQUEST" "e2e-unsafe-path" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+expect_error "invalid_config" "$UNSAFE_PATH_CONFIG" "$UNSAFE_PATH_REQUEST"
+pass "runtime roots containing parent traversal are rejected before execution"
+
+UNSAFE_MODE_CONFIG="$RUN_ROOT/helper-unsafe-mode.json"
+cp -- "$SNAPSHOT_CONFIG" "$UNSAFE_MODE_CONFIG"
+chmod 0666 "$UNSAFE_MODE_CONFIG"
+expect_error "invalid_config" "$UNSAFE_MODE_CONFIG" "$UNSAFE_PATH_REQUEST"
+SAFE_CONFIG_LINK="$RUN_ROOT/helper-config-link.json"
+ln -s "$SNAPSHOT_CONFIG" "$SAFE_CONFIG_LINK"
+expect_error "invalid_config" "$SAFE_CONFIG_LINK" "$UNSAFE_PATH_REQUEST"
+pass "writable and symlinked helper configuration files are rejected before parsing"
+
+ORIGINAL_SHA="$(jq -r '.artifact_sha256' "$SUCCESS_JSON")"
+printf X | dd of="$SUCCESS_ARTIFACT" bs=1 seek=0 conv=notrunc status=none
+[[ "$(sha256sum "$SUCCESS_ARTIFACT" | awk '{print $1}')" != "$ORIGINAL_SHA" ]]
+REPAIRED_JSON="$RUN_ROOT/repaired.json"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$SUCCESS_REQUEST" > "$REPAIRED_JSON"
+[[ "$(sha256sum "$SUCCESS_ARTIFACT" | awk '{print $1}')" == "$(jq -r '.artifact_sha256' "$REPAIRED_JSON")" ]]
+pass "corrupt cached artifact is discarded and rebuilt"
+
+mkdir -p "$VERIFY_SOCKET"
+chmod 700 "$VERIFY_SOCKET"
+"$PG_CTL" -D "$RUN_ROOT/primary" -l "$RUN_ROOT/log/helper-artifact-verify.log" \
+    -o "-c archive_mode=off -p $VERIFY_PORT -k $VERIFY_SOCKET" start -w -t 60 > /dev/null
+PRIMARY_STARTED=1
+
+CONTROLLER_FAILURE_ERR="$RUN_ROOT/controller-repository-busy.err"
+flock -x "$EXPIRE_LOCK" -c 'sleep 3' &
+LOCK_PID=$!
+sleep 0.2
+set +e
+PGHOST="$VERIFY_SOCKET" PGPORT="$VERIFY_PORT" PGUSER="$(id -un)" \
+    "$SCRIPT_DIR/pg_flashback_backup_restore.sh" \
+        --config "$SNAPSHOT_CONFIG" \
+        --dbname pocdb \
+        --table public.target_table \
+        --target-lsn "$DROP_MARKER_LSN" \
+        --helper "$HELPER" > /dev/null 2> "$CONTROLLER_FAILURE_ERR"
+CONTROLLER_FAILURE_RC=$?
+set -e
+wait "$LOCK_PID"
+[[ "$CONTROLLER_FAILURE_RC" != "0" ]]
+grep -q '"code":"repository_busy"' "$CONTROLLER_FAILURE_ERR"
+FAILED_CONTROLLER_REQUEST="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT request_id FROM flashback.backup_restore_requests WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1;")"
+[[ -n "$FAILED_CONTROLLER_REQUEST" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = 'flashback_import' AND c.relkind IN ('r', 'p');")" == "0" ]]
+pass "reference controller records helper failure and leaves no imported table"
+
+CONTROLLER_JSON="$RUN_ROOT/controller-success.json"
+PGHOST="$VERIFY_SOCKET" PGPORT="$VERIFY_PORT" PGUSER="$(id -un)" \
+    "$SCRIPT_DIR/pg_flashback_backup_restore.sh" \
+        --config "$SNAPSHOT_CONFIG" \
+        --dbname pocdb \
+        --request "$SUCCESS_REQUEST" \
+        --helper "$HELPER" > "$CONTROLLER_JSON"
+[[ "$(jq -r '.status' "$CONTROLLER_JSON")" == "completed" ]]
+[[ "$(jq -r '.request_id' "$CONTROLLER_JSON")" == "$SUCCESS_REQUEST_ID" ]]
+PRODUCTION_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb -c "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM public.target_table AS t;")"
+[[ "$PRODUCTION_FP" == "$TARGET_FINGERPRINT" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb -c "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.target_table'::regclass;")" == "pgfb_poc_owner" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb -c "SELECT has_table_privilege('pgfb_poc_reader', 'public.target_table', 'SELECT');")" == "t" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb -v request_id="$SUCCESS_REQUEST_ID" -f <(printf '%s\n' "SELECT status FROM flashback.backup_restore_requests WHERE request_id = :'request_id';"))" == "completed" ]]
+pass "reference controller verifies the artifact and completes the extension shadow swap"
+
+"$PG_BIN/dropdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" --if-exists helper_verify > /dev/null
+"$PG_BIN/createdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" helper_verify
+"$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify -c 'CREATE SCHEMA flashback_import;' > /dev/null
+"$PG_RESTORE" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify --no-owner --no-acl "$SUCCESS_ARTIFACT"
+ACTUAL_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify -c "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM flashback_import.\"$SUCCESS_ARTIFACT_TABLE\" AS t;")"
+[[ "$ACTUAL_FP" == "$TARGET_FINGERPRINT" ]]
+"$PG_RESTORE" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify --no-owner --no-acl "$QUOTED_ARTIFACT"
+ACTUAL_QUOTED_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify -c "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM flashback_import.\"$QUOTED_ARTIFACT_TABLE\" AS t;")"
+[[ "$ACTUAL_QUOTED_FP" == "$QUOTED_FINGERPRINT" ]]
+"$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null
+PRIMARY_STARTED=0
+pass "returned artifacts restore into a separate database with matching fingerprints"
+
+HELPER_VERSION="$($HELPER --version)"
+[[ -n "$HELPER_VERSION" ]] || die "helper --version returned an empty value"
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+SOURCE_DIRTY=true
+if git -C "$REPO_ROOT" diff --quiet \
+    && git -C "$REPO_ROOT" diff --cached --quiet \
+    && [[ -z "$(git -C "$REPO_ROOT" ls-files --others --exclude-standard)" ]]; then
+    SOURCE_DIRTY=false
+fi
+jq -n \
+    --arg run_id "$RUN_ID" \
+    --arg status "ok" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg platform "$(uname -sm)" \
+    --arg postgres "$("$PG_BIN/postgres" --version)" \
+    --arg pgbackrest "$($PGBACKREST version)" \
+    --arg helper "$HELPER_VERSION" \
+    --arg snapshot_sha "$(jq -r '.artifact_sha256' "$REPAIRED_JSON")" \
+    --arg classic_sha "$(jq -r '.artifact_sha256' "$CLASSIC_JSON")" \
+    --argjson source_dirty "$SOURCE_DIRTY" \
+    --argjson checks "$PASSED" \
+    '{run_id: $run_id, status: $status, checks_passed: $checks,
+      source: {commit: $source_commit, dirty: $source_dirty, platform: $platform},
+      versions: {postgres: $postgres, pgbackrest: $pgbackrest, helper: $helper},
+      artifacts: {snapshot_sha256: $snapshot_sha, classic_sha256: $classic_sha}}' > "$SUMMARY_JSON"
+
+RUN_COMPLETE=1
+log "all $PASSED checks passed"
+log "summary: $SUMMARY_JSON"
