@@ -475,6 +475,7 @@ DECLARE
     v_pol  record;
     v_saved_acl aclitem[];
     v_owner     regrole;
+    v_temp_probe text;
 BEGIN
     IF ddl_info IS NULL THEN
         RAISE EXCEPTION 'flashback_recreate_table_from_ddl: ddl_info is null';
@@ -494,6 +495,23 @@ BEGIN
     ELSE
         v_tgt_schema := v_schema;
         v_tgt_table  := v_table;
+    END IF;
+
+    -- pg_temp is a session alias, not a schema PostgreSQL permits us to
+    -- CREATE.  Ensure the backend has a temporary namespace and resolve the
+    -- alias to its physical pg_temp_N name before the generic schema check.
+    IF v_tgt_schema = 'pg_temp' THEN
+        IF pg_my_temp_schema() = 0 THEN
+            v_temp_probe := format('__fb_temp_namespace_%s_%s',
+                                   pg_backend_pid(),
+                                   floor(random() * 1000000000)::bigint);
+            EXECUTE format('CREATE TEMP TABLE %I () ON COMMIT DROP', v_temp_probe);
+            EXECUTE format('DROP TABLE pg_temp.%I', v_temp_probe);
+        END IF;
+
+        SELECT nspname INTO STRICT v_tgt_schema
+        FROM pg_namespace
+        WHERE oid = pg_my_temp_schema();
     END IF;
 
     -- Build column definitions (skip nextval defaults — restored later)

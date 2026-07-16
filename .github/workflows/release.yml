@@ -1,28 +1,46 @@
-name: Release
+name: Release candidate
 
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   PGRX_VERSION: "0.16.1"
 
 jobs:
-  release:
-    name: Create GitHub Release
+  verify-version:
+    name: Verify tag and changelog
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Match tag to package version
+        run: |
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          helper_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' tools/pg_flashback_recovery/Cargo.toml | head -1)"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+          test "$helper_version" = "$package_version"
+          grep -Fq "## [${package_version}]" CHANGELOG.md
+
+  extension-package:
+    name: Extension package (PG${{ matrix.pg }})
+    needs: verify-version
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17", "18"]
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
 
       - name: Install system dependencies
         run: |
@@ -30,46 +48,157 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev libclang-dev clang
 
-      - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
-
-      - name: Initialize pgrx for PG 17
-        run: cargo pgrx init --pg17 download
-
-      - name: Build extension (PG17)
-        run: cargo pgrx package --no-default-features --features pg17
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Create release archive
+      - name: Install cargo-pgrx and PostgreSQL ${{ matrix.pg }}
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          mkdir -p dist
-          tar -czf "dist/pg_flashback-${VERSION}-pg17.tar.gz" \
-            target/release/pg_flashback-pg17/ \
-            sql/ \
-            pg_flashback.control \
-            README.md \
-            LICENSE
+          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          cargo pgrx init --pg${{ matrix.pg }} download
 
-      - name: Generate release notes from CHANGELOG
-        id: notes
+      - name: Build install tree
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          # Extract section for this version from the upgrade scripts
-          echo "Release pg_flashback v${VERSION}" > /tmp/release_notes.md
-          echo "" >> /tmp/release_notes.md
-          if [[ -f "sql/upgrade/pg_flashback--*.--${VERSION}.sql" ]]; then
-            head -30 sql/upgrade/pg_flashback--*.--${VERSION}.sql >> /tmp/release_notes.md
-          fi
-          echo "NOTES_FILE=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
+          cargo pgrx package \
+            --pg-config "$(cargo pgrx info pg-config ${{ matrix.pg }})" \
+            --no-default-features --features pg${{ matrix.pg }} \
+            --out-dir dist/package
 
-      - name: Create GitHub Release
+      - name: Create extension archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive_root="pg_flashback-${version}-pg${{ matrix.pg }}-x86_64-linux"
+          package_so="$(find dist/package -type f -name pg_flashback.so -print -quit)"
+          package_control="$(find dist/package -type f -name pg_flashback.control -print -quit)"
+          package_sql="$(find dist/package -type f -name 'pg_flashback--*.sql' -print -quit)"
+          test -n "$package_so" && test -n "$package_control" && test -n "$package_sql"
+          mkdir -p "dist/${archive_root}/lib" \
+            "dist/${archive_root}/share/extension" "dist/${archive_root}/docs"
+          install -m 0755 "$package_so" "dist/${archive_root}/lib/pg_flashback.so"
+          install -m 0644 "$package_control" "$package_sql" \
+            "dist/${archive_root}/share/extension/"
+          printf '%s\n' "${{ matrix.pg }}" > "dist/${archive_root}/PG_MAJOR"
+          cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
+            "dist/${archive_root}/"
+          cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md \
+            "dist/${archive_root}/docs/"
+          tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
+
+      - name: Smoke-install the portable archive layout
+        run: |
+          pg_config="$(cargo pgrx info pg-config ${{ matrix.pg }})"
+          pg_bin="$(dirname "$pg_config")"
+          archive_root="$(find dist -maxdepth 1 -type d \
+            -name 'pg_flashback-*-pg${{ matrix.pg }}-x86_64-linux' -print -quit)"
+          test -n "$archive_root"
+          test "$(cat "$archive_root/PG_MAJOR")" = "${{ matrix.pg }}"
+          port=$((55400 + ${{ matrix.pg }}))
+          install -m 0755 "$archive_root/lib/pg_flashback.so" \
+            "$($pg_config --pkglibdir)/pg_flashback.so"
+          install -m 0644 "$archive_root/share/extension/pg_flashback.control" \
+            "$archive_root"/share/extension/pg_flashback--*.sql \
+            "$($pg_config --sharedir)/extension/"
+          data="$(mktemp -d)"
+          socket="$(mktemp -d)"
+          cleanup() {
+            "$pg_bin/pg_ctl" -D "$data" stop -m immediate -w >/dev/null 2>&1 || true
+            rm -rf "$data" "$socket"
+          }
+          trap cleanup EXIT
+          "$pg_bin/initdb" -D "$data" --locale=C.UTF-8 -A trust >/dev/null
+          "$pg_bin/pg_ctl" -D "$data" -l "$data/postgresql.log" \
+            -o "-p $port -k $socket -c shared_preload_libraries=pg_flashback -c wal_level=logical" \
+            start -w >/dev/null
+          result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
+            -qAtc "CREATE EXTENSION pg_flashback;
+              CREATE TABLE package_smoke(id integer PRIMARY KEY);
+              SELECT flashback_track_backup('public.package_smoke', 'default');
+              SELECT extversion || ':' ||
+                (SELECT recovery_profile FROM flashback.tracked_tables
+                 WHERE table_name = 'package_smoke')
+              FROM pg_extension WHERE extname = 'pg_flashback';")"
+          test "$result" = $'t\n0.1.0:backup'
+
+      - name: Upload extension archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-flashback-pg${{ matrix.pg }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  helper-package:
+    name: Recovery helper package
+    needs: verify-version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Build helper
+        run: cargo build --release --locked --manifest-path tools/pg_flashback_recovery/Cargo.toml
+
+      - name: Create helper archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive_root="pg-flashback-recovery-${version}-x86_64-linux"
+          mkdir -p "dist/${archive_root}/bin" "dist/${archive_root}/examples" \
+            "dist/${archive_root}/docs"
+          install -m 0755 tools/pg_flashback_recovery/target/release/pg-flashback-recovery \
+            "dist/${archive_root}/bin/"
+          install -m 0755 scripts/pg_flashback_backup_restore.sh \
+            scripts/pgbackrest_with_flashback_lock.sh "dist/${archive_root}/bin/"
+          cp tools/pg_flashback_recovery/examples/*.json "dist/${archive_root}/examples/"
+          cp tools/pg_flashback_recovery/README.md "dist/${archive_root}/README.md"
+          cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
+            "dist/${archive_root}/"
+          cp docs/RECOVERY_HELPER_DESIGN.md docs/BACKUP_RESTORE_RUNBOOK.md \
+            docs/RELEASE_SCOPE.md "dist/${archive_root}/docs/"
+          tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
+
+      - name: Upload helper archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-flashback-recovery
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  draft-release:
+    name: Assemble draft release
+    needs: [extension-package, helper-package]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archive set and generate checksums
+        run: |
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [${version}]" '
+            $0 == heading {found=1; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          test -s dist/RELEASE_NOTES.md
+
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: ${{ steps.notes.outputs.NOTES_FILE }}
-          files: dist/*.tar.gz
-          draft: false
+          body_path: dist/RELEASE_NOTES.md
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          draft: true
           prerelease: false

@@ -13,7 +13,92 @@
 use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::pg_sys::*;
+use std::collections::HashSet;
 use std::ffi::CStr;
+use std::sync::{Mutex, OnceLock};
+
+static EMITTED_TRANSACTIONS: OnceLock<Mutex<HashSet<TransactionId>>> = OnceLock::new();
+
+struct DecoderState {
+    tracked_relations: HashSet<u32>,
+}
+
+fn emitted_transactions() -> &'static Mutex<HashSet<TransactionId>> {
+    EMITTED_TRANSACTIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_transaction_emitted(xid: TransactionId) {
+    emitted_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(xid);
+}
+
+fn take_transaction_emitted(xid: TransactionId) -> bool {
+    emitted_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&xid)
+}
+
+fn is_internal_schema(schema: &str) -> bool {
+    schema == "flashback"
+        || schema == "pg_catalog"
+        || schema == "information_schema"
+        || schema.starts_with("pg_toast")
+        || schema.starts_with("pg_temp_")
+}
+
+fn parse_tracked_oids(value: &str) -> HashSet<u32> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let oid = part.trim().parse::<u32>().ok()?;
+            (oid != pg_sys::InvalidOid.to_u32()).then_some(oid)
+        })
+        .collect()
+}
+
+unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
+    let mut tracked_relations = HashSet::new();
+
+    if !options.is_null() {
+        let options_ref = unsafe { &*options };
+        if options_ref.length > 0 && !options_ref.elements.is_null() {
+            for index in 0..options_ref.length as usize {
+                let cell = unsafe { &*options_ref.elements.add(index) };
+                let elem = cell.ptr_value.cast::<pg_sys::DefElem>();
+                if elem.is_null() || unsafe { (*elem).defname }.is_null() {
+                    continue;
+                }
+
+                let name = unsafe { CStr::from_ptr((*elem).defname) }
+                    .to_str()
+                    .unwrap_or("");
+                if name != "tracked_oids" {
+                    continue;
+                }
+
+                let value_ptr = unsafe { pg_sys::defGetString(elem) };
+                if !value_ptr.is_null() {
+                    let value = unsafe { CStr::from_ptr(value_ptr) }.to_str().unwrap_or("");
+                    tracked_relations.extend(parse_tracked_oids(value));
+                }
+            }
+        }
+    }
+
+    DecoderState { tracked_relations }
+}
+
+unsafe fn relation_is_tracked(ctx: *mut LogicalDecodingContext, oid: u32) -> bool {
+    if ctx.is_null() || unsafe { (*ctx).output_plugin_private }.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
+    state.tracked_relations.contains(&oid)
+}
 
 // ─── Output Plugin Entry Point ──────────────────────────────────────
 
@@ -24,7 +109,6 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut OutputPluginCall
     cb.startup_cb = Some(fb_decode_startup);
     cb.begin_cb = Some(fb_decode_begin);
     cb.change_cb = Some(fb_decode_change);
-    cb.truncate_cb = Some(fb_decode_truncate);
     cb.commit_cb = Some(fb_decode_commit);
     cb.message_cb = Some(fb_decode_message);
     cb.shutdown_cb = Some(fb_decode_shutdown);
@@ -41,26 +125,24 @@ unsafe extern "C-unwind" fn fb_decode_startup(
     opt.output_type = OutputPluginOutputType::OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
     opt.receive_rewrites = false;
     let ctx_ref = unsafe { &mut *ctx };
-    ctx_ref.output_plugin_private = std::ptr::null_mut();
+    let state = unsafe { decoder_options(ctx_ref.output_plugin_options) };
+    ctx_ref.output_plugin_private = Box::into_raw(Box::new(state)).cast();
+    emitted_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 // ─── Begin Transaction ──────────────────────────────────────────────
 
 unsafe extern "C-unwind" fn fb_decode_begin(
-    ctx: *mut LogicalDecodingContext,
-    txn: *mut ReorderBufferTXN,
+    _ctx: *mut LogicalDecodingContext,
+    _txn: *mut ReorderBufferTXN,
 ) {
-    let txn_ref = unsafe { &*txn };
-    let xid = txn_ref.xid;
-
-    let msg = format!("{{\"begin\":{xid}}}");
-    let c_msg = std::ffi::CString::new(msg).unwrap_or_default();
-    unsafe {
-        OutputPluginPrepareWrite(ctx, true);
-        let buf = (*ctx).out;
-        appendStringInfoString(buf, c_msg.as_ptr());
-        OutputPluginWrite(ctx, true);
-    }
+    // BEGIN used to be emitted eagerly for every decoded transaction. That
+    // makes the consumer's own flashback.* metadata writes generate another
+    // output row forever. A transaction is now visible only if a user-table
+    // change or pg_flashback logical DDL message is emitted below.
 }
 
 // ─── DML Change (INSERT / UPDATE / DELETE) ──────────────────────────
@@ -85,6 +167,14 @@ unsafe extern "C-unwind" fn fb_decode_change(
     let rd_rel = unsafe { &*rel.rd_rel };
     let oid: u32 = rd_rel.oid.into();
 
+    // The caller supplies the exact relation set that is recoverable in the
+    // current generation graph.  Reject unrelated relations before namespace
+    // lookup or tuple-to-JSON conversion: otherwise a large, untracked table
+    // would still consume decoder CPU and memory even though SQL discarded it.
+    if !unsafe { relation_is_tracked(ctx, oid) } {
+        return;
+    }
+
     let nsp_oid = rd_rel.relnamespace;
     let nsp_name_ptr = unsafe { get_namespace_name(nsp_oid) };
     let schema: std::string::String = if nsp_name_ptr.is_null() {
@@ -95,6 +185,10 @@ unsafe extern "C-unwind" fn fb_decode_change(
             .unwrap_or("public")
             .to_owned()
     };
+
+    if is_internal_schema(&schema) {
+        return;
+    }
 
     let table_name_ptr = rd_rel.relname.data.as_ptr();
     let table: std::string::String = unsafe { CStr::from_ptr(table_name_ptr) }
@@ -129,10 +223,15 @@ unsafe extern "C-unwind" fn fb_decode_change(
     };
 
     let xid = unsafe { (*txn).xid };
+    mark_transaction_emitted(xid);
     let mut json = std::string::String::with_capacity(256);
-    json.push_str(&format!(
-        "{{\"op\":\"{op}\",\"schema\":\"{schema}\",\"table\":\"{table}\",\"oid\":{oid},\"xid\":{xid}"
-    ));
+    json.push_str("{\"op\":\"");
+    json.push_str(op);
+    json.push_str("\",\"schema\":\"");
+    json_escape_into(&mut json, &schema);
+    json.push_str("\",\"table\":\"");
+    json_escape_into(&mut json, &table);
+    json.push_str(&format!("\",\"oid\":{oid},\"xid\":{xid}"));
     if let Some(ref old) = old_json {
         json.push_str(",\"old\":");
         json.push_str(old);
@@ -152,53 +251,6 @@ unsafe extern "C-unwind" fn fb_decode_change(
     }
 }
 
-// ─── TRUNCATE ───────────────────────────────────────────────────────
-
-unsafe extern "C-unwind" fn fb_decode_truncate(
-    ctx: *mut LogicalDecodingContext,
-    txn: *mut ReorderBufferTXN,
-    nrelations: ::core::ffi::c_int,
-    relations: *mut Relation,
-    _change: *mut ReorderBufferChange,
-) {
-    let xid = unsafe { (*txn).xid };
-
-    for i in 0..nrelations as usize {
-        let relation = unsafe { *relations.add(i) };
-        let rel = unsafe { &*relation };
-        let rd_rel = unsafe { &*rel.rd_rel };
-        let oid: u32 = rd_rel.oid.into();
-
-        let nsp_oid = rd_rel.relnamespace;
-        let nsp_name_ptr = unsafe { get_namespace_name(nsp_oid) };
-        let schema: std::string::String = if nsp_name_ptr.is_null() {
-            "public".into()
-        } else {
-            unsafe { CStr::from_ptr(nsp_name_ptr) }
-                .to_str()
-                .unwrap_or("public")
-                .to_owned()
-        };
-
-        let table_name_ptr = rd_rel.relname.data.as_ptr();
-        let table: std::string::String = unsafe { CStr::from_ptr(table_name_ptr) }
-            .to_str()
-            .unwrap_or("unknown")
-            .to_owned();
-
-        let json = format!(
-            "{{\"op\":\"TRUNCATE\",\"schema\":\"{schema}\",\"table\":\"{table}\",\"oid\":{oid},\"xid\":{xid}}}"
-        );
-        let c_json = std::ffi::CString::new(json).unwrap_or_default();
-        unsafe {
-            OutputPluginPrepareWrite(ctx, true);
-            let buf = (*ctx).out;
-            appendStringInfoString(buf, c_json.as_ptr());
-            OutputPluginWrite(ctx, true);
-        }
-    }
-}
-
 // ─── Commit ─────────────────────────────────────────────────────────
 
 unsafe extern "C-unwind" fn fb_decode_commit(
@@ -208,6 +260,9 @@ unsafe extern "C-unwind" fn fb_decode_commit(
 ) {
     let txn_ref = unsafe { &*txn };
     let xid = txn_ref.xid;
+    if !take_transaction_emitted(xid) {
+        return;
+    }
     let commit_time = txn_ref.xact_time.commit_time;
 
     let lsn_str = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xFFFFFFFF);
@@ -221,18 +276,18 @@ unsafe extern "C-unwind" fn fb_decode_commit(
     }
 }
 
-// ─── Logical Message (DDL events via pg_logical_emit_message) ────
+// ─── Transactional Commit Marker ──────────────────────────────────
 
 unsafe extern "C-unwind" fn fb_decode_message(
     ctx: *mut LogicalDecodingContext,
-    _txn: *mut ReorderBufferTXN,
+    txn: *mut ReorderBufferTXN,
     _message_lsn: XLogRecPtr,
-    _transactional: bool,
+    transactional: bool,
     prefix: *const ::core::ffi::c_char,
-    message_size: Size,
-    message: *const ::core::ffi::c_char,
+    _message_size: Size,
+    _message: *const ::core::ffi::c_char,
 ) {
-    if prefix.is_null() || message.is_null() || message_size == 0 {
+    if prefix.is_null() || !transactional || txn.is_null() {
         return;
     }
 
@@ -242,11 +297,14 @@ unsafe extern "C-unwind" fn fb_decode_message(
         return;
     }
 
-    // The message payload is the DDL event JSON — emit it as-is
-    let msg_bytes = unsafe { std::slice::from_raw_parts(message.cast::<u8>(), message_size) };
-    let msg_str = std::str::from_utf8(msg_bytes).unwrap_or("{}");
-
-    let c_msg = std::ffi::CString::new(msg_str).unwrap_or_default();
+    // pg_logical_emit_message() is executable by PUBLIC, so its body is
+    // untrusted input.  Never forward it.  Legitimate DDL payload lives in
+    // flashback.pending_wal_events, which ordinary roles cannot write.  This
+    // fixed marker only makes the transaction's real COMMIT record visible.
+    let xid = unsafe { (*txn).xid };
+    mark_transaction_emitted(xid);
+    let marker = format!("{{\"marker\":{xid}}}");
+    let c_msg = std::ffi::CString::new(marker).unwrap_or_default();
     unsafe {
         OutputPluginPrepareWrite(ctx, true);
         let buf = (*ctx).out;
@@ -257,7 +315,18 @@ unsafe extern "C-unwind" fn fb_decode_message(
 
 // ─── Shutdown ───────────────────────────────────────────────────────
 
-unsafe extern "C-unwind" fn fb_decode_shutdown(_ctx: *mut LogicalDecodingContext) {}
+unsafe extern "C-unwind" fn fb_decode_shutdown(ctx: *mut LogicalDecodingContext) {
+    emitted_transactions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    if !ctx.is_null() && !unsafe { (*ctx).output_plugin_private }.is_null() {
+        let state = unsafe { (*ctx).output_plugin_private.cast::<DecoderState>() };
+        unsafe { drop(Box::from_raw(state)) };
+        unsafe { (*ctx).output_plugin_private = std::ptr::null_mut() };
+    }
+}
 
 // ─── Utility: HeapTuple → JSON string ───────────────────────────────
 
@@ -344,17 +413,7 @@ unsafe fn heap_tuple_to_json(
             let val_cstr = unsafe { OidOutputFunctionCall(typoutput, values[i]) };
             let val_str = unsafe { CStr::from_ptr(val_cstr) }.to_str().unwrap_or("");
 
-            if is_numeric_type(atttypid) {
-                if atttypid == pg_sys::BOOLOID {
-                    json.push_str(if val_str == "t" { "true" } else { "false" });
-                } else {
-                    json.push_str(val_str);
-                }
-            } else {
-                json.push('"');
-                json_escape_into(&mut json, val_str);
-                json.push('"');
-            }
+            push_json_value(&mut json, val_str, atttypid);
 
             unsafe { pfree(val_cstr as *mut _) };
         }
@@ -375,6 +434,26 @@ fn is_numeric_type(typoid: Oid) -> bool {
         || typoid == pg_sys::BOOLOID
 }
 
+/// Append one column value in valid JSON. Numeric types are emitted bare,
+/// EXCEPT the special values NaN / Infinity / -Infinity, which JSON has no
+/// literal for — those are emitted as quoted strings (replay casts text
+/// back to the column type, so 'NaN'::numeric round-trips losslessly).
+fn push_json_value(buf: &mut std::string::String, val_str: &str, typoid: Oid) {
+    if is_numeric_type(typoid) {
+        if typoid == pg_sys::BOOLOID {
+            buf.push_str(if val_str == "t" { "true" } else { "false" });
+            return;
+        }
+        if !matches!(val_str, "NaN" | "Infinity" | "-Infinity") && !val_str.is_empty() {
+            buf.push_str(val_str);
+            return;
+        }
+    }
+    buf.push('"');
+    json_escape_into(buf, val_str);
+    buf.push('"');
+}
+
 fn json_escape_into(buf: &mut std::string::String, s: &str) {
     for c in s.chars() {
         match c {
@@ -388,5 +467,57 @@ fn json_escape_into(buf: &mut std::string::String, s: &str) {
             }
             c => buf.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod json_format_tests {
+    use super::{json_escape_into, parse_tracked_oids, push_json_value};
+    use pgrx::pg_sys;
+
+    fn escaped(s: &str) -> String {
+        let mut buf = String::new();
+        json_escape_into(&mut buf, s);
+        buf
+    }
+
+    fn value(val: &str, typoid: pg_sys::Oid) -> String {
+        let mut buf = String::new();
+        push_json_value(&mut buf, val, typoid);
+        buf
+    }
+
+    #[test]
+    fn escapes_quoted_identifiers() {
+        // CREATE TABLE "we""ird" is legal — its relname contains a quote
+        assert_eq!(escaped(r#"we"ird"#), r#"we\"ird"#);
+        assert_eq!(escaped(r"back\slash"), r"back\\slash");
+        assert_eq!(escaped("tab\there"), "tab\\there");
+    }
+
+    #[test]
+    fn nan_and_infinity_are_quoted() {
+        assert_eq!(value("NaN", pg_sys::NUMERICOID), "\"NaN\"");
+        assert_eq!(value("Infinity", pg_sys::FLOAT8OID), "\"Infinity\"");
+        assert_eq!(value("-Infinity", pg_sys::FLOAT4OID), "\"-Infinity\"");
+        assert_eq!(value("", pg_sys::NUMERICOID), "\"\"");
+    }
+
+    #[test]
+    fn normal_values_keep_their_shape() {
+        assert_eq!(value("42", pg_sys::INT4OID), "42");
+        assert_eq!(value("-1.5", pg_sys::NUMERICOID), "-1.5");
+        assert_eq!(value("t", pg_sys::BOOLOID), "true");
+        assert_eq!(value("f", pg_sys::BOOLOID), "false");
+        assert_eq!(value("hello \"x\"", pg_sys::TEXTOID), "\"hello \\\"x\\\"\"");
+    }
+
+    #[test]
+    fn tracked_oid_option_is_strict_and_deduplicated() {
+        let parsed = parse_tracked_oids("16384, 16385,16384,invalid,0");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&16384));
+        assert!(parsed.contains(&16385));
+        assert!(!parsed.contains(&0));
     }
 }

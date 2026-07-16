@@ -2,6 +2,10 @@
 name = "pg_flashback"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/CaghanTU/pg_flashback"
+description = "Table-level point-in-time recovery for PostgreSQL"
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -12,8 +16,6 @@ path = "./src/bin/pgrx_embed.rs"
 
 [features]
 default = ["pg17"]
-pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
@@ -23,6 +25,7 @@ pg_test = []
 [dependencies]
 pgrx = "=0.16.1"
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

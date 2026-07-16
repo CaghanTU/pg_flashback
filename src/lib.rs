@@ -291,6 +291,30 @@ mod tests {
         it_set_schema_tracking,
         "../tests/sql/integration/set_schema_tracking.sql"
     );
+    sql_test!(
+        it_retention_active_partition_survives,
+        "../tests/sql/integration/retention_active_partition_survives.sql"
+    );
+    sql_test!(
+        it_trigger_pipeline_restore,
+        "../tests/sql/integration/trigger_pipeline_restore.sql"
+    );
+    sql_test!(
+        it_backup_profile_contract,
+        "../tests/sql/integration/backup_profile_contract.sql"
+    );
+    sql_test!(
+        it_coverage_schema_contract,
+        "../tests/sql/integration/coverage_schema_contract.sql"
+    );
+    sql_test!(
+        it_coverage_lifecycle_hardening,
+        "../tests/sql/integration/coverage_lifecycle_hardening.sql"
+    );
+    sql_test!(
+        it_lsn_target_adversarial,
+        "../tests/sql/integration/lsn_target_adversarial.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

@@ -11,8 +11,10 @@ PORT="${1:-28817}"
 SOCKDIR="${2:-$HOME/.pgrx}"
 
 # Detect psql/pgbench: prefer pgrx-installed PG17, fall back to PATH
-_PGRX_BIN="$HOME/.pgrx/17.*/pgrx-install/bin"
-_RESOLVED=$(echo $_PGRX_BIN 2>/dev/null | tr ' ' '\n' | head -1)
+_RESOLVED=""
+for candidate in "$HOME"/.pgrx/17.*/pgrx-install/bin; do
+  [[ -d "$candidate" ]] && _RESOLVED="$candidate" && break
+done
 if [[ -d "$_RESOLVED" ]]; then
   PSQL_BIN="$_RESOLVED/psql"
   PGBENCH_BIN="$_RESOLVED/pgbench"
@@ -95,7 +97,6 @@ CREATE TABLE bm2 (id serial PRIMARY KEY, val integer, data text);
 INSERT INTO bm2 (val, data) SELECT g, 'init' FROM generate_series(1,10000) g;
 SQL
 
-SINGLE_SQL="UPDATE bm2 SET val = val + 1, data = 'upd' WHERE id = (1 + (random()*9999)::int)"
 SINGLE_BATCH="DO \$\$ BEGIN FOR i IN 1..10000 LOOP UPDATE bm2 SET val=val+1, data='upd' WHERE id=i; END LOOP; END; \$\$"
 SINGLE_RESET="UPDATE bm2 SET val=0, data='reset'"
 
@@ -192,8 +193,6 @@ echo ""
 # ──────────────────────────────────────────────────────────────────────
 # SCENARIO 5: Concurrent simulation via pgbench
 # ──────────────────────────────────────────────────────────────────────
-PGBENCH="/usr/local/pgsql-17/bin/pgbench -h $SOCKDIR -p $PORT -d postgres"
-
 echo "━━━ Scenario 5: pgbench TPS (8 clients, 30s) ━━━━━━━━━━━━━━━━━━"
 
 $PSQL -q <<'SQL'

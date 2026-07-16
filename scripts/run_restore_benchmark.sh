@@ -10,8 +10,10 @@ PORT="${1:-28817}"
 SOCKDIR="${2:-$HOME/.pgrx}"
 
 # Detect psql: prefer pgrx-installed PG17, fall back to PATH
-_PGRX_BIN="$HOME/.pgrx/17.*/pgrx-install/bin"
-_RESOLVED=$(echo $_PGRX_BIN 2>/dev/null | tr ' ' '\n' | head -1)
+_RESOLVED=""
+for candidate in "$HOME"/.pgrx/17.*/pgrx-install/bin; do
+  [[ -d "$candidate" ]] && _RESOLVED="$candidate" && break
+done
 if [[ -d "$_RESOLVED" ]]; then
   PSQL_BIN="$_RESOLVED/psql"
 else
@@ -74,14 +76,14 @@ BEGIN
              JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
              WHERE tt.table_name IN ('rb_orders','rb_mixed','rb_parallel')
     LOOP
-        EXECUTE format('DROP TABLE IF EXISTS %s', r.snapshot_table);
+        PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table));
     END LOOP;
     -- Also drop base_snapshot tables
     FOR r IN SELECT base_snapshot_table
              FROM flashback.tracked_tables
              WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel')
     LOOP
-        EXECUTE format('DROP TABLE IF EXISTS %s', r.base_snapshot_table);
+        PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
     END LOOP;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
@@ -119,9 +121,9 @@ BEGIN
     FOR r IN SELECT s.snapshot_table FROM flashback.snapshots s
              JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
              WHERE tt.table_name = 'rb_orders'
-    LOOP EXECUTE format('DROP TABLE IF EXISTS %s', r.snapshot_table); END LOOP;
+    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table)); END LOOP;
     FOR r IN SELECT base_snapshot_table FROM flashback.tracked_tables WHERE table_name = 'rb_orders'
-    LOOP EXECUTE format('DROP TABLE IF EXISTS %s', r.base_snapshot_table); END LOOP;
+    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table)); END LOOP;
 EXCEPTION WHEN OTHERS THEN NULL;
 END $$;
 DELETE FROM flashback.delta_log WHERE table_name = 'public.rb_orders';
@@ -151,10 +153,6 @@ SQL
     # Attach direct-to-delta_log trigger (bypass staging worker)
     attach_bench_trigger public rb_orders
 
-    # Record t_before AFTER tracking (tracked_since is now set)
-    local t_before
-    t_before=$($PSQL -Atq -c "SELECT clock_timestamp();")
-
     # Insert rows — these INSERT events land directly in delta_log
     $PSQL -q -c "
 INSERT INTO rb_orders (customer, amount, status, region, notes)
@@ -173,9 +171,11 @@ FROM generate_series(1, ${rows}) g;
     $PSQL -q -c "UPDATE rb_orders SET status = 'DISASTER', notes = repeat('y',20);"
 
     # Measure restore — restore to t_disaster (replays the UPDATE disaster back to pre-disaster state)
-    local wall_start=$(date +%s%N)
+    local wall_start
+    wall_start=$(date +%s%N)
     $PSQL -q -c "SELECT flashback_restore('rb_orders', '${t_disaster}'::timestamptz);" 
-    local wall_end=$(date +%s%N)
+    local wall_end
+    wall_end=$(date +%s%N)
     local wall_ms=$(( (wall_end - wall_start) / 1000000 ))
     local rps=$(( rows * 1000 / (wall_ms + 1) ))
 

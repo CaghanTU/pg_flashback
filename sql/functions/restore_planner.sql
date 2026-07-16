@@ -56,7 +56,8 @@ BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
         INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE (
+    WHERE tt.recovery_profile = 'local_delta'
+      AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
@@ -73,6 +74,16 @@ BEGIN
 
     IF v_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_restore: table % is not tracked (was it ever tracked, or was retention already applied?)', target_table;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM flashback.tracked_tables tt
+        JOIN flashback.coverage_generations cg USING (tracking_id)
+        WHERE tt.rel_oid = v_rel_oid
+    ) THEN
+        RAISE EXCEPTION 'flashback_restore(timestamp) is disabled for correctness-qualified WAL coverage'
+            USING HINT = 'Call flashback_resolve_target(table, timestamp), inspect its pinned frontier, then execute flashback_restore_lsn(table, resolved_lsn).';
     END IF;
 
     IF target_time < v_tracked_since THEN
@@ -481,10 +492,15 @@ BEGIN
 
         v_post_snap_tbl := format('snap_%s_%s', v_rel_oid::text, v_post_snap_id::text);
 
-        EXECUTE format('DROP TABLE IF EXISTS flashback.%I', v_post_snap_tbl);
+        PERFORM public.flashback_drop_payload_table(
+            to_regclass(format('flashback.%I', v_post_snap_tbl))
+        );
         EXECUTE format(
             'CREATE TABLE flashback.%I AS TABLE %I.%I',
             v_post_snap_tbl, v_schema_name, v_table_name
+        );
+        PERFORM public.flashback_own_payload_table(
+            to_regclass(format('flashback.%I', v_post_snap_tbl))
         );
         EXECUTE format('SELECT count(*) FROM flashback.%I', v_post_snap_tbl)
           INTO v_post_row_count;
@@ -668,7 +684,8 @@ BEGIN
     SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
-    WHERE (
+    WHERE tt.recovery_profile = 'local_delta'
+      AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
           OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
@@ -682,6 +699,15 @@ BEGIN
 
     IF v_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_query: table % is not tracked (was it ever tracked, or was retention already applied?)', target_table;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM flashback.tracked_tables tt
+        JOIN flashback.coverage_generations cg USING (tracking_id)
+        WHERE tt.rel_oid = v_rel_oid
+    ) THEN
+        RAISE EXCEPTION 'flashback_query(timestamp) is disabled for correctness-qualified WAL coverage'
+            USING HINT = 'Resolve the timestamp with flashback_resolve_target(), then call flashback_query_lsn().';
     END IF;
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_query: target_time % is before tracked_since %', target_time, v_tracked_since;
@@ -995,6 +1021,7 @@ BEGIN
       INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
     WHERE tt.is_active
+      AND tt.recovery_profile = 'local_delta'
       AND (
           tt.rel_oid = to_regclass(target_table)::oid
           OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
@@ -1008,6 +1035,15 @@ BEGIN
 
     IF v_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_recover_deleted: table % is not tracked', target_table;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM flashback.tracked_tables tt
+        JOIN flashback.coverage_generations cg USING (tracking_id)
+        WHERE tt.rel_oid = v_rel_oid
+    ) THEN
+        RAISE EXCEPTION 'flashback_recover_deleted(timestamp) is disabled for correctness-qualified WAL coverage'
+            USING HINT = 'Resolve the timestamp with flashback_resolve_target(), then call flashback_recover_deleted_lsn().';
     END IF;
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_recover_deleted: target_time % is before tracked_since %',

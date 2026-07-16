@@ -1,0 +1,19 @@
+{
+  "profile": "flashback_plain",
+  "pgbackrest_bin": "/usr/local/bin/pgbackrest",
+  "pgbackrest_config": "/etc/pgbackrest/pgbackrest-flashback.conf",
+  "pg_bin_dir": "/usr/local/pgsql-17/bin",
+  "cp_bin": "/usr/bin/cp",
+  "repository_path": "/var/lib/pgbackrest-flashback",
+  "repository_key": 1,
+  "stanza": "app_flashback",
+  "work_root": "/var/lib/pg_flashback/recovery",
+  "socket_root": "/run/pg_flashback",
+  "recovery_port": 28919,
+  "recovery_user": "postgres",
+  "snapshot_provider": "xfs_reflink",
+  "expire_lock_path": "/run/lock/pg_flashback/app_flashback.lock",
+  "max_work_bytes": 536870912000,
+  "command_timeout_seconds": 3600,
+  "recovery_timeout_seconds": 3600
+}
