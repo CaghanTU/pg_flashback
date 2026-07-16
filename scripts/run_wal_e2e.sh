@@ -403,6 +403,8 @@ assert_eq "izlenmeyen DEFAULT tablo decoder ledger'ına girmedi" "0" \
     "$(q "SELECT count(*) FROM flashback.capture_commits WHERE source_xid=$AMP_DEFAULT_XID")"
 assert_eq "izlenmeyen RI FULL tablo decoder ledger'ına girmedi" "0" \
     "$(q "SELECT count(*) FROM flashback.capture_commits WHERE source_xid=$AMP_FULL_XID")"
+assert_ne "izlenen batch transaction XID üretildi" "" "$AMP_TRACKED_XID"
+assert_ne "izlenen batch app WAL ölçümü üretildi" "" "$AMP_TRACKED_APP_WAL"
 BATCH_ELAPSED_MS=$((($(date +%s%N) - BATCH_STARTED_NS) / 1000000))
 AMP_TOTAL_END=$(q "SELECT pg_current_wal_insert_lsn()")
 AMP_TRACKED_TOTAL_WAL=$(q "SELECT pg_wal_lsn_diff('$AMP_TOTAL_END', '$AMP_TOTAL_START')::bigint")
@@ -415,7 +417,7 @@ if ! awk -v full="$AMP_FULL_WAL" -v base="$AMP_DEFAULT_WAL" \
     echo "FAIL: REPLICA IDENTITY FULL WAL maliyeti baseline'dan büyük ölçülmedi"
     exit 1
 fi
-echo "  ok: WAL amplification — default=${AMP_DEFAULT_WAL} B, RI_FULL=${AMP_FULL_WAL} B (${AMP_RI_RATIO}x), tracked-total=${AMP_TRACKED_TOTAL_WAL} B (${AMP_TOTAL_RATIO}x)"
+echo "  ok: WAL amplification — default=${AMP_DEFAULT_WAL} B, RI_FULL=${AMP_FULL_WAL} B (${AMP_RI_RATIO}x), tracked-total=${AMP_TRACKED_TOTAL_WAL} B (${AMP_TOTAL_RATIO}x), tracked-xid=${AMP_TRACKED_XID}, tracked-app-wal=${AMP_TRACKED_APP_WAL} B"
 echo "  ok: büyük transaction capture süresi = ${BATCH_ELAPSED_MS}ms"
 
 q "INSERT INTO orders (customer, amount) SELECT 'cust_'||g, g*1.5 FROM generate_series(1,1000) g" > /dev/null
