@@ -54,11 +54,41 @@ UNCOV_DB="wal_e2e_uncov"
 
 OLD_TARGETS=""
 OLD_MODE=""
+OLD_ENABLED=""
 GUCS_MODIFIED=0
 CLEANED=0
+RETENTION_PAUSE_PID=""
+RETENTION_PIN_PID=""
+RETENTION_BEGIN_PID=""
+RETENTION_BLOCKER_PID=""
+RETENTION_RESUME_PID=""
+STOPPED_WORKER_PID=""
 
 q()  { $PSQL -d "$DB" -qAtc "$1"; }
 qp() { $PSQL -d postgres -qAtc "$1"; }
+
+stop_idle_worker() {
+    local pid=""
+    for _ in $(seq 1 100); do
+        pid=$(q "SELECT pid FROM pg_stat_activity
+            WHERE backend_type='pg_flashback delta worker'
+              AND datname=current_database()
+              AND wait_event_type='Extension'
+            LIMIT 1")
+        if [[ -n "$pid" ]]; then
+            kill -STOP "$pid"
+            sleep 0.05
+            if [[ "$(q "SELECT count(*) FROM pg_locks
+                         WHERE pid=$pid AND locktype='advisory' AND granted")" == "0" ]]; then
+                echo "$pid"
+                return 0
+            fi
+            kill -CONT "$pid" > /dev/null 2>&1 || true
+        fi
+        sleep 0.05
+    done
+    return 1
+}
 
 assert_eq() { # desc expected actual
     if [[ "$2" != "$3" ]]; then echo "FAIL: $1 (beklenen=$2, bulunan=$3)"; exit 1; fi
@@ -88,6 +118,14 @@ cleanup() {
         exit "$rc"
     fi
     set +e
+    [[ -n "$STOPPED_WORKER_PID" ]] && kill -CONT "$STOPPED_WORKER_PID" > /dev/null 2>&1
+    [[ -n "$RETENTION_RESUME_PID" ]] && kill "$RETENTION_RESUME_PID" > /dev/null 2>&1
+    [[ -n "$RETENTION_BLOCKER_PID" ]] && kill "$RETENTION_BLOCKER_PID" > /dev/null 2>&1
+    [[ -n "$RETENTION_BEGIN_PID" ]] && kill "$RETENTION_BEGIN_PID" > /dev/null 2>&1
+    [[ -n "$RETENTION_PIN_PID" ]] && kill "$RETENTION_PIN_PID" > /dev/null 2>&1
+    [[ -n "$RETENTION_PAUSE_PID" ]] && kill "$RETENTION_PAUSE_PID" > /dev/null 2>&1
+    q "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+       WHERE application_name LIKE 'pgfb_%' AND pid <> pg_backend_pid()" > /dev/null 2>&1
     echo "━━━ Temizlik: GUC'ları geri al, restart, test DB/slot'larını düşür ━━━"
     if [[ "$GUCS_MODIFIED" == "1" ]]; then
         # Guard: a previous ABORTED run may have left our own test DB name in
@@ -103,6 +141,11 @@ cleanup() {
         else
             qp "ALTER SYSTEM RESET pg_flashback.capture_mode" > /dev/null 2>&1
         fi
+        if [[ -n "$OLD_ENABLED" ]]; then
+            qp "ALTER SYSTEM SET pg_flashback.enabled = '$OLD_ENABLED'" > /dev/null 2>&1
+        else
+            qp "ALTER SYSTEM RESET pg_flashback.enabled" > /dev/null 2>&1
+        fi
         restart_pg || echo "  uyarı: instance yeniden başlatılamadı — elle kontrol edin"
     fi
     qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
@@ -113,7 +156,15 @@ cleanup() {
     rm -f /tmp/pg_flashback_track_race_1.out \
         /tmp/pg_flashback_track_race_2.out \
         /tmp/pg_flashback_boundary_writer.out \
-        /tmp/pg_flashback_slot_loss_lock.out
+        /tmp/pg_flashback_slot_loss_lock.out \
+        /tmp/pg_flashback_retention_pause.out \
+        /tmp/pg_flashback_retention_pin.out \
+        /tmp/pg_flashback_retention_begin.out \
+        /tmp/pg_flashback_retention_blocker.out \
+        /tmp/pg_flashback_retention_resume.out \
+        /tmp/pg_flashback_retention_admit.out \
+        /tmp/pg_flashback_enabled_gap_reject.out \
+        /tmp/pg_flashback_mode_ddl_reject.out
     echo "  ok: temizlik tamamlandı (target_databases=$(qp "SELECT current_setting('pg_flashback.target_databases', true)" 2>/dev/null))"
     echo ""
     if [[ "$rc" == "0" ]]; then
@@ -135,6 +186,7 @@ trap 'echo "FAIL: hata (satır $LINENO)"' ERR
 echo "━━━ 0. Ortam hazırlığı (GUC kaydet, DB + slot temizle, restart) ━━━"
 OLD_TARGETS=$(qp "SELECT current_setting('pg_flashback.target_databases', true)")
 OLD_MODE=$(qp "SELECT current_setting('pg_flashback.capture_mode', true)")
+OLD_ENABLED=$(qp "SELECT current_setting('pg_flashback.enabled', true)")
 
 qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
     WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}')" > /dev/null || true
@@ -146,6 +198,7 @@ qp "CREATE DATABASE $DB" > /dev/null
 GUCS_MODIFIED=1
 qp "ALTER SYSTEM SET pg_flashback.target_databases = '$DB'" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.capture_mode = 'wal'" > /dev/null
+qp "ALTER SYSTEM SET pg_flashback.enabled = 'on'" > /dev/null
 restart_pg || { echo "FAIL: PostgreSQL yeniden başlatılamadı"; exit 1; }
 echo "  ok: instance yeniden başladı (target_databases=$DB, capture_mode=wal)"
 
@@ -442,9 +495,23 @@ for _ in $(seq 1 100); do
 done
 
 echo "━━━ 4b. Felaket-öncesi COMMIT LSN'e full restore ━━━"
+# Freeze the worker only while it is idle and owns no advisory key, then commit
+# one old-OID UPDATE before the restore swaps the physical table. On
+# resume the decoder must attach that buffered WAL to the immutable predecessor
+# generation, not discard it because tracked_tables now points at the new OID.
+STOPPED_WORKER_PID=$(stop_idle_worker)
+[[ -n "$STOPPED_WORKER_PID" ]] || { echo "FAIL: backlog testi worker PID bulamadı"; exit 1; }
+BUFFERED_OLD_OID_XID=$(q "BEGIN;
+    SELECT txid_current()::text;
+    UPDATE orders SET amount=amount+7 WHERE id=1001;
+    COMMIT")
+
 q "SELECT flashback_restore_lsn(
        ARRAY['orders', '\"we\"\"ird\"'], '$RESOLVED_LSN'
    )" > /dev/null
+
+kill -CONT "$STOPPED_WORKER_PID"
+STOPPED_WORKER_PID=""
 assert_eq "restore sonrası satır sayısı" "1001" "$(q "SELECT count(*) FROM orders")"
 assert_eq "yeni_musteri kurtarıldı" "1" "$(q "SELECT count(*) FROM orders WHERE customer='yeni_musteri'")"
 assert_eq "güncellenmiş tutarlar korundu" "115.00" "$(q "SELECT max(amount) FROM orders WHERE id <= 10")"
@@ -458,6 +525,7 @@ assert_eq "multi-table LSN restore ikinci tabloyu da korudu" "2" \
 
 for _ in $(seq 1 100); do
     [[ "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='active'")" == "1" \
+       && "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")" == "1" \
        && "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='building'")" == "0" ]] && break
     sleep 0.1
 done
@@ -465,6 +533,19 @@ assert_eq "post-restore successor aktif" "1" \
     "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='active' AND cg.generation_no=2")"
 assert_eq "post-restore pending generation kalmadı" "0" \
     "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='building'")"
+assert_eq "restore öncesi buffered eski-OID WAL predecessor generation'a bağlandı" "1" \
+    "$(q "SELECT count(*)
+           FROM flashback.delta_log d
+           JOIN flashback.coverage_generations cg
+             ON cg.generation_id=d.generation_id
+            AND cg.tracking_id=d.tracking_id
+           JOIN flashback.tracked_tables tt
+             ON tt.tracking_id=d.tracking_id
+           WHERE d.source_xid=$BUFFERED_OLD_OID_XID
+             AND d.event_type='UPDATE'
+             AND cg.state='sealed'
+             AND d.rel_oid=cg.rel_oid_at_boundary
+             AND d.rel_oid<>tt.rel_oid")"
 
 LEGACY_RC=0
 $PSQL -d "$DB" -qc "SELECT flashback_restore('orders', '$T_MID')" > /tmp/pg_flashback_legacy_reject.out 2>&1 || LEGACY_RC=$?
@@ -472,7 +553,245 @@ $PSQL -d "$DB" -qc "SELECT flashback_restore('orders', '$T_MID')" > /tmp/pg_flas
 grep -q "disabled for correctness-qualified WAL coverage" /tmp/pg_flashback_legacy_reject.out
 echo "  ok: legacy timestamp restore fail-closed"
 
-echo "━━━ 4c. Slot kaybı coverage'ı donduruyor; explicit re-anchor yeni epoch açıyor ━━━"
+echo "━━━ 4c. Generation retention: durable intent, kill, idempotent resume ━━━"
+RETIRE_GENERATION=$(q "SELECT cg.generation_id
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt USING (tracking_id)
+    WHERE tt.table_name='orders'
+      AND cg.state='sealed'
+      AND cg.valid_through_lsn >= cg.superseded_before_lsn
+    ORDER BY cg.generation_no
+    LIMIT 1")
+[[ -n "$RETIRE_GENERATION" ]] || { echo "FAIL: retire edilebilir sealed orders generation bulunamadı"; exit 1; }
+IFS='|' read -r RETIRE_SNAPSHOT RETIRE_DELTA_ROWS RETIRE_SCHEMA_ROWS <<< "$(q "
+    SELECT snap.snapshot_table,
+           (SELECT count(*) FROM flashback.delta_log d
+            WHERE d.generation_id=cg.generation_id),
+           (SELECT count(*) FROM flashback.schema_versions sv
+            WHERE sv.generation_id=cg.generation_id)
+    FROM flashback.coverage_generations cg
+    JOIN flashback.snapshots snap
+      ON snap.snapshot_id=cg.boundary_snapshot_id
+     AND snap.tracking_id=cg.tracking_id
+    WHERE cg.generation_id=$RETIRE_GENERATION")"
+RETIRE_ACTIVE_TARGET=$(q "SELECT cg.boundary_lsn
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt USING (tracking_id)
+    WHERE tt.table_name='orders' AND cg.state='active'")
+
+# Keep the background worker's maintenance branch paused with an unrelated
+# lifecycle-class advisory key. Manual retention calls use the real orders key
+# and remain unblocked; this makes the crash window deterministic.
+$PSQL -d "$DB" -qAt > /tmp/pg_flashback_retention_pause.out 2>&1 <<'SQL' &
+SET application_name = 'pgfb_retention_pause';
+SELECT pg_advisory_lock(358944::integer, 2147483000::integer);
+SELECT pg_sleep(60);
+SQL
+RETENTION_PAUSE_PID=$!
+for _ in $(seq 1 50); do
+    [[ "$(q "SELECT count(*) FROM pg_locks l
+               JOIN pg_stat_activity a ON a.pid=l.pid
+               WHERE l.locktype='advisory' AND l.classid=358944
+                 AND l.objid=2147483000 AND l.granted
+                 AND a.application_name='pgfb_retention_pause'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "worker maintenance retention testi boyunca duraklatıldı" "1" \
+    "$(q "SELECT count(*) FROM pg_locks l
+           JOIN pg_stat_activity a ON a.pid=l.pid
+           WHERE l.locktype='advisory' AND l.classid=358944
+             AND l.objid=2147483000 AND l.granted
+             AND a.application_name='pgfb_retention_pause'")"
+
+q "UPDATE flashback.tracked_tables
+      SET retention_interval=interval '0 seconds'
+    WHERE table_name='orders'" > /dev/null
+
+# Admission holds the stable lifecycle pin for its whole transaction. A
+# retirement intent must wait behind that pin and must not become visible
+# while a query/recover/restore caller can still materialize the generation.
+$PSQL -d "$DB" -qAt > /tmp/pg_flashback_retention_pin.out 2>&1 <<SQL &
+SET application_name = 'pgfb_retention_pin';
+BEGIN;
+SELECT count(*) FROM flashback_admit_lsn_target('orders', '$RESOLVED_LSN');
+SELECT pg_sleep(60);
+COMMIT;
+SQL
+RETENTION_PIN_PID=$!
+for _ in $(seq 1 50); do
+    [[ "$(q "SELECT count(*) FROM pg_locks l
+               JOIN pg_stat_activity a ON a.pid=l.pid
+               WHERE l.locktype='advisory' AND l.classid=358944
+                 AND l.granted AND a.application_name='pgfb_retention_pin'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "admission transaction generation payload'ını pinledi" "1" \
+    "$(q "SELECT count(*) FROM pg_locks l
+           JOIN pg_stat_activity a ON a.pid=l.pid
+           WHERE l.locktype='advisory' AND l.classid=358944
+             AND l.granted AND a.application_name='pgfb_retention_pin'")"
+
+PGAPPNAME=pgfb_retention_begin $PSQL -d "$DB" -qc \
+    "SELECT flashback_begin_generation_retirement($RETIRE_GENERATION)" \
+    > /tmp/pg_flashback_retention_begin.out 2>&1 &
+RETENTION_BEGIN_PID=$!
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM pg_stat_activity
+               WHERE application_name='pgfb_retention_begin'
+                 AND wait_event_type='Lock'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "retirement pinned admission bitene kadar bekledi" "1" \
+    "$(q "SELECT count(*) FROM pg_stat_activity
+           WHERE application_name='pgfb_retention_begin'
+             AND wait_event_type='Lock'")"
+assert_eq "pin açıkken retirement intent görünmedi" "0" \
+    "$(q "SELECT count(*) FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION")"
+
+kill "$RETENTION_PIN_PID" > /dev/null 2>&1 || true
+# Closing the psql client does not reliably interrupt a backend currently in
+# pg_sleep(): PostgreSQL may not observe the socket EOF until the sleep timer
+# fires. Terminate the server backend explicitly so the lifecycle advisory
+# lock is released immediately and the waiting retirement call can resume.
+RETENTION_PIN_BACKEND=$(q "SELECT pid FROM pg_stat_activity
+    WHERE application_name='pgfb_retention_pin' LIMIT 1")
+if [[ -n "$RETENTION_PIN_BACKEND" ]]; then
+    q "SELECT pg_terminate_backend($RETENTION_PIN_BACKEND)" > /dev/null
+fi
+wait "$RETENTION_PIN_PID" 2>/dev/null || true
+RETENTION_PIN_PID=""
+set +e
+wait "$RETENTION_BEGIN_PID"
+RETENTION_BEGIN_RC=$?
+set -e
+if [[ "$RETENTION_BEGIN_RC" != "0" ]]; then
+    echo "FAIL: retirement begin backend exited with rc=$RETENTION_BEGIN_RC"
+    sed -n '1,120p' /tmp/pg_flashback_retention_begin.out >&2 || true
+    exit 1
+fi
+RETENTION_BEGIN_PID=""
+assert_eq "pin bırakılınca durable intent commit edildi" "retiring" \
+    "$(q "SELECT state FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "intent sonrası generation henüz sealed" "sealed" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "intent sonrası snapshot fiziksel olarak duruyor" "t" \
+    "$(q "SELECT to_regclass('$RETIRE_SNAPSHOT') IS NOT NULL")"
+
+RETIRE_ADMIT_RC=0
+$PSQL -d "$DB" -qc "SELECT * FROM flashback_admit_lsn_target('orders', '$RESOLVED_LSN')" \
+    > /tmp/pg_flashback_retention_admit.out 2>&1 || RETIRE_ADMIT_RC=$?
+[[ "$RETIRE_ADMIT_RC" != "0" ]] || { echo "FAIL: retiring generation admission'a açık kaldı"; exit 1; }
+grep -q "owned by 0 eligible generations" /tmp/pg_flashback_retention_admit.out
+assert_eq "retiring predecessor kapanırken active successor kullanılabilir" "1" \
+    "$(q "SELECT count(*) FROM flashback_admit_lsn_target('orders', '$RETIRE_ACTIVE_TARGET')")"
+
+# Block the snapshot DROP, start the resume transaction, then terminate that
+# backend. PostgreSQL must roll back every destructive step while the already
+# committed retirement intent remains available for the next cycle.
+$PSQL -d "$DB" -qAt > /tmp/pg_flashback_retention_blocker.out 2>&1 <<SQL &
+SET application_name = 'pgfb_retention_snapshot_blocker';
+BEGIN;
+LOCK TABLE $RETIRE_SNAPSHOT IN ACCESS SHARE MODE;
+SELECT pg_sleep(60);
+COMMIT;
+SQL
+RETENTION_BLOCKER_PID=$!
+for _ in $(seq 1 50); do
+    [[ "$(q "SELECT count(*) FROM pg_stat_activity
+               WHERE application_name='pgfb_retention_snapshot_blocker'")" == "1" ]] && break
+    sleep 0.1
+done
+
+PGAPPNAME=pgfb_retention_resume $PSQL -d "$DB" -qc "SELECT flashback_apply_retention()" \
+    > /tmp/pg_flashback_retention_resume.out 2>&1 &
+RETENTION_RESUME_PID=$!
+RETENTION_RESUME_BACKEND=""
+for _ in $(seq 1 100); do
+    RETENTION_RESUME_BACKEND=$(q "SELECT pid FROM pg_stat_activity
+        WHERE application_name='pgfb_retention_resume'
+          AND wait_event_type='Lock'")
+    [[ -n "$RETENTION_RESUME_BACKEND" ]] && break
+    sleep 0.1
+done
+[[ -n "$RETENTION_RESUME_BACKEND" ]] || { echo "FAIL: retention resume snapshot lock'unda beklemedi"; exit 1; }
+q "SELECT pg_terminate_backend($RETENTION_RESUME_BACKEND)" > /dev/null
+if wait "$RETENTION_RESUME_PID"; then
+    echo "FAIL: terminate edilen retention resume backend başarı döndürdü"
+    exit 1
+fi
+RETENTION_RESUME_PID=""
+kill "$RETENTION_BLOCKER_PID" > /dev/null 2>&1 || true
+RETENTION_BLOCKER_BACKEND=$(q "SELECT pid FROM pg_stat_activity
+    WHERE application_name='pgfb_retention_snapshot_blocker' LIMIT 1")
+if [[ -n "$RETENTION_BLOCKER_BACKEND" ]]; then
+    q "SELECT pg_terminate_backend($RETENTION_BLOCKER_BACKEND)" > /dev/null
+fi
+wait "$RETENTION_BLOCKER_PID" 2>/dev/null || true
+RETENTION_BLOCKER_PID=""
+
+assert_eq "kesinti sonrası intent resumable kaldı" "retiring" \
+    "$(q "SELECT state FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "kesinti snapshot DROP'unu rollback etti" "t" \
+    "$(q "SELECT to_regclass('$RETIRE_SNAPSHOT') IS NOT NULL")"
+assert_eq "kesinti delta payload'ını rollback etti" "$RETIRE_DELTA_ROWS" \
+    "$(q "SELECT count(*) FROM flashback.delta_log
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "kesinti schema payload'ını rollback etti" "$RETIRE_SCHEMA_ROWS" \
+    "$(q "SELECT count(*) FROM flashback.schema_versions
+           WHERE generation_id=$RETIRE_GENERATION")"
+
+# Policy B: cleanup verifies identity/ownership/need, NOT content. Drift in a
+# payload we are about to discard must not wedge retention (the old full
+# COUNT(*) verification turned any stray row into unbounded disk growth).
+# The intent-time row count stays as immutable forensic evidence.
+SNAPSHOT_EVIDENCE_ROWS=$(q "SELECT snapshot_row_count
+    FROM flashback.generation_payload_retirements
+    WHERE generation_id=$RETIRE_GENERATION")
+q "INSERT INTO $RETIRE_SNAPSHOT (id, customer, amount)
+   VALUES (2000000, 'content_drift_probe', 0)" > /dev/null
+
+q "SELECT flashback_apply_retention()" > /dev/null
+assert_eq "içerik kayması cleanup'ı bloke etmedi (forensik kanıt intent-anı değerinde)" \
+    "$SNAPSHOT_EVIDENCE_ROWS" \
+    "$(q "SELECT snapshot_row_count FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "resume audit'i removed yaptı" "removed" \
+    "$(q "SELECT state FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "resume generation audit'ini retired yaptı" "retired" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "resume snapshot payload'ını kaldırdı" "f" \
+    "$(q "SELECT to_regclass('$RETIRE_SNAPSHOT') IS NOT NULL")"
+assert_eq "resume delta payload'ını bütünüyle kaldırdı" "0" \
+    "$(q "SELECT count(*) FROM flashback.delta_log
+           WHERE generation_id=$RETIRE_GENERATION")"
+assert_eq "resume schema payload'ını bütünüyle kaldırdı" "0" \
+    "$(q "SELECT count(*) FROM flashback.schema_versions
+           WHERE generation_id=$RETIRE_GENERATION")"
+q "SELECT flashback_apply_retention()" > /dev/null
+assert_eq "tekrar cleanup immutable audit'i çoğaltmadı" "1" \
+    "$(q "SELECT count(*) FROM flashback.generation_payload_retirements
+           WHERE generation_id=$RETIRE_GENERATION AND state='removed'")"
+
+q "UPDATE flashback.tracked_tables
+      SET retention_interval=interval '7 days'
+    WHERE table_name='orders'" > /dev/null
+
+kill "$RETENTION_PAUSE_PID" > /dev/null 2>&1 || true
+RETENTION_PAUSE_BACKEND=$(q "SELECT pid FROM pg_stat_activity
+    WHERE application_name='pgfb_retention_pause' LIMIT 1")
+if [[ -n "$RETENTION_PAUSE_BACKEND" ]]; then
+    q "SELECT pg_terminate_backend($RETENTION_PAUSE_BACKEND)" > /dev/null
+fi
+wait "$RETENTION_PAUSE_PID" 2>/dev/null || true
+RETENTION_PAUSE_PID=""
+
+echo "━━━ 4d. Slot kaybı coverage'ı donduruyor; explicit re-anchor yeni epoch açıyor ━━━"
 OLD_STREAM_ID=$(q "SELECT cg.stream_id
                     FROM flashback.coverage_generations cg
                     JOIN flashback.tracked_tables tt USING (tracking_id)
@@ -535,7 +854,7 @@ assert_eq "health slot kaybını degraded gösteriyor" "degraded" \
     "$(q "SELECT health FROM flashback_health()
            WHERE table_name='public.orders'")"
 assert_eq "kırık stream'in kanıtlanmış eski hedefi hâlâ okunabilir" "1" \
-    "$(q "SELECT count(*) FROM flashback_admit_lsn_target('orders', '$RESOLVED_LSN')")"
+    "$(q "SELECT count(*) FROM flashback_admit_lsn_target('orders', '$OLD_FRONTIER')")"
 
 # This committed update is intentionally outside every logical slot.  The
 # exact LSN sampled immediately afterward must remain a rejected interval even
@@ -589,7 +908,7 @@ assert_eq "re-anchor sonrası DML yeni generation'a bağlandı" "1" \
            WHERE d.generation_id=$REANCHOR_GENERATION
              AND d.event_type='UPDATE'")"
 
-echo "━━━ 4d. Harici slot ilerletme sessiz devam etmiyor ━━━"
+echo "━━━ 4e. Harici slot ilerletme sessiz devam etmiyor ━━━"
 q "CREATE TABLE external_advance_probe (id int PRIMARY KEY)" > /dev/null
 EXTERNAL_OLD_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams
                           WHERE state='active'")
@@ -669,10 +988,152 @@ $PSQL -d "$DB" -qc "SELECT * FROM flashback_admit_lsn_target('orders', '$EXTERNA
 grep -q "owned by 0 eligible generations" /tmp/pg_flashback_external_gap_reject.out
 echo "  ok: harici tüketici aralığı kalıcı gap olarak reddedildi"
 
-echo "━━━ 4e. untrack orijinal REPLICA IDENTITY'yi geri getiriyor ━━━"
+echo "━━━ 4f. untrack orijinal REPLICA IDENTITY'yi geri getiriyor ━━━"
 $PSQL -d "$DB" -qc 'SELECT flashback_untrack('"'"'"we""ird"'"'"')' > /dev/null
 assert_eq "untrack sonrası replica identity DEFAULT" "d" \
     "$(q "SELECT relreplident FROM pg_class WHERE relname = 'we\"ird'")"
+
+echo "━━━ 4g. enabled/capture_mode SIGHUP geçişleri durable gap açıyor ━━━"
+CONFIG_DISABLED_STREAM=$(q "SELECT cg.stream_id
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt USING (tracking_id)
+    WHERE tt.table_name='orders' AND cg.state='active'")
+CONFIG_DISABLED_GENERATION=$(q "SELECT cg.generation_id
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt USING (tracking_id)
+    WHERE tt.table_name='orders' AND cg.state='active'")
+qp "ALTER SYSTEM SET pg_flashback.enabled = 'off'" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT invalidation_reason FROM flashback.capture_streams
+               WHERE stream_id=$CONFIG_DISABLED_STREAM")" == "capture_disabled" ]] && break
+    sleep 0.1
+done
+assert_eq "enabled=off worker idling öncesi stream'i kırdı" "capture_disabled" \
+    "$(q "SELECT invalidation_reason FROM flashback.capture_streams
+           WHERE stream_id=$CONFIG_DISABLED_STREAM")"
+assert_eq "enabled=off orders için tek LOGGED gap açtı" "1" \
+    "$(q "SELECT count(*) FROM flashback.coverage_gaps
+           WHERE source_generation_id=$CONFIG_DISABLED_GENERATION
+             AND reason='capture_disabled'")"
+
+q "UPDATE orders SET amount=amount+3 WHERE id=1001" > /dev/null
+CONFIG_DISABLED_LSN=$(q "SELECT pg_current_wal_insert_lsn()")
+qp "ALTER SYSTEM SET pg_flashback.enabled = 'on'" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.capture_streams
+               WHERE state='active' AND stream_id <> $CONFIG_DISABLED_STREAM")" == "1" ]] && break
+    sleep 0.1
+done
+CONFIG_ENABLED_REANCHOR=$(q "SELECT flashback_reanchor('orders')")
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT state FROM flashback.coverage_generations
+               WHERE generation_id=$CONFIG_ENABLED_REANCHOR")" == "active" ]] && break
+    sleep 0.1
+done
+assert_eq "enabled=on sonrası explicit re-anchor yeni epoch açtı" "active" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$CONFIG_ENABLED_REANCHOR")"
+CONFIG_DISABLED_GAP_RC=0
+$PSQL -d "$DB" -qc "SELECT * FROM flashback_admit_lsn_target('orders', '$CONFIG_DISABLED_LSN')" \
+    > /tmp/pg_flashback_enabled_gap_reject.out 2>&1 || CONFIG_DISABLED_GAP_RC=$?
+[[ "$CONFIG_DISABLED_GAP_RC" != "0" ]] || { echo "FAIL: enabled=off aralığındaki LSN kabul edildi"; exit 1; }
+grep -q "owned by 0 eligible generations" /tmp/pg_flashback_enabled_gap_reject.out
+echo "  ok: enabled=off ile re-anchor arasındaki boşluk kalıcı reddedildi"
+
+CONFIG_MODE_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams WHERE state='active'")
+CONFIG_MODE_GENERATION=$CONFIG_ENABLED_REANCHOR
+qp "ALTER SYSTEM SET pg_flashback.capture_mode = 'trigger'" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT invalidation_reason FROM flashback.capture_streams
+               WHERE stream_id=$CONFIG_MODE_STREAM")" == "capture_mode_changed" ]] && break
+    sleep 0.1
+done
+assert_eq "capture_mode=trigger stream'i senkron kırdı" "capture_mode_changed" \
+    "$(q "SELECT invalidation_reason FROM flashback.capture_streams
+           WHERE stream_id=$CONFIG_MODE_STREAM")"
+assert_eq "capture_mode değişimi orders için tek LOGGED gap açtı" "1" \
+    "$(q "SELECT count(*) FROM flashback.coverage_gaps
+           WHERE source_generation_id=$CONFIG_MODE_GENERATION
+             AND reason='capture_mode_changed'")"
+
+CONFIG_DDL_RC=0
+$PSQL -d "$DB" -qc "ALTER TABLE orders SET (autovacuum_enabled = false)" \
+    > /tmp/pg_flashback_mode_ddl_reject.out 2>&1 || CONFIG_DDL_RC=$?
+[[ "$CONFIG_DDL_RC" != "0" ]] || { echo "FAIL: broken stream üzerinde DDL kabul edildi"; exit 1; }
+# Depending on whether the caller's session-local mode is reconciled before
+# the durable stream-state check, the fail-closed guard reports either the
+# stream state or the disabled/no-active-epoch reason. Both are the required
+# invariant: no DDL may commit while the qualified WAL stream is broken.
+grep -Eq "DDL capture refused because (WAL stream|capture configuration is disabled)" \
+    /tmp/pg_flashback_mode_ddl_reject.out
+echo "  ok: broken qualified stream üzerinde DDL fail-closed"
+
+qp "ALTER SYSTEM SET pg_flashback.capture_mode = 'wal'" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.capture_streams
+               WHERE state='active' AND stream_id <> $CONFIG_MODE_STREAM")" == "1" ]] && break
+    sleep 0.1
+done
+CONFIG_MODE_REANCHOR=$(q "SELECT flashback_reanchor('orders')")
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT state FROM flashback.coverage_generations
+               WHERE generation_id=$CONFIG_MODE_REANCHOR")" == "active" ]] && break
+    sleep 0.1
+done
+assert_eq "WAL moduna dönüş explicit re-anchor olmadan coverage uydurmadı" "active" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$CONFIG_MODE_REANCHOR")"
+
+echo "━━━ 4h. İlk boundary'den önce slot kaybı taslağı abort ediyor; re-anchor kurtarıyor ━━━"
+q "CREATE TABLE initial_abort_probe (id integer PRIMARY KEY, note text);
+   INSERT INTO initial_abort_probe VALUES (1, 'base')" > /dev/null
+
+STOPPED_WORKER_PID=$(stop_idle_worker)
+[[ -n "$STOPPED_WORKER_PID" ]] || { echo "FAIL: initial-abort worker PID bulunamadı"; exit 1; }
+
+q "SELECT flashback_track('initial_abort_probe')" > /dev/null
+INITIAL_ABORT_GENERATION=$(q "SELECT cg.generation_id
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt USING (tracking_id)
+    WHERE tt.table_name='initial_abort_probe' AND cg.state='building'")
+[[ -n "$INITIAL_ABORT_GENERATION" ]] || { echo "FAIL: initial-abort building generation oluşmadı"; exit 1; }
+q "SELECT pg_drop_replication_slot('pg_flashback_${DB}')" > /dev/null
+kill -CONT "$STOPPED_WORKER_PID"
+STOPPED_WORKER_PID=""
+
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT state FROM flashback.coverage_generations
+               WHERE generation_id=$INITIAL_ABORT_GENERATION")" == "aborted" ]] && break
+    sleep 0.1
+done
+assert_eq "boundary COMMIT görülmeyen generation audit tombstone oldu" "aborted" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$INITIAL_ABORT_GENERATION")"
+assert_eq "aborted generation fiziksel snapshot bırakmadı" "0" \
+    "$(q "SELECT count(*) FROM flashback.snapshots s
+           JOIN flashback.coverage_generations cg
+             ON cg.boundary_snapshot_id=s.snapshot_id
+            AND cg.tracking_id=s.tracking_id
+           WHERE cg.generation_id=$INITIAL_ABORT_GENERATION
+             AND (s.payload_state<>'missing' OR to_regclass(s.snapshot_table) IS NOT NULL)")"
+
+q "SELECT pg_create_logical_replication_slot('pg_flashback_${DB}', 'pg_flashback')" > /dev/null
+INITIAL_RECOVERY_GENERATION=$(q "SELECT flashback_reanchor('initial_abort_probe')")
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT state FROM flashback.coverage_generations
+               WHERE generation_id=$INITIAL_RECOVERY_GENERATION")" == "active" ]] && break
+    sleep 0.1
+done
+assert_eq "aborted ilk boundary yeni exact re-anchor ile kurtarıldı" "active" \
+    "$(q "SELECT state FROM flashback.coverage_generations
+           WHERE generation_id=$INITIAL_RECOVERY_GENERATION")"
+assert_eq "yeni generation aborted tombstone'u lineage olarak korudu" "$INITIAL_ABORT_GENERATION" \
+    "$(q "SELECT parent_generation_id FROM flashback.coverage_generations
+           WHERE generation_id=$INITIAL_RECOVERY_GENERATION")"
 
 echo "━━━ 5. Kapsam dışı veritabanı fail-closed ━━━"
 qp "CREATE DATABASE $UNCOV_DB" > /dev/null

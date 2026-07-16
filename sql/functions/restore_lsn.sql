@@ -2,6 +2,65 @@
 -- Correctness-qualified COMMIT-LSN restore/query/recovery APIs.
 -- =================================================================
 
+-- Drain every already-committed WAL record for relations that are about to be
+-- physically swapped. Logical decoding cannot reconstruct a relation after
+-- its old pg_class row is dropped, so a restore must prove this queue empty
+-- while ACCESS EXCLUSIVE prevents new writes to those exact OIDs.
+CREATE OR REPLACE FUNCTION flashback_drain_relation_wal(
+    p_rel_oids oid[],
+    p_max_batches integer DEFAULT 1000
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_oid_list text;
+    v_has_output boolean;
+    v_batches integer := 0;
+    v_events bigint := 0;
+BEGIN
+    IF p_rel_oids IS NULL OR array_length(p_rel_oids, 1) IS NULL THEN
+        RAISE EXCEPTION 'flashback_drain_relation_wal: relation OID list is empty';
+    END IF;
+    IF p_max_batches < 1 THEN
+        RAISE EXCEPTION 'flashback_drain_relation_wal: max batches must be positive';
+    END IF;
+
+    SELECT string_agg(DISTINCT rel_oid::text, ',' ORDER BY rel_oid::text)
+      INTO v_oid_list
+    FROM unnest(p_rel_oids) AS ids(rel_oid)
+    WHERE rel_oid IS NOT NULL;
+    IF v_oid_list IS NULL THEN
+        RAISE EXCEPTION 'flashback_drain_relation_wal: relation OID list contains no usable OID';
+    END IF;
+
+    LOOP
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_logical_slot_peek_changes(
+                flashback_effective_slot_name(), NULL, 50000,
+                'tracked_oids', v_oid_list
+            ) AS ch(lsn, xid, data)
+            WHERE ch.data LIKE '{%'
+        ) INTO v_has_output;
+        EXIT WHEN NOT v_has_output;
+
+        IF v_batches >= p_max_batches THEN
+            RAISE EXCEPTION 'pg_flashback: WAL backlog for relation OIDs % did not drain after % batches',
+                v_oid_list, p_max_batches
+                USING HINT = 'Reduce concurrent WAL pressure, verify logical-slot health, and retry the restore.';
+        END IF;
+
+        v_events := v_events + flashback_consume_wal(50000);
+        v_batches := v_batches + 1;
+    END LOOP;
+
+    RETURN v_events;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_materialize_lsn(
     p_target_table text,
     p_target_lsn pg_lsn,
@@ -353,6 +412,15 @@ BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
+    -- Freeze the old physical relation before draining its logical backlog.
+    -- ensure_active_wal_stream() already owns the database-stream key, so the
+    -- background worker cannot race this preflight.
+    EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+                   admission.schema_name, admission.table_name);
+    PERFORM flashback_drain_relation_wal(ARRAY[admission.rel_oid]);
+    SELECT * INTO STRICT admission
+    FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
+
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg
         WHERE cg.tracking_id = admission.tracking_id
@@ -391,15 +459,6 @@ BEGIN
 
     IF v_new_rel_oid <> v_old_rel_oid THEN
         UPDATE flashback.tracked_tables
-           SET rel_oid = v_new_rel_oid
-         WHERE tracking_id = admission.tracking_id;
-        UPDATE flashback.delta_log
-           SET rel_oid = v_new_rel_oid
-         WHERE tracking_id = admission.tracking_id;
-        UPDATE flashback.snapshots
-           SET rel_oid = v_new_rel_oid
-         WHERE tracking_id = admission.tracking_id;
-        UPDATE flashback.schema_versions
            SET rel_oid = v_new_rel_oid
          WHERE tracking_id = admission.tracking_id;
     END IF;
@@ -606,7 +665,7 @@ BEGIN
             SELECT r.table_name
             FROM unnest(p_tables) AS r(table_name)
         )
-        SELECT DISTINCT a.tracking_id
+        SELECT DISTINCT a.tracking_id, a.schema_name, a.table_name
         FROM requested r
         CROSS JOIN LATERAL flashback_admit_lsn_target(
             r.table_name, p_target_lsn
@@ -615,6 +674,8 @@ BEGIN
     LOOP
         PERFORM pg_advisory_xact_lock(358944::integer,
                                       hashint8(lock_rec.tracking_id));
+        EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+                       lock_rec.schema_name, lock_rec.table_name);
     END LOOP;
 
     -- Parents are restored before children.  A cycle is rejected rather than

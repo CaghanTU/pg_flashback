@@ -24,9 +24,9 @@ optimistically.
   selected restore profile supplies them
 - one stable per-tracking lock namespace shared by restore, checkpoint,
   retention, untrack and backup finalization
-- `building` (including a pending/unanchored successor), retired and ambiguous
-  generations are never selected; a broken stream preserves only targets at
-  or before its frozen watermark
+- `building` (including a pending/unanchored successor), `aborted`, retired and
+  ambiguous generations are never selected; a broken stream preserves only
+  targets at or before its frozen watermark
 
 ## Local-delta profile
 
@@ -50,6 +50,9 @@ The local profile is supported only after its coverage runtime gates pass:
   predecessor backlog drains through its upper coordinate
 - restore/query admission against immutable generation and persistent-gap
   metadata
+- restore takes the final target relation lock and drains its already-committed
+  logical WAL before replacing the relation OID; an unprovable or excessive
+  backlog aborts before the shadow swap
 - two-phase post-restore finalization: the swap transaction creates the base,
   binds capture and writes a LOGGED pending marker; only post-commit resolution
   of the real commit time/COMMIT LSN may activate the successor
@@ -156,9 +159,15 @@ The local profile is supported only after its coverage runtime gates pass:
    after commit. Backup restore remains unanchored until a new verified full
    backup stop anchor whose start LSN is strictly after that resolved
    commit.
-9. Missing or contradictory evidence fails with an actionable stable error;
+9. Before a local shadow swap can replace a relation OID, restore drains and
+   persists all already-committed WAL for the locked old relation. Historical
+   generation OIDs remain immutable; only the current relation binding changes.
+10. An initial or successor boundary whose stream breaks before activation is
+   retained as an immutable `aborted` audit tombstone after its draft physical
+   payload is removed. It can never be admitted as coverage.
+11. Missing or contradictory evidence fails with an actionable stable error;
    no read/restore API falls back to the nearest surviving snapshot.
-10. Payload cleanup commits a durable `retiring` intent before deletion and is
+12. Payload cleanup commits a durable `retiring` intent before deletion and is
     idempotently resumable; audit tombstones survive the transition to
     `retired`.
 
@@ -195,10 +204,11 @@ The local profile is supported only after its coverage runtime gates pass:
 - verified physical-anchor, generation and persistent-gap runtime is fully
   wired for the backup profile;
 - RB-01 through RB-11 have regression or qualification evidence;
-- capture disablement fails closed synchronously and appears in
-  `flashback_health()`; the qualified decoder never silently skips by the
-  legacy trigger row-size limit;
-- retention/restore concurrency pins one immutable generation;
+- capture disablement and mode changes durably break the stream before the
+  worker applies the new behavior, appear in `flashback_health()`, and the
+  qualified decoder never silently skips by the legacy trigger row-size limit;
+- retention/restore/query concurrency pins one immutable generation, and a
+  committed retirement intent remains resumable after interruption;
 - local post-restore preflight, pending marker, base, post-commit coordinate
   resolution and pre-activation non-success behavior are tested;
 - backup swap remains pending/unanchored until a new completed, verified full

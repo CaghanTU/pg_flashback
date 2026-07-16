@@ -308,6 +308,10 @@ mod tests {
         "../tests/sql/integration/coverage_schema_contract.sql"
     );
     sql_test!(
+        it_coverage_lifecycle_hardening,
+        "../tests/sql/integration/coverage_lifecycle_hardening.sql"
+    );
+    sql_test!(
         it_lsn_target_adversarial,
         "../tests/sql/integration/lsn_target_adversarial.sql"
     );

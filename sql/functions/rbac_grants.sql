@@ -61,12 +61,16 @@ $$;
 -- admin to create objects there would permit helper-name shadowing.
 REVOKE CREATE ON SCHEMA flashback FROM flashback_admin;
 GRANT USAGE ON SCHEMA flashback TO flashback_admin;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA flashback TO flashback_admin;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA flashback TO flashback_admin;
+-- Delegated administration is API-only. Direct writes could forge coverage,
+-- mutate a base snapshot, or bypass the generation/stream guards. Revoke old
+-- broad grants upgrade-safely and make sure future runtime payload tables do
+-- not inherit them either.
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA flashback FROM flashback_admin;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA flashback FROM flashback_admin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO flashback_admin;
+    REVOKE ALL PRIVILEGES ON TABLES FROM flashback_admin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
-    GRANT USAGE, SELECT ON SEQUENCES TO flashback_admin;
+    REVOKE ALL PRIVILEGES ON SEQUENCES FROM flashback_admin;
 REVOKE ALL ON SCHEMA flashback_import FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_admin;
 GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_recovery_agent;
@@ -86,9 +90,6 @@ GRANT EXECUTE ON FUNCTION flashback_reanchor(text)                    TO flashba
 GRANT EXECUTE ON FUNCTION flashback_flush_staging(integer)            TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_consume_wal(integer)              TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_apply_retention()                 TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_set_restore_in_progress(bool)     TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_attach_capture_trigger(text, text) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_detach_capture_trigger(text, text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_query(text, timestamptz, text)    TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_query_lsn(text, pg_lsn, text)     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_resolve_target(text, timestamptz) TO flashback_admin;
@@ -125,6 +126,7 @@ GRANT SELECT ON flashback.capture_commits TO pg_monitor;
 GRANT SELECT ON flashback.backup_anchors TO pg_monitor;
 GRANT SELECT ON flashback.coverage_generations TO pg_monitor;
 GRANT SELECT ON flashback.coverage_gaps TO pg_monitor;
+GRANT SELECT ON flashback.generation_payload_retirements TO pg_monitor;
 GRANT SELECT ON flashback.backup_restore_requests TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_history(text, interval)        TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
@@ -161,7 +163,7 @@ COMMENT ON FUNCTION flashback_checkpoint(text)
 COMMENT ON FUNCTION flashback_reanchor(text)
     IS 'Create an explicit exact local base and pending successor generation; activation waits for the boundary transaction COMMIT LSN.';
 COMMENT ON FUNCTION flashback_apply_retention()
-    IS 'Purge expired delta_log rows, old snapshots, and stale data per each table''s retention_interval.';
+    IS 'Advance the two-transaction generation-retirement state machine: resume committed intents, then durably mark newly eligible sealed generations. Active generation payload is never age-pruned.';
 COMMENT ON FUNCTION flashback_retention_status()
     IS 'Show retention health per tracked table: delta counts, restorable window, and a warning flag at >90% consumption.';
 COMMENT ON FUNCTION flashback_adopt_existing_payload_tables()
@@ -169,13 +171,13 @@ COMMENT ON FUNCTION flashback_adopt_existing_payload_tables()
 COMMENT ON FUNCTION flashback_history(text, interval)
     IS 'Return change history (INSERT/UPDATE/DELETE events) for a table within a lookback window, with PK-based row identity.';
 COMMENT ON FUNCTION flashback_set_restore_in_progress(bool)
-    IS 'Set the process-local restore-in-progress flag. Superuser only. Used internally by flashback_restore.';
+    IS '[Internal] Set the process-local restore-in-progress flag. Extension-owner execution chain only.';
 COMMENT ON FUNCTION flashback_is_restore_in_progress(oid)
     IS 'Return whether the current backend has a restore in progress. Safe to call from triggers or monitoring.';
 COMMENT ON FUNCTION flashback_attach_capture_trigger(text, text)
-    IS 'Attach INSERT/UPDATE/DELETE capture triggers to a table. Called internally by flashback_track.';
+    IS '[Internal] Attach INSERT/UPDATE/DELETE capture triggers to a table. Called only by guarded lifecycle APIs.';
 COMMENT ON FUNCTION flashback_detach_capture_trigger(text, text)
-    IS 'Remove all capture triggers from a table. Called internally by flashback_untrack.';
+    IS '[Internal] Remove capture triggers from a table. Called only by guarded lifecycle APIs.';
 COMMENT ON FUNCTION flashback_take_due_checkpoints()
     IS 'Auto-checkpoint all tracked tables whose checkpoint_interval has elapsed. Called by the background worker.';
 COMMENT ON FUNCTION flashback_flush_staging(integer)

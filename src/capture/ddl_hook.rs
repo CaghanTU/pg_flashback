@@ -143,9 +143,15 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
+                // Do not let a table DDL commit after its protected capture
+                // path failed.  Logging and continuing would create exactly
+                // the silent coverage hole the WAL epoch protocol is meant
+                // to prevent.  PostgreSQL ERROR aborts the user's statement
+                // (and rolls back any durable gap marker written in this
+                // transaction), preserving the atomic fail-closed contract.
                 error!(
-                    "pg_flashback: DDL capture failed closed before {}: {err}",
-                    event_type
+                    "pg_flashback: DDL capture failed before {}: {}",
+                    event_type, err
                 );
             }
         } else if let Some(("ALTER", targets)) = parse_post_utility_targets(pstmt) {
@@ -154,7 +160,7 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
             // before execution; native recovery to a post-ALTER LSN cannot
             // reconstruct the pre-disaster definition.
             if let Err(err) = capture_backup_marker_for_targets("ALTER", &targets) {
-                error!("pg_flashback: backup ALTER marker failed closed: {err}");
+                error!("pg_flashback: backup ALTER marker failed: {}", err);
             }
         }
     }
@@ -189,9 +195,12 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
     {
         if let Some((event_type, targets)) = parse_post_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
+                // The post-utility hook is still part of the same user
+                // transaction.  Abort rather than allowing an uncaptured
+                // ALTER/RENAME to commit after the WAL payload failed.
                 error!(
-                    "pg_flashback: DDL capture failed closed after {}: {err}",
-                    event_type
+                    "pg_flashback: DDL capture failed after {}: {}",
+                    event_type, err
                 );
             }
         }

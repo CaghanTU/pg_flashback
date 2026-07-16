@@ -1,7 +1,7 @@
 # Coverage generation model
 
-Status: **T-01/A WAL-local runtime implemented; retention and backup-profile
-runtime phases remain open**
+Status: **T-01/A WAL-local runtime and generation-aware local retention
+implemented; backup-profile runtime phase remains open**
 
 This document turns the policy in [`STORAGE_POLICY.md`](STORAGE_POLICY.md)
 into a data model and transaction protocol. It addresses RB-01, RB-02, RB-03,
@@ -11,8 +11,9 @@ RB-04, RB-05 and RB-07 from
 Legacy rows are never backfilled as valid. The WAL-local runtime now creates
 and consumes the model atomically for tracking, capture, target admission,
 timestamp resolution, LSN restore/query/recovery, stream breaks and re-anchor.
-Legacy trigger/timestamp paths remain separate. Generation-aware cleanup and
-backup-profile anchoring still must land with their own regression tests.
+Legacy trigger/timestamp paths remain separate. Generation-aware cleanup is
+now wired for qualified local generations; backup-profile anchoring still must
+land with its own regression tests.
 
 ## Why the legacy model is insufficient
 
@@ -77,9 +78,14 @@ Canonical generation states are:
 
 ```text
 building -> active -> sealed -> retired
+        `-> aborted
 ```
 
 - `building` is never target-eligible.
+- `aborted` is an immutable audit tombstone for a boundary that could not be
+  established. Its draft physical payload is removed, it is never
+  target-eligible, and an explicit re-anchor may use it only as lineage when no
+  active predecessor ever existed.
 - `active` is the sole current chain for a tracking identity.
 - `sealed` has immutable ownership and half-open applicability and may continue
   serving historical targets. Payload already bound to it may still drain;
@@ -87,7 +93,8 @@ building -> active -> sealed -> retired
   coordinate.
 - `retired` retains audit metadata but its payload is no longer advertised.
 
-Only `active` and `sealed` generations are target-eligible. Capture failure is
+Only `active` and `sealed` generations are target-eligible. `aborted` and
+`retired` are terminal audit states. Capture failure is
 represented by a broken stream, a frozen inclusive watermark and a persistent
 gap; `broken` is a stream/health condition and must never be stored as a
 generation lifecycle state.
@@ -101,7 +108,8 @@ At most one `active` and one `building` generation may exist for a tracking
 identity. They may coexist while a maintenance boundary is prepared. Zero
 active generations is valid only as an explicit fail-closed lifecycle state,
 including the backup interval after a resolved production swap has sealed its
-predecessor and before a qualifying full backup activates its successor.
+predecessor and before a qualifying full backup activates its successor, or
+after an initial local boundary aborts before any generation became active.
 
 `boundary_snapshot_id` is nullable because backup generations have no local
 snapshot. WAL-local track, restore and re-anchor create a real snapshot row for
@@ -293,7 +301,7 @@ For every restore, query-as-of or deleted-row recovery:
 4. Select exactly one `active` or `sealed` generation whose half-open
    applicability interval contains the target and whose inclusive proven
    watermark is not before it. `building` (including an unanchored pending
-   successor) and `retired` states are never selected.
+   successor), `aborted` and `retired` states are never selected.
 5. Pin that generation row (`FOR SHARE` or an equivalent immutable reference)
    for the operation.
 6. Reject if any persistent gap contains the target. A broken stream does not
@@ -407,17 +415,18 @@ It removes a generation's replay assets as a unit and marks metadata `retired`;
 it does not delete generation or gap records. Cleanup is an idempotent
 fail-closed state machine:
 
-1. a retirement coordinator holds the stable coverage advisory key at session
-   scope across the multi-transaction operation; under that lock, write and
-   commit a durable payload tombstone/intent in `retiring` state before
-   destructive work, and make admission reject that payload;
+1. under the stable coverage transaction lock, write and commit a durable
+   payload tombstone/intent in `retiring` state before destructive work;
+   admission treats that committed intent as a fence and rejects the payload;
 2. remove the identified database/partition/external assets idempotently;
-3. under the same lock, verify absence, record removal time and integrity/hash
-   metadata, mark the tombstone `removed` and transition the generation to
-   `retired` atomically;
-4. after interruption, the session lock is released by PostgreSQL; one retrier
-   reacquires it and resumes from the durable intent. Never infer retained
-   payload merely because the generation row still says `sealed`.
+3. in a later transaction, reacquire the same lock, revalidate the immutable
+   intent evidence, remove the snapshot/delta/schema assets, verify exact
+   absence, record removal counts/time, mark the tombstone `removed` and
+   transition the generation to `retired` atomically;
+4. after interruption PostgreSQL rolls back that destructive transaction; a
+   retrier reacquires the lock and resumes from the committed intent. Never
+   infer retained payload merely because the generation row still says
+   `sealed`.
 
 Foreign keys and cleanup procedures must not cascade-delete generation, gap,
 lineage or tombstone audit records.
@@ -447,6 +456,20 @@ even if PostgreSQL reuses an OID or the schema/table name is identical.
 
 Restore pins a source generation before reading its base or deltas. Retention
 cannot retire that generation while the restore holds the coverage lock/pin.
+A qualified local restore then takes the target relation's final
+`ACCESS EXCLUSIVE` lock and synchronously drains every already-committed WAL
+change for that relation through the trusted decoder before materialization or
+shadow swap. If the relation backlog cannot be proven drained within the
+bounded guard, the restore fails closed and leaves the live relation intact.
+This prevents a committed change from becoming undecodable when the old
+relation is dropped and replaced with a new OID.
+
+Qualified history keeps the immutable relation OID recorded at each generation
+boundary. A post-restore swap updates only the current `tracked_tables` binding;
+it never rewrites historical generation, snapshot, schema or delta identities
+to the new OID. Stable `tracking_id`/`generation_id` ownership connects those
+historical assets to the current lifecycle.
+
 A restore creates a new timeline, but the two profiles establish its successor
 boundary differently.
 
@@ -603,8 +626,9 @@ boundaries were not established by this protocol.
 3. **WAL-local read/restore — implemented:** common lock, generation
    admission, LSN query/recover/restore, fail-closed timestamp resolver and
    post-restore pending-generation activation.
-4. **Generation-aware retention — open:** whole-generation retirement and safe
-   partition cleanup.
+4. **Generation-aware retention — implemented for local generations:** durable
+   two-transaction intent, admission fence, whole-generation retirement,
+   interruption-safe resume and lock-then-recheck empty-partition cleanup.
 5. **Migration qualification — open:** existing installations become `unanchored`
    until an explicit profile-qualified re-anchor; no automatic trust backfill.
 

@@ -9,9 +9,10 @@ change-rate, write-stall or RTO budget. Profile choice is not a size-only
 heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 
 > **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
-> qualified, but the project as a whole is still pre-release. Generation-aware
-> retention, capture/maintenance worker isolation, backup-profile coverage
-> finalization and versioned upgrade packaging remain release gates. Read the binding
+> qualified, including generation-aware local retention, but the project as a
+> whole is still pre-release. Automated capacity/write-stall admission,
+> capture/maintenance worker isolation, backup-profile coverage finalization
+> and versioned upgrade packaging remain release gates. Read the binding
 > [storage policy](docs/STORAGE_POLICY.md),
 > [coverage design](docs/COVERAGE_MODEL.md) and
 > [release scope](docs/RELEASE_SCOPE.md) before evaluating the project.
@@ -66,7 +67,7 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 | `delta_log` | Generation/stream-bound JSONB event store, partitioned by `committed_at`; qualified events carry row-change and transaction COMMIT LSNs. |
 | Coverage generations | Exact locked base + one immutable WAL stream epoch + an inclusive complete-commit watermark. Slot discontinuity freezes the old frontier and opens a durable gap; `flashback_reanchor()` creates a new exact base. |
 | `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
-| `flashback_restore_lsn()` | Admits one COMMIT-LSN prefix, materializes it, swaps atomically, then leaves a successor base pending until its real commit record is consumed. |
+| `flashback_restore_lsn()` | Admits one COMMIT-LSN prefix, locks and drains committed WAL for the old relation, materializes it, swaps atomically, then leaves a successor base pending until its real commit record is consumed. |
 | `flashback_query_lsn()` / `flashback_recover_deleted_lsn()` | Read or recover from the same admitted immutable generation without nearest-snapshot fallback. |
 | `flashback_restore_parallel()` | Restore with parallel query hints (`max_parallel_workers_per_gather`). Emits per‑partition guidance for partitioned tables. |
 | `flashback_query_lsn()` | Reconstructs one admitted COMMIT-LSN state in a temporary table; caller-side filtering remains SECURITY INVOKER. |
@@ -138,7 +139,7 @@ the missing interval never becomes valid retroactively.
 
 ### PostgreSQL
 
-**Tested versions:** PostgreSQL 15, 16, 17, 18 (68/68 tests pass on all four,
+**Tested versions:** PostgreSQL 15, 16, 17, 18 (69/69 tests pass on all four,
 verified locally; CI runs the same matrix)
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
 
@@ -311,8 +312,8 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 
 | GUC | Default | Reload | Description |
 |-----|---------|--------|-------------|
-| `enabled` | `on` | SIGHUP | `off` stops capture, but the current runtime does not persist the required coverage break. Do not toggle it while tables are tracked. |
-| `capture_mode` | `auto` | SIGHUP | `auto` selects WAL only when `wal_level=logical`; it never silently downgrades qualified tracking to triggers. Explicit `trigger` is legacy/experimental. Do not change mode while qualified lifecycles are active: synchronous break recording remains a release gate. |
+| `enabled` | `on` | SIGHUP | `off` makes each database worker durably break its active qualified stream and open one LOGGED gap before idling. Re-enable creates a new stream epoch; each table requires explicit `flashback_reanchor()`. |
+| `capture_mode` | `auto` | SIGHUP | `auto` selects WAL only when `wal_level=logical`; it never silently downgrades qualified tracking to triggers. A transition away from effective WAL durably breaks the current stream before the worker changes behavior. Explicit `trigger` is legacy/experimental. Returning to WAL requires explicit re-anchor. |
 | `slot_name` | `pg_flashback_<dbname>` | Suset | Per-database logical slot name. Slot loss, replacement, identity change or unexplained external advancement freezes the old epoch, opens a gap and requires re-anchor. |
 | `restore_work_mem` | `256MB` | Suset | `work_mem` override for snapshot bulk load during `flashback_restore`. Higher values speed up large table restores. |
 | `index_build_work_mem` | `512MB` | Suset | `maintenance_work_mem` override for deferred index builds on the shadow table during restore. |
@@ -323,9 +324,10 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 | `target_databases` | *(unset)* | Restart | Comma-separated list of databases for multi‑DB mode. Each database gets its own worker. Example: `'app,analytics,audit'`. |
 | `max_workers` | `4` | Restart | Maximum number of background workers registered at startup. Extra workers beyond the database count exit gracefully. |
 
-All GUCs except those marked *Restart* take effect via `SIGHUP`. Do not toggle
-`enabled` while qualified tables are active: synchronous disable/enable gap
-recording remains a release gate.
+All GUCs except those marked *Restart* take effect via `SIGHUP`. For qualified
+tables, `enabled` and effective capture-mode transitions deliberately invalidate
+continuity; wait for `flashback_health()` to report the break, return to WAL,
+then establish a new exact boundary with `flashback_reanchor()`.
 
 ## 7. SQL API Reference
 
@@ -344,7 +346,7 @@ recording remains a release gate.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_restore_lsn(table, pg_lsn)` | `bigint` | Correctness-qualified single-table restore. Pins one generation, replays one contiguous COMMIT-LSN prefix and creates a pending post-restore successor base. |
+| `flashback_restore_lsn(table, pg_lsn)` | `bigint` | Correctness-qualified single-table restore. Pins one generation, locks the live relation, drains its committed WAL, replays one contiguous COMMIT-LSN prefix and creates a pending post-restore successor base. |
 | `flashback_restore_lsn(tables[], pg_lsn)` | `bigint` | Multi-table qualified restore. Acquires stable lifecycle locks in ID order, orders FK parents before children and rejects cycles. |
 | `flashback_resolve_target(table, timestamptz)` | `SETOF record` | Convenience planner returning one `resolved_lsn` only when the timestamp is a unique, complete WAL-prefix cut inside one pinned frontier. Collisions/inversions fail closed. |
 | `flashback_restore(table, timestamptz)` | `bigint` | Legacy compatibility API; explicitly rejects a correctness-qualified WAL lifecycle. Resolve the timestamp and call `flashback_restore_lsn()` instead. |
@@ -365,7 +367,8 @@ recording remains a release gate.
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `flashback_checkpoint(table)` | `bigint` | Legacy trigger checkpoint; explicitly rejected for qualified WAL generations. Use controlled `flashback_reanchor()` for a new local boundary. |
-| `flashback_retention_status()` | `SETOF record` | Legacy age/storage status; it is not generation/gap-aware coverage health. |
+| `flashback_apply_retention()` | `integer` | Advance durable whole-generation retirement: resume committed intents first, then mark newly eligible sealed generations. Never age-prunes active payload. |
+| `flashback_retention_status()` | `SETOF record` | Storage/window projection; use `flashback_health()` for authoritative generation/gap health. |
 
 ### Monitoring & Audit
 
@@ -458,11 +461,11 @@ the generation-admission gates called out explicitly below.
 | Schema evolution awareness (ADD / DROP / ALTER COLUMN) | ✅ |
 | DDL capture (TRUNCATE, DROP TABLE, ALTER TABLE, RENAME) | ✅ |
 | Automatic periodic full checkpoints | ❌ rejected by adopted policy |
-| Generation-aware retention | 🚧 legacy age-based purge is not release-safe |
+| Generation-aware retention | ✅ sealed local generation retirement is durable, pinned and resumable |
 | Serial / sequence restoration | ✅ |
 | Trigger & RLS policy preservation during restore | ✅ |
 | Generated column awareness | ✅ |
-| Coverage-safe capture disable/enable | 🚧 synchronous `enabled` transition gap remains a release gate |
+| Coverage-safe capture disable/enable | ✅ worker records a durable gap before applying the transition; re-anchor required |
 | Monitoring view (`pg_stat_flashback`) | ✅ |
 | Restore audit log + progress reporting | ✅ |
 | Large row coverage invalidation | ✅ qualified WAL decoder does not use the legacy trigger size-skip path |
@@ -479,7 +482,7 @@ the generation-admission gates called out explicitly below.
 | **Partitioned-table path** (per-row triggers) | legacy demo; ❌ first release |
 | **Parallel restore hints** (`flashback_restore_parallel`) | ✅ |
 | **WAL capture mode** (async; measured WAL amplification) | ✅ |
-| **Coverage-safe `capture_mode` changes** | 🚧 synchronous break + new epoch before mode switch remains a release gate |
+| **Coverage-safe `capture_mode` changes** | ✅ durable break + new epoch; return to WAL requires re-anchor |
 | **delta_log time‑partitioned** (monthly, auto‑managed) | ✅ |
 | **Slot lifecycle changes** (`slot_name`) | ✅ slot loss/replacement/external advancement freeze epoch and open a gap |
 | **Restore/index memory GUCs** | ✅ |
@@ -496,7 +499,7 @@ the generation-admission gates called out explicitly below.
 
 ### Test Suite
 
-64 PostgreSQL tests plus 4 decoder unit tests cover DML, DDL, schema
+65 PostgreSQL tests plus 4 decoder unit tests cover DML, DDL, schema
 evolution, multi-table FK, checkpoints, edge cases, query/recovery, RBAC,
 generation/stream contracts, timestamp collision/inversion, frozen frontiers,
 persistent gaps and WAL-mode behavior:
@@ -504,10 +507,10 @@ persistent gaps and WAL-mode behavior:
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
-cargo pgrx test pg15  # test result: ok. 68 passed; 0 failed
-cargo pgrx test pg16  # test result: ok. 68 passed; 0 failed
-cargo pgrx test pg17  # test result: ok. 68 passed; 0 failed
-cargo pgrx test pg18  # test result: ok. 68 passed; 0 failed
+cargo pgrx test pg15  # test result: ok. 69 passed; 0 failed
+cargo pgrx test pg16  # test result: ok. 69 passed; 0 failed
+cargo pgrx test pg17  # test result: ok. 69 passed; 0 failed
+cargo pgrx test pg18  # test result: ok. 69 passed; 0 failed
 ```
 
 ### Monitoring Queries
@@ -546,7 +549,7 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (68 tests each, verified locally on all four; CI runs the same matrix on every push)
+- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (69 tests each, verified locally on all four; CI runs the same matrix on every push)
 - **Security audit**: `cargo audit`
 - **Recovery E2E**: 27 real pgBackRest/native-PITR success and fail-closed checks
 - **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release
@@ -652,8 +655,10 @@ SELECT flashback_restore_lsn(
 `flashback_checkpoint()` rejects qualified WAL generations. Use
 `flashback_reanchor()` only as a controlled exact boundary. Slot identity
 changes freeze the old epoch and require re-anchor. Do not change
-`capture_mode` or toggle `pg_flashback.enabled` while tracking is active because
-synchronous mode/disable transition gaps remain release gates.
+`capture_mode` or `pg_flashback.enabled` transitions intentionally break the
+qualified stream. Wait until `flashback_health()` exposes the break, return to
+WAL, then call `flashback_reanchor()`; the intervening interval remains a
+permanent rejected gap.
 
 ### Partitioned tables (legacy functional demo)
 
@@ -702,6 +707,13 @@ The backup profile is operator-driven through the reference controller because
 PostgreSQL extensions do not launch privileged operating-system recovery
 processes.
 
+`flashback_admin` is deliberately API-only: it has no direct DML privilege on
+coverage metadata or runtime snapshots, and cannot toggle the internal restore
+guard or attach/detach capture triggers. Runtime payload is transferred to the
+extension owner, stripped of delegated-role ACLs and admitted only while its
+extension membership and catalog identity remain valid. PostgreSQL superusers
+remain inside the trusted database-administration boundary.
+
 ## 14. Troubleshooting
 
 ### ⚠️ Development and release blockers
@@ -713,9 +725,9 @@ items explain current behavior and remaining release gates.
 In WAL mode the replication slot retains WAL segments until the background
 worker consumes them. If the worker crashes, is disabled
 (`pg_flashback.enabled = off`), or falls behind on a write-heavy cluster,
-unread WAL accumulates and **can fill disk**. Disabling also breaks coverage;
-the current runtime does not persist that break. PostgreSQL will not delete
-retained slot WAL automatically.
+unread WAL accumulates and **can fill disk**. Disabling durably breaks coverage
+before the worker idles; PostgreSQL still will not delete retained slot WAL
+automatically.
 
 ```sql
 -- Monitor slot lag
@@ -749,6 +761,11 @@ The atomic shadow swap (`DROP original → RENAME shadow`) requires an `AccessEx
 SET lock_timeout = '5s';
 SELECT flashback_restore_lsn('orders', '0/8F12340'::pg_lsn);
 ```
+After acquiring that lock, the qualified path drains already-committed logical
+WAL for the old relation before replacing its OID. A large relation-specific
+backlog therefore extends the write pause; if the bounded drain cannot prove
+completion, restore fails before the swap. Keep worker lag within the release
+SLO and inspect slot health before a production restore.
 
 **4. `flashback_track()` on a large table is expensive**
 `flashback_track()` takes an immediate full-table snapshot. The current local

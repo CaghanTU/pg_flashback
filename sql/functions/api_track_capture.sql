@@ -180,16 +180,21 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_capture_insert_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_table_name text;
     v_max_size   integer;
     v_skipped    bigint;
 BEGIN
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
         RETURN NULL;
     END IF;
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
+    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
     END IF;
 
@@ -224,16 +229,21 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_capture_insert_row_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_table_name text;
     v_max_size   integer;
     v_rel_oid    oid;
 BEGIN
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
         RETURN NULL;
     END IF;
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
+    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
     END IF;
 
@@ -270,16 +280,21 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_capture_delete_row_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_table_name text;
     v_max_size   integer;
     v_rel_oid    oid;
 BEGIN
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
         RETURN NULL;
     END IF;
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
+    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
     END IF;
 
@@ -316,6 +331,8 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_capture_update_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_table_name text;
@@ -326,10 +343,13 @@ DECLARE
     v_old_diff jsonb;
     v_new_diff jsonb;
 BEGIN
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
         RETURN NULL;
     END IF;
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
+    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
     END IF;
 
@@ -394,16 +414,21 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_capture_delete_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_table_name text;
     v_max_size   integer;
     v_skipped    bigint;
 BEGIN
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
+    IF flashback_is_restore_in_progress(TG_RELID) THEN
         RETURN NULL;
     END IF;
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
+    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
+        RETURN NULL;
+    END IF;
+    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
         RETURN NULL;
     END IF;
 
@@ -1170,6 +1195,7 @@ DECLARE
     v_has_output boolean;
     v_tracked_oids text;
     pending record;
+    lock_rec record;
 BEGIN
     IF to_regclass('flashback.delta_log') IS NULL THEN
         RETURN 0;
@@ -1180,8 +1206,8 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Decode only OIDs that belong to the current local_delta lifecycle.
-    -- Historical generation OIDs are retained because a restore swaps the
+    -- Decode OIDs belonging to active local_delta/backup lifecycles. Historical
+    -- local_delta generation OIDs are retained because a restore swaps the
     -- physical relation while the slot may still contain pre-swap WAL.
     SELECT COALESCE(string_agg(rel_oid::text, ',' ORDER BY rel_oid), '')
       INTO v_tracked_oids
@@ -1189,7 +1215,7 @@ BEGIN
         SELECT tt.rel_oid
         FROM flashback.tracked_tables tt
         WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
+          AND tt.recovery_profile IN ('local_delta', 'backup')
         UNION
         SELECT cg.rel_oid_at_boundary
         FROM flashback.coverage_generations cg
@@ -1198,6 +1224,21 @@ BEGIN
           AND tt.recovery_profile = 'local_delta'
           AND cg.state IN ('building', 'active', 'sealed')
     ) recoverable_relations;
+
+    -- The stream lock acquired by flashback_ensure_active_wal_stream() is the
+    -- outer lock. Pin every qualified lifecycle in stable-ID order before WAL
+    -- promotion so retention cannot freeze counts/delete a sealed generation
+    -- while an already-owned backlog row is still being attached to it.
+    FOR lock_rec IN
+        SELECT tt.tracking_id
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+        ORDER BY tt.tracking_id
+    LOOP
+        PERFORM pg_advisory_xact_lock(358944::integer,
+                                      hashint8(lock_rec.tracking_id));
+    END LOOP;
 
     -- Do not advance the slot (or create temp/catalog WAL) when the output
     -- plugin has no user-table message.  get_changes() advances across
@@ -1411,6 +1452,7 @@ BEGIN
                reanchored_by_generation_id = pending.generation_id,
                reanchored_at = clock_timestamp()
          WHERE tracking_id = pending.tracking_id
+           AND source_generation_id = pending.parent_generation_id
            AND reanchored_by_generation_id IS NULL
            AND gap_start_lsn < pending.commit_lsn;
     END LOOP;
@@ -1431,22 +1473,34 @@ BEGIN
             tt.recovery_profile
         FROM _fb_wal_events e
         JOIN _fb_wal_commits c USING (source_xid)
-        JOIN flashback.tracked_tables tt
-          ON tt.rel_oid = e.rel_oid
-         AND tt.is_active
-        LEFT JOIN flashback.coverage_generations cg
-          ON cg.tracking_id = tt.tracking_id
-         AND cg.stream_id = v_stream_id
+        JOIN flashback.coverage_generations cg
+          ON cg.stream_id = v_stream_id
          AND cg.state IN ('active', 'sealed')
+         -- A restore swaps tracked_tables.rel_oid to the new physical OID,
+         -- while already-buffered WAL still carries the predecessor OID.
+         -- The immutable generation boundary is the ownership identity.
+         AND cg.rel_oid_at_boundary = e.rel_oid
          AND c.commit_lsn > cg.boundary_lsn
          AND (cg.superseded_before_lsn IS NULL
               OR c.commit_lsn < cg.superseded_before_lsn)
-        WHERE (
-            tt.recovery_profile = 'local_delta' AND cg.generation_id IS NOT NULL
-        ) OR (
-            tt.recovery_profile = 'backup'
-            AND e.event_type IN ('TRUNCATE', 'DROP', 'ALTER')
-        )
+        JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = cg.tracking_id
+         AND tt.is_active
+         AND tt.recovery_profile = 'local_delta'
+
+        UNION ALL
+
+        SELECT
+            e.*, c.commit_lsn, c.committed_at,
+            tt.tracking_id, NULL::bigint, NULL::bigint,
+            tt.recovery_profile
+        FROM _fb_wal_events e
+        JOIN _fb_wal_commits c USING (source_xid)
+        JOIN flashback.tracked_tables tt
+          ON tt.rel_oid = e.rel_oid
+         AND tt.is_active
+         AND tt.recovery_profile = 'backup'
+        WHERE e.event_type IN ('TRUNCATE', 'DROP', 'ALTER')
     ), ins AS (
         INSERT INTO flashback.delta_log (
             event_time, event_type, table_name, rel_oid, source_xid,
@@ -1644,7 +1698,7 @@ DECLARE
     rec record;
 BEGIN
     FOR rec IN
-        SELECT tt.rel_oid,
+        SELECT tt.rel_oid, tt.tracking_id,
                format('%I.%I', tt.schema_name, tt.table_name) AS tbl,
                tt.retention_interval AS ri
         FROM flashback.tracked_tables tt WHERE tt.is_active
@@ -1655,7 +1709,9 @@ BEGIN
                count(*)::bigint,
                (clock_timestamp() - COALESCE(min(d.event_time), clock_timestamp()))::interval,
                COALESCE((clock_timestamp() - min(d.event_time)) > (rec.ri * 0.9), false)
-        FROM flashback.delta_log d WHERE d.rel_oid = rec.rel_oid;
+        FROM flashback.delta_log d
+        WHERE d.tracking_id = rec.tracking_id
+           OR (d.tracking_id IS NULL AND d.rel_oid = rec.rel_oid);
     END LOOP;
 END;
 $$;
@@ -1674,10 +1730,11 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_rel_oid oid;
+    v_tracking_id bigint;
     v_pk_cols text[];
     rec record;
 BEGIN
-    SELECT tt.rel_oid INTO v_rel_oid
+    SELECT tt.rel_oid, tt.tracking_id INTO v_rel_oid, v_tracking_id
     FROM flashback.tracked_tables tt
     WHERE tt.is_active
       AND (
@@ -1709,7 +1766,10 @@ BEGIN
     FOR rec IN
         SELECT d.event_time, d.event_type, d.old_data, d.new_data
         FROM flashback.delta_log d
-        WHERE d.rel_oid = v_rel_oid
+        WHERE (
+            (v_tracking_id IS NOT NULL AND d.tracking_id = v_tracking_id)
+            OR (v_tracking_id IS NULL AND d.rel_oid = v_rel_oid)
+        )
           AND d.committed_at IS NOT NULL
           AND d.event_time >= clock_timestamp() - lookback
         ORDER BY d.event_time DESC
@@ -1773,6 +1833,16 @@ BEGIN
     ) INTO v_has_generations;
 
     IF v_has_generations THEN
+        -- Qualified WAL lifecycle operations use database-stream -> stable
+        -- tracking order. Untrack consumes the slot before retiring the
+        -- binding, so taking only the tracking key first would deadlock
+        -- against the worker (which takes the database key first).
+        IF flashback_effective_capture_mode() = 'wal' THEN
+            PERFORM pg_advisory_xact_lock(
+                358945::integer,
+                (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+            );
+        END IF;
         PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
         IF EXISTS (
             SELECT 1 FROM flashback.coverage_generations cg
@@ -1780,6 +1850,16 @@ BEGIN
         ) THEN
             RAISE EXCEPTION 'flashback_untrack: lifecycle % has a pending generation', v_tracking_id
                 USING HINT = 'Wait for its boundary COMMIT LSN to resolve before untracking.';
+        END IF;
+        IF EXISTS (
+            SELECT 1
+            FROM flashback.generation_payload_retirements r
+            WHERE r.tracking_id = v_tracking_id
+              AND r.state = 'retiring'
+        ) THEN
+            RAISE EXCEPTION 'flashback_untrack: lifecycle % has an unfinished retention cleanup',
+                v_tracking_id
+                USING HINT = 'Resume the durable generation retirement, then retry untrack.';
         END IF;
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
             EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE',
@@ -1836,7 +1916,9 @@ BEGIN
 
     FOR snap_rec IN
         SELECT snapshot_id, snapshot_table
-        FROM flashback.snapshots WHERE rel_oid = v_rel_oid
+        FROM flashback.snapshots
+        WHERE (v_has_generations AND tracking_id = v_tracking_id)
+           OR (NOT v_has_generations AND rel_oid = v_rel_oid)
     LOOP
         IF snap_rec.snapshot_table IS NOT NULL AND snap_rec.snapshot_table <> '' THEN
             IF snap_rec.snapshot_table !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
@@ -1856,9 +1938,13 @@ BEGIN
         END IF;
     END LOOP;
 
-    DELETE FROM flashback.delta_log WHERE rel_oid = v_rel_oid;
+    DELETE FROM flashback.delta_log
+    WHERE (v_has_generations AND tracking_id = v_tracking_id)
+       OR (NOT v_has_generations AND rel_oid = v_rel_oid);
     DELETE FROM flashback.staging_events WHERE rel_oid = v_rel_oid;
-    DELETE FROM flashback.schema_versions WHERE rel_oid = v_rel_oid;
+    DELETE FROM flashback.schema_versions
+    WHERE (v_has_generations AND tracking_id = v_tracking_id)
+       OR (NOT v_has_generations AND rel_oid = v_rel_oid);
 
     IF v_has_generations THEN
         UPDATE flashback.coverage_generations
@@ -1953,6 +2039,7 @@ DECLARE
     v_actual_table  text;
     v_generation_id bigint;
     v_stream_id bigint;
+    v_stream_state text;
 BEGIN
     IF input_table IS NULL OR input_table = '' THEN RETURN; END IF;
 
@@ -1995,19 +2082,48 @@ BEGIN
 
     IF tracked.rel_oid IS NULL THEN RETURN; END IF;
 
-    IF tracked.recovery_profile = 'local_delta'
-       AND flashback_effective_capture_mode() = 'wal'
-    THEN
-        SELECT cg.generation_id, cg.stream_id
-          INTO v_generation_id, v_stream_id
+    IF tracked.recovery_profile = 'local_delta' THEN
+        -- DDL has no row trigger to mediate a session-local SUSET override.
+        -- Reconcile it synchronously before routing the event; a refused guard
+        -- fails the hook closed so the DDL cannot commit against an unrecorded
+        -- qualified lifecycle.
+        IF NOT flashback_capture_configuration_guard(tracked.rel_oid) THEN
+            RAISE EXCEPTION 'pg_flashback: DDL capture refused because capture configuration is disabled or no active WAL epoch exists'
+                USING HINT = 'Restore pg_flashback.enabled/capture_mode, then establish a new exact boundary with flashback_reanchor().';
+        END IF;
+
+        -- Serialize DDL routing with stream breaks and generation retirement.
+        -- The configuration reconciler holds the database-stream key first
+        -- and then this key; this path never takes the outer database key.
+        PERFORM pg_advisory_xact_lock(358944::integer,
+                                      hashint8(tracked.tracking_id));
+
+        -- An existing qualified lifecycle is routed by its durable generation
+        -- binding, never by a caller's session-local capture_mode GUC. This
+        -- prevents `SET capture_mode=trigger` from silently sending DDL around
+        -- the protected WAL path.
+        SELECT cg.generation_id, cg.stream_id, cs.state
+          INTO v_generation_id, v_stream_id, v_stream_state
         FROM flashback.coverage_generations cg
+        JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         WHERE cg.tracking_id = tracked.tracking_id
           AND cg.state = 'active'
         LIMIT 1;
 
-        IF v_generation_id IS NULL THEN
+        IF v_generation_id IS NULL AND (
+            EXISTS (
+                SELECT 1 FROM flashback.coverage_generations cg
+                WHERE cg.tracking_id = tracked.tracking_id
+            )
+            OR flashback_effective_capture_mode() = 'wal'
+        ) THEN
             RAISE EXCEPTION 'pg_flashback: DDL capture refused because tracking lifecycle % has no active WAL generation',
                 tracked.tracking_id;
+        END IF;
+        IF v_generation_id IS NOT NULL AND v_stream_state <> 'active' THEN
+            RAISE EXCEPTION 'pg_flashback: DDL capture refused because WAL stream % is %',
+                v_stream_id, v_stream_state
+                USING HINT = 'Restore pg_flashback.enabled/capture_mode, then establish a new exact boundary with flashback_reanchor().';
         END IF;
     END IF;
 
@@ -2032,6 +2148,7 @@ BEGIN
 
         -- Recreate triggers with updated table-name argument
         IF tracked.recovery_profile = 'local_delta'
+           AND v_generation_id IS NULL
            AND flashback_effective_capture_mode() = 'trigger'
         THEN
             PERFORM flashback_detach_capture_trigger(v_actual_schema, v_actual_table);
@@ -2126,7 +2243,7 @@ BEGIN
     -- PostgreSQL, so its body is deliberately ignored by the decoder; the
     -- marker exists only to expose this transaction's real COMMIT record.
     -- Trigger mode retains the direct legacy delta_log path.
-    IF tracked.recovery_profile = 'local_delta' AND flashback_effective_capture_mode() = 'wal' THEN
+    IF tracked.recovery_profile = 'local_delta' AND v_generation_id IS NOT NULL THEN
         INSERT INTO flashback.pending_wal_events (
             tracking_id, generation_id, stream_id, source_xid,
             event_type, table_name, rel_oid, event_lsn, schema_version,

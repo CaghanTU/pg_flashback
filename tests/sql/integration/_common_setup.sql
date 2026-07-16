@@ -3,6 +3,7 @@
 -- as soon as a schema-contract test inserts a generation.
 TRUNCATE
     flashback.pending_wal_events,
+    flashback.generation_payload_retirements,
     flashback.coverage_gaps,
     flashback.coverage_generations,
     flashback.backup_anchors,

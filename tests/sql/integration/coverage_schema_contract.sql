@@ -578,7 +578,7 @@ BEGIN
           AND c.relname IN (
               'tracking_lifecycles', 'capture_streams',
               'backup_anchors', 'coverage_generations', 'coverage_gaps',
-              'pending_wal_events'
+              'pending_wal_events', 'generation_payload_retirements'
           )
           AND c.relpersistence <> 'p'
     ) THEN
@@ -619,6 +619,11 @@ BEGIN
             ('schema_versions', 'commit_lsn'),
             ('backup_restore_requests', 'tracking_id'),
             ('backup_restore_requests', 'generation_id'),
+            ('generation_payload_retirements', 'tracking_id'),
+            ('generation_payload_retirements', 'generation_id'),
+            ('generation_payload_retirements', 'snapshot_id'),
+            ('generation_payload_retirements', 'intent_txid'),
+            ('generation_payload_retirements', 'state'),
             ('coverage_generations', 'boundary_xid'),
             ('coverage_generations', 'boundary_marker'),
             ('coverage_generations', 'backup_anchor_id'),
@@ -660,6 +665,21 @@ BEGIN
           AND condeferred
     ) <> 9 THEN
         RAISE EXCEPTION 'lifecycle children are not bound to immutable parent';
+    END IF;
+
+    IF (
+        SELECT count(*)
+        FROM pg_constraint
+        WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
+          AND conname IN (
+              'generation_payload_retirements_generation_tracking_fk',
+              'generation_payload_retirements_snapshot_tracking_fk'
+          )
+          AND contype = 'f'
+          AND condeferrable
+          AND condeferred
+    ) <> 2 THEN
+        RAISE EXCEPTION 'retirement audit is not bound to immutable generation payload identity';
     END IF;
 
     IF (
@@ -712,6 +732,7 @@ BEGIN
        OR NOT has_table_privilege('pg_monitor', 'flashback.backup_anchors', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.coverage_generations', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.coverage_gaps', 'SELECT')
+       OR NOT has_table_privilege('pg_monitor', 'flashback.generation_payload_retirements', 'SELECT')
     THEN
         RAISE EXCEPTION 'pg_monitor cannot inspect coverage metadata';
     END IF;

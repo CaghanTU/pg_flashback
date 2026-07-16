@@ -57,12 +57,76 @@ BEGIN
             'flashback_admin has CREATE on flashback schema; SECURITY DEFINER helper shadowing is possible';
     END IF;
 
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'flashback'
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND (
+              has_table_privilege('flashback_admin', c.oid, 'INSERT')
+              OR has_table_privilege('flashback_admin', c.oid, 'UPDATE')
+              OR has_table_privilege('flashback_admin', c.oid, 'DELETE')
+              OR has_table_privilege('flashback_admin', c.oid, 'TRUNCATE')
+              OR has_table_privilege('flashback_admin', c.oid, 'REFERENCES')
+              OR has_table_privilege('flashback_admin', c.oid, 'TRIGGER')
+          )
+    ) THEN
+        RAISE EXCEPTION
+            'flashback_admin can mutate internal tables; delegated administration must be API-only';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_default_acl da
+        CROSS JOIN LATERAL aclexplode(da.defaclacl) default_acl
+        WHERE da.defaclnamespace = 'flashback'::regnamespace
+          AND default_acl.grantee = 'flashback_admin'::regrole
+          AND default_acl.privilege_type IN (
+              'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+          )
+    ) THEN
+        RAISE EXCEPTION
+            'future flashback payload tables inherit mutating flashback_admin privileges';
+    END IF;
+
     IF has_table_privilege('public', 'flashback.pending_wal_events', 'INSERT')
        OR has_table_privilege('public', 'flashback.pending_wal_events', 'UPDATE')
        OR has_table_privilege('public', 'flashback.pending_wal_events', 'DELETE')
     THEN
         RAISE EXCEPTION 'PUBLIC can forge protected pending WAL events';
     END IF;
+
+    -- Runtime payload is created after CREATE EXTENSION, so verify the
+    -- adoption helper transfers ownership and strips delegated-role ACLs
+    -- rather than relying only on install-time grants.
+    EXECUTE 'CREATE TABLE flashback.snap_987654321_987654321 (id integer)';
+    PERFORM flashback_own_payload_table(
+        'flashback.snap_987654321_987654321'::regclass
+    );
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_extension e ON e.extname = 'pg_flashback'
+        WHERE c.oid = 'flashback.snap_987654321_987654321'::regclass
+          AND c.relowner = e.extowner
+    ) THEN
+        RAISE EXCEPTION 'runtime payload owner is not the extension owner';
+    END IF;
+    IF has_table_privilege(
+        'flashback_admin',
+        'flashback.snap_987654321_987654321',
+        'INSERT,UPDATE,DELETE,TRUNCATE'
+    ) OR has_table_privilege(
+        'flashback_recovery_agent',
+        'flashback.snap_987654321_987654321',
+        'INSERT,UPDATE,DELETE,TRUNCATE'
+    ) THEN
+        RAISE EXCEPTION 'runtime payload remains writable by a delegated role';
+    END IF;
+    PERFORM flashback_drop_payload_table(
+        'flashback.snap_987654321_987654321'::regclass
+    );
 
     -- Compare direct delegated-role ACLs with the complete allowlist. This
     -- catches both an accidentally exposed new helper and a stale grant that
@@ -83,9 +147,6 @@ BEGIN
             ('flashback_admin', 'public.flashback_flush_staging(integer)'),
             ('flashback_admin', 'public.flashback_consume_wal(integer)'),
             ('flashback_admin', 'public.flashback_apply_retention()'),
-            ('flashback_admin', 'public.flashback_set_restore_in_progress(boolean)'),
-            ('flashback_admin', 'public.flashback_attach_capture_trigger(text,text)'),
-            ('flashback_admin', 'public.flashback_detach_capture_trigger(text,text)'),
             ('flashback_admin', 'public.flashback_query(text,timestamp with time zone,text)'),
             ('flashback_admin', 'public.flashback_query_lsn(text,pg_lsn,text)'),
             ('flashback_admin', 'public.flashback_resolve_target(text,timestamp with time zone)'),
@@ -194,6 +255,23 @@ BEGIN
         'EXECUTE'
     ) THEN
         RAISE EXCEPTION 'flashback_recovery_agent lacks its helper API allowlist';
+    END IF;
+
+    IF has_function_privilege(
+        'flashback_admin',
+        'public.flashback_set_restore_in_progress(boolean)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        'flashback_admin',
+        'public.flashback_attach_capture_trigger(text,text)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        'flashback_admin',
+        'public.flashback_detach_capture_trigger(text,text)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'flashback_admin can execute capture-bypass internals';
     END IF;
 
     IF has_function_privilege(

@@ -25,6 +25,17 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/retention_runtime.sql",
+    name = "flashback_retention_runtime",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_payload_ownership_helpers",
+        "flashback_api_track_capture",
+        "flashback_coverage_runtime"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/backup_restore_api.sql",
     name = "flashback_backup_restore_api",
     requires = [

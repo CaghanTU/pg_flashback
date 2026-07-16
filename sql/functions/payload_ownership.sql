@@ -66,6 +66,75 @@ BEGIN
 END;
 $$;
 
+-- O(1) with respect to payload data size: prove that a runtime relation is a
+-- recognized object owned by this extension, without scanning its heap.
+CREATE OR REPLACE FUNCTION flashback_payload_is_owned(p_relation regclass)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    SELECT public.flashback_payload_kind(p_relation) IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_extension e
+              ON e.extname = 'pg_flashback'
+             AND c.relowner = e.extowner
+            JOIN pg_depend d
+              ON d.classid = 'pg_class'::regclass
+             AND d.objid = c.oid
+             AND d.objsubid = 0
+             AND d.refclassid = 'pg_extension'::regclass
+             AND d.refobjid = e.oid
+             AND d.deptype = 'e'
+            WHERE c.oid = p_relation::oid
+       )
+$$;
+
+-- Catalog-only structural fingerprint for policy-B retirement evidence. This
+-- deliberately hashes tuple layout, not heap contents, so its cost is bounded
+-- by the number of columns rather than snapshot size.
+CREATE OR REPLACE FUNCTION flashback_payload_schema_fingerprint(
+    p_relation regclass
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    SELECT md5(jsonb_build_object(
+        'relkind', c.relkind::text,
+        'persistence', c.relpersistence::text,
+        'columns', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'attnum', a.attnum,
+                    'name', a.attname,
+                    'type_oid', a.atttypid,
+                    'typmod', a.atttypmod,
+                    'collation_oid', a.attcollation,
+                    'not_null', a.attnotnull,
+                    'dropped', a.attisdropped,
+                    'identity', a.attidentity::text,
+                    'generated', a.attgenerated::text,
+                    'storage', a.attstorage::text,
+                    'compression', a.attcompression::text
+                ) ORDER BY a.attnum
+            )
+            FROM pg_attribute a
+            WHERE a.attrelid = c.oid
+              AND a.attnum > 0
+        ), '[]'::jsonb)
+    )::text)
+    FROM pg_class c
+    WHERE c.oid = p_relation::oid
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_own_payload_table(p_relation regclass)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -78,6 +147,7 @@ DECLARE
     v_name      text;
     v_kind      text;
     v_extension text;
+    v_extension_owner name;
 BEGIN
     IF p_relation IS NULL THEN
         RAISE EXCEPTION 'flashback_own_payload_table: relation does not exist';
@@ -104,6 +174,23 @@ BEGIN
             'flashback_own_payload_table: %.% is not a recognized pg_flashback payload table',
             v_schema, v_name;
     END IF;
+
+    SELECT pg_get_userbyid(e.extowner)
+      INTO STRICT v_extension_owner
+    FROM pg_extension e
+    WHERE e.extname = 'pg_flashback';
+
+    -- Runtime payload must not remain owned or writable by the delegated role
+    -- that created/imported it. Extension membership controls dump/drop
+    -- behavior, but does not by itself change the relation owner or ACL.
+    EXECUTE format(
+        'ALTER TABLE %I.%I OWNER TO %I',
+        v_schema, v_name, v_extension_owner
+    );
+    EXECUTE format(
+        'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC, flashback_admin, flashback_recovery_agent, pg_monitor',
+        v_schema, v_name
+    );
 
     SELECT e.extname INTO v_extension
     FROM pg_depend d
@@ -159,14 +246,16 @@ DECLARE
     v_name      text;
     v_kind      text;
     v_extension text;
+    v_relation_owner oid;
+    v_extension_owner oid;
 BEGIN
     IF p_relation IS NULL THEN
         RETURN false;
     END IF;
     v_oid := p_relation::oid;
 
-    SELECT n.nspname, c.relname
-      INTO v_schema, v_name
+    SELECT n.nspname, c.relname, c.relowner
+      INTO v_schema, v_name, v_relation_owner
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.oid = v_oid;
@@ -183,6 +272,16 @@ BEGIN
     IF v_kind IS NULL THEN
         RAISE EXCEPTION
             'flashback_release_payload_table: %.% is not a recognized pg_flashback payload table',
+            v_schema, v_name;
+    END IF;
+
+    SELECT e.extowner
+      INTO STRICT v_extension_owner
+    FROM pg_extension e
+    WHERE e.extname = 'pg_flashback';
+    IF v_relation_owner IS DISTINCT FROM v_extension_owner THEN
+        RAISE EXCEPTION
+            'flashback_release_payload_table: %.% owner changed from extension owner',
             v_schema, v_name;
     END IF;
 
@@ -325,6 +424,10 @@ COMMENT ON FUNCTION flashback_adopt_existing_payload_tables()
     IS 'Adopt legacy runtime snapshot, delta-partition, and restore-artifact tables as pg_flashback extension members; idempotent and fail-closed.';
 COMMENT ON FUNCTION flashback_payload_kind(regclass)
     IS '[Internal] Classify a reserved pg_flashback runtime payload relation.';
+COMMENT ON FUNCTION flashback_payload_is_owned(regclass)
+    IS '[Internal] Verify payload kind, extension membership, and extension ownership without scanning heap data.';
+COMMENT ON FUNCTION flashback_payload_schema_fingerprint(regclass)
+    IS '[Internal] Return a catalog-only physical tuple-layout fingerprint for retention identity evidence.';
 COMMENT ON FUNCTION flashback_own_payload_table(regclass)
     IS '[Internal] Add a validated runtime payload table to pg_flashback extension membership.';
 COMMENT ON FUNCTION flashback_release_payload_table(regclass)

@@ -58,10 +58,10 @@ rm -rf target/test-pgdata && cargo pgrx test pg17
 rm -rf target/test-pgdata && cargo pgrx test pg18
 ```
 
-- [ ] PostgreSQL 15: 68/68.
-- [ ] PostgreSQL 16: 68/68.
-- [ ] PostgreSQL 17: 68/68.
-- [ ] PostgreSQL 18: 68/68.
+- [ ] PostgreSQL 15: 69/69.
+- [ ] PostgreSQL 16: 69/69.
+- [ ] PostgreSQL 17: 69/69.
+- [ ] PostgreSQL 18: 69/69.
 - [ ] The real WAL/worker E2E passes: `scripts/run_wal_e2e.sh`.
 
 ## 4. Coverage correctness qualification
@@ -82,8 +82,9 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
       capture watermark; at a handoff coordinate only the successor is
       selected.
 - [ ] Only `active` and `sealed` generations are admitted. `building`
-      (including a pending/unanchored successor) is never selected, while a
-      broken stream still serves targets no later than its frozen watermark.
+      (including a pending/unanchored successor), `aborted` and `retired` are
+      never selected, while a broken stream still serves targets no later than
+      its frozen watermark.
 - [ ] WAL backlog crossing a boundary is routed to the correct generation;
       payload carries commit LSN separately from change LSN and legacy trigger
       rows never enter a qualified generation.
@@ -114,10 +115,25 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
 - [ ] Local swap rollback, crash after commit but before activation, duplicate
       resolver retry and DML committed during the pending window all preserve
       exactly-once activation and successor payload routing.
+- [ ] With the worker stopped, committed WAL for the old relation is drained
+      under the final relation lock before restore swaps the OID; the event is
+      owned by the sealed predecessor and historical OIDs are not rewritten.
+- [ ] A stream break during the very first `building` boundary removes its
+      draft payload, leaves an immutable `aborted` tombstone, and permits only
+      a new explicit re-anchor generation while the missing interval remains
+      rejected.
 - [ ] Whole-generation payload retirement leaves durable audit tombstones and
       cannot cascade-delete generation, gap or lineage metadata; interruption
       before/during/after deletion resumes from committed `retiring` intent,
       concurrent retriers serialize, and admission rejects the payload.
+- [ ] Policy-B cleanup performs no snapshot heap re-count: content-only drift
+      does not wedge retirement, while catalog OID, extension owner/membership,
+      physical tuple-layout drift, lifecycle binding and the newer active
+      anchor are revalidated immediately before removal.
+- [ ] `flashback_admin` has no direct mutating ACL on internal/runtime payload
+      and cannot execute restore-guard or trigger attach/detach helpers; newly
+      adopted payload is owned by the extension owner with delegated ACLs
+      removed.
 - [ ] A populated-installation upgrade has measured lock, rewrite, disk/WAL
       and downtime bounds and a maintenance runbook. A real `pg_dump`/restore
       round trip proves that no tracking, payload or coverage state is silently

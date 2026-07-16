@@ -79,6 +79,9 @@ local checkpoints remain research, not a first-release promise.
    tracking lock happen without an unlocked interval, and the relation OID is
    then locked/revalidated. Metadata is reread after locking. Multi-table
    operations acquire all stable tracking locks in ascending ID order.
+   A qualified local restore also takes the final relation lock and drains all
+   already-committed WAL for the old relation before its OID can be replaced.
+   Historical payload keeps its boundary OID; only the current binding moves.
 3. A continuous local handoff activates the new generation and seals its
    predecessor atomically. The backup post-restore transition is the explicit
    exception: resolving the production-swap commit seals the predecessor at
@@ -98,6 +101,10 @@ local checkpoints remain research, not a first-release promise.
 6. Missing, ambiguous or stale evidence rejects the target. Coverage health is
    represented by generations, stream epochs, watermarks and persistent gaps,
    not by one global healthy/unhealthy Boolean.
+7. If a stream break prevents a `building` boundary from ever becoming active,
+   its draft payload is removed and the generation becomes an immutable
+   `aborted` audit tombstone. It is never target-eligible; a later explicit
+   re-anchor creates a new generation and leaves the missing interval rejected.
 
 These rules apply to `flashback_restore_lsn()`, `flashback_query_lsn()` and
 `flashback_recover_deleted_lsn()`. Their timestamp-named predecessors are
@@ -274,12 +281,29 @@ events by age in isolation.
   inclusive watermark may advance monotonically only up to its
   `superseded_before` coordinate. Retirement is forbidden until that drain is
   complete and the frontier through the exclusive upper bound is proven. The
-  coordinator holds that advisory key at session scope across the
-  multi-transaction cleanup, first commits a durable `retiring`
-  intent/tombstone, performs idempotent deletion, and transitions metadata to
-  `retired` only after verified absence. A crash releases the session lock; one
-  retrier reacquires it and resumes from the intent while admission remains
+  coordinator takes that advisory key in each transaction. It first commits a
+  durable `retiring` intent/tombstone, which becomes the cross-transaction
+  admission fence. A later transaction reacquires the key, revalidates the
+  frozen evidence, performs idempotent deletion, and transitions metadata to
+  `retired` only after verified absence. A crash rolls back partial deletion;
+  one retrier resumes from the committed intent while admission remains
   fail-closed.
+- **Deletion validates identity and need, not content.** Cleanup proves it is
+  removing the right physical payload object (catalog OID, payload
+  naming/namespace contract, extension ownership/membership,
+  tracking/generation/snapshot binding and a catalog-only physical tuple-layout
+  fingerprint) and that a newer active generation still anchors coverage at
+  removal time; it never re-scans heap content. Content integrity is a use-time
+  property of restore/query admission. The intent-time row count
+  stays in the tombstone as forensic evidence only — drift in a payload that
+  is about to be discarded must not wedge retention, and a full re-count
+  would make cleanup cost proportional to table size without proving
+  integrity (equal-count modifications pass a count check).
+- Delegated `flashback_admin` operation is API-only. It cannot directly mutate
+  internal tables or runtime payload, toggle the process-local restore guard,
+  or attach/detach capture triggers. A PostgreSQL superuser remains inside the
+  trusted administration boundary and can invalidate any extension's
+  guarantees.
 - Generation and gap metadata remain as an audit/rejection record even after
   payload retirement.
 - Payload retirement records a durable tombstone containing at least the
@@ -381,8 +405,9 @@ The WAL-local runtime now writes stable lifecycle/generation/stream/gap
 metadata, promotes complete COMMIT-LSN batches, admits immutable generation
 targets, resolves only unambiguous timestamp-to-prefix mappings, and implements
 restore/query/recover/re-anchor LSN APIs. Trigger and timestamp functions remain
-legacy. Generation-aware retention and the backup-profile generation protocol
-are not yet wired. Schema migration is also not assumed to be lock-free: before upgrading a populated installation, release
+legacy. Local generation-aware retention is wired; the backup-profile
+generation protocol is not yet wired. Schema migration is also not assumed to
+be lock-free: before upgrading a populated installation, release
 qualification must measure lock duration, table-rewrite/disk requirements and
 downtime and provide a maintenance runbook. Logical dump/restore deliberately
 does not migrate any pg_flashback tracking, payload or coverage state: relation
@@ -417,9 +442,10 @@ Release remains blocked until at least:
 - payload is bound to stable tracking and generation identities;
 - every active backup generation references one immutable, identity-complete
   backup anchor and its boundary equals the verified backup stop LSN;
-- retention is converted to whole-generation ownership and cannot race a
-  pinned LSN read/restore;
-- capture disablement is recorded synchronously and visible through
+- generation-aware retention remains covered by its durable-intent,
+  interruption-resume and pinned-admission regression/E2E tests;
+- capture disablement and mode changes continue to record a LOGGED stream break
+  before the worker applies the new behavior, and remain visible through
   `flashback_health()`;
 - local automated disk/write-stall preflight is added around the implemented
   in-swap base, pending marker and post-commit activation protocol;

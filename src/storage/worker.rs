@@ -242,6 +242,8 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     // Track whether slot is ready (lazily created on first WAL cycle)
     let mut slot_ready = false;
     let mut slot_warned = false;
+    let mut last_enabled: Option<bool> = None;
+    let mut last_mode: Option<&'static str> = None;
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -250,11 +252,30 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             }
         }
 
-        // When pg_flashback.enabled = off, worker idles completely.
-        if is_capture_enabled() {
-            let cycle_start = std::time::Instant::now();
+        let enabled = is_capture_enabled();
+        let mode = effective_capture_mode();
+        if last_enabled != Some(enabled) || last_mode != Some(mode) {
+            // Reconcile in a LOGGED database transaction before the worker
+            // acts on a changed GUC. A disabled/non-WAL qualified stream is
+            // frozen with durable gaps first; re-enabling creates a fresh
+            // epoch and still requires explicit re-anchor.
+            if !reconcile_capture_configuration() {
+                // Fail closed: do not apply the new enabled/mode behavior
+                // until the LOGGED discontinuity transaction succeeds.
+                let interval_ms = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
+                if !BackgroundWorker::wait_latch(Some(Duration::from_millis(interval_ms))) {
+                    break;
+                }
+                continue;
+            }
+            last_enabled = Some(enabled);
+            last_mode = Some(mode);
+        }
 
-            let mode = effective_capture_mode();
+        // When pg_flashback.enabled = off, the worker idles only after the
+        // configuration discontinuity above has been durably recorded.
+        if enabled {
+            let cycle_start = std::time::Instant::now();
 
             let t0 = std::time::Instant::now();
             if mode == "wal" {
@@ -330,6 +351,27 @@ fn is_any_restore_active() -> bool {
         Ok(active)
     });
     result.unwrap_or(false)
+}
+
+fn reconcile_capture_configuration() -> bool {
+    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+        let fn_exists = Spi::get_one::<bool>(
+            "SELECT to_regprocedure('flashback_reconcile_capture_configuration()') IS NOT NULL",
+        )?
+        .unwrap_or(false);
+        if fn_exists {
+            Spi::run("SELECT flashback_reconcile_capture_configuration()")?;
+        }
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            log!("pg_flashback CAPTURE_CONFIGURATION_RECONCILE_ERROR error={err:?}");
+            false
+        }
+    }
 }
 
 /// Determine the effective capture mode based on GUC and wal_level.

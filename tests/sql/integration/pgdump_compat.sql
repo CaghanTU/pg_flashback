@@ -58,11 +58,11 @@ BEGIN
           'tracking_lifecycles', 'tracked_tables', 'delta_log', 'snapshots', 'restore_log',
           'staging_events', 'schema_versions', 'capture_streams', 'capture_commits', 'backup_anchors',
           'coverage_generations', 'coverage_gaps', 'pending_wal_events',
-          'backup_restore_requests'
+          'generation_payload_retirements', 'backup_restore_requests'
       );
 
-    IF v_cnt <> 14 THEN
-        RAISE EXCEPTION 'expected 14 core/coverage tables owned by extension, got %', v_cnt;
+    IF v_cnt <> 15 THEN
+        RAISE EXCEPTION 'expected 15 core/coverage tables owned by extension, got %', v_cnt;
     END IF;
 END;
 $tv2$;

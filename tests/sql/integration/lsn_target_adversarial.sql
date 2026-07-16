@@ -3,12 +3,15 @@
 -- must reject timestamp collisions/inversions and admission must reject every
 -- target beyond a frozen frontier or inside a durable gap.
 DROP TABLE IF EXISTS public.it_lsn_adversarial CASCADE;
-DROP TABLE IF EXISTS flashback.it_lsn_adversarial_snapshot CASCADE;
+DROP TABLE IF EXISTS flashback.base_snapshot_987654320 CASCADE;
 
 CREATE TABLE public.it_lsn_adversarial (id integer PRIMARY KEY, note text);
 INSERT INTO public.it_lsn_adversarial VALUES (1, 'boundary');
-CREATE TABLE flashback.it_lsn_adversarial_snapshot
+CREATE TABLE flashback.base_snapshot_987654320
 AS TABLE public.it_lsn_adversarial;
+SELECT flashback_own_payload_table(
+    'flashback.base_snapshot_987654320'::regclass
+);
 
 DO $test$
 DECLARE
@@ -26,7 +29,7 @@ BEGIN
     ) VALUES (
         'public.it_lsn_adversarial'::regclass,
         'public', 'it_lsn_adversarial',
-        'flashback.it_lsn_adversarial_snapshot',
+        'flashback.base_snapshot_987654320',
         'local_delta', true
     ) RETURNING tracking_id INTO v_tracking_id;
 
@@ -47,7 +50,7 @@ BEGIN
         schema_def, row_count, captured_at
     ) VALUES (
         'public.it_lsn_adversarial'::regclass, v_tracking_id,
-        'flashback.it_lsn_adversarial_snapshot', '0/1000',
+        'flashback.base_snapshot_987654320', '0/1000',
         '{}'::jsonb, 1, v_base
     ) RETURNING snapshot_id INTO v_snapshot_id;
 
