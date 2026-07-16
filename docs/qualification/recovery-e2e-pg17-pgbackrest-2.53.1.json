@@ -1,10 +1,10 @@
 {
-  "run_id": "20260716T091129Z-122553",
+  "run_id": "20260716T091434Z-124880",
   "status": "ok",
   "checks_passed": 27,
   "source": {
-    "commit": "be114d55880a877df062c6f3911574540c7c50e6",
-    "dirty": true,
+    "commit": "0c04f0225b2f041e28cf2689aa448f18714e21ee",
+    "dirty": false,
     "platform": "Linux aarch64"
   },
   "versions": {
@@ -13,7 +13,7 @@
     "helper": "pg-flashback-recovery 0.1.0"
   },
   "artifacts": {
-    "snapshot_sha256": "42dd79de2f56739da0737c8cafdd5998fd38f0af023394c3db97997638163c95",
-    "classic_sha256": "c997e8f3f3491767f51766653700b6f96170587950993d35be478535e61510d1"
+    "snapshot_sha256": "f224395f30808f5a3aaf0887bd88c576ad5fbfdb543373d9cf5d89c76ed6167b",
+    "classic_sha256": "d47a58c197a3a1eb39911c380b7e8b11eda87e6ba6ed2400ba5f387e8d9da675"
   }
 }
