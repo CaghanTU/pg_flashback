@@ -124,9 +124,23 @@ strategy is still unsuitable for large tables. A later integration change must
 add a backup-backed tracking profile that does not create those full local table
 copies.
 
+The preferred deployment is an additional local, short-retention, plain
+repository key in the same pgBackRest stanza. It is an acceleration tier
+alongside the normal compressed/encrypted disaster-recovery repository, not a
+replacement for it. Backups are scheduled independently per repository; using
+the same stanza avoids creating a second WAL archive pipeline. A separate
+stanza is only appropriate when a tested dual archive-push wrapper provides
+clear partial-failure semantics.
+
+The phase-1 helper planner already fails with `target_before_oldest_backup`
+when no completed full backup precedes the requested LSN; it never silently
+chooses an invalid base.
+
 ## Unclosed risks before product integration
 
 - incremental/differential backup sets and hardlink closure
+- concurrent backup while the helper selects/clones a backup set
+- retention/expire between request acceptance and private clone creation
 - tablespaces and symlink mapping
 - encrypted repositories
 - required extension/shared-library availability in the temporary instance

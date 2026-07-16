@@ -409,11 +409,21 @@ yet.
 - [PoC design and reproduction guide](docs/LARGE_DB_POC.md)
 - [Measured results and architecture decision](docs/LARGE_DB_POC_RESULTS.md)
 - [Machine-readable benchmark summary](docs/benchmarks/large-db-poc-20260716.json)
+- [External recovery helper contract](docs/RECOVERY_HELPER_DESIGN.md)
 
 Run a 500 MiB local comparison:
 
 ```bash
 ./scripts/run_large_db_restore_poc.sh 500
+```
+
+The phase-1 helper exposes fail-closed capability probing and backup planning;
+restore execution remains disabled until its lifecycle safety gates have E2E
+coverage:
+
+```bash
+cargo run --manifest-path tools/pg_flashback_recovery/Cargo.toml -- \
+  probe --config tools/pg_flashback_recovery/examples/helper.json
 ```
 
 ## 13. Operations & Integration

@@ -51,6 +51,15 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --no-default-features --features pg17 -- -D warnings
 
+      - name: Recovery helper fmt
+        run: cargo fmt --manifest-path tools/pg_flashback_recovery/Cargo.toml --all -- --check
+
+      - name: Recovery helper clippy
+        run: cargo clippy --locked --manifest-path tools/pg_flashback_recovery/Cargo.toml --all-targets -- -D warnings
+
+      - name: Recovery helper tests
+        run: cargo test --locked --manifest-path tools/pg_flashback_recovery/Cargo.toml
+
   test:
     name: Test (PG ${{ matrix.pg }})
     runs-on: ubuntu-22.04
@@ -110,4 +119,3 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit
-
