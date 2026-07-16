@@ -31,8 +31,9 @@ database.
 | RB-08 | Unbounded local checkpoints | Default 15-minute checkpoints plus seven-day retention keep about 672 full CTAS copies per table, in addition to the base snapshot. There is no byte/count quota or headroom preflight. | Choose a bounded checkpoint policy before release. |
 | RB-09 | Local restore capacity | Restore has no disk preflight. On a 489 MB live table, measured peak growth was 944,603,136 bytes: one complete shadow plus one post-restore snapshot. | Add a capacity plan/preflight and decide whether post-restore snapshots are automatic. |
 | RB-10 | Helper work capacity | Snapshot-direct initially reserves only 64 MiB of free space, while replay CoW growth is unknown. Quota is per request, successful dumps have no GC/expiry command, and retained artifacts are unbounded in aggregate. | Add continuous free-space reserve enforcement and an explicit artifact/request retention lifecycle. |
+| RB-11 | Worker head-of-line blocking | While the worker was blocked for five seconds taking a checkpoint on one table, a committed event for another table remained in `staging_events`; it was still absent from `delta_log` after one second and became visible only after 5,055 ms. | Decouple capture draining from checkpoint/retention work or give maintenance work a bounded, cancellable schedule. The trigger/DDL crash window is not bounded by `worker_interval_ms` today. |
 
-Until RB-01 through RB-10 are either fixed or explicitly removed from the
+Until RB-01 through RB-11 are either fixed or explicitly removed from the
 supported release contract, a successful restore cannot be treated as proof
 of recoverability.
 
@@ -156,6 +157,25 @@ The retained 32 MiB qualification run passed all 27 helper E2E checks. It left
 test cleanup. The five dumps totalled 830,090 bytes because the fixture is
 highly compressible; production dumps may approach table data size. There is
 no aggregate work-root limit or successful-artifact expiry command.
+
+### 2.7 Worker scheduling
+
+Capture consumption, staging flush, restore-lock inspection, all due
+checkpoints, partition maintenance and retention run serially in one worker per
+database. Checkpoints for every due table are also executed inside one SPI
+transaction. A slow or lock-blocked checkpoint therefore delays capture for
+unrelated tables and extends WAL lag or the UNLOGGED staging crash window.
+
+The lock-blocked checkpoint experiment measured 5,055 ms from commit to delta
+visibility with a 50 ms worker interval. The event remained only in
+`staging_events` for that period.
+
+An idle worker at the minimum 50 ms interval consumed 310 ms of CPU during a
+5,005 ms sample on this host (`6.19%` of one CPU), despite having no tracked
+tables or events. The loop enters five separate SPI transaction wrappers per
+cycle; PostgreSQL's database transaction counters did not expose those worker
+transactions. CPU figures are host-specific, but the cost multiplies by the
+configured database/worker count (up to eight workers).
 
 ## 3. Positive guarantees confirmed
 

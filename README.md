@@ -606,7 +606,14 @@ max_slot_wal_keep_size = 10GB   -- adjust to your disk headroom
 ```
 
 **2. `staging_events` is UNLOGGED — crash window in trigger mode**
-In trigger mode, DML captured by triggers writes to `staging_events` (an UNLOGGED table). Events not yet flushed to `delta_log` by the background worker (up to `worker_interval_ms`, default 75 ms) are **lost on a PostgreSQL crash or hard reboot**. WAL mode has no DML crash window (events are durable in the replication slot at commit time); use it when DML durability matters.
+In trigger mode, DML captured by triggers writes to `staging_events` (an
+UNLOGGED table). Events not yet flushed to `delta_log` are **lost on a
+PostgreSQL crash or hard reboot**. With an idle worker the nominal window is
+about `worker_interval_ms` (default 75 ms), but the worker runs WAL consumption,
+checkpoint and retention work serially. A slow checkpoint, recovery batch or
+lock wait extends the crash window by that operation's full duration. WAL mode
+has no DML crash window (events are durable in the replication slot at commit
+time); use it when DML durability matters.
 
 **3. `flashback_restore` exclusive lock can pause under a long-running query**
 The atomic shadow swap (`DROP original → RENAME shadow`) requires an `AccessExclusiveLock`. If there is a long-running `SELECT`, `VACUUM`, or open transaction on the table at restore time, the lock acquisition will block — and will in turn block all subsequent reads/writes behind it. Always restore during a low-traffic window or set a `lock_timeout` in your session first:
@@ -646,7 +653,11 @@ When `flashback_restore` replays a table to an older timestamp, `max(id)` in the
 
 ## 15. Caveats & Limitations
 
-- **WAL crash window:** In WAL mode, DML events are durable in the replication slot from the moment the transaction commits — no staging crash window. DDL events still flow through `staging_events` (UNLOGGED) and carry up to a `worker_interval_ms` (default 75 ms) crash window.
+- **WAL crash window:** In WAL mode, DML events are durable in the replication
+  slot from the moment the transaction commits — no staging crash window. DDL
+  events still flow through `staging_events` (UNLOGGED). Their nominal idle
+  crash window is `worker_interval_ms` (default 75 ms), but serial worker work
+  or lock waits can extend it by the full consume/checkpoint/retention duration.
 - **Trigger crash window:** `staging_events` is UNLOGGED. Events not yet flushed to `delta_log` are lost on a PostgreSQL crash. Use WAL mode for stricter DML durability.
 - **WAL mode requirement:** `wal_level = logical` must be set cluster-wide before enabling WAL capture. `capture_mode = 'auto'` falls back to trigger mode when `wal_level < logical`.
 - **Trigger-mode PITR accuracy — requires `track_commit_timestamp = on`:** In trigger mode, `event_time` is set to `clock_timestamp()` at statement execution inside the trigger, not at transaction commit. A long-running transaction that starts at T₀ and commits at T₁ will have `event_time ≈ T₀`, so `flashback_restore` and `flashback_query` may replay it even when the target timestamp is between T₀ and T₁. To get commit-time-correct PITR in trigger mode, add `track_commit_timestamp = on` to `postgresql.conf` (restart required). The background worker will then use `pg_xact_commit_timestamp()` for both `event_time` and `committed_at`. `flashback_track()` emits a NOTICE when trigger mode is active and `track_commit_timestamp` is off. WAL mode is always commit-time-correct regardless of this setting.
