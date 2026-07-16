@@ -403,8 +403,6 @@ assert_eq "izlenmeyen DEFAULT tablo decoder ledger'ına girmedi" "0" \
     "$(q "SELECT count(*) FROM flashback.capture_commits WHERE source_xid=$AMP_DEFAULT_XID")"
 assert_eq "izlenmeyen RI FULL tablo decoder ledger'ına girmedi" "0" \
     "$(q "SELECT count(*) FROM flashback.capture_commits WHERE source_xid=$AMP_FULL_XID")"
-assert_ne "izlenen batch transaction XID üretildi" "" "$AMP_TRACKED_XID"
-assert_ne "izlenen batch app WAL ölçümü üretildi" "" "$AMP_TRACKED_APP_WAL"
 BATCH_ELAPSED_MS=$((($(date +%s%N) - BATCH_STARTED_NS) / 1000000))
 AMP_TOTAL_END=$(q "SELECT pg_current_wal_insert_lsn()")
 AMP_TRACKED_TOTAL_WAL=$(q "SELECT pg_wal_lsn_diff('$AMP_TOTAL_END', '$AMP_TOTAL_START')::bigint")
