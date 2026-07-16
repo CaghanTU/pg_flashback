@@ -10,6 +10,8 @@
 # This script does exactly that, including:
 #   * per-database slot creation via flashback_track()
 #   * background worker consumption (real commit_time + LSN stamping)
+#   * large-transaction consumption stays linear (commit map is not rescanned
+#     once per decoded row)
 #   * poison-value safety (quoted table name, NaN numeric)
 #   * PITR correctness of a restore to a point between committed transactions
 #   * REPLICA IDENTITY lifecycle (track sets FULL, restore keeps it,
@@ -137,7 +139,14 @@ echo "  ok: instance yeniden başladı (target_databases=$DB, capture_mode=wal)"
 echo "━━━ 1. Extension + track (per-DB slot, ayrı transaction'lar) ━━━"
 q "CREATE EXTENSION pg_flashback" > /dev/null
 q "CREATE TABLE orders (id serial PRIMARY KEY, customer text, amount numeric(10,2))" > /dev/null
+q "CREATE TABLE wal_batch_probe (id int PRIMARY KEY, version int NOT NULL DEFAULT 0, payload text NOT NULL);
+   INSERT INTO wal_batch_probe
+   SELECT g, 0, string_agg(md5(g::text || ':' || s::text), '')
+   FROM generate_series(1,2000) AS g
+   CROSS JOIN generate_series(1,32) AS s
+   GROUP BY g" > /dev/null
 q "SELECT flashback_track('orders')" > /dev/null
+q "SELECT flashback_track('wal_batch_probe')" > /dev/null
 $PSQL -d "$DB" -q <<'SQL'
 CREATE TABLE "we""ird" (id int PRIMARY KEY, amount numeric);
 SELECT flashback_track('"we""ird"');
@@ -158,6 +167,30 @@ done
 assert_eq "worker bu veritabanına bağlı" "$DB" "$WORKER_DB"
 
 echo "━━━ 2. Commit edilen DML'in worker tarafından tüketilmesi ━━━"
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.snapshots WHERE rel_oid='wal_batch_probe'::regclass")" -ge 1 ]] && break
+    sleep 0.1
+done
+
+# Regression for the decoded-commit lookup.  Without a MATERIALIZED commit
+# map, PostgreSQL scans the whole decoded batch for every row (O(n^2)); this
+# exact 2,000-row/1 KiB transaction took ~27 seconds on the qualification host.
+BATCH_STARTED_NS=$(date +%s%N)
+q "UPDATE wal_batch_probe AS t
+   SET version=version+1,
+       payload=(SELECT string_agg(md5(t.id::text || ':' || t.version::text || ':' || s::text), '')
+                FROM generate_series(1,32) AS s)" > /dev/null
+BATCH_CAPTURED=0
+for _ in $(seq 1 100); do
+    BATCH_CAPTURED=$(q "SELECT count(*) FROM flashback.delta_log
+                         WHERE rel_oid='wal_batch_probe'::regclass AND event_type='UPDATE'")
+    [[ "$BATCH_CAPTURED" == "2000" ]] && break
+    sleep 0.1
+done
+assert_eq "2.000 satırlık WAL transaction 10 saniyede tüketildi" "2000" "$BATCH_CAPTURED"
+BATCH_ELAPSED_MS=$((($(date +%s%N) - BATCH_STARTED_NS) / 1000000))
+echo "  ok: büyük transaction capture süresi = ${BATCH_ELAPSED_MS}ms"
+
 q "INSERT INTO orders (customer, amount) SELECT 'cust_'||g, g*1.5 FROM generate_series(1,1000) g" > /dev/null
 q "UPDATE orders SET amount = amount + 100 WHERE id <= 10" > /dev/null
 q "INSERT INTO orders (customer, amount) VALUES ('yeni_musteri', 999.99)" > /dev/null
@@ -171,8 +204,8 @@ q "DELETE FROM orders WHERE id <= 500" > /dev/null
 sleep 2
 
 assert_eq "INSERT olay sayısı" "1003" "$(q "SELECT count(*) FROM flashback.delta_log WHERE event_type='INSERT'")"
-assert_eq "UPDATE olay sayısı" "10"   "$(q "SELECT count(*) FROM flashback.delta_log WHERE event_type='UPDATE'")"
-assert_eq "DELETE olay sayısı" "500"  "$(q "SELECT count(*) FROM flashback.delta_log WHERE event_type='DELETE'")"
+assert_eq "orders UPDATE olay sayısı" "10"   "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='orders'::regclass AND event_type='UPDATE'")"
+assert_eq "orders DELETE olay sayısı" "500"  "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='orders'::regclass AND event_type='DELETE'")"
 assert_eq "LSN'siz olay sayısı" "0"   "$(q "SELECT count(*) FROM flashback.delta_log WHERE lsn IS NULL")"
 assert_eq "NaN kayıpsız yakalandı" "NaN" \
     "$(q "SELECT new_data->>'amount' FROM flashback.delta_log WHERE table_name LIKE '%ird%' AND new_data->>'id' = '1'")"

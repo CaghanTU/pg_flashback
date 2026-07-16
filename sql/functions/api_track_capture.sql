@@ -970,7 +970,12 @@ BEGIN
         -- else instead of poisoning the whole batch with a cast error.
         WHERE ch.data LIKE '{%'
     ),
-    commits AS (
+    -- The planner otherwise inlines this one-row-per-transaction lookup and
+    -- may rescan the entire decoded batch once for every DML record.  A 2,000
+    -- row transaction then performs roughly four million JSON predicate
+    -- checks.  Materialize the commit map once so the join remains linear in
+    -- the number of decoded messages.
+    commits AS MATERIALIZED (
         SELECT ((data::jsonb)->>'commit')::bigint AS commit_xid,
                -- commit_time is a raw TimestampTz: microseconds since 2000-01-01 UTC
                TIMESTAMPTZ '2000-01-01 00:00:00+00'
