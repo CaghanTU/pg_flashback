@@ -5,17 +5,23 @@ All notable changes to pg_flashback are documented here. The project follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-07-16
+Draft content for the first intended public release (`v0.1.0`). This section is
+not a published release. Do not treat it as shipping until every gate in
+[`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) and
+[`docs/RELIABLE_RELEASE_PLAN.md`](docs/RELIABLE_RELEASE_PLAN.md) passes for the
+exact release commit.
 
-First supported open-source release candidate.
+Platform note: tagged prebuilt artifacts and release qualification target
+Linux x86_64. aarch64 is source-build only and is not release-qualified.
 
 ### Added
 
 - PostgreSQL 15–18 table-level point-in-time restore, historical query and
-  deleted-row recovery using local snapshots plus trigger or logical-WAL
-  capture.
+  deleted-row recovery using local snapshots plus logical-WAL capture for the
+  qualified local profile; trigger capture remains legacy/experimental.
 - Backup profile for large ordinary tables without an in-database base copy or
-  row-delta duplication.
+  row-delta duplication. Helper recovery is implemented; coverage-generation
+  integration remains a release gate.
 - External `pg-flashback-recovery` executor with pgBackRest full-backup
   selection, real XFS reflink capability probing, classic restore fallback and
   private native PostgreSQL LSN recovery.
@@ -43,5 +49,4 @@ First supported open-source release candidate.
 - Removed unsupported PostgreSQL 13/14 builds whose tuple layout was not
   safely handled.
 
-[Unreleased]: https://github.com/CaghanTU/pg_flashback/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/CaghanTU/pg_flashback/releases/tag/v0.1.0
+[Unreleased]: https://github.com/CaghanTU/pg_flashback/compare/main...HEAD

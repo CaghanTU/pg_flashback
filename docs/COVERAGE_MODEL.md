@@ -17,7 +17,7 @@ land with its own regression tests.
 
 ## Why the legacy model is insufficient
 
-The current model uses a mutable relation OID as identity, one
+The pre-generation model used a mutable relation OID as identity, one
 `tracked_since` timestamp, optional backup start/end LSNs and an age-based
 retention cutoff. That cannot represent:
 
@@ -642,8 +642,9 @@ It must also prove that retired payload leaves its audit tombstone.
 
 The legacy `coverage_start_lsn`, `coverage_end_lsn`, `tracked_since`,
 `retention_cutoff`, `checkpoint_interval` and `base_snapshot_table` columns
-remain temporarily for compatibility. They stop being sources of truth only
-when the corresponding runtime phase lands atomically.
+remain temporarily for compatibility. They are no longer sources of truth for
+qualified local generations; backup-profile anchoring still must stop treating
+legacy coverage LSN columns as authoritative when that runtime phase lands.
 
 ## Required regression matrix
 

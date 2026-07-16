@@ -1,6 +1,7 @@
 # Reliable v0.1.0 release plan
 
-Status: **proposed execution plan — implementation gates remain open**
+Status: **proposed execution plan — Milestone 0 docs contract freeze ready for
+review; implementation gates remain open**
 
 Last updated: 2026-07-17
 

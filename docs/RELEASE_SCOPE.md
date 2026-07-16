@@ -11,8 +11,9 @@ optimistically.
 
 ## Common supported contract
 
-- PostgreSQL 15–18 on Linux x86_64 or aarch64 source builds; tagged prebuilt
-  extension archives are x86_64
+- PostgreSQL 15–18 on Linux. Tagged prebuilt extension archives and release
+  qualification target x86_64. aarch64 is source-build only and is not
+  release-qualified
 - ordinary logged tables whose stable tracking identity can be proven
 - a target contained by exactly one `active` or `sealed` generation's
   half-open applicability interval and at or before its separate inclusive
@@ -61,6 +62,12 @@ The local profile is supported only after its coverage runtime gates pass:
   requires post-commit `flashback_health()` activation
 
 ## Backup profile
+
+The backup profile is part of the first-release contract, but its coverage-
+generation runtime is not yet wired. Until those gates pass, helper recovery
+and the legacy controller APIs remain experimental/scaffold paths: they must
+not report recoverability from an unverified generation. The bullets below are
+the release-required behavior, not a claim that every rule is already enforced.
 
 - local POSIX pgBackRest repository
 - completed full backups
