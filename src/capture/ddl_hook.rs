@@ -99,18 +99,12 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         return;
     }
 
-    let skip_capture = should_skip_capture_for_query(query_string);
-    let capture_enabled = if skip_capture {
-        false
-    } else {
-        // Skip extension check for non-table DDL (CREATE/DROP DATABASE, etc.)
-        // to avoid SPI/catalog access in unsafe contexts.
-        let is_table_ddl = !pstmt.is_null() && is_table_related_utility(pstmt);
-        is_table_ddl && is_extension_installed_current_db()
-    };
+    // DDL executed internally by flashback_restore runs either with the
+    // restore-in-progress flag set (checked above) or in a non-TOPLEVEL
+    // ProcessUtility context (SPI), so no query-string inspection is needed.
+    let capture_enabled = is_extension_installed_current_db();
 
-    if !skip_capture
-        && capture_enabled
+    if capture_enabled
         && context == pg_sys::ProcessUtilityContext::PROCESS_UTILITY_TOPLEVEL
         && !pstmt.is_null()
     {
@@ -150,8 +144,7 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         );
     }
 
-    if !skip_capture
-        && capture_enabled
+    if capture_enabled
         && context == pg_sys::ProcessUtilityContext::PROCESS_UTILITY_TOPLEVEL
         && !pstmt.is_null()
     {
@@ -164,15 +157,6 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
             }
         }
     }
-}
-
-fn should_skip_capture_for_query(query_string: *const std::ffi::c_char) -> bool {
-    if query_string.is_null() {
-        return false;
-    }
-
-    let query = unsafe { CStr::from_ptr(query_string).to_string_lossy() };
-    query.contains("flashback_restore(") || query.contains("flashback_recreate_table_from_ddl(")
 }
 
 fn is_extension_installed_current_db() -> bool {

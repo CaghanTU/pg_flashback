@@ -19,7 +19,8 @@ static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
 /// Capture mode: 'wal' (WAL-based via logical decoding), 'trigger' (legacy trigger-based),
 /// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
 static CAPTURE_MODE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-/// Logical replication slot name. Allows multiple pg_flashback instances on the same cluster.
+/// Logical replication slot name override. Default is per-database
+/// (pg_flashback_<dbname>) because logical slots are database-specific.
 static SLOT_NAME_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// work_mem override for snapshot bulk load during flashback_restore.
 static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -31,14 +32,17 @@ pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
 }
 
-/// Returns the configured replication slot name, falling back to 'pg_flashback_slot'.
-fn effective_slot_name() -> String {
-    SLOT_NAME_GUC
-        .get()
-        .and_then(|cs| cs.to_str().ok().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "pg_flashback_slot".to_string())
-}
+/// SQL expression yielding the effective replication slot name for the
+/// connected database. Mirrors flashback_effective_slot_name() but works
+/// even before the extension is installed in this database.
+/// Slot names are cluster-wide unique while logical slots are
+/// database-specific, so the default derives from the database name.
+const EFFECTIVE_SLOT_NAME_SQL: &str = "COALESCE(
+        NULLIF(current_setting('pg_flashback.slot_name', true), ''),
+        left('pg_flashback_' ||
+             lower(regexp_replace(current_database(), '[^a-zA-Z0-9_]', '_', 'g')),
+             63)
+    )";
 
 fn effective_worker_batch_size() -> usize {
     WORKER_BATCH_SIZE_GUC.get().clamp(128, 50_000) as usize
@@ -50,7 +54,7 @@ pub fn register_worker_and_guc() {
         c"pg_flashback delta worker flush interval",
         c"How often the background worker flushes staging events to flashback.delta_log (milliseconds).",
         &WORKER_INTERVAL_MS,
-        10,
+        50,
         10_000,
         GucContext::Sighup,
         GucFlags::UNIT_MS,
@@ -128,7 +132,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_string_guc(
         c"pg_flashback.slot_name",
         c"Logical replication slot name used by pg_flashback",
-        c"Override when running multiple pg_flashback installations on the same cluster. Default: pg_flashback_slot.",
+        c"Overrides the per-database default (pg_flashback_<dbname>). Slots are database-specific, so set this only on single-database installs.",
         &SLOT_NAME_GUC,
         GucContext::Suset,
         GucFlags::default(),
@@ -258,7 +262,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
                 if !slot_ready {
                     slot_ready = ensure_replication_slot();
                     if !slot_ready && !slot_warned {
-                        log!("pg_flashback: replication slot '{}' not found, waiting for flashback_track() to create it", effective_slot_name());
+                        log!("pg_flashback: no replication slot for database {db_name}, waiting for flashback_track() to create it");
                         slot_warned = true;
                     }
                 }
@@ -366,20 +370,26 @@ fn effective_capture_mode() -> &'static str {
     }
 }
 
-/// Ensure the pg_flashback logical replication slot exists.
+/// Ensure the pg_flashback logical replication slot exists FOR THIS DATABASE.
 /// Returns true if slot is ready.
+///
+/// Logical slots are database-specific: a slot with the right name that was
+/// created in another database cannot decode this database's changes, so the
+/// check is scoped to current_database().
 ///
 /// NOTE: Slot creation by the background worker is unreliable because
 /// pg_create_logical_replication_slot() requires a clean, write-free
 /// transaction. Instead, the slot should be created by flashback_track()
 /// or manually by the DBA. This function only checks for existence.
 fn ensure_replication_slot() -> bool {
-    let slot_name = effective_slot_name();
     let result: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
-        let exists = Spi::get_one_with_args::<bool>(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-            &[slot_name.as_str().into()],
-        )?
+        let exists = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pg_replication_slots
+                 WHERE slot_name = {EFFECTIVE_SLOT_NAME_SQL}
+                   AND database = current_database()
+             )"
+        ))?
         .unwrap_or(false);
         Ok(exists)
     });
@@ -387,83 +397,21 @@ fn ensure_replication_slot() -> bool {
 }
 
 /// Consume WAL changes from the logical replication slot and insert into delta_log.
-/// Each change is a JSON line produced by our output plugin (_PG_output_plugin_init).
+/// The heavy lifting lives in the SQL function flashback_consume_wal(), which
+/// stamps events with the real commit time and change LSN. Skips silently when
+/// the extension is not (yet) installed in this database.
 fn consume_wal_changes() {
-    let slot_name = effective_slot_name();
     let batch_size = effective_worker_batch_size() as i32;
     let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        let table_exists =
-            Spi::get_one::<bool>("SELECT to_regclass('flashback.delta_log') IS NOT NULL")?
-                .unwrap_or(false);
-        if !table_exists {
+        let fn_exists = Spi::get_one::<bool>(
+            "SELECT to_regprocedure('flashback_consume_wal(integer)') IS NOT NULL",
+        )?
+        .unwrap_or(false);
+        if !fn_exists {
             return Ok(());
         }
 
-        // Consume changes from the slot in a batch
-        // pg_logical_slot_get_changes returns (lsn, xid, data) rows
-        // Handles both DML events (from change_cb) and DDL events (from message_cb)
-        //
-        // slot_name cannot be passed as a bind parameter to pg_logical_slot_get_changes
-        // (it only accepts a literal name). The slot name originates from a superuser-only
-        // GUC (pg_flashback.slot_name), so we sanitize to alphanumeric/underscore/hyphen
-        // characters only before embedding it in the query string.
-        let safe_slot: String = slot_name
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        let query = format!(
-            "WITH wal_changes AS (
-                SELECT lsn, xid, data
-                FROM pg_logical_slot_get_changes(
-                    '{}', NULL, $1
-                )
-            ),
-            parsed AS (
-                SELECT
-                    (data::jsonb)->>'op' AS event_type,
-                    format('%I.%I', (data::jsonb)->>'schema', (data::jsonb)->>'table') AS table_name,
-                    ((data::jsonb)->>'oid')::oid AS rel_oid,
-                    xid::text::bigint AS source_xid,
-                    (data::jsonb)->'old' AS old_data,
-                    (data::jsonb)->'new' AS new_data,
-                    (data::jsonb)->'ddl_info' AS ddl_info,
-                    ((data::jsonb)->>'schema_version')::bigint AS msg_schema_version
-                FROM wal_changes
-                WHERE (data::jsonb)->>'op' IS NOT NULL
-                  AND (data::jsonb)->>'op' IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE',
-                                                'DROP', 'ALTER')
-            )
-            INSERT INTO flashback.delta_log (
-                event_time, event_type, table_name, rel_oid, source_xid,
-                committed_at, schema_version, old_data, new_data, ddl_info
-            )
-            SELECT
-                clock_timestamp(),
-                p.event_type,
-                p.table_name,
-                p.rel_oid,
-                p.source_xid,
-                clock_timestamp(),
-                COALESCE(p.msg_schema_version, (
-                    SELECT sv.schema_version
-                    FROM flashback.schema_versions sv
-                    WHERE sv.rel_oid = p.rel_oid
-                      AND sv.applied_at <= clock_timestamp()
-                    ORDER BY sv.schema_version DESC
-                    LIMIT 1
-                ), 1),
-                p.old_data,
-                p.new_data,
-                p.ddl_info
-            FROM parsed p
-            WHERE EXISTS (
-                SELECT 1 FROM flashback.tracked_tables tt
-                WHERE tt.rel_oid = p.rel_oid
-                  AND tt.is_active
-            )",
-            safe_slot
-        );
-        Spi::run_with_args(&query, &[batch_size.into()])?;
+        Spi::run_with_args("SELECT flashback_consume_wal($1)", &[batch_size.into()])?;
         Ok(())
     });
 
@@ -483,14 +431,9 @@ fn flush_staging_to_delta_log() {
             return Ok(());
         }
 
-        // In WAL mode, DML comes from the slot and DDL comes from WAL messages.
-        // staging_events only holds DML events from trigger mode.
-        // So in WAL mode, staging_events should be empty — skip the flush.
-        let mode = effective_capture_mode();
-        if mode == "wal" {
-            return Ok(());
-        }
-
+        // In WAL mode staging_events is normally empty (DML comes from the
+        // slot, DDL from WAL messages), but flushing unconditionally is cheap
+        // and drains any events left behind by a trigger→wal mode switch.
         let query = "WITH moved AS (
                 DELETE FROM flashback.staging_events
                 WHERE staging_id IN (
@@ -540,7 +483,10 @@ fn flush_staging_to_delta_log() {
                 WHERE tt.rel_oid = m.rel_oid
                   AND tt.is_active
                   AND m.event_time >= tt.tracked_since
-            )";
+            )
+            -- event_id assignment must follow capture order: replay's
+            -- net-effect computation orders events by event_id.
+            ORDER BY m.staging_id";
 
         Spi::run_with_args(query, &[batch_size.into()])?;
         Ok(())

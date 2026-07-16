@@ -130,9 +130,13 @@ unsafe extern "C-unwind" fn fb_decode_change(
 
     let xid = unsafe { (*txn).xid };
     let mut json = std::string::String::with_capacity(256);
-    json.push_str(&format!(
-        "{{\"op\":\"{op}\",\"schema\":\"{schema}\",\"table\":\"{table}\",\"oid\":{oid},\"xid\":{xid}"
-    ));
+    json.push_str("{\"op\":\"");
+    json.push_str(op);
+    json.push_str("\",\"schema\":\"");
+    json_escape_into(&mut json, &schema);
+    json.push_str("\",\"table\":\"");
+    json_escape_into(&mut json, &table);
+    json.push_str(&format!("\",\"oid\":{oid},\"xid\":{xid}"));
     if let Some(ref old) = old_json {
         json.push_str(",\"old\":");
         json.push_str(old);
@@ -186,9 +190,12 @@ unsafe extern "C-unwind" fn fb_decode_truncate(
             .unwrap_or("unknown")
             .to_owned();
 
-        let json = format!(
-            "{{\"op\":\"TRUNCATE\",\"schema\":\"{schema}\",\"table\":\"{table}\",\"oid\":{oid},\"xid\":{xid}}}"
-        );
+        let mut json = std::string::String::with_capacity(128);
+        json.push_str("{\"op\":\"TRUNCATE\",\"schema\":\"");
+        json_escape_into(&mut json, &schema);
+        json.push_str("\",\"table\":\"");
+        json_escape_into(&mut json, &table);
+        json.push_str(&format!("\",\"oid\":{oid},\"xid\":{xid}}}"));
         let c_json = std::ffi::CString::new(json).unwrap_or_default();
         unsafe {
             OutputPluginPrepareWrite(ctx, true);
@@ -344,17 +351,7 @@ unsafe fn heap_tuple_to_json(
             let val_cstr = unsafe { OidOutputFunctionCall(typoutput, values[i]) };
             let val_str = unsafe { CStr::from_ptr(val_cstr) }.to_str().unwrap_or("");
 
-            if is_numeric_type(atttypid) {
-                if atttypid == pg_sys::BOOLOID {
-                    json.push_str(if val_str == "t" { "true" } else { "false" });
-                } else {
-                    json.push_str(val_str);
-                }
-            } else {
-                json.push('"');
-                json_escape_into(&mut json, val_str);
-                json.push('"');
-            }
+            push_json_value(&mut json, val_str, atttypid);
 
             unsafe { pfree(val_cstr as *mut _) };
         }
@@ -375,6 +372,26 @@ fn is_numeric_type(typoid: Oid) -> bool {
         || typoid == pg_sys::BOOLOID
 }
 
+/// Append one column value in valid JSON. Numeric types are emitted bare,
+/// EXCEPT the special values NaN / Infinity / -Infinity, which JSON has no
+/// literal for — those are emitted as quoted strings (replay casts text
+/// back to the column type, so 'NaN'::numeric round-trips losslessly).
+fn push_json_value(buf: &mut std::string::String, val_str: &str, typoid: Oid) {
+    if is_numeric_type(typoid) {
+        if typoid == pg_sys::BOOLOID {
+            buf.push_str(if val_str == "t" { "true" } else { "false" });
+            return;
+        }
+        if !matches!(val_str, "NaN" | "Infinity" | "-Infinity") && !val_str.is_empty() {
+            buf.push_str(val_str);
+            return;
+        }
+    }
+    buf.push('"');
+    json_escape_into(buf, val_str);
+    buf.push('"');
+}
+
 fn json_escape_into(buf: &mut std::string::String, s: &str) {
     for c in s.chars() {
         match c {
@@ -388,5 +405,48 @@ fn json_escape_into(buf: &mut std::string::String, s: &str) {
             }
             c => buf.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod json_format_tests {
+    use super::{json_escape_into, push_json_value};
+    use pgrx::pg_sys;
+
+    fn escaped(s: &str) -> String {
+        let mut buf = String::new();
+        json_escape_into(&mut buf, s);
+        buf
+    }
+
+    fn value(val: &str, typoid: pg_sys::Oid) -> String {
+        let mut buf = String::new();
+        push_json_value(&mut buf, val, typoid);
+        buf
+    }
+
+    #[test]
+    fn escapes_quoted_identifiers() {
+        // CREATE TABLE "we""ird" is legal — its relname contains a quote
+        assert_eq!(escaped(r#"we"ird"#), r#"we\"ird"#);
+        assert_eq!(escaped(r"back\slash"), r"back\\slash");
+        assert_eq!(escaped("tab\there"), "tab\\there");
+    }
+
+    #[test]
+    fn nan_and_infinity_are_quoted() {
+        assert_eq!(value("NaN", pg_sys::NUMERICOID), "\"NaN\"");
+        assert_eq!(value("Infinity", pg_sys::FLOAT8OID), "\"Infinity\"");
+        assert_eq!(value("-Infinity", pg_sys::FLOAT4OID), "\"-Infinity\"");
+        assert_eq!(value("", pg_sys::NUMERICOID), "\"\"");
+    }
+
+    #[test]
+    fn normal_values_keep_their_shape() {
+        assert_eq!(value("42", pg_sys::INT4OID), "42");
+        assert_eq!(value("-1.5", pg_sys::NUMERICOID), "-1.5");
+        assert_eq!(value("t", pg_sys::BOOLOID), "true");
+        assert_eq!(value("f", pg_sys::BOOLOID), "false");
+        assert_eq!(value("hello \"x\"", pg_sys::TEXTOID), "\"hello \\\"x\\\"\"");
     }
 }

@@ -1,26 +1,28 @@
--- Test: WAL capture mode behaviors
+-- Test: WAL capture mode behaviors (harness-testable subset)
 --
--- Verifies observable WAL mode behaviors that are testable inside the pgrx
--- transaction harness:
+-- The pgrx harness runs each test inside ONE write-dirty transaction, and
+-- logical slot creation refuses such transactions — so a successful WAL-mode
+-- flashback_track() is impossible here BY DESIGN (fail-closed). This file
+-- therefore verifies:
 --   1. flashback_effective_capture_mode() returns 'wal' when wal_level=logical
 --      and capture_mode='auto' (the default).
 --   2. SET pg_flashback.capture_mode='trigger' overrides auto-detection.
---   3. flashback_track() in WAL mode sets REPLICA IDENTITY FULL on the table.
+--   3. Explicit 'wal' override works.
 --   4. flashback_track() in trigger mode does NOT set REPLICA IDENTITY FULL.
---   5. WAL mode slot creation attempt is handled gracefully (no exception
---      propagated to the caller even when it fails inside a dirty transaction).
+--   5. flashback_track() in WAL mode FAILS CLOSED with an exception when the
+--      slot is missing and cannot be created — succeeding without a slot
+--      would silently capture nothing, which is exactly the disaster this
+--      guard prevents. Nothing may be persisted on failure.
 --
--- NOTE: Full end-to-end WAL decoding (pg_logical_slot_get_changes → delta_log
--- → flashback_restore) requires the background worker to be running and cannot
--- be exercised inside the pgrx test transaction harness (slot creation is
--- blocked by prior DML within the same transaction). That path is covered by
--- the manual WAL benchmark scripts in scripts/.
+-- Everything that needs a SUCCESSFUL WAL-mode track (REPLICA IDENTITY FULL,
+-- worker consumption, commit-time stamping, restore semantics, untrack RI
+-- restore, cross-DB coverage warning) runs in scripts/run_wal_e2e.sh against
+-- a live instance with separate committed transactions.
 
 DO $tv$
 DECLARE
     v_mode text;
     v_replica_identity char;
-    v_is_full boolean;
 BEGIN
     -- ----------------------------------------------------------------
     -- 1. Default auto mode: should resolve to 'wal' when wal_level=logical
@@ -53,31 +55,7 @@ BEGIN
     END IF;
 
     -- ----------------------------------------------------------------
-    -- 4. flashback_track() in WAL mode sets REPLICA IDENTITY FULL
-    -- ----------------------------------------------------------------
-    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
-
-    DROP TABLE IF EXISTS public.it_wal_behaviors_wal CASCADE;
-    CREATE TABLE public.it_wal_behaviors_wal (id int PRIMARY KEY, val text);
-
-    -- Track in WAL mode — sets REPLICA IDENTITY FULL
-    -- Slot creation may fail inside this transaction (that's expected and handled)
-    PERFORM flashback_track('public.it_wal_behaviors_wal');
-
-    SELECT c.relreplident
-      INTO v_replica_identity
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public'
-      AND c.relname = 'it_wal_behaviors_wal';
-
-    v_is_full := (v_replica_identity = 'f');
-    IF NOT v_is_full THEN
-        RAISE EXCEPTION 'WAL mode track should set REPLICA IDENTITY FULL, got relreplident=%', v_replica_identity;
-    END IF;
-
-    -- ----------------------------------------------------------------
-    -- 5. flashback_track() in trigger mode does NOT set REPLICA IDENTITY FULL
+    -- 4. flashback_track() in trigger mode does NOT set REPLICA IDENTITY FULL
     -- ----------------------------------------------------------------
     PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
 
@@ -92,117 +70,51 @@ BEGIN
     WHERE n.nspname = 'public'
       AND c.relname = 'it_wal_behaviors_trig';
 
-    -- Trigger mode should leave DEFAULT (relreplident = 'd')
     IF v_replica_identity = 'f' THEN
         RAISE EXCEPTION 'trigger mode track should NOT set REPLICA IDENTITY FULL';
     END IF;
 
     -- ----------------------------------------------------------------
-    -- 6. capture_mode='wal' + restore via in-test direct delta_log writes
-    --    (simulates what the worker does after consuming the WAL slot)
+    -- 5. Fail-closed: WAL-mode track must raise when the slot is missing
+    --    and cannot be created inside a write-dirty transaction.
     -- ----------------------------------------------------------------
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
 
-    DROP TABLE IF EXISTS public.it_wal_restore CASCADE;
-    CREATE TABLE public.it_wal_restore (id int PRIMARY KEY, val text);
-    PERFORM flashback_track('public.it_wal_restore');
-    PERFORM flashback_test_attach_capture_trigger('public.it_wal_restore'::regclass);
+    -- Make sure no slot lingers from an earlier run in the same pgdata
+    -- (pg_drop_replication_slot is non-transactional and takes effect now).
+    PERFORM pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = flashback_effective_slot_name()
+      AND database = current_database();
 
+    DROP TABLE IF EXISTS public.it_wal_failclosed CASCADE;
+    CREATE TABLE public.it_wal_failclosed (id int PRIMARY KEY, val text);
     DECLARE
-        t_before timestamptz;
-        v_cnt bigint;
-        v_has_trigger boolean;
-        v_ri_after char;
+        v_raised boolean := false;
     BEGIN
-        t_before := clock_timestamp();
-        INSERT INTO public.it_wal_restore VALUES (1, 'a'), (2, 'b');
-        INSERT INTO public.it_wal_restore VALUES (3, 'c');
-        UPDATE public.it_wal_restore SET val = 'b_updated' WHERE id = 2;
-        DELETE FROM public.it_wal_restore WHERE id = 3;
-
-        -- Restore to t_before: table should be empty
-        PERFORM flashback_restore('public.it_wal_restore', t_before);
-        SELECT count(*) INTO v_cnt FROM public.it_wal_restore;
-        IF v_cnt <> 0 THEN
-            RAISE EXCEPTION 'WAL mode restore to before-inserts: expected 0, got %', v_cnt;
+        BEGIN
+            PERFORM flashback_track('public.it_wal_failclosed');
+        EXCEPTION WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%replication slot%' THEN
+                RAISE;
+            END IF;
+            v_raised := true;
+        END;
+        IF NOT v_raised THEN
+            RAISE EXCEPTION 'flashback_track in WAL mode must fail closed when the slot cannot be created';
         END IF;
-
-        -- Fix 4: after WAL-mode restore, NO flashback capture trigger should be attached.
-        -- A trigger would accumulate events in staging that the worker will never flush
-        -- (worker skips staging_events in WAL mode).
-        SELECT EXISTS (
-            SELECT 1 FROM pg_trigger tg
-            JOIN pg_class c ON c.oid = tg.tgrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public'
-              AND c.relname = 'it_wal_restore'
-              AND tg.tgname LIKE 'flashback_capture_%'
-        ) INTO v_has_trigger;
-
-        IF v_has_trigger THEN
-            RAISE EXCEPTION 'WAL mode restore must not reattach capture triggers (staging is skipped in WAL mode)';
-        END IF;
-
-        -- Fix 4 (cont.): REPLICA IDENTITY FULL must be preserved after WAL-mode restore.
-        SELECT c.relreplident INTO v_ri_after
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relname = 'it_wal_restore';
-
-        IF v_ri_after <> 'f' THEN
-            RAISE EXCEPTION 'WAL mode restore must keep REPLICA IDENTITY FULL, got %', v_ri_after;
-        END IF;
-    END;
-
-    -- ----------------------------------------------------------------
-    -- 7. flashback_untrack() in WAL mode restores original REPLICA IDENTITY
-    -- ----------------------------------------------------------------
-    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
-
-    DROP TABLE IF EXISTS public.it_wal_untrack CASCADE;
-    CREATE TABLE public.it_wal_untrack (id int PRIMARY KEY, val text);
-    -- Verify the table starts with DEFAULT replica identity (relreplident = 'd')
-    DECLARE
-        v_ri_before char;
-        v_ri_untracked char;
-    BEGIN
-        SELECT c.relreplident INTO v_ri_before
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
-
-        IF v_ri_before = 'f' THEN
-            RAISE EXCEPTION 'test precondition: new table should start with DEFAULT replica identity, got FULL';
-        END IF;
-
-        PERFORM flashback_track('public.it_wal_untrack');
-
-        -- After tracking in WAL mode, must be FULL
-        SELECT c.relreplident INTO v_ri_before
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
-        IF v_ri_before <> 'f' THEN
-            RAISE EXCEPTION 'after WAL track: expected REPLICA IDENTITY FULL, got %', v_ri_before;
-        END IF;
-
-        PERFORM flashback_untrack('public.it_wal_untrack');
-
-        -- After untracking, must be restored to DEFAULT
-        SELECT c.relreplident INTO v_ri_untracked
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relname = 'it_wal_untrack';
-        IF v_ri_untracked = 'f' THEN
-            RAISE EXCEPTION 'after WAL untrack: REPLICA IDENTITY should be restored (not FULL), got %', v_ri_untracked;
+        -- Fail-closed means nothing was persisted either
+        IF EXISTS (
+            SELECT 1 FROM flashback.tracked_tables
+            WHERE table_name = 'it_wal_failclosed'
+        ) THEN
+            RAISE EXCEPTION 'fail-closed track must not leave a tracked_tables entry behind';
         END IF;
     END;
 
     -- Cleanup
     PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
-    DROP TABLE IF EXISTS public.it_wal_behaviors_wal CASCADE;
     DROP TABLE IF EXISTS public.it_wal_behaviors_trig CASCADE;
-    DROP TABLE IF EXISTS public.it_wal_restore CASCADE;
-    DROP TABLE IF EXISTS public.it_wal_untrack CASCADE;
+    DROP TABLE IF EXISTS public.it_wal_failclosed CASCADE;
 END;
 $tv$;

@@ -291,6 +291,14 @@ mod tests {
         it_set_schema_tracking,
         "../tests/sql/integration/set_schema_tracking.sql"
     );
+    sql_test!(
+        it_retention_active_partition_survives,
+        "../tests/sql/integration/retention_active_partition_survives.sql"
+    );
+    sql_test!(
+        it_trigger_pipeline_restore,
+        "../tests/sql/integration/trigger_pipeline_restore.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

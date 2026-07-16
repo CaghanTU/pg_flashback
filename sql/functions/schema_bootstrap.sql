@@ -28,6 +28,7 @@ BEGIN
             old_data        JSONB,
             new_data        JSONB,
             ddl_info        JSONB,
+            lsn             PG_LSN,
             PRIMARY KEY (committed_at, event_id)
         ) PARTITION BY RANGE (committed_at)';
         -- Default partition captures data that doesn''t match any range partition
@@ -58,6 +59,17 @@ BEGIN
         WHERE table_schema = 'flashback' AND table_name = 'delta_log' AND column_name = 'source_xid'
     ) THEN
         ALTER TABLE flashback.delta_log ADD COLUMN source_xid BIGINT;
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'delta_log' AND column_name = 'lsn'
+    ) THEN
+        ALTER TABLE flashback.delta_log ADD COLUMN lsn PG_LSN;
     END IF;
 END
 $$;

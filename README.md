@@ -57,7 +57,7 @@ DML (INSERT / UPDATE / DELETE)
 WAL (wal_level=logical)
   │
   ▼
-logical replication slot (pg_flashback_slot)
+logical replication slot (pg_flashback_<dbname>)
   │
   ▼  background worker reads slot (every 75 ms)
   └──────────────────────────────────────────►  delta_log (direct, no staging)
@@ -82,8 +82,8 @@ flashback_restore(table, timestamp)
 
 ### PostgreSQL
 
-**CI-tested versions:** PostgreSQL 15, 16, 17, 18 (59/59 tests pass on all four)  
-**Compile-supported:** PostgreSQL 13 – 18 (pgrx feature flags; untested on 13–14)
+**Tested versions:** PostgreSQL 15, 16, 17, 18 (64/64 tests pass on all four, verified locally; CI runs the same matrix)  
+**Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
 
 **End-to-end verified (manual):** Both capture modes tested with 1 000+ row tables, mass-delete/update disaster scenarios, and full restore — trigger mode: ~58 ms restore, WAL mode: ~82 ms restore, 0 data integrity errors.
 
@@ -174,7 +174,7 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 |-----|---------|--------|-------------|
 | `enabled` | `on` | SIGHUP | Global kill switch. `off` stops all capture; worker idles. Superuser only. |
 | `capture_mode` | `auto` | SIGHUP | Capture backend: `auto` (WAL if `wal_level=logical`, else trigger), `wal`, or `trigger`. |
-| `slot_name` | `pg_flashback_slot` | Suset | Logical replication slot name. Override when running multiple pg_flashback installations on the same cluster. |
+| `slot_name` | `pg_flashback_<dbname>` | Suset | Logical replication slot name. Defaults to a per-database name (slots are database-specific and slot names cluster-wide unique). Override only for single-database installs. |
 | `restore_work_mem` | `256MB` | Suset | `work_mem` override for snapshot bulk load during `flashback_restore`. Higher values speed up large table restores. |
 | `index_build_work_mem` | `512MB` | Suset | `maintenance_work_mem` override for deferred index builds on the shadow table during restore. |
 | `max_row_size` | `64kB` | SIGHUP | Rows larger than this are skipped with a WARNING (TOAST protection). |
@@ -327,15 +327,15 @@ WAL mode carries near-zero foreground write overhead because capture is fully as
 
 ### Test Suite
 
-59 integration tests covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, flashback query, partitioned tables, diff‑only UPDATE, batch replay, RBAC, WAL capture mode, SET SCHEMA tracking, classical INHERITS preservation, and non-destructive row recovery behaviors:
+61 integration tests (plus 3 decoder unit tests) covering DML, DDL, schema evolution, multi‑table FK, checkpoints, edge cases, flashback query, partitioned tables, diff‑only UPDATE, batch replay, RBAC, WAL capture mode, SET SCHEMA tracking, classical INHERITS preservation, and non-destructive row recovery behaviors:
 
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
-cargo pgrx test pg15  # test result: ok. 59 passed; 0 failed
-cargo pgrx test pg16  # test result: ok. 59 passed; 0 failed
-cargo pgrx test pg17  # test result: ok. 59 passed; 0 failed
-cargo pgrx test pg18  # test result: ok. 59 passed; 0 failed
+cargo pgrx test pg15  # test result: ok. 64 passed; 0 failed
+cargo pgrx test pg16  # test result: ok. 64 passed; 0 failed
+cargo pgrx test pg17  # test result: ok. 64 passed; 0 failed
+cargo pgrx test pg18  # test result: ok. 64 passed; 0 failed
 ```
 
 ### Monitoring Queries
@@ -368,7 +368,7 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (59 tests each, verified locally and in CI)
+- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (64 tests each, verified locally on all four; CI runs the same matrix on every push)
 - **Security audit**: `cargo audit`
 - **Release workflow**: on `v*.*.*` tags, builds and publishes GitHub Releases
 
@@ -484,9 +484,10 @@ In WAL mode the replication slot retains WAL segments until the background worke
 
 ```sql
 -- Monitor slot lag
-SELECT slot_name, wal_status, lag_bytes
+SELECT slot_name, database, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag
 FROM pg_replication_slots
-WHERE slot_name = 'pg_flashback_slot';
+WHERE slot_name LIKE 'pg_flashback_%';
 ```
 
 Set a hard cap in `postgresql.conf` to prevent runaway growth:

@@ -23,6 +23,24 @@ BEGIN
 END;
 $$;
 
+-- Effective replication slot name for THIS database.
+-- Logical replication slots are database-specific and slot names are
+-- cluster-wide unique, so the default derives from the database name.
+-- pg_flashback.slot_name overrides it (single-database installs only).
+-- Slot names may contain only lower-case letters, digits and underscores.
+CREATE OR REPLACE FUNCTION flashback_effective_slot_name()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT COALESCE(
+        NULLIF(current_setting('pg_flashback.slot_name', true), ''),
+        left('pg_flashback_' ||
+             lower(regexp_replace(current_database(), '[^a-zA-Z0-9_]', '_', 'g')),
+             63)
+    );
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_collect_schema_def(input_rel_oid oid)
 RETURNS jsonb
 LANGUAGE sql
@@ -520,11 +538,33 @@ BEGIN
         RAISE EXCEPTION 'flashback_track: table % does not exist', target_table;
     END IF;
 
-    -- In WAL mode, ensure replication slot exists.
-    -- pg_create_logical_replication_slot requires a write-free transaction,
-    -- so we wrap it in a sub-block with EXCEPTION handler. If it fails
-    -- (e.g. inside a test harness or an already-dirty transaction), the
-    -- background worker will pick it up on its next cycle.
+    -- The background worker only serves the databases listed in
+    -- pg_flashback.target_databases / target_database. If this database is
+    -- not covered, captured events are never flushed (trigger mode) nor
+    -- consumed from the slot (WAL mode) — capture silently does nothing.
+    DECLARE
+        v_db_list text;
+    BEGIN
+        v_db_list := COALESCE(
+            NULLIF(current_setting('pg_flashback.target_databases', true), ''),
+            NULLIF(current_setting('pg_flashback.target_database', true), ''),
+            'postgres'
+        );
+        IF NOT EXISTS (
+            SELECT 1 FROM unnest(string_to_array(v_db_list, ',')) AS d
+            WHERE trim(d) = current_database()
+        ) THEN
+            RAISE WARNING 'pg_flashback: database % is NOT covered by any background worker (pg_flashback.target_databases = %). Captured events will not be processed until this database is added and PostgreSQL is restarted.',
+                current_database(), v_db_list;
+        END IF;
+    END;
+
+    -- In WAL mode, ensure the replication slot exists. The slot is created
+    -- HERE and only here — the background worker merely checks for it — so
+    -- a creation failure must abort tracking (fail-closed): returning
+    -- success without a slot would mean silently capturing nothing.
+    -- pg_create_logical_replication_slot requires a transaction that has
+    -- not performed writes yet.
     IF flashback_effective_capture_mode() = 'wal' THEN
         -- Capture the current replica identity BEFORE we change it so that
         -- flashback_untrack() can restore the table to its original setting.
@@ -541,19 +581,34 @@ BEGIN
               AND i.indisreplident;
         END IF;
 
+        -- Logical slots are database-specific: a slot with our name that
+        -- belongs to ANOTHER database cannot decode this database's changes,
+        -- so the existence check must be scoped to current_database().
         IF NOT EXISTS (
             SELECT 1 FROM pg_replication_slots
-            WHERE slot_name = COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot')
+            WHERE slot_name = flashback_effective_slot_name()
+              AND database = current_database()
         ) THEN
+            IF EXISTS (
+                SELECT 1 FROM pg_replication_slots
+                WHERE slot_name = flashback_effective_slot_name()
+            ) THEN
+                RAISE EXCEPTION 'pg_flashback: replication slot % already exists but belongs to another database. WAL capture cannot work for %. Set pg_flashback.slot_name to a database-unique name.',
+                    flashback_effective_slot_name(), current_database();
+            END IF;
             BEGIN
                 PERFORM pg_create_logical_replication_slot(
-                    COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot'),
+                    flashback_effective_slot_name(),
                     'pg_flashback'
                 );
                 RAISE NOTICE 'pg_flashback: created logical replication slot %',
-                    COALESCE(NULLIF(current_setting('pg_flashback.slot_name', true), ''), 'pg_flashback_slot');
+                    flashback_effective_slot_name();
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'pg_flashback: could not create replication slot in this transaction (%), background worker will retry', SQLERRM;
+                RAISE EXCEPTION 'pg_flashback: could not create replication slot % (%). Without a slot, WAL capture would silently miss every change, so tracking is aborted.',
+                    flashback_effective_slot_name(), SQLERRM
+                    USING HINT = format(
+                        'Run flashback_track in a fresh transaction with no prior writes, or create the slot manually first: SELECT pg_create_logical_replication_slot(%L, %L);',
+                        flashback_effective_slot_name(), 'pg_flashback');
             END;
         END IF;
         -- WAL mode: enable REPLICA IDENTITY FULL so old_data is available in UPDATE events
@@ -848,7 +903,10 @@ BEGIN
             WHERE tt.rel_oid = m.rel_oid
               AND tt.is_active
               AND m.event_time >= tt.tracked_since
-        );
+        )
+        -- event_id assignment must follow capture order: replay's net-effect
+        -- computation orders events by event_id.
+        ORDER BY m.staging_id;
 
         GET DIAGNOSTICS v_moved = ROW_COUNT;
         v_total := v_total + v_moved;
@@ -856,6 +914,96 @@ BEGIN
     END LOOP;
 
     RETURN v_total;
+END;
+$$;
+
+-- Consume decoded changes from this database's logical replication slot
+-- into delta_log. Normally invoked by the background worker every cycle;
+-- callable manually for testing or after worker downtime.
+-- Events are stamped with the transaction's REAL commit time (emitted by
+-- the output plugin in its commit message) and the change LSN, so PITR
+-- stays accurate even when consumption lags behind commits.
+-- Returns the number of events inserted into delta_log.
+CREATE OR REPLACE FUNCTION flashback_consume_wal(batch_size integer DEFAULT 4096)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_inserted integer := 0;
+BEGIN
+    IF to_regclass('flashback.delta_log') IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    WITH wal_changes AS (
+        -- WITH ORDINALITY preserves decode order: event_id assignment MUST
+        -- follow it, because replay's net-effect computation orders events
+        -- by event_id. A join further down may otherwise reorder rows and
+        -- give an UPDATE a smaller event_id than the INSERT it follows.
+        SELECT ch.lsn, ch.xid, ch.data, ch.ord
+        FROM pg_logical_slot_get_changes(flashback_effective_slot_name(), NULL, batch_size)
+             WITH ORDINALITY AS ch(lsn, xid, data, ord)
+        -- Defense in depth: the plugin only emits JSON objects; skip anything
+        -- else instead of poisoning the whole batch with a cast error.
+        WHERE ch.data LIKE '{%'
+    ),
+    commits AS (
+        SELECT ((data::jsonb)->>'commit')::bigint AS commit_xid,
+               -- commit_time is a raw TimestampTz: microseconds since 2000-01-01 UTC
+               TIMESTAMPTZ '2000-01-01 00:00:00+00'
+                   + ((data::jsonb)->>'commit_time')::bigint * interval '1 microsecond'
+                   AS commit_ts
+        FROM wal_changes
+        WHERE (data::jsonb) ? 'commit'
+    ),
+    parsed AS (
+        SELECT
+            w.lsn,
+            w.ord,
+            (w.data::jsonb)->>'op' AS event_type,
+            format('%I.%I', (w.data::jsonb)->>'schema', (w.data::jsonb)->>'table') AS table_name,
+            ((w.data::jsonb)->>'oid')::oid AS rel_oid,
+            w.xid::text::bigint AS source_xid,
+            (w.data::jsonb)->'old' AS old_data,
+            (w.data::jsonb)->'new' AS new_data,
+            (w.data::jsonb)->'ddl_info' AS ddl_info,
+            ((w.data::jsonb)->>'schema_version')::bigint AS msg_schema_version
+        FROM wal_changes w
+        WHERE (w.data::jsonb)->>'op' IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE',
+                                         'DROP', 'ALTER')
+    ),
+    ins AS (
+        INSERT INTO flashback.delta_log (
+            event_time, event_type, table_name, rel_oid, source_xid,
+            committed_at, schema_version, old_data, new_data, ddl_info, lsn
+        )
+        SELECT
+            COALESCE(c.commit_ts, clock_timestamp()),
+            p.event_type, p.table_name, p.rel_oid, p.source_xid,
+            COALESCE(c.commit_ts, clock_timestamp()),
+            COALESCE(p.msg_schema_version, (
+                SELECT sv.schema_version
+                FROM flashback.schema_versions sv
+                WHERE sv.rel_oid = p.rel_oid
+                ORDER BY sv.schema_version DESC
+                LIMIT 1
+            ), 1),
+            p.old_data, p.new_data, p.ddl_info, p.lsn
+        FROM parsed p
+        LEFT JOIN commits c ON c.commit_xid = p.source_xid
+        WHERE EXISTS (
+            SELECT 1 FROM flashback.tracked_tables tt
+            WHERE tt.rel_oid = p.rel_oid
+              AND tt.is_active
+        )
+        ORDER BY p.ord
+        RETURNING 1
+    )
+    SELECT count(*) INTO v_inserted FROM ins;
+
+    RETURN v_inserted;
 END;
 $$;
 
@@ -929,8 +1077,13 @@ BEGIN
 
             IF v_bound_text IS NOT NULL THEN
                 BEGIN
-                    v_bound_upper := substring(v_bound_text from '''([^'']+)''')::timestamptz;
-                    IF v_bound_upper < v_min_cutoff THEN
+                    -- The partition bound expression looks like:
+                    --   FOR VALUES FROM ('2026-07-01 ...') TO ('2026-08-01 ...')
+                    -- The first quoted value is the LOWER bound; a partition is
+                    -- only safe to drop when its UPPER bound (inside "TO (...)")
+                    -- is older than the retention cutoff.
+                    v_bound_upper := substring(v_bound_text from 'TO \(''([^'']+)''\)')::timestamptz;
+                    IF v_bound_upper IS NOT NULL AND v_bound_upper < v_min_cutoff THEN
                         EXECUTE format('DROP TABLE IF EXISTS %s', v_part.part_name);
                     END IF;
                 EXCEPTION WHEN OTHERS THEN
@@ -1272,8 +1425,13 @@ BEGIN
     DECLARE
         v_row_count bigint;
     BEGIN
-        EXECUTE format('SELECT count(*) FROM %I.%I', tracked.schema_name, tracked.table_name)
-          INTO v_row_count;
+        -- Bounded count: stop scanning at 100001 rows so a DDL statement on
+        -- a huge table never pays a full-table scan just to decide that the
+        -- inline snapshot must be skipped anyway.
+        EXECUTE format(
+            'SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 100001) q',
+            tracked.schema_name, tracked.table_name
+        ) INTO v_row_count;
         IF v_row_count > 100000 THEN
             RAISE WARNING 'pg_flashback: table %.% has % rows — skipping inline DDL snapshot (checkpoint data preserved)',
                 tracked.schema_name, tracked.table_name, v_row_count;

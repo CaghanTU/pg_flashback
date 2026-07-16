@@ -1,6 +1,7 @@
-comment = 'pg_flashback:  Created by pgrx'
+comment = 'Table-level point-in-time restore and time-travel queries'
 default_version = '@CARGO_VERSION@'
 module_pathname = 'pg_flashback'
 relocatable = false
+schema = 'public'
 superuser = true
 trusted = false
