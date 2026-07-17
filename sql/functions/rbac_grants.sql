@@ -127,6 +127,10 @@ GRANT EXECUTE ON FUNCTION flashback_active_backup_labels()
     TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_freeze_backup_generation(bigint, text, jsonb)
     TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_backup_proof_result(text, bigint)
+    TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_frontier_proof_result(text, bigint)
+    TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_install_verified_backup_proof(
     text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz, jsonb
 ) TO flashback_recovery_agent;

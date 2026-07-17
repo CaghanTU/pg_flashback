@@ -121,6 +121,9 @@ digest, start/stop LSNs, and archive frontier are read by the helper from the
 configured repository while holding its shared lock. The least-privilege
 controller connection uses `flashback_recovery_agent`; passwords remain in
 the process environment/PGPASSFILE rather than command arguments or logs.
+Consumed proof results are queryable through a restricted controller API, so
+a retry after helper termination reconstructs the same proof/generation
+result instead of installing a second proof.
 
 ## Planning and execution
 

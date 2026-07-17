@@ -631,6 +631,101 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_backup_proof_result(
+    p_verification_request_id text,
+    p_tracking_id bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_proof record;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'backup proof result requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    SELECT * INTO v_proof
+    FROM flashback.verified_backup_proofs
+    WHERE verification_request_id = $1;
+    IF v_proof.proof_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF v_proof.tracking_id IS DISTINCT FROM p_tracking_id THEN
+        RAISE EXCEPTION 'verification request % belongs to another tracking lifecycle',
+            p_verification_request_id;
+    END IF;
+    RETURN jsonb_build_object(
+        'proof_id', v_proof.proof_id,
+        'tracking_id', v_proof.tracking_id,
+        'generation_id', v_proof.consumed_generation_id,
+        'helper_profile', v_proof.helper_profile,
+        'repository_key', v_proof.repository_key,
+        'stanza', v_proof.stanza,
+        'backup_label', v_proof.backup_label,
+        'timeline_id', v_proof.timeline_id,
+        'manifest_reference', v_proof.manifest_reference,
+        'manifest_sha256', v_proof.manifest_sha256,
+        'verified_lsn', v_proof.backup_stop_lsn,
+        'consumed', v_proof.consumed_at IS NOT NULL
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_frontier_proof_result(
+    p_verification_request_id text,
+    p_tracking_id bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_result jsonb;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'frontier proof result requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    SELECT jsonb_build_object(
+        'proof_id', p.proof_id,
+        'tracking_id', p.tracking_id,
+        'generation_id', p.generation_id,
+        'helper_profile', p.helper_profile,
+        'repository_key', p.repository_key,
+        'stanza', p.stanza,
+        'backup_label', ba.backup_label,
+        'timeline_id', p.timeline_id,
+        'archive_proof_sha256', p.archive_proof_sha256,
+        'verified_lsn', p.valid_through_lsn,
+        'status', p.details->>'consume_status',
+        'consumed', p.consumed_at IS NOT NULL
+    )
+      INTO v_result
+    FROM flashback.verified_wal_frontier_proofs p
+    LEFT JOIN flashback.coverage_generations cg
+      ON cg.generation_id = p.generation_id
+     AND cg.tracking_id = p.tracking_id
+    LEFT JOIN flashback.backup_anchors ba
+      ON ba.backup_anchor_id = cg.backup_anchor_id
+     AND ba.tracking_id = cg.tracking_id
+    WHERE p.verification_request_id = $1;
+    IF v_result IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF (v_result->>'tracking_id')::bigint IS DISTINCT FROM p_tracking_id THEN
+        RAISE EXCEPTION 'verification request % belongs to another tracking lifecycle',
+            p_verification_request_id;
+    END IF;
+    RETURN v_result;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_install_verified_backup_proof(
     p_verification_request_id text,
     p_tracking_id bigint,

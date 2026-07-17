@@ -505,7 +505,7 @@ QUOTED_TRACKING_ID=""
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     activate_backup_table() {
         local table_ref=$1
-        local tracking_id helper_profile request_file result_file
+        local tracking_id helper_profile request_file result_file first_proof_id
         # Resolve while the relation still exists.
         tracking_id=$(primary_sql "SELECT tracking_id FROM flashback.tracked_tables
             WHERE is_active
@@ -526,6 +526,14 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
                 --request "$request_file" > "$result_file"
             [[ "$(jq -r '.status' "$result_file")" == "verified" ]] \
                 || die "anchor verifier did not return verified for tracking_id=$tracking_id"
+            first_proof_id="$(jq -r '.proof_id' "$result_file")"
+            rm -f "$VERIFIER_WORK_ROOT/.proof-results/poc-anchor-$tracking_id.json"
+            "$VERIFIER_BIN" verify-anchor \
+                --config "$VERIFIER_CONFIG" \
+                --request "$request_file" > "$result_file.retry"
+            [[ "$(jq -r '.proof_id' "$result_file.retry")" == "$first_proof_id" ]] \
+                || die "anchor verifier retry created a conflicting proof"
+            mv "$result_file.retry" "$result_file"
             printf '%s\n' "$tracking_id"
             return
         fi
@@ -553,6 +561,24 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     [[ -n "$TARGET_TRACKING_ID" && -n "$QUOTED_TRACKING_ID" ]] \
         || die "backup activation did not return tracking ids"
     if [[ -n "$VERIFIER_BIN" ]]; then
+        conflict_request="$RUN_ROOT/verify-anchor-request-conflict.json"
+        jq -n \
+            --arg request_id "poc-anchor-$TARGET_TRACKING_ID" \
+            --argjson tracking_id "$QUOTED_TRACKING_ID" \
+            '{request_id: $request_id, tracking_id: $tracking_id}' \
+            > "$conflict_request"
+        chmod 600 "$conflict_request"
+        set +e
+        "$VERIFIER_BIN" verify-anchor \
+            --config "$VERIFIER_CONFIG" \
+            --request "$conflict_request" \
+            > /dev/null 2> "$RUN_ROOT/verify-anchor-request-conflict.err"
+        conflict_rc=$?
+        set -e
+        [[ "$conflict_rc" != "0" &&
+           "$(jq -r '.code' "$RUN_ROOT/verify-anchor-request-conflict.err")" == "request_conflict" ]] \
+            || die "verification request ID was reusable across tracking lifecycles"
+
         set +e
         "$VERIFIER_BIN" expire --config "$VERIFIER_CONFIG" \
             > "$RUN_ROOT/pinned-expire.out" 2> "$RUN_ROOT/pinned-expire.err"

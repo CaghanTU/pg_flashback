@@ -58,6 +58,24 @@ struct InstalledFrontier {
     valid_through_lsn: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DurableProof {
+    proof_id: i64,
+    tracking_id: i64,
+    generation_id: Option<i64>,
+    helper_profile: String,
+    repository_key: String,
+    stanza: String,
+    backup_label: String,
+    timeline_id: u32,
+    manifest_reference: Option<String>,
+    manifest_sha256: Option<String>,
+    archive_proof_sha256: Option<String>,
+    verified_lsn: String,
+    status: Option<String>,
+    consumed: bool,
+}
+
 /// Verify and consume one repository-derived FULL backup anchor.
 ///
 /// # Errors
@@ -74,6 +92,10 @@ pub fn verify_anchor(
     let _profile_lock = acquire_profile_lock(config)?;
     let _request_lock = acquire_request_lock_for_id(config, &request.request_id)?;
     if let Some(existing) = existing_result(config, request, "anchor")? {
+        return Ok(existing);
+    }
+    if let Some(existing) = durable_proof_result(config, request, "anchor")? {
+        persist_result(config, &existing)?;
         return Ok(existing);
     }
     let _repository_lock = acquire_repository_lock(config, false)?;
@@ -211,6 +233,15 @@ pub fn verify_frontier(
     let _profile_lock = acquire_profile_lock(config)?;
     let _request_lock = acquire_request_lock_for_id(config, &request.request_id)?;
     if let Some(existing) = existing_result(config, request, "frontier")? {
+        return Ok(existing);
+    }
+    if let Some(existing) = durable_proof_result(config, request, "frontier")? {
+        persist_result(config, &existing)?;
+        if existing.status == "timeline_mismatch" {
+            return Err(RecoveryError::VerificationFailed(
+                "repository timeline mismatches the active anchor; coverage was frozen".to_owned(),
+            ));
+        }
         return Ok(existing);
     }
     let _repository_lock = acquire_repository_lock(config, false)?;
@@ -402,6 +433,72 @@ fn validate_context_identity(
         ));
     }
     Ok(())
+}
+
+fn durable_proof_result(
+    config: &RecoveryConfig,
+    request: &BackupVerificationRequest,
+    kind: &str,
+) -> Result<Option<BackupVerificationResult>, RecoveryError> {
+    let function = if kind == "anchor" {
+        "flashback_backup_proof_result"
+    } else {
+        "flashback_frontier_proof_result"
+    };
+    let sql = format!(
+        "SELECT COALESCE(
+           {function}({request_id}, {tracking_id}),
+           'null'::jsonb
+         )::text",
+        request_id = sql_literal(&request.request_id),
+        tracking_id = request.tracking_id,
+    );
+    let Some(proof): Option<DurableProof> = query_json(config, &sql)? else {
+        return Ok(None);
+    };
+    if !proof.consumed
+        || proof.tracking_id != request.tracking_id
+        || proof.helper_profile != config.profile
+        || proof.repository_key != config.repository_key.to_string()
+        || proof.stanza != config.stanza
+    {
+        return Err(RecoveryError::RequestConflict(request.request_id.clone()));
+    }
+    let generation_id = proof.generation_id.ok_or_else(|| {
+        RecoveryError::VerificationFailed(
+            "durable proof is consumed without a generation identity".to_owned(),
+        )
+    })?;
+    let digest = if kind == "anchor" {
+        proof.manifest_sha256.ok_or_else(|| {
+            RecoveryError::VerificationFailed(
+                "durable anchor proof has no manifest digest".to_owned(),
+            )
+        })?
+    } else {
+        proof.archive_proof_sha256.ok_or_else(|| {
+            RecoveryError::VerificationFailed(
+                "durable frontier proof has no archive digest".to_owned(),
+            )
+        })?
+    };
+    Ok(Some(BackupVerificationResult {
+        result_format_version: RESULT_FORMAT_VERSION,
+        status: proof.status.unwrap_or_else(|| "verified".to_owned()),
+        verification_kind: kind.to_owned(),
+        request_id: request.request_id.clone(),
+        tracking_id: request.tracking_id,
+        generation_id,
+        profile: config.profile.clone(),
+        repository_key: config.repository_key,
+        stanza: config.stanza.clone(),
+        backup_label: proof.backup_label,
+        timeline_id: proof.timeline_id,
+        manifest_reference: proof.manifest_reference.unwrap_or_default(),
+        manifest_sha256: digest,
+        verified_lsn: proof.verified_lsn,
+        proof_id: proof.proof_id,
+    }))
 }
 
 fn freeze_repository_failure(config: &RecoveryConfig, tracking_id: i64, detail: &str) {
