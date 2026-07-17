@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
-# shellcheck source=qualification_provenance.sh
+# shellcheck source=scripts/qualification_provenance.sh
 source "$ROOT/scripts/qualification_provenance.sh"
 qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"

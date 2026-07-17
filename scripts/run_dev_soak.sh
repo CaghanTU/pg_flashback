@@ -8,7 +8,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
-# shellcheck source=qualification_provenance.sh
+# shellcheck source=scripts/qualification_provenance.sh
 source "$ROOT/scripts/qualification_provenance.sh"
 qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
@@ -48,8 +48,6 @@ LAG_NEAR_START=false
 LAG_NEAR_START_SLACK_BYTES="${PG_FLASHBACK_SOAK_LAG_NEAR_START_SLACK_BYTES:-1048576}"
 SLOT_LAG_STABLE_OR_DECREASING=false
 START_EPOCH="$(date +%s)"
-COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
-
 require_file() {
     [[ -f "$1" ]] || {
         echo "FAIL: required file not found: $1" >&2
