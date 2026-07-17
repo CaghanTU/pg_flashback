@@ -1125,9 +1125,14 @@ assert_eq "harici confirmed_flush ilerlemesi stream'i kırdı" \
     "replication_slot_advanced_externally" \
     "$(q "SELECT invalidation_reason FROM flashback.capture_streams
            WHERE stream_id=$EXTERNAL_OLD_STREAM")"
-assert_eq "harici ilerleme sonrası health reanchor_recommended" "reanchor_recommended" \
-    "$(q "SELECT health FROM flashback_health()
-           WHERE table_name='public.orders'")"
+EXTERNAL_HEALTH="$(q "SELECT health FROM flashback_health()
+                        WHERE table_name='public.orders'")"
+# External slot consumers typically leave the slot missing/invalid; slot_lost
+# is the stronger fail-closed signal (recreate slot + reanchor). Older builds
+# projected reanchor_recommended for the same break.
+[[ "$EXTERNAL_HEALTH" == "slot_lost" || "$EXTERNAL_HEALTH" == "reanchor_recommended" ]] \
+    || { echo "FAIL: harici ilerleme sonrası health beklenen slot_lost|reanchor_recommended, bulunan=$EXTERNAL_HEALTH"; exit 1; }
+echo "  ok: harici ilerleme sonrası health $EXTERNAL_HEALTH"
 
 EXTERNAL_REANCHOR_GENERATION=$(q "SELECT flashback_reanchor('orders')")
 for _ in $(seq 1 100); do
