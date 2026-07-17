@@ -344,8 +344,12 @@ then establish a new exact boundary with `flashback_reanchor()`.
 | `flashback_track(table)` | `boolean` | In WAL/auto-logical mode, creates a dedicated lifecycle, verified stream binding and exact locked base. Must be the first write in a dedicated READ COMMITTED transaction and the database must have a configured worker. Explicit trigger mode creates legacy state only. |
 | `flashback_reanchor(table)` | `bigint` | After a broken stream, creates a new exact base on the current WAL epoch. The intervening gap remains permanently rejected. The new generation activates only when its real COMMIT record is consumed. |
 | `flashback_untrack(table)` | `void` | Stop tracking and restore the original replica identity. Retires the lifecycle; retracking allocates a new identity. |
-| `flashback_track_backup(table, helper_profile)` | `boolean` | Enable legacy metadata-only backup tracking: no row snapshot or DML deltas. Ordinary LOGGED, non-partitioned tables only. |
-| `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Record the legacy controller assertion; it does not yet create a verified coverage generation. |
+| `flashback_track_backup(table, helper_profile)` | `boolean` | Start backup-profile tracking: building generation + LOGGED marker, zero active until a verified FULL proof is consumed. Ordinary LOGGED, non-partitioned tables only. |
+| `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Legacy assertion — always rejected (`feature_not_supported`). |
+| `flashback_activate_backup_anchor(...)` | `bigint` | Raw caller-supplied activation — always rejected. Use `flashback_install_verified_backup_proof` + `flashback_consume_verified_backup_proof`. |
+| `flashback_advance_backup_frontier(...)` | `pg_lsn` | Raw caller-supplied frontier — always rejected. Use verified WAL frontier proofs. |
+| `flashback_install_verified_backup_proof(...)` | `bigint` | Recovery-agent/superuser only: install a one-time verified FULL backup proof bound to one tracking lifecycle. |
+| `flashback_consume_verified_backup_proof(proof_id)` | `bigint` | Consume a proof exactly once and activate the building generation. |
 | `flashback_backup_disaster_points(table [, lookback])` | `SETOF record` | List DDL disaster markers and pre-DDL target LSNs. |
 
 ### Restore

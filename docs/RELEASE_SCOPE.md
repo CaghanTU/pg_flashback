@@ -63,11 +63,14 @@ The local profile is supported only after its coverage runtime gates pass:
 
 ## Backup profile
 
-The backup profile is part of the first-release contract, but its coverage-
-generation runtime is not yet wired. Until those gates pass, helper recovery
-and the legacy controller APIs remain experimental/scaffold paths: they must
-not report recoverability from an unverified generation. The bullets below are
-the release-required behavior, not a claim that every rule is already enforced.
+The backup profile is part of the first-release contract. Raw
+caller-supplied activation/frontier APIs are fail-closed. Coverage may be
+activated only by consuming a one-time verified FULL backup proof installed by
+the recovery agent (or a superuser acting for a locked helper verification).
+Helper/controller repository-lock verification that installs those proofs is
+still **PARTIAL** until the release gates below pass; until then do not report
+recoverability from an unverified generation. The bullets below are the
+release-required behavior.
 
 - local POSIX pgBackRest repository
 - completed full backups

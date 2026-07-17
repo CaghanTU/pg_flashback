@@ -158,10 +158,12 @@ snapshot or DML capture triggers:
 SELECT flashback_track_backup('public.orders', 'app_repo2');
 ```
 
-`flashback_track_backup()` and `flashback_set_backup_coverage()` below are the
-current legacy controller contract. They do not create a
-`coverage_generations` row and therefore do not by themselves prove an
-admissible target. Generation integration is a release gate.
+`flashback_track_backup()` creates a building backup generation and a LOGGED
+tracking marker. Coverage stays **unanchored (zero active)** until a recovery
+agent installs a one-time verified FULL backup proof and that proof is consumed.
+`flashback_set_backup_coverage()`, `flashback_activate_backup_anchor(...)`, and
+`flashback_advance_backup_frontier(...)` are fail-closed stubs: caller-supplied
+LSNs or manifest digests are not recoverability evidence.
 
 The release-qualified initial-tracking protocol must first commit a durable
 LOGGED tracking marker and resolve its real commit coordinate. Tracking remains
@@ -169,26 +171,50 @@ unanchored with zero active generations until pgBackRest completes a **new
 full backup whose start LSN is strictly after that resolved marker
 commit**. A backup that already existed or was in progress when tracking began
 does not qualify even if it stops afterward. Once verified under the repository
-lock, that full backup's stop boundary becomes the first physical-backup anchor
-and initial `valid_through_lsn`.
+shared lock, the helper/controller installs an immutable proof
+(`verification_request_id`, repository/profile, stanza, label, sysid, timeline,
+manifest reference + SHA-256, start/stop LSN) and consumes it exactly once for
+that tracking lifecycle.
+
+**Status: PARTIAL.** Proof install/consume SQL exists and raw admin forging is
+closed, but a production helper path that verifies pgBackRest under the
+repository lock and installs proofs is not yet release-qualified. Do not treat
+SQL-only smoke activation as a COMPLETE backup coverage gate.
 
 After that qualifying full backup, read its start and stop LSNs from
 `pgbackrest info --output=json`. The reported `lsn.start` is established only
 after pgBackRest's backup-start checkpoint completes. Verify the ordering above
-and persist the stop anchor. Periodically force an archive switch, wait for
-`pgbackrest check` to
-succeed, and record the range actually verified by the controller:
+under the repository shared lock, then install and consume a proof (recovery
+agent / trusted controller only):
 
 ```sql
-SELECT flashback_set_backup_coverage(
-    'public.orders',
-    '0/5000028'::pg_lsn,  -- oldest retained eligible full backup stop LSN
-    '0/9000000'::pg_lsn   -- latest LSN verified present in the archive
+-- recovery agent / trusted controller after repo-lock verification
+SELECT flashback_consume_verified_backup_proof(
+    flashback_install_verified_backup_proof(
+        'verify-req-001',           -- unique verification_request_id
+        :tracking_id,
+        'app_repo2',                -- helper_profile
+        'repo-key',
+        'stanza',
+        '20260717-000001F',
+        :sysid,
+        :timeline,
+        'backup/.../backup.manifest',
+        :manifest_sha256,
+        :backup_start_lsn,
+        :backup_stop_lsn
+    )
 );
 ```
 
+Frontier advances likewise require a one-time verified archive proof via
+`flashback_install_verified_wal_frontier_proof` +
+`flashback_consume_verified_wal_frontier_proof` (structured status; timeline
+mismatch freezes coverage durably without rolling back the gap). Never advance
+coverage from caller-supplied LSNs alone.
+
 Coverage metadata is an admission-control assertion, not a substitute for the
-helper's real backup/WAL checks. Never advance `coverage_end_lsn` beyond WAL
+helper's real backup/WAL checks. Never advance `valid_through_lsn` beyond WAL
 that has actually reached the configured repository.
 
 DDL disaster-point metadata may be retired only when generation-aware coverage
