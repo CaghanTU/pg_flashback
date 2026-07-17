@@ -286,7 +286,7 @@ $(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
   "max_visibility_ms": $max_ms,
   "visibility_samples": [$visibility_samples_json],
   "visibility_samples_jsonl": "$samples_file",
-  "visibility_measurement_status": "per-commit monotonic commit-ack to first delta_log visibility; one polling observation may timestamp many commits, so $observed_samples samples were derived from $polls polling cycles at $POLL_SECONDS-second resolution"
+  "visibility_measurement_status": "per-commit monotonic commit-ack followed immediately by exact-event polling; $observed_samples samples were derived from $polls polling cycles at $POLL_SECONDS-second resolution"
 }
 EOF
 
