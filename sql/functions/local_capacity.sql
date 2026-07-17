@@ -249,7 +249,7 @@ CREATE OR REPLACE FUNCTION flashback_apply_local_boundary_lock_timeout()
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_stall_ms integer;

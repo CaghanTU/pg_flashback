@@ -85,19 +85,28 @@ GEN_COUNT=$(q "SELECT count(*) FROM flashback.coverage_generations")
 echo "  ok: lock timeout left no payload/generation residue"
 
 echo "── privileged override is visible ──"
-q "SELECT set_config('pg_flashback.local_max_snapshot_bytes','64', false)" >/dev/null
-q "SELECT set_config('pg_flashback.local_capacity_override','on', false)" >/dev/null
-q "SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track')" >/dev/null
-OVERRIDE=$(q "SELECT capacity_override FROM flashback_advise('capacity_lock'::regclass)")
-[[ "$OVERRIDE" == "t" ]] || { echo "FAIL: override not visible in advise"; exit 1; }
-q "SELECT set_config('pg_flashback.local_capacity_override','off', false)" >/dev/null
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -Atqc "
+SELECT set_config('pg_flashback.local_max_snapshot_bytes','64', false);
+SELECT set_config('pg_flashback.local_max_restore_peak_bytes','16GB', false);
+SELECT set_config('pg_flashback.local_min_filesystem_bytes','64MB', false);
+SELECT set_config('pg_flashback.local_capacity_override','on', false);
+SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track');
+SELECT capacity_override FROM flashback_advise('capacity_lock'::regclass);
+" >/tmp/pg_flashback_capacity_override.out
+OVERRIDE=$(tail -n1 /tmp/pg_flashback_capacity_override.out)
+[[ "$OVERRIDE" == "t" ]] || { echo "FAIL: override not visible in advise (got '$OVERRIDE')"; cat /tmp/pg_flashback_capacity_override.out; exit 1; }
 echo "  ok: override visible"
 
 echo "── bounded success path ──"
-q "SELECT set_config('pg_flashback.local_max_snapshot_bytes','8GB', false)" >/dev/null
-q "SELECT set_config('pg_flashback.local_boundary_write_stall_ms','60000', false)" >/dev/null
-q "SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track')" >/dev/null
-q "SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'restore')" >/dev/null
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -Atqc "
+SELECT set_config('pg_flashback.local_max_snapshot_bytes','8GB', false);
+SELECT set_config('pg_flashback.local_max_restore_peak_bytes','16GB', false);
+SELECT set_config('pg_flashback.local_min_filesystem_bytes','64MB', false);
+SELECT set_config('pg_flashback.local_capacity_override','off', false);
+SELECT set_config('pg_flashback.local_boundary_write_stall_ms','60000', false);
+SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track');
+SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'restore');
+" >/dev/null
 echo "  ok: bounded track/restore admission succeeded"
 
 echo "╔══════════════════════════════════════════╗"
