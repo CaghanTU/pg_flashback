@@ -339,6 +339,10 @@ mod tests {
         "../tests/sql/integration/retained_full_activation.sql"
     );
     sql_test!(
+        it_retained_target_routing,
+        "../tests/sql/integration/retained_target_routing.sql"
+    );
+    sql_test!(
         it_slot_health_actions,
         "../tests/sql/integration/slot_health_actions.sql"
     );

@@ -22,10 +22,20 @@ pg-flashback-recovery --version
 pg-flashback-recovery probe --config helper.json
 pg-flashback-recovery plan --config helper.json --request request.json
 pg-flashback-recovery restore-table --config helper.json --request request.json
+pg-flashback-recovery verify-anchor --config helper.json --request verification.json
+pg-flashback-recovery verify-frontier --config helper.json --request verification.json
+pg-flashback-recovery reconcile-anchors --config helper.json --dry-run
+pg-flashback-recovery reconcile-anchors --config helper.json
+pg-flashback-recovery audit-anchors --config helper.json
+pg-flashback-recovery expire --config helper.json
 pg-flashback-recovery gc --config helper.json --dry-run
 pg-flashback-recovery gc --config helper.json
 pg-flashback-recovery unpin --config helper.json --request-id <id>
 ```
+
+`reconcile-anchors` discovers newer operator-scheduled FULL backups and advances
+preferred anchors. It never creates backups. Schedule it externally (see
+`deploy/pg-flashback-reconcile-anchors.{service,timer}`).
 
 All success output is JSON on stdout. Errors are JSON on stderr:
 

@@ -460,10 +460,15 @@ BEGIN
         'tracking_id', tt.tracking_id,
         'helper_profile', tt.helper_profile,
         'generation_id', cg.generation_id,
+        'boundary_kind', cg.boundary_kind,
         'marker_commit_lsn', COALESCE(
             cg.details->>'tracking_marker_lsn',
             cg.boundary_lsn::text
         ),
+        'predecessor_generation_id', NULLIF(cg.details->>'predecessor_generation_id', '')::bigint,
+        'predecessor_backup_label', pred_ba.backup_label,
+        'predecessor_backup_stop_lsn', pred.boundary_lsn::text,
+        'predecessor_valid_through_lsn', pred.valid_through_lsn::text,
         'database_system_identifier', (SELECT system_identifier::text FROM pg_control_system()),
         'timeline_id', (SELECT timeline_id FROM pg_control_checkpoint()),
         'wal_segment_size_bytes', pg_size_bytes(current_setting('wal_segment_size'))
@@ -471,6 +476,11 @@ BEGIN
       INTO v_context
     FROM flashback.tracked_tables tt
     JOIN flashback.coverage_generations cg USING (tracking_id)
+    LEFT JOIN flashback.coverage_generations pred
+      ON pred.generation_id = NULLIF(cg.details->>'predecessor_generation_id', '')::bigint
+    LEFT JOIN flashback.backup_anchors pred_ba
+      ON pred_ba.backup_anchor_id = pred.backup_anchor_id
+     AND pred_ba.tracking_id = pred.tracking_id
     WHERE tt.tracking_id = p_tracking_id
       AND tt.is_active
       AND tt.recovery_profile = 'backup'
@@ -680,6 +690,262 @@ BEGIN
      WHERE lease_id = p_lease_id
        AND state = 'active';
     RETURN jsonb_build_object('status', 'completed', 'lease_id', p_lease_id);
+END;
+$$;
+
+-- Create (or resume) a building successor for advancing to a newer FULL.
+-- Does not start a backup and does not activate coverage; verify-anchor does.
+CREATE OR REPLACE FUNCTION flashback_begin_backup_anchor_advancement(
+    p_tracking_id bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_tracked record;
+    v_active record;
+    v_building record;
+    v_generation_id bigint;
+    v_generation_no integer;
+    v_marker_lsn pg_lsn;
+    v_rel_oid oid;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'backup anchor advancement requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_begin_backup_anchor_advancement: tracking_id is required';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    -- Serialize with expire leases.
+    PERFORM pg_advisory_xact_lock_shared(358946::integer, 0);
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = p_tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup'
+    FOR UPDATE;
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_begin_backup_anchor_advancement: no active backup lifecycle %',
+            p_tracking_id;
+    END IF;
+
+    SELECT cg.* INTO v_building
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = p_tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'building'
+    ORDER BY cg.generation_no DESC
+    LIMIT 1
+    FOR UPDATE;
+    IF v_building.generation_id IS NOT NULL THEN
+        IF v_building.boundary_kind = 'full_reanchor' THEN
+            RETURN jsonb_build_object(
+                'status', 'resumed',
+                'tracking_id', p_tracking_id,
+                'generation_id', v_building.generation_id,
+                'predecessor_generation_id',
+                    NULLIF(v_building.details->>'predecessor_generation_id', '')::bigint
+            );
+        END IF;
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', format(
+                'building generation %s boundary_kind=%s blocks advancement',
+                v_building.generation_id, v_building.boundary_kind
+            ),
+            'tracking_id', p_tracking_id,
+            'generation_id', v_building.generation_id
+        );
+    END IF;
+
+    SELECT cg.* INTO v_active
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = p_tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'active'
+    FOR UPDATE;
+    IF v_active.generation_id IS NULL
+       OR v_active.backup_anchor_id IS NULL
+       OR v_active.boundary_lsn IS NULL
+       OR v_active.valid_through_lsn IS NULL
+    THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', 'no verified active backup generation to advance from',
+            'tracking_id', p_tracking_id
+        );
+    END IF;
+    IF COALESCE(v_active.state_reason, '') IN (
+        'timeline_mismatch_frontier_frozen',
+        'repository_verification_failed',
+        'anchor_missing'
+    ) THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', format('active generation is frozen (%s)', v_active.state_reason),
+            'tracking_id', p_tracking_id,
+            'generation_id', v_active.generation_id
+        );
+    END IF;
+
+    v_marker_lsn := COALESCE(
+        NULLIF(v_active.details->>'tracking_marker_lsn', '')::pg_lsn,
+        v_tracked.coverage_start_lsn,
+        v_active.boundary_lsn
+    );
+    v_rel_oid := COALESCE(v_tracked.rel_oid, v_active.rel_oid_at_boundary);
+    v_generation_no := v_active.generation_no + 1;
+
+    INSERT INTO flashback.coverage_generations (
+        tracking_id, generation_no, stream_id, recovery_profile, state,
+        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id, backup_anchor_id,
+        boundary_xid, boundary_marker, details
+    ) VALUES (
+        p_tracking_id, v_generation_no, NULL, 'backup', 'building',
+        'full_reanchor', v_rel_oid, NULL, NULL,
+        (txid_current() % 4294967296)::bigint,
+        format('full-reanchor:%s:%s', p_tracking_id, v_active.generation_id),
+        jsonb_build_object(
+            'tracking_marker_lsn', v_marker_lsn,
+            'predecessor_generation_id', v_active.generation_id,
+            'predecessor_backup_anchor_id', v_active.backup_anchor_id,
+            'predecessor_boundary_lsn', v_active.boundary_lsn,
+            'predecessor_valid_through_lsn', v_active.valid_through_lsn,
+            'helper_profile', v_tracked.helper_profile
+        )
+    ) RETURNING generation_id INTO v_generation_id;
+
+    RETURN jsonb_build_object(
+        'status', 'started',
+        'tracking_id', p_tracking_id,
+        'generation_id', v_generation_id,
+        'predecessor_generation_id', v_active.generation_id,
+        'predecessor_boundary_lsn', v_active.boundary_lsn,
+        'predecessor_valid_through_lsn', v_active.valid_through_lsn
+    );
+END;
+$$;
+
+-- Retire a sealed predecessor only after its exclusive target range is outside
+-- the configured retention window. Does not call pgBackRest.
+CREATE OR REPLACE FUNCTION flashback_retire_sealed_backup_generation(
+    p_generation_id bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_gen record;
+    v_tracked record;
+    v_cutoff timestamptz;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'backup generation retirement requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_retire_sealed_backup_generation: generation_id is required';
+    END IF;
+
+    SELECT cg.* INTO v_gen
+    FROM flashback.coverage_generations cg
+    WHERE cg.generation_id = p_generation_id
+      AND cg.recovery_profile = 'backup'
+    FOR UPDATE;
+    IF v_gen.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_retire_sealed_backup_generation: generation % not found',
+            p_generation_id;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_gen.tracking_id));
+    PERFORM pg_advisory_xact_lock_shared(358946::integer, 0);
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_gen.tracking_id;
+
+    IF v_gen.state = 'retired' THEN
+        RETURN jsonb_build_object(
+            'status', 'already_retired',
+            'generation_id', p_generation_id,
+            'tracking_id', v_gen.tracking_id
+        );
+    END IF;
+    IF v_gen.state IS DISTINCT FROM 'sealed' THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', format('generation state is %s, not sealed', v_gen.state),
+            'generation_id', p_generation_id
+        );
+    END IF;
+    IF v_gen.superseded_before_lsn IS NULL OR v_gen.sealed_at IS NULL THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', 'sealed generation lacks superseded_before/sealed_at',
+            'generation_id', p_generation_id
+        );
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM flashback.coverage_generations succ
+        WHERE succ.tracking_id = v_gen.tracking_id
+          AND succ.recovery_profile = 'backup'
+          AND succ.state IN ('active', 'sealed')
+          AND succ.generation_no > v_gen.generation_no
+          AND succ.backup_anchor_id IS NOT NULL
+    ) THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', 'no verified successor generation remains',
+            'generation_id', p_generation_id
+        );
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM flashback.backup_restore_requests r
+        WHERE r.generation_id = p_generation_id
+          AND r.status IN ('pending', 'running')
+    ) THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', 'restore requests still pin this generation',
+            'generation_id', p_generation_id,
+            'tracking_id', v_gen.tracking_id
+        );
+    END IF;
+
+    v_cutoff := clock_timestamp() - COALESCE(v_tracked.retention_interval, interval '7 days');
+    IF v_gen.sealed_at > v_cutoff THEN
+        RETURN jsonb_build_object(
+            'status', 'blocked',
+            'reason', 'retention window still includes this predecessor exclusive range',
+            'generation_id', p_generation_id,
+            'sealed_at', v_gen.sealed_at,
+            'retention_cutoff', v_cutoff
+        );
+    END IF;
+
+    -- state_reason/details stay immutable once sealed; only lifecycle columns
+    -- may change under the coverage generation guard.
+    UPDATE flashback.coverage_generations
+       SET state = 'retired',
+           retired_at = clock_timestamp()
+     WHERE generation_id = p_generation_id
+       AND state = 'sealed';
+
+    RETURN jsonb_build_object(
+        'status', 'retired',
+        'generation_id', p_generation_id,
+        'tracking_id', v_gen.tracking_id,
+        'backup_anchor_id', v_gen.backup_anchor_id,
+        'superseded_before_lsn', v_gen.superseded_before_lsn
+    );
 END;
 $$;
 
@@ -1118,6 +1384,7 @@ DECLARE
     v_proof record;
     v_tracked record;
     v_pending record;
+    v_predecessor record;
     v_anchor_id bigint;
     v_generation_id bigint;
     v_sysid numeric;
@@ -1126,6 +1393,7 @@ DECLARE
     v_activation_mode text;
     v_wal_through pg_lsn;
     v_valid_through pg_lsn;
+    v_coverage_lower pg_lsn;
 BEGIN
     IF p_proof_id IS NULL THEN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof_id is required';
@@ -1195,6 +1463,14 @@ BEGIN
         NULLIF(btrim(COALESCE(v_proof.details, '{}'::jsonb) ->> 'activation_mode'), ''),
         'fresh_full_after_marker'
     );
+    -- Post-swap and FULL re-anchor successors require a fresh FULL after the
+    -- resolved marker; a pre-marker retained FULL must not re-enter coverage.
+    IF v_pending.boundary_kind IN ('post_restore', 'full_reanchor')
+       AND v_activation_mode = 'retained_full_plus_wal'
+    THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: boundary_kind % forbids retained_full_plus_wal; take and verify a fresh FULL after the marker',
+            v_pending.boundary_kind;
+    END IF;
     IF v_activation_mode = 'retained_full_plus_wal' THEN
         -- Retained FULL completed at/before the marker; continuous WAL must
         -- already be attested through the marker in the helper proof.
@@ -1244,13 +1520,61 @@ BEGIN
         RETURN v_generation_id;
     END IF;
 
-    IF EXISTS (
-        SELECT 1 FROM flashback.coverage_generations cg
-        WHERE cg.tracking_id = v_tracked.tracking_id
-          AND cg.state = 'active'
-          AND cg.recovery_profile = 'backup'
-    ) THEN
-        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: an active backup generation already exists';
+    SELECT cg.* INTO v_predecessor
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracked.tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'active'
+    FOR UPDATE;
+
+    IF v_predecessor.generation_id IS NOT NULL THEN
+        IF v_pending.boundary_kind IS DISTINCT FROM 'full_reanchor' THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: an active backup generation already exists';
+        END IF;
+        IF v_activation_mode IS DISTINCT FROM 'fresh_full_after_marker' THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: full_reanchor requires fresh_full_after_marker';
+        END IF;
+        IF v_predecessor.boundary_lsn IS NULL
+           OR v_predecessor.valid_through_lsn IS NULL
+           OR v_predecessor.backup_anchor_id IS NULL
+        THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: predecessor is not a verified active anchor';
+        END IF;
+        -- No coverage gap: successor physical boundary must already be covered
+        -- by the predecessor's proven WAL frontier.
+        IF v_proof.backup_stop_lsn <= v_predecessor.boundary_lsn THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: successor FULL stop % is not after predecessor boundary %',
+                v_proof.backup_stop_lsn, v_predecessor.boundary_lsn;
+        END IF;
+        IF v_proof.backup_stop_lsn > v_predecessor.valid_through_lsn THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: successor FULL stop % is beyond predecessor valid_through %; advance the frontier or choose an earlier FULL',
+                v_proof.backup_stop_lsn, v_predecessor.valid_through_lsn;
+        END IF;
+        IF NULLIF(v_pending.details->>'predecessor_generation_id', '')::bigint
+           IS DISTINCT FROM v_predecessor.generation_id
+        THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building successor is not bound to the active predecessor';
+        END IF;
+        -- Inherit the already-proven WAL frontier so targets at/after the
+        -- successor stop remain covered without a gap.
+        v_valid_through := v_predecessor.valid_through_lsn;
+
+        -- Inherit the proven frontier for the successor first, then seal the
+        -- predecessor. Clamp the sealed watermark to superseded_before so the
+        -- applicability CHECK remains true (half-open exclusive upper bound).
+        -- Do not mutate immutable qualified details.
+        UPDATE flashback.coverage_generations
+           SET state = 'sealed',
+               sealed_at = clock_timestamp(),
+               superseded_before_lsn = v_proof.backup_stop_lsn,
+               superseded_before_time = v_proof.verified_at,
+               valid_through_lsn = LEAST(
+                   v_predecessor.valid_through_lsn,
+                   v_proof.backup_stop_lsn
+               ),
+               state_reason = 'superseded_by_full_reanchor'
+         WHERE generation_id = v_predecessor.generation_id
+           AND state = 'active';
     END IF;
 
     IF EXISTS (
@@ -1273,6 +1597,11 @@ BEGIN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
             v_pending.boundary_lsn;
     END IF;
+
+    v_coverage_lower := CASE
+        WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
+        ELSE v_proof.backup_stop_lsn
+    END;
 
     INSERT INTO flashback.backup_anchors (
         tracking_id, helper_profile, repository_key, stanza, backup_label,
@@ -1314,6 +1643,7 @@ BEGIN
            details = COALESCE(details, '{}'::jsonb)
                || jsonb_build_object(
                    'tracking_marker_lsn', v_marker_lsn,
+                   'coverage_lower_lsn', v_coverage_lower,
                    'verification_request_id', v_proof.verification_request_id,
                    'activation_mode', v_activation_mode,
                    'backup_stop_lsn', v_proof.backup_stop_lsn,
@@ -1321,7 +1651,13 @@ BEGIN
                    'required_dependencies', COALESCE(
                        v_proof.details -> 'required_dependencies', '[]'::jsonb
                    ),
-                   'dependency_pin_id', v_proof.details ->> 'dependency_pin_id'
+                   'dependency_pin_id', v_proof.details ->> 'dependency_pin_id',
+                   'superseded_predecessor_generation_id',
+                       CASE
+                           WHEN v_predecessor.generation_id IS NOT NULL
+                           THEN to_jsonb(v_predecessor.generation_id)
+                           ELSE 'null'::jsonb
+                       END
                )
      WHERE generation_id = v_pending.generation_id
        AND state = 'building'
@@ -1334,10 +1670,14 @@ BEGIN
 
     UPDATE flashback.tracked_tables
        SET coverage_start_lsn = CASE
-               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
-               ELSE v_proof.backup_stop_lsn
+               WHEN v_pending.boundary_kind = 'full_reanchor'
+                   THEN COALESCE(coverage_start_lsn, v_coverage_lower)
+               ELSE v_coverage_lower
            END,
-           coverage_end_lsn = v_valid_through
+           coverage_end_lsn = GREATEST(
+               COALESCE(coverage_end_lsn, v_valid_through),
+               v_valid_through
+           )
      WHERE tracking_id = v_tracked.tracking_id;
 
     UPDATE flashback.coverage_gaps
@@ -1732,7 +2072,17 @@ BEGIN
       AND cg.backup_anchor_id IS NOT NULL
       AND cg.boundary_lsn IS NOT NULL
       AND cg.valid_through_lsn IS NOT NULL
-      AND target_lsn >= cg.boundary_lsn
+      -- Advertised coverage lower bound: retained gens use the tracking marker
+      -- (coverage_lower_lsn), not the earlier physical FULL stop.
+      AND target_lsn >= COALESCE(
+              NULLIF(cg.details->>'coverage_lower_lsn', '')::pg_lsn,
+              CASE
+                  WHEN COALESCE(cg.details->>'activation_mode', '') = 'retained_full_plus_wal'
+                  THEN NULLIF(cg.details->>'tracking_marker_lsn', '')::pg_lsn
+                  ELSE NULL
+              END,
+              cg.boundary_lsn
+          )
       AND target_lsn <= cg.valid_through_lsn
       AND (cg.superseded_before_lsn IS NULL OR target_lsn < cg.superseded_before_lsn)
     ORDER BY cg.generation_no DESC

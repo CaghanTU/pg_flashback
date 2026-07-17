@@ -1,0 +1,25 @@
+[Unit]
+Description=pg_flashback reconcile backup anchors (never creates FULL backups)
+Documentation=file:///usr/share/doc/pg_flashback/BACKUP_RESTORE_RUNBOOK.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+# Point Config at the recovery-helper JSON for this stanza/profile.
+ExecStart=/usr/local/bin/pg-flashback-recovery reconcile-anchors --config /etc/pg_flashback/helper.json
+# Optional dry-run probe before enabling the timer in production:
+# ExecStart=/usr/local/bin/pg-flashback-recovery reconcile-anchors --config /etc/pg_flashback/helper.json --dry-run
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pg_flashback /var/log/pg_flashback
+
+[Install]
+WantedBy=multi-user.target

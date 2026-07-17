@@ -19,7 +19,7 @@ use crate::executor::{
 };
 use crate::model::{
     AnchorAuditFinding, AnchorAuditReport, BackupVerificationRequest, BackupVerificationResult,
-    ExpireResult, RecoveryConfig,
+    ExpireResult, ReconcileAnchorAction, ReconcileAnchorsReport, RecoveryConfig,
 };
 use crate::pgbackrest::{parse_lsn, read_repository_metadata, SelectedBackup};
 use crate::{load_json, MAX_CONTRACT_BYTES};
@@ -93,7 +93,18 @@ struct AnchorContext {
     tracking_id: i64,
     helper_profile: String,
     generation_id: i64,
+    #[serde(default)]
+    boundary_kind: Option<String>,
     marker_commit_lsn: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    predecessor_generation_id: Option<i64>,
+    #[serde(default)]
+    predecessor_backup_label: Option<String>,
+    #[serde(default)]
+    predecessor_backup_stop_lsn: Option<String>,
+    #[serde(default)]
+    predecessor_valid_through_lsn: Option<String>,
     database_system_identifier: String,
     timeline_id: u32,
     wal_segment_size_bytes: u64,
@@ -227,30 +238,59 @@ pub fn verify_anchor(
         ));
     }
 
-    // Prefer a fresh FULL after the marker (shortest replay). Otherwise select
-    // the newest retained FULL with stop <= marker and continuous WAL through
-    // the marker. Never auto-start a cluster-sized backup here.
+    let boundary_kind = context.boundary_kind.as_deref().unwrap_or("initial_track");
+    let forbid_retained = matches!(boundary_kind, "post_restore" | "full_reanchor");
+    let pred_stop = context
+        .predecessor_backup_stop_lsn
+        .as_deref()
+        .map(parse_lsn)
+        .transpose()
+        .map_err(RecoveryError::VerificationFailed)?;
+    let pred_valid_through = context
+        .predecessor_valid_through_lsn
+        .as_deref()
+        .map(parse_lsn)
+        .transpose()
+        .map_err(RecoveryError::VerificationFailed)?;
+    let pred_label = context.predecessor_backup_label.as_deref();
+
+    // Prefer a fresh FULL after the marker (shortest replay). Otherwise, for
+    // initial_track only, select the newest retained FULL with stop <= marker
+    // and continuous WAL through the marker. Never auto-start a FULL backup.
     let mut fresh = metadata
         .backups
         .iter()
         .filter(|backup| backup.backup_type == "full")
+        .filter(|backup| pred_label.is_none_or(|label| backup.label != label))
         .filter_map(|backup| {
             let start = parse_lsn(&backup.start_lsn).ok()?;
             let stop = parse_lsn(&backup.stop_lsn).ok()?;
             let timeline = backup.archive_start.as_deref().and_then(segment_timeline)?;
-            (start > marker
+            let mut ok = start > marker
                 && stop >= start
                 && backup.database_system_id == system_id
-                && timeline == context.timeline_id)
-                .then_some((start, backup))
+                && timeline == context.timeline_id;
+            if boundary_kind == "full_reanchor" {
+                let pred_stop = pred_stop?;
+                let pred_valid_through = pred_valid_through?;
+                ok = ok && stop > pred_stop && stop <= pred_valid_through;
+            }
+            ok.then_some((stop, backup))
         })
         .collect::<Vec<_>>();
-    fresh.sort_unstable_by_key(|(start, _)| *start);
+    // Prefer the newest eligible fresh FULL (largest stop) for advancement;
+    // for initial activation prefer earliest start after marker via stop order
+    // among post-marker FULLs (usually one).
+    fresh.sort_unstable_by_key(|(stop, _)| std::cmp::Reverse(*stop));
 
     let mut selected_mode = "fresh_full_after_marker";
     let mut wal_through: Option<String> = None;
     let backup = if let Some((_, backup)) = fresh.first() {
         *backup
+    } else if forbid_retained {
+        return Err(RecoveryError::VerificationFailed(format!(
+            "boundary_kind {boundary_kind} requires a fresh FULL after the marker; retained pre-marker FULLs are ineligible"
+        )));
     } else {
         let mut retained = metadata
             .backups
@@ -750,6 +790,349 @@ pub fn expire_backups(config: &RecoveryConfig) -> Result<ExpireResult, RecoveryE
         stanza: config.stanza.clone(),
         protected_backup_labels: Vec::new(),
     })
+}
+
+/// Discover newer FULL backups and advance/retire backup anchors without
+/// creating backups. Intended for systemd timer / cron, not the PG backend.
+///
+/// # Errors
+///
+/// Returns configuration, lock, repository, or controller failures. Per-tracking
+/// advancement failures are recorded as blocked actions when fail-closed.
+#[allow(clippy::too_many_lines)]
+pub fn reconcile_anchors(
+    config: &RecoveryConfig,
+    dry_run: bool,
+) -> Result<ReconcileAnchorsReport, RecoveryError> {
+    prepare_secure_directory(&config.work_root)?;
+    // Do not hold helper flock locks across verify_anchor: that command acquires
+    // the same profile/repository locks and would self-deadlock. PostgreSQL
+    // advisory locks inside begin/retire/consume serialize coverage mutations.
+
+    let tracking_ids: Vec<i64> = query_json(
+        config,
+        &format!(
+            "SELECT COALESCE(jsonb_agg(tt.tracking_id ORDER BY tt.tracking_id), '[]'::jsonb)::text
+             FROM flashback.tracked_tables tt
+             WHERE tt.is_active
+               AND tt.recovery_profile = 'backup'
+               AND tt.helper_profile = {}",
+            sql_literal(&config.profile)
+        ),
+    )?;
+    let metadata = read_repository_metadata(config)?;
+    let mut actions = Vec::new();
+
+    for tracking_id in tracking_ids {
+        let active: Option<ActiveAnchorRow> = query_json(
+            config,
+            &format!(
+                "SELECT COALESCE((
+                   SELECT jsonb_build_object(
+                     'generation_id', cg.generation_id,
+                     'backup_label', ba.backup_label,
+                     'backup_stop_lsn', ba.backup_stop_lsn::text,
+                     'valid_through_lsn', cg.valid_through_lsn::text,
+                     'marker_lsn', COALESCE(cg.details->>'tracking_marker_lsn', cg.boundary_lsn::text)
+                   )
+                   FROM flashback.coverage_generations cg
+                   JOIN flashback.backup_anchors ba
+                     ON ba.backup_anchor_id = cg.backup_anchor_id
+                    AND ba.tracking_id = cg.tracking_id
+                   WHERE cg.tracking_id = {tracking_id}
+                     AND cg.recovery_profile = 'backup'
+                     AND cg.state = 'active'
+                   LIMIT 1
+                 ), 'null'::jsonb)::text"
+            ),
+        )?;
+        let building: Option<BuildingRow> = query_json(
+            config,
+            &format!(
+                "SELECT COALESCE((
+                   SELECT jsonb_build_object(
+                     'generation_id', cg.generation_id,
+                     'boundary_kind', cg.boundary_kind
+                   )
+                   FROM flashback.coverage_generations cg
+                   WHERE cg.tracking_id = {tracking_id}
+                     AND cg.recovery_profile = 'backup'
+                     AND cg.state = 'building'
+                   ORDER BY cg.generation_no DESC
+                   LIMIT 1
+                 ), 'null'::jsonb)::text"
+            ),
+        )?;
+
+        if let Some(building) = building {
+            if building.boundary_kind != "full_reanchor" {
+                actions.push(ReconcileAnchorAction {
+                    tracking_id,
+                    action: "blocked".to_owned(),
+                    detail: format!(
+                        "building generation {} ({}) blocks advancement",
+                        building.generation_id, building.boundary_kind
+                    ),
+                    generation_id: Some(building.generation_id),
+                    backup_label: None,
+                });
+                continue;
+            }
+            if dry_run {
+                actions.push(ReconcileAnchorAction {
+                    tracking_id,
+                    action: "would_activate_successor".to_owned(),
+                    detail: "resuming full_reanchor building generation".to_owned(),
+                    generation_id: Some(building.generation_id),
+                    backup_label: None,
+                });
+                continue;
+            }
+            let request_id = format!(
+                "reconcile-activate-{tracking_id}-{}",
+                building.generation_id
+            );
+            match verify_anchor(
+                config,
+                &BackupVerificationRequest {
+                    request_id,
+                    tracking_id,
+                },
+            ) {
+                Ok(result) => actions.push(ReconcileAnchorAction {
+                    tracking_id,
+                    action: "activated".to_owned(),
+                    detail: "activated building full_reanchor successor".to_owned(),
+                    generation_id: Some(result.generation_id),
+                    backup_label: Some(result.backup_label),
+                }),
+                Err(error) => actions.push(ReconcileAnchorAction {
+                    tracking_id,
+                    action: "blocked".to_owned(),
+                    detail: error.to_string(),
+                    generation_id: Some(building.generation_id),
+                    backup_label: None,
+                }),
+            }
+            continue;
+        }
+
+        let Some(active) = active else {
+            actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "noop".to_owned(),
+                detail: "no active verified backup generation".to_owned(),
+                generation_id: None,
+                backup_label: None,
+            });
+            continue;
+        };
+        let pred_stop =
+            parse_lsn(&active.backup_stop_lsn).map_err(RecoveryError::VerificationFailed)?;
+        let pred_through =
+            parse_lsn(&active.valid_through_lsn).map_err(RecoveryError::VerificationFailed)?;
+        let marker = parse_lsn(&active.marker_lsn).map_err(RecoveryError::VerificationFailed)?;
+
+        let mut candidates = metadata
+            .backups
+            .iter()
+            .filter(|backup| backup.backup_type == "full")
+            .filter(|backup| backup.label != active.backup_label)
+            .filter_map(|backup| {
+                let start = parse_lsn(&backup.start_lsn).ok()?;
+                let stop = parse_lsn(&backup.stop_lsn).ok()?;
+                (start > marker && stop > pred_stop && stop <= pred_through)
+                    .then_some((stop, backup))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|(stop, _)| std::cmp::Reverse(*stop));
+        let Some((_, candidate)) = candidates.first() else {
+            actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "noop".to_owned(),
+                detail: "no newer eligible FULL within the proven WAL frontier".to_owned(),
+                generation_id: Some(active.generation_id),
+                backup_label: Some(active.backup_label.clone()),
+            });
+            continue;
+        };
+
+        if dry_run {
+            actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "would_advance".to_owned(),
+                detail: format!(
+                    "eligible successor FULL {} stop={}",
+                    candidate.label, candidate.stop_lsn
+                ),
+                generation_id: Some(active.generation_id),
+                backup_label: Some(candidate.label.clone()),
+            });
+            continue;
+        }
+
+        let began: AdvancementBegin = query_json(
+            config,
+            &format!("SELECT flashback_begin_backup_anchor_advancement({tracking_id})::text"),
+        )?;
+        if began.status != "started" && began.status != "resumed" {
+            actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "blocked".to_owned(),
+                detail: began
+                    .reason
+                    .unwrap_or_else(|| format!("advancement status {}", began.status)),
+                generation_id: began.generation_id,
+                backup_label: None,
+            });
+            continue;
+        }
+        let request_id = format!(
+            "reconcile-advance-{tracking_id}-{}",
+            began.generation_id.unwrap_or_default()
+        );
+        match verify_anchor(
+            config,
+            &BackupVerificationRequest {
+                request_id,
+                tracking_id,
+            },
+        ) {
+            Ok(result) => actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "advanced".to_owned(),
+                detail: format!("activated successor FULL {}", result.backup_label),
+                generation_id: Some(result.generation_id),
+                backup_label: Some(result.backup_label),
+            }),
+            Err(error) => actions.push(ReconcileAnchorAction {
+                tracking_id,
+                action: "blocked".to_owned(),
+                detail: error.to_string(),
+                generation_id: began.generation_id,
+                backup_label: Some(candidate.label.clone()),
+            }),
+        }
+    }
+
+    // Retire sealed predecessors whose exclusive ranges are outside retention.
+    let sealed_ids: Vec<i64> = query_json(
+        config,
+        &format!(
+            "SELECT COALESCE(jsonb_agg(cg.generation_id ORDER BY cg.generation_id), '[]'::jsonb)::text
+             FROM flashback.coverage_generations cg
+             JOIN flashback.tracked_tables tt ON tt.tracking_id = cg.tracking_id
+             WHERE tt.is_active
+               AND tt.recovery_profile = 'backup'
+               AND tt.helper_profile = {}
+               AND cg.recovery_profile = 'backup'
+               AND cg.state = 'sealed'
+               AND cg.superseded_before_lsn IS NOT NULL",
+            sql_literal(&config.profile)
+        ),
+    )?;
+    for generation_id in sealed_ids {
+        if dry_run {
+            let preview: RetirementResult = query_json(
+                config,
+                &format!(
+                    "SELECT jsonb_build_object(
+                       'status', CASE
+                         WHEN cg.sealed_at <= clock_timestamp() - COALESCE(tt.retention_interval, interval '7 days')
+                         THEN 'would_retire' ELSE 'retention_holds' END,
+                       'generation_id', cg.generation_id,
+                       'tracking_id', cg.tracking_id
+                     )::text
+                     FROM flashback.coverage_generations cg
+                     JOIN flashback.tracked_tables tt ON tt.tracking_id = cg.tracking_id
+                     WHERE cg.generation_id = {generation_id}"
+                ),
+            )?;
+            actions.push(ReconcileAnchorAction {
+                tracking_id: preview.tracking_id.unwrap_or(0),
+                action: preview.status,
+                detail: "sealed predecessor retention evaluation".to_owned(),
+                generation_id: Some(generation_id),
+                backup_label: None,
+            });
+            continue;
+        }
+        let retired: RetirementResult = query_json(
+            config,
+            &format!("SELECT flashback_retire_sealed_backup_generation({generation_id})::text"),
+        )?;
+        let tracking_id = retired.tracking_id.unwrap_or(0);
+        if retired.status == "retired" {
+            if let Ok(Some(pin_id)) = query_json::<Option<String>>(
+                config,
+                &format!(
+                    "SELECT COALESCE(
+                       to_jsonb(NULLIF(cg.details->>'dependency_pin_id', '')),
+                       'null'::jsonb
+                     )::text
+                     FROM flashback.coverage_generations cg
+                     WHERE cg.generation_id = {generation_id}"
+                ),
+            ) {
+                let pin_path = config
+                    .work_root
+                    .join("dependency-pins")
+                    .join(format!("{pin_id}.json"));
+                let _ = std::fs::remove_file(pin_path);
+            }
+        }
+        actions.push(ReconcileAnchorAction {
+            tracking_id,
+            action: retired.status,
+            detail: retired
+                .reason
+                .unwrap_or_else(|| "sealed predecessor retirement".to_owned()),
+            generation_id: Some(generation_id),
+            backup_label: None,
+        });
+    }
+
+    Ok(ReconcileAnchorsReport {
+        status: "ok".to_owned(),
+        profile: config.profile.clone(),
+        stanza: config.stanza.clone(),
+        dry_run,
+        created_backup: false,
+        actions,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveAnchorRow {
+    generation_id: i64,
+    backup_label: String,
+    backup_stop_lsn: String,
+    valid_through_lsn: String,
+    marker_lsn: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildingRow {
+    generation_id: i64,
+    boundary_kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdvancementBegin {
+    status: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    generation_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetirementResult {
+    status: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    tracking_id: Option<i64>,
 }
 
 /// Audit every retained backup anchor and durably freeze missing/corrupt ones.
