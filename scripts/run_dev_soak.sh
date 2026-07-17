@@ -8,6 +8,9 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
+# shellcheck source=qualification_provenance.sh
+source "$ROOT/scripts/qualification_provenance.sh"
+qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
@@ -31,6 +34,10 @@ SAMPLES=""
 START_SLOT_LAG=0
 FINAL_SLOT_LAG=0
 DRAIN_OK=false
+GLOBAL_PREFIX_CAUGHT_UP=false
+FINAL_WAL_TARGET=""
+FINAL_CONFIRMED_FLUSH=""
+DRAIN_SECONDS=0
 ACTUAL_INSERTS=0
 ACTUAL_UPDATES=0
 ACTUAL_DELETES=0
@@ -51,14 +58,16 @@ require_file() {
 }
 
 write_result() {
-    local rc=$1 elapsed
+    local rc=$1 elapsed finished_at
     elapsed=$(( $(date +%s) - START_EPOCH ))
+    finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$RESULT_DIR"
     cat >"$RESULT_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
-  "commit": "$COMMIT",
+$(qualification_provenance_json "$finished_at"),
   "qualification_kind": "development_soak",
+  "config": {"worker_interval_ms": 25, "duration_seconds": $SOAK_SECONDS, "target_mib": $TARGET_MIB, "drain_timeout_seconds": ${DRAIN_TIMEOUT_SECONDS:-120}, "lag_slack_bytes": $LAG_NEAR_START_SLACK_BYTES},
   "status": "$STATUS",
   "exit_code": $rc,
   "duration_seconds": $elapsed,
@@ -71,6 +80,10 @@ write_result() {
   "event_counts_ok": $EVENT_COUNTS_OK,
   "start_slot_lag_bytes": $START_SLOT_LAG,
   "final_slot_lag_bytes": $FINAL_SLOT_LAG,
+  "final_wal_target_lsn": "$FINAL_WAL_TARGET",
+  "final_confirmed_flush_lsn": "$FINAL_CONFIRMED_FLUSH",
+  "global_prefix_caught_up": $GLOBAL_PREFIX_CAUGHT_UP,
+  "drain_seconds": $DRAIN_SECONDS,
   "drain_ok": $DRAIN_OK,
   "catchup_ok": $CATCHUP_OK,
   "fingerprint_ok": $FINGERPRINT_OK,
@@ -183,14 +196,13 @@ done
 [[ "$CYCLES" -gt 0 ]] || { echo "FAIL: no soak cycles completed" >&2; exit 1; }
 
 # Draining is a qualification condition, not an informational postscript.
-# Require exact decoded DML counts and prove the slot confirmed_flush has
-# caught up to this table's last captured commit LSN. Global slot lag may
-# remain elevated when filtered non-output WAL is present (consume returns
-# early without advancing across empty peeks); that alone must not hide
-# silent capture loss, and must not force FAIL when every expected event is
-# durable and confirmed_flush is past the table's max commit_lsn.
+# Freeze the final WAL boundary after workload completion. PASS requires both
+# table-level capture correctness and global slot advancement through this
+# exact prefix, with remaining lag back inside the explicit baseline slack.
+FINAL_WAL_TARGET="$(q "SELECT pg_current_wal_flush_lsn();")"
 DRAIN_TIMEOUT_SECONDS="${PG_FLASHBACK_SOAK_DRAIN_TIMEOUT_SECONDS:-120}"
 LAG_NEAR_START_SLACK_BYTES="${PG_FLASHBACK_SOAK_LAG_NEAR_START_SLACK_BYTES:-1048576}"
+drain_started=$(date +%s)
 drain_deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 last_lag=-1
 EVENT_COUNTS_OK=false
@@ -201,9 +213,7 @@ LAG_NEAR_START=false
 FINGERPRINT_OK=false
 FINAL_SLOT_LAG=0
 while (( $(date +%s) <= drain_deadline )); do
-    # Larger batches reduce empty-peek stalls when filtered catalog WAL sits
-    # ahead of the remaining user-table changes.
-    q "SELECT flashback_consume_wal(65536);" >/dev/null || true
+    q "SELECT flashback_consume_wal(65536);" >/dev/null
     counts="$(q "SELECT
         count(*) FILTER (WHERE event_type = 'INSERT'),
         count(*) FILTER (WHERE event_type = 'UPDATE'),
@@ -219,6 +229,8 @@ while (( $(date +%s) <= drain_deadline )); do
     fi
     FINAL_SLOT_LAG="$(q "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint
                          FROM pg_replication_slots WHERE slot_name = '$SLOT';")"
+    FINAL_CONFIRMED_FLUSH="$(q "SELECT confirmed_flush_lsn
+                                FROM pg_replication_slots WHERE slot_name = '$SLOT';")"
     catchup="$(q "SELECT CASE
         WHEN max(d.commit_lsn) IS NULL THEN false
         WHEN s.confirmed_flush_lsn >= max(d.commit_lsn) THEN true
@@ -231,17 +243,25 @@ while (( $(date +%s) <= drain_deadline )); do
       GROUP BY s.confirmed_flush_lsn;")"
     CATCHUP_OK=false
     [[ "$catchup" == "t" ]] && CATCHUP_OK=true
+    GLOBAL_PREFIX_CAUGHT_UP=false
+    [[ "$(q "SELECT '$FINAL_CONFIRMED_FLUSH'::pg_lsn >=
+                       '$FINAL_WAL_TARGET'::pg_lsn;")" == "t" ]] &&
+        GLOBAL_PREFIX_CAUGHT_UP=true
     SLOT_LAG_STABLE_OR_DECREASING=false
     (( last_lag < 0 || FINAL_SLOT_LAG <= last_lag )) && SLOT_LAG_STABLE_OR_DECREASING=true
     LAG_NEAR_START=false
     (( FINAL_SLOT_LAG <= START_SLOT_LAG + LAG_NEAR_START_SLACK_BYTES )) && LAG_NEAR_START=true
-    if [[ "$EVENT_COUNTS_OK" == true && "$CATCHUP_OK" == true ]]; then
+    if [[ "$EVENT_COUNTS_OK" == true &&
+          "$CATCHUP_OK" == true &&
+          "$GLOBAL_PREFIX_CAUGHT_UP" == true &&
+          "$LAG_NEAR_START" == true ]]; then
         DRAIN_OK=true
         break
     fi
     last_lag=$FINAL_SLOT_LAG
     sleep 0.05
 done
+DRAIN_SECONDS=$(( $(date +%s) - drain_started ))
 
 # Spot-check silent loss: every inserted id must appear as an INSERT in delta_log.
 if [[ "$EVENT_COUNTS_OK" == true ]]; then
@@ -255,9 +275,13 @@ if [[ "$EVENT_COUNTS_OK" == true ]]; then
     [[ "$missing" == "0" ]] && FINGERPRINT_OK=true
 fi
 
-[[ "$EVENT_COUNTS_OK" == true && "$DRAIN_OK" == true && "$FINGERPRINT_OK" == true ]] || {
-    echo "FAIL: capture did not drain to expected event counts and slot catch-up" >&2
-    echo "  event_counts_ok=$EVENT_COUNTS_OK catchup_ok=$CATCHUP_OK drain_ok=$DRAIN_OK fingerprint_ok=$FINGERPRINT_OK final_lag=$FINAL_SLOT_LAG lag_near_start=$LAG_NEAR_START" >&2
+[[ "$EVENT_COUNTS_OK" == true &&
+   "$DRAIN_OK" == true &&
+   "$FINGERPRINT_OK" == true &&
+   "$GLOBAL_PREFIX_CAUGHT_UP" == true &&
+   "$LAG_NEAR_START" == true ]] || {
+    echo "FAIL: capture did not drain through the fixed final WAL prefix" >&2
+    echo "  event_counts_ok=$EVENT_COUNTS_OK catchup_ok=$CATCHUP_OK global_prefix_caught_up=$GLOBAL_PREFIX_CAUGHT_UP drain_ok=$DRAIN_OK fingerprint_ok=$FINGERPRINT_OK final_lag=$FINAL_SLOT_LAG lag_near_start=$LAG_NEAR_START" >&2
     exit 1
 }
 STATUS=PASS

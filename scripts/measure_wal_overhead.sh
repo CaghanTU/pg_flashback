@@ -5,6 +5,9 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
+# shellcheck source=qualification_provenance.sh
+source "$ROOT/scripts/qualification_provenance.sh"
+qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
@@ -101,7 +104,8 @@ TRACKED_RATIO="$(awk -v n="$TRACKED_WAL" -v d="$DEFAULT_WAL" 'BEGIN {printf "%.3
 cat >"$RESULT_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
-  "commit": "$(git -C "$ROOT" rev-parse HEAD)",
+$(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
+  "config": {"worker_interval_ms": 25, "rows": $ROWS},
   "status": "PASS",
   "rows": $ROWS,
   "measurements": {

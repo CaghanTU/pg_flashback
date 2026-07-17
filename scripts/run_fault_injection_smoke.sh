@@ -5,6 +5,9 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
+# shellcheck source=qualification_provenance.sh
+source "$ROOT/scripts/qualification_provenance.sh"
+qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
@@ -30,7 +33,8 @@ write_result() {
     cat >"$RESULT_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
-  "commit": "$(git -C "$ROOT" rev-parse HEAD)",
+$(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
+  "config": {"worker_interval_ms": 25, "faults": ["postmaster_restart", "fast_shutdown_restart"]},
   "status": "$([[ "$RESTART_PASS" == true && "$FAST_STOP_PASS" == true && "$CLEANUP_OK" == true ]] && echo PASS || echo FAIL)",
   "faults": [
     {"name": "postmaster_restart_worker_recovery", "pass": $RESTART_PASS},

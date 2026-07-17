@@ -14,6 +14,9 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
+# shellcheck source=qualification_provenance.sh
+source "$ROOT/scripts/qualification_provenance.sh"
+qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
@@ -203,12 +206,16 @@ LOCK_PID=""
 
 rows_during=$(q "SELECT count(*) FROM flashback.delta_log
                   WHERE rel_oid = 'public.m3_open'::regclass;")
+final_wal_target=$(q "SELECT pg_current_wal_flush_lsn();")
 drain_deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))
 drain_target=$(( start_lag + 65536 ))
 (( drain_target < 65536 )) && drain_target=65536
 drain_ok=false
+tracked_prefix_caught_up=false
+global_prefix_caught_up=false
+global_slot_lag_within_target=false
 while (( $(date +%s) <= drain_deadline )); do
-    q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+    q "SELECT flashback_consume_wal(8192);" >/dev/null
     # Catch-up means confirmed_flush has reached the last observed open-table commit.
     catchup=$(q "SELECT CASE
         WHEN max(d.commit_lsn) IS NULL THEN false
@@ -222,7 +229,19 @@ while (( $(date +%s) <= drain_deadline )); do
       GROUP BY s.confirmed_flush_lsn;")
     final_lag=$(q "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint
                    FROM pg_replication_slots WHERE slot_name = '$SLOT';")
-    if [[ "$catchup" == "t" ]]; then
+    final_confirmed=$(q "SELECT confirmed_flush_lsn
+                         FROM pg_replication_slots WHERE slot_name = '$SLOT';")
+    tracked_prefix_caught_up=false
+    [[ "$catchup" == "t" ]] && tracked_prefix_caught_up=true
+    global_prefix_caught_up=false
+    [[ "$(q "SELECT '$final_confirmed'::pg_lsn >=
+                       '$final_wal_target'::pg_lsn;")" == "t" ]] &&
+        global_prefix_caught_up=true
+    global_slot_lag_within_target=false
+    (( final_lag <= drain_target )) && global_slot_lag_within_target=true
+    if [[ "$tracked_prefix_caught_up" == true &&
+          "$global_prefix_caught_up" == true &&
+          "$global_slot_lag_within_target" == true ]]; then
         drain_ok=true
         break
     fi
@@ -244,8 +263,10 @@ fi
 cat >"$RESULT_JSON" <<EOF
 {
   "run_id": "$RUN_ID",
+$(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
   "status": "$status",
   "hold_seconds": $HOLD_SECONDS,
+  "config": {"worker_interval_ms": 50, "maintenance_every_n_cycles": 1, "maintenance_lock_timeout_ms": 100, "maintenance_statement_timeout_ms": 1000, "commit_samples": $COMMIT_SAMPLES, "poll_seconds": $POLL_SECONDS},
   "measurement_note": "Capture and maintenance share one background-worker loop; this measures progress despite a held unrelated lifecycle lock.",
   "shared_background_worker_loop": true,
   "worker_interval_ms": 50,
@@ -260,6 +281,11 @@ cat >"$RESULT_JSON" <<EOF
   "start_slot_lag_bytes": $start_lag,
   "final_slot_lag_bytes": $final_lag,
   "slot_lag_drain_target_bytes": $drain_target,
+  "final_wal_target_lsn": "$final_wal_target",
+  "final_confirmed_flush_lsn": "$final_confirmed",
+  "tracked_prefix_caught_up": $tracked_prefix_caught_up,
+  "global_prefix_caught_up": $global_prefix_caught_up,
+  "global_slot_lag_within_target": $global_slot_lag_within_target,
   "drain_ok": $drain_ok,
   "visibility_poll_seconds": $POLL_SECONDS,
   "visibility_poll_count": $polls,
@@ -271,10 +297,9 @@ cat >"$RESULT_JSON" <<EOF
   "max_visibility_ms": $max_ms,
   "visibility_samples": [$visibility_samples_json],
   "visibility_samples_jsonl": "$samples_file",
-  "visibility_measurement_status": "per-commit monotonic commit-ack to first delta_log visibility, sampled every $POLL_SECONDS seconds"
+  "visibility_measurement_status": "per-commit monotonic commit-ack to first delta_log visibility; one polling observation may timestamp many commits, so $observed_samples samples were derived from $polls polling cycles at $POLL_SECONDS-second resolution"
 }
 EOF
-cp "$RESULT_JSON" "$ROOT/docs/qualification/capture-maintenance-isolation-latest.json"
 
 echo "M3 isolation qualification: $status ($RESULT_JSON)"
 [[ "$status" == "PASS" ]]
