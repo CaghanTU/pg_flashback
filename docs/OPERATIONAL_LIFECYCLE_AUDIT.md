@@ -5,8 +5,10 @@ Date: 2026-07-16
 Audited baseline: `b9e4c2f`; the WAL commit-map fix and its regression test are
 included with this audit
 
-Status: **not release-ready; A+ policy adopted, runtime enforcement and
-correctness fixes required**
+Status: **not release-ready.** A+ policy adopted. WAL-local correctness and
+generation-aware local retention are implemented for the qualified profile;
+backup-profile coverage wiring, capacity preflight/artifact GC and capture/
+maintenance isolation remain open release gates.
 
 This audit deliberately separates three questions:
 
@@ -35,9 +37,10 @@ database. The decision made after the evidence review is recorded in
 | RB-10 | Helper work capacity | Snapshot-direct initially reserves only 64 MiB of free space, while replay CoW growth is unknown. Quota is per request, successful dumps have no GC/expiry command, and retained artifacts are unbounded in aggregate. | Add continuous free-space reserve enforcement and an explicit artifact/request retention lifecycle. |
 | RB-11 | Worker head-of-line blocking | While the worker was blocked for five seconds taking a checkpoint on one table, a committed event for another table remained in LOGGED `staging_events`; it was still absent from `delta_log` after one second and became visible only after 5,055 ms. | Decouple capture draining from checkpoint/retention work or give maintenance work a bounded, cancellable schedule. The delay affects visibility/RTO and can grow WAL slot lag. |
 
-Until RB-01 through RB-11 are either fixed or explicitly removed from the
-supported release contract, a successful restore cannot be treated as proof
-of recoverability.
+A successful restore cannot be treated as proof of recoverability until every
+remaining open release gate is closed or explicitly removed from the supported
+contract. Section 6 records which WAL-local correctness blockers are already
+closed; RB-08 through RB-11 remain open.
 
 ## 2. Capacity model and measurements
 
@@ -215,11 +218,14 @@ for non-blocking MVCC-aware checkpoints.
 
 ## 5. Implementation disposition
 
-- RB-01 through RB-07 require the generation, stream-watermark, persistent-gap
-  and common-lock protocol in [`COVERAGE_MODEL.md`](COVERAGE_MODEL.md).
-- RB-08 through RB-10 require the bounded capacity, retention and artifact
-  lifecycle in [`STORAGE_POLICY.md`](STORAGE_POLICY.md).
-- RB-11 requires capture draining to be separated from maintenance work.
+- RB-01 through RB-07 required the generation, stream-watermark, persistent-gap
+  and common-lock protocol in [`COVERAGE_MODEL.md`](COVERAGE_MODEL.md). For the
+  qualified WAL-local profile those blockers are closed; see Section 6.
+  Backup-profile coverage still needs the same model wired end-to-end.
+- RB-08 through RB-10 remain open and require the bounded capacity, retention
+  and artifact lifecycle in [`STORAGE_POLICY.md`](STORAGE_POLICY.md).
+- RB-11 remains open and requires capture draining to be separated from
+  maintenance work.
 
 Generation ownership is half-open: a sealed generation serves targets from its
 inclusive boundary up to, but excluding, its successor boundary; the active
@@ -255,9 +261,11 @@ start LSN is strictly later may establish the first verified
 physical-backup anchor. This anchor is not the exact write-locked local-base
 boundary used by `local_delta`.
 
-The schema scaffold does not satisfy these blockers by itself. Runtime wiring,
-fail-closed target admission and the listed regression tests must land before
-the release status can change.
+The schema scaffold alone never satisfied these blockers. WAL-local runtime
+wiring, fail-closed target admission and generation-aware local retention have
+landed for the qualified profile. Backup-profile generation wiring, capacity
+preflight/artifact GC, worker isolation and the remaining regression evidence
+must still land before the release status can change.
 
 ## 6. WAL-local milestone update
 
@@ -288,6 +296,8 @@ The earlier DDL privilege restriction was also removed safely: the hook enters
 the extension owner's identity only for its internal metadata call, while the
 ordinary table owner remains the actor for PostgreSQL's DDL permission check.
 
-This update does not close RB-02 generation-aware retention, RB-08/RB-09
-automated capacity preflight, RB-10 helper artifact lifecycle or RB-11 worker
-isolation. Those remain whole-project release gates.
+This update also closes RB-02 for qualified local generations: whole sealed-
+generation retirement is durable, pinned and resumable. RB-08/RB-09 automated
+capacity preflight, RB-10 helper artifact lifecycle and RB-11 worker isolation
+remain whole-project release gates. Backup-profile coverage anchoring is still
+open and is tracked separately from the original local retention reproduction.

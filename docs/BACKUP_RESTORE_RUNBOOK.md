@@ -139,6 +139,11 @@ why classic restore will be used.
 
 ## 5. Enable tracking and coverage
 
+This section documents the current helper/controller workflow and the adopted
+release-required protocol. It is not a release-qualified production enablement
+path until coverage-generation integration lands. Do not treat a successful
+helper restore as proof of an admissible generation.
+
 Backup tracking stores schema/DDL metadata only. It does not create a table
 snapshot or DML capture triggers:
 

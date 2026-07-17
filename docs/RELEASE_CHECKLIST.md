@@ -58,11 +58,13 @@ rm -rf target/test-pgdata && cargo pgrx test pg17
 rm -rf target/test-pgdata && cargo pgrx test pg18
 ```
 
-- [ ] PostgreSQL 15: 69/69.
-- [ ] PostgreSQL 16: 69/69.
-- [ ] PostgreSQL 17: 69/69.
-- [ ] PostgreSQL 18: 69/69.
+- [ ] PostgreSQL 15 regression suite passes for the exact release commit.
+- [ ] PostgreSQL 16 regression suite passes for the exact release commit.
+- [ ] PostgreSQL 17 regression suite passes for the exact release commit.
+- [ ] PostgreSQL 18 regression suite passes for the exact release commit.
 - [ ] The real WAL/worker E2E passes: `scripts/run_wal_e2e.sh`.
+- [ ] Record the exact suite/check counts in the qualification artifact for
+      this commit; do not hard-code suite sizes in this checklist.
 
 ## 4. Coverage correctness qualification
 
@@ -153,9 +155,10 @@ Use the exact PostgreSQL and pgBackRest versions named in
 scripts/run_recovery_helper_e2e.sh
 ```
 
-- [ ] All 27 checks pass, including snapshot-direct and classic recovered-data
-      fingerprint equality, a real post-DROP extension request and final
-      production swap.
+- [ ] The recovery-helper E2E suite passes for the exact release commit,
+      including snapshot-direct and classic recovered-data fingerprint
+      equality, a real post-DROP extension request and final production swap.
+      Record the exact check count in the qualification artifact.
 - [ ] Every backup-profile swap commits a LOGGED pending/unanchored state and
       opens a durable gap; it does not create a local row snapshot, and both
       the result and `flashback_health()` report the required next full backup.

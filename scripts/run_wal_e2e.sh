@@ -415,7 +415,7 @@ if ! awk -v full="$AMP_FULL_WAL" -v base="$AMP_DEFAULT_WAL" \
     echo "FAIL: REPLICA IDENTITY FULL WAL maliyeti baseline'dan büyük ölçülmedi"
     exit 1
 fi
-echo "  ok: WAL amplification — default=${AMP_DEFAULT_WAL} B, RI_FULL=${AMP_FULL_WAL} B (${AMP_RI_RATIO}x), tracked-total=${AMP_TRACKED_TOTAL_WAL} B (${AMP_TOTAL_RATIO}x)"
+echo "  ok: WAL amplification — default=${AMP_DEFAULT_WAL} B, RI_FULL=${AMP_FULL_WAL} B (${AMP_RI_RATIO}x), tracked-total=${AMP_TRACKED_TOTAL_WAL} B (${AMP_TOTAL_RATIO}x), tracked-xid=${AMP_TRACKED_XID}, tracked-app-wal=${AMP_TRACKED_APP_WAL} B"
 echo "  ok: büyük transaction capture süresi = ${BATCH_ELAPSED_MS}ms"
 
 q "INSERT INTO orders (customer, amount) SELECT 'cust_'||g, g*1.5 FROM generate_series(1,1000) g" > /dev/null

@@ -54,7 +54,8 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 - **Backup profile for local-budget-ineligible tables:** no base-table copy and no row-delta
   duplication; native PostgreSQL PITR runs in a private cluster and returns a
   validated one-table artifact through snapshot-direct or classic pgBackRest
-  restore.
+  restore. Helper recovery is implemented; coverage-generation integration is
+  still a release gate and is not yet release-qualified.
 
 ## 2. Architecture Overview
 
@@ -139,9 +140,12 @@ the missing interval never becomes valid retroactively.
 
 ### PostgreSQL
 
-**Tested versions:** PostgreSQL 15, 16, 17, 18 (69/69 tests pass on all four,
-verified locally; CI runs the same matrix)
+**Tested versions:** PostgreSQL 15, 16, 17, 18. The regression matrix must pass
+on each major for the exact release commit; record suite counts in
+qualification artifacts rather than embedding them here.
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
+**Release artifacts:** Linux x86_64 only. aarch64 is source-build only and is
+not release-qualified.
 
 **Legacy smoke evidence:** both capture modes completed limited 1,000+ row
 mass-delete/update scenarios (trigger restore ~58 ms, WAL restore ~82 ms). Those
@@ -206,8 +210,10 @@ sudo install -m 0644 share/extension/pg_flashback.control \
   share/extension/pg_flashback--*.sql "$(pg_config --sharedir)/extension/"
 ```
 
-Prebuilt release archives target x86_64 Linux. Other Linux architectures can
-build the same tagged source with the commands above.
+Prebuilt release archives target x86_64 Linux and are the only release-
+qualified platform. aarch64 and other Linux architectures may build the same
+tagged source with the commands above, but those builds are source-only and
+are not release-qualified.
 
 ### Enable the Extension
 
@@ -480,7 +486,7 @@ the generation-admission gates called out explicitly below.
 | **lz4 compression on delta_log** (where available) | ✅ |
 | **Multi‑database worker** (`target_databases` GUC) | ✅ |
 | **Partitioned-table path** (per-row triggers) | legacy demo; ❌ first release |
-| **Parallel restore hints** (`flashback_restore_parallel`) | ✅ |
+| **Parallel restore hints** (`flashback_restore_parallel`) | legacy/experimental; outside the WAL-first release contract |
 | **WAL capture mode** (async; measured WAL amplification) | ✅ |
 | **Coverage-safe `capture_mode` changes** | ✅ durable break + new epoch; return to WAL requires re-anchor |
 | **delta_log time‑partitioned** (monthly, auto‑managed) | ✅ |
@@ -488,35 +494,39 @@ the generation-admission gates called out explicitly below.
 | **Restore/index memory GUCs** | ✅ |
 | **REPLICA IDENTITY preservation** (`FULL` / `DEFAULT` / `USING INDEX` round-trip) | ✅ |
 | **Dependent view/matview recreation** (owner, reloptions, indexes, populate) | ✅ |
-| **Non-destructive row recovery** (`flashback_recover_deleted` — re-inserts only missing rows, survivors untouched) | ✅ |
+| **Non-destructive row recovery** (`flashback_recover_deleted_lsn`; legacy `flashback_recover_deleted` rejects qualified WAL lifecycles) | ✅ COMMIT-LSN path |
 | **SET SCHEMA tracking** (schema move auto-detected via OID lookup; triggers recreated) | ✅ |
 | **RENAME TABLE auto-tracking** (OID-based; capture trigger recreated transparently) | ✅ |
-| **DROP TABLE recovery** (`flashback_restore` reconstructs a dropped table from delta history) | ✅ |
+| **DROP TABLE recovery** (`flashback_restore_lsn` reconstructs a dropped table; legacy `flashback_restore` is not the qualified API) | ✅ COMMIT-LSN path |
 | **Classical INHERITS child preservation** (children detached before DROP, re-attached after swap) | ✅ |
-| **Backup-backed recovery profile** (pgBackRest + private native PITR + validated table swap) | ✅ helper path; coverage integration still gated |
+| **Backup-backed recovery profile** (pgBackRest + private native PITR + validated table swap) | experimental helper path; coverage-generation integration still gated |
 
 ## 11. Testing & Observability
 
 ### Test Suite
 
-65 PostgreSQL tests plus 4 decoder unit tests cover DML, DDL, schema
-evolution, multi-table FK, checkpoints, edge cases, query/recovery, RBAC,
+The PostgreSQL regression suite and decoder unit tests cover DML, DDL, schema
+evolution, multi-table FK, edge cases, query/recovery, RBAC,
 generation/stream contracts, timestamp collision/inversion, frozen frontiers,
-persistent gaps and WAL-mode behavior:
+persistent gaps and WAL-mode behavior. Record the exact pass counts for the
+commit under qualification; do not treat a hard-coded suite size as a living
+gate:
 
 ```bash
 # Remove stale test data first (prevents mutex lock conflicts)
 rm -rf target/test-pgdata
-cargo pgrx test pg15  # test result: ok. 69 passed; 0 failed
-cargo pgrx test pg16  # test result: ok. 69 passed; 0 failed
-cargo pgrx test pg17  # test result: ok. 69 passed; 0 failed
-cargo pgrx test pg18  # test result: ok. 69 passed; 0 failed
+cargo pgrx test pg15
+cargo pgrx test pg16
+cargo pgrx test pg17
+cargo pgrx test pg18
 ```
 
 ### Monitoring Queries
 
-The retention function reports legacy age/storage state only; it is not proof
-of recoverability. `flashback_health()` is the coverage view.
+`flashback_apply_retention()` retires whole sealed local generations under the
+adopted coverage contract. `flashback_retention_status()` still reports legacy
+age/storage fields for operators and is not proof of recoverability.
+`flashback_health()` is the coverage view.
 
 ```sql
 -- Dashboard
@@ -549,10 +559,14 @@ FROM flashback_retention_status();
 GitHub Actions pipeline runs on every push to `main` and on every pull request:
 
 - **Lint job**: `cargo fmt --check` + `cargo clippy -D warnings`
-- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` (69 tests each, verified locally on all four; CI runs the same matrix on every push)
+- **Test matrix**: PostgreSQL 15, 16, 17, 18 — `cargo pgrx test pg{15..18}` for
+  the commit under test; archive exact suite counts in qualification records
 - **Security audit**: `cargo audit`
-- **Recovery E2E**: 27 real pgBackRest/native-PITR success and fail-closed checks
-- **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release
+- **Recovery E2E**: real pgBackRest/native-PITR success and fail-closed checks;
+  archive the exact check count for the commit under test
+- **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux
+  PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release.
+  aarch64 remains source-build only and is not release-qualified.
 
 Local:
 ```bash
@@ -803,7 +817,7 @@ cluster-level recovery.
 | TOAST / large row warnings | These come from the legacy trigger path. They are not accepted coverage evidence; use the qualified WAL path or stop/re-anchor before trusting legacy history. |
 | UNLOGGED table skipped in WAL mode | UNLOGGED targets are outside the first-release contract in either capture mode. Use an ordinary LOGGED table; switching to trigger does not make the topology supported. |
 | Restore missing rows after `max_row_size` trim | The table used legacy trigger capture; that path is outside correctness claims. Qualified WAL capture does not use this size-skip GUC. |
-| Retention window expired/error | Legacy age-based retention is not the adopted contract. Do not add automatic checkpoints; generation-aware retention must preserve a complete boundary/replay chain or block cleanup. |
+| Retention window expired/error | Prefer `flashback_health()` and generation state over legacy age fields. Generation-aware local retention preserves a complete boundary/replay chain or blocks cleanup; do not add automatic checkpoints. |
 | Dependent view ACLs not restored | ACL grants on views cannot be restored automatically; a NOTICE lists affected views. Re-grant manually after restore. |
 | Test mutex conflict | Run `rm -rf target/test-pgdata` before `cargo pgrx test`. |
 | Socket connection issues (pgrx dev) | Try: `psql -h ~/.pgrx -p 28817 postgres` |

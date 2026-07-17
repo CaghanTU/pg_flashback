@@ -11,9 +11,13 @@ It supersedes the policy candidates in
 remains the evidence record; [`COVERAGE_MODEL.md`](COVERAGE_MODEL.md) defines
 the technical model that must enforce this policy.
 
-The current runtime does not yet enforce every rule below. Until the release
-gates in this document and [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) pass, the
-project is not publishable as a correctness-guaranteed recovery system.
+The current runtime does not yet enforce every rule below. WAL-local capture,
+admission and generation-aware local retention are implemented for the
+qualified profile. Backup-profile generation anchoring, capacity preflight,
+helper artifact GC and capture/maintenance isolation remain open. Until every
+release gate in this document and [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md)
+passes, the project is not publishable as a correctness-guaranteed recovery
+system.
 
 ## Decision: A+
 
