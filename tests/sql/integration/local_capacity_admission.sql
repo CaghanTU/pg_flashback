@@ -61,6 +61,17 @@ BEGIN
     THEN
         RAISE EXCEPTION 'restore shadow projection missing rebuilt indexes';
     END IF;
+    -- Peak must include shadow + live retained until commit + successor base.
+    IF v_advice.projected_restore_peak_bytes
+           <> (
+               2 * (v_advice.live_heap_bytes + v_advice.live_toast_bytes + v_advice.live_index_bytes)
+               + (v_advice.live_heap_bytes + v_advice.live_toast_bytes)
+               + v_advice.configured_safety_reserve_bytes
+           )
+    THEN
+        RAISE EXCEPTION 'restore peak undercounts deferred DROP / coexistence: got %',
+            v_advice.projected_restore_peak_bytes;
+    END IF;
 
     -- Restore peak budget rejection.
     PERFORM set_config('pg_flashback.local_max_snapshot_bytes', '8GB', true);

@@ -16,7 +16,7 @@ RETURNS TABLE (
     safe_wal_size bigint
 )
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
@@ -117,7 +117,7 @@ RETURNS TABLE (
     reason text
 )
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
@@ -331,17 +331,34 @@ BEGIN
                 'tracking_id %s is unanchored after production swap; a new qualifying FULL backup is required',
                 rec.tracking_id
             );
+        ELSIF slot.safe_wal_size IS NOT NULL
+           AND slot.safe_wal_size <= v_lag_risk
+        THEN
+            -- safe_wal_size is remaining WAL budget before PostgreSQL may
+            -- invalidate the slot (NULL when max_slot_wal_keep_size is -1).
+            v_health := 'slot_at_risk';
+            v_action := 'drain_capture_or_reduce_wal_pressure';
+            v_reason := format(
+                'slot remaining safe_wal_size %s bytes is at or below at-risk budget %s',
+                slot.safe_wal_size, v_lag_risk
+            );
         ELSIF slot.retained_wal_bytes IS NOT NULL
-           AND (
-               (slot.safe_wal_size IS NOT NULL AND slot.retained_wal_bytes >= slot.safe_wal_size)
-               OR slot.retained_wal_bytes >= v_lag_risk
-           )
+           AND slot.retained_wal_bytes >= v_lag_risk
         THEN
             v_health := 'slot_at_risk';
             v_action := 'drain_capture_or_reduce_wal_pressure';
             v_reason := format(
-                'slot retained WAL %s bytes approaches safe_wal_size/at-risk budget',
-                slot.retained_wal_bytes
+                'slot retained WAL %s bytes meets or exceeds at-risk budget %s',
+                slot.retained_wal_bytes, v_lag_risk
+            );
+        ELSIF slot.safe_wal_size IS NOT NULL
+           AND slot.safe_wal_size <= v_lag_warn
+        THEN
+            v_health := 'slot_lag_warning';
+            v_action := 'inspect_capture_worker_and_slot_lag';
+            v_reason := format(
+                'slot remaining safe_wal_size %s bytes is at or below warning budget %s',
+                slot.safe_wal_size, v_lag_warn
             );
         ELSIF slot.retained_wal_bytes IS NOT NULL
            AND slot.retained_wal_bytes >= v_lag_warn

@@ -81,7 +81,8 @@ BEGIN
         RETURN false;
     END IF;
     -- Privileged roles only so the override cannot silently become an
-    -- unprivileged default path.
+    -- unprivileged default path. Non-privileged callers see override as
+    -- inactive (advise/health stay readable); admit still fail-closes on budgets.
     IF NOT (
         pg_catalog.pg_has_role(session_user, 'flashback_admin', 'MEMBER')
         OR EXISTS (
@@ -91,8 +92,7 @@ BEGIN
               AND rolsuper
         )
     ) THEN
-        RAISE EXCEPTION 'pg_flashback.local_capacity_override requires flashback_admin or superuser'
-            USING ERRCODE = 'insufficient_privilege';
+        RETURN false;
     END IF;
     RETURN true;
 END;
@@ -233,8 +233,15 @@ BEGIN
     assumed_copy_mib_per_sec := v_mib_per_sec;
     projected_track_bytes := (v_heap + v_toast) + v_reserve;
     projected_reanchor_bytes := (v_heap + v_toast) + v_reserve;
+    -- Restore peak must budget the shadow (heap+TOAST+indexes), the live
+    -- relation retained until commit (DROP is deferred), the successor base
+    -- CTAS (heap+TOAST), and the configured safety reserve. See STORAGE_POLICY.
     projected_restore_peak_bytes :=
-        (v_heap + v_toast + v_index) + (v_heap + v_toast) + v_reserve;
+        (v_heap + v_toast + v_index)
+        + (v_heap + v_toast + v_index)
+        + (v_heap + v_toast)
+        + v_reserve;
+    -- CTAS duration estimate for one heap+TOAST copy (track/re-anchor).
     estimated_copy_ms := CEIL(
         ((v_heap + v_toast)::numeric * 1000.0)
         / (v_mib_per_sec::numeric * 1048576.0)
@@ -320,6 +327,15 @@ BEGIN
             v_reasons := v_reasons || ARRAY[format(
                 'projected restore peak %s bytes exceeds local_max_restore_peak_bytes=%s',
                 m.projected_restore_peak_bytes, v_budget
+            )];
+        END IF;
+        -- ACCESS EXCLUSIVE hold covers shadow heap/TOAST copy plus successor
+        -- base CTAS (about two heap+TOAST copies). lock_timeout only bounds
+        -- wait-to-acquire; this compares estimated hold duration to the stall budget.
+        IF (2 * m.estimated_copy_ms) > m.configured_write_stall_ms THEN
+            v_reasons := v_reasons || ARRAY[format(
+                'estimated restore hold %s ms exceeds local_boundary_write_stall_ms=%s',
+                (2 * m.estimated_copy_ms), m.configured_write_stall_ms
             )];
         END IF;
     END IF;
@@ -434,6 +450,7 @@ BEGIN
             < (GREATEST(m.projected_track_bytes, m.projected_restore_peak_bytes)
                + m.configured_min_filesystem_bytes)
        OR m.estimated_copy_ms > m.configured_write_stall_ms
+       OR (2 * m.estimated_copy_ms) > m.configured_write_stall_ms
     THEN
         v_rec := 'reject local profile; use backup profile or raise configured budgets';
     ELSE
