@@ -1013,7 +1013,7 @@ done
 assert_eq "eski stream missing-slot ile kırıldı" "replication_slot_missing" \
     "$(q "SELECT invalidation_reason FROM flashback.capture_streams
            WHERE stream_id=$OLD_STREAM_ID")"
-assert_eq "health slot kaybını degraded gösteriyor" "degraded" \
+assert_eq "health slot kaybını slot_lost gösteriyor" "slot_lost" \
     "$(q "SELECT health FROM flashback_health()
            WHERE table_name='public.orders'")"
 assert_eq "kırık stream'in kanıtlanmış eski hedefi hâlâ okunabilir" "1" \
@@ -1125,7 +1125,7 @@ assert_eq "harici confirmed_flush ilerlemesi stream'i kırdı" \
     "replication_slot_advanced_externally" \
     "$(q "SELECT invalidation_reason FROM flashback.capture_streams
            WHERE stream_id=$EXTERNAL_OLD_STREAM")"
-assert_eq "harici ilerleme sonrası health degraded" "degraded" \
+assert_eq "harici ilerleme sonrası health reanchor_recommended" "reanchor_recommended" \
     "$(q "SELECT health FROM flashback_health()
            WHERE table_name='public.orders'")"
 

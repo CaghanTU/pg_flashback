@@ -186,11 +186,11 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM flashback_health()
         WHERE tracking_id = v_tracking_id
-          AND health = 'degraded'
+          AND health = 'slot_lost'
           AND open_gap_count = 1
           AND reason = 'adversarial_slot_loss'
     ) THEN
-        RAISE EXCEPTION 'broken stream was not visible as degraded health';
+        RAISE EXCEPTION 'broken stream was not visible as slot_lost health';
     END IF;
 
     -- An independent permanent gap inside the frozen prefix must override the

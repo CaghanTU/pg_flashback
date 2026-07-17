@@ -33,6 +33,17 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/health_runtime.sql",
+    name = "flashback_health_runtime",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_api_track_capture",
+        "flashback_coverage_runtime",
+        "flashback_local_capacity"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
     name = "flashback_retention_runtime",
     requires = [

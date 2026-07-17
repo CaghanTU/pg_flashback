@@ -48,6 +48,12 @@ static LOCAL_BOUNDARY_WRITE_STALL_MS_GUC: GucSetting<i32> = GucSetting::<i32>::n
 static LOCAL_ASSUMED_COPY_MIB_PER_SEC_GUC: GucSetting<i32> = GucSetting::<i32>::new(32);
 /// Privileged override that admits local capacity failures; never a silent default.
 static LOCAL_CAPACITY_OVERRIDE_GUC: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Slot retained-WAL warning threshold for health projection.
+static SLOT_LAG_WARNING_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Slot retained-WAL at-risk threshold for health projection.
+static SLOT_LAG_AT_RISK_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 /// Root-owned/shared secret used to authenticate repository-derived proofs.
 static PROOF_HMAC_KEY_FILE_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
@@ -283,6 +289,24 @@ pub fn register_worker_and_guc() {
         c"Privileged override that admits local capacity/write-stall failures",
         c"Must be set explicitly by a privileged role. Visible in flashback_advise()/health and logged; never a silent default.",
         &LOCAL_CAPACITY_OVERRIDE_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.slot_lag_warning_bytes",
+        c"Slot retained-WAL warning threshold for flashback_health()",
+        c"Accepted by pg_size_bytes(). Default when unset: 256MB. Health becomes slot_lag_warning before slot loss.",
+        &SLOT_LAG_WARNING_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.slot_lag_at_risk_bytes",
+        c"Slot retained-WAL at-risk threshold for flashback_health()",
+        c"Accepted by pg_size_bytes(). Default when unset: 1GB. Also compared with safe_wal_size when PostgreSQL provides it.",
+        &SLOT_LAG_AT_RISK_BYTES_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );

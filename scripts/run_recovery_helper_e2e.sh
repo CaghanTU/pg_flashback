@@ -773,7 +773,7 @@ mv "$ANCHOR_MANIFEST.audit-missing" "$ANCHOR_MANIFEST"
 [[ "$(jq -r '.status' "$MISSING_AUDIT_JSON")" == "degraded" ]]
 [[ "$(jq '[.findings[] | select(.status == "frozen")] | length' "$MISSING_AUDIT_JSON")" -ge 1 ]]
 [[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
-    -c "SELECT count(*) > 0 FROM flashback_health() WHERE health = 'degraded' AND reason LIKE '%repository proof%';")" == "t" ]]
+    -c "SELECT count(*) > 0 FROM flashback_health() WHERE health = 'repository_anchor_missing' AND reason LIKE '%repository proof%';")" == "t" ]]
 pass "externally removed anchor is detected, durably frozen and surfaced by health"
 
 # Prove the database-side lease closes the expire/admission race. This uses a

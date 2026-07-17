@@ -334,6 +334,10 @@ mod tests {
         it_local_capacity_admission,
         "../tests/sql/integration/local_capacity_admission.sql"
     );
+    sql_test!(
+        it_slot_health_actions,
+        "../tests/sql/integration/slot_health_actions.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

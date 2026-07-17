@@ -262,7 +262,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM flashback_health()
         WHERE tracking_id = v_tracking_id
-          AND health = 'degraded'
+          AND health = 'timeline_mismatch'
           AND reason LIKE '%timeline%'
     ) THEN
         RAISE EXCEPTION 'health must surface timeline freeze';

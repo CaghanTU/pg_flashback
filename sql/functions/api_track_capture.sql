@@ -1212,6 +1212,7 @@ DECLARE
     v_empty_min_advance_bytes constant bigint := 65536;
     v_discarded integer;
     pending record;
+    v_gap_inserted integer;
     lock_rec record;
 BEGIN
     IF to_regclass('flashback.delta_log') IS NULL THEN
@@ -1678,6 +1679,25 @@ BEGIN
                       AND g.reason = 'post_restore_unanchored'
                       AND g.reanchored_by_generation_id IS NULL
                 );
+                GET DIAGNOSTICS v_gap_inserted = ROW_COUNT;
+                IF v_gap_inserted > 0 THEN
+                    RAISE WARNING
+                        'pg_flashback: tracking_id % requires action backup_reanchor_required after production swap; take a new qualifying FULL backup',
+                        pending.tracking_id;
+                    -- Transactional NOTIFY: delivered only if this consume
+                    -- transaction commits. Health metadata remains authoritative
+                    -- if the notification is lost.
+                    PERFORM pg_notify(
+                        'pg_flashback_action_required',
+                        jsonb_build_object(
+                            'tracking_id', pending.tracking_id,
+                            'generation_id', pending.generation_id,
+                            'action', 'backup_reanchor_required',
+                            'reason', 'post_restore_unanchored',
+                            'marker_lsn', pending.commit_lsn
+                        )::text
+                    );
+                END IF;
             ELSE
                 -- Keep boundary_lsn NULL until activate binds the FULL stop LSN.
                 UPDATE flashback.coverage_generations
