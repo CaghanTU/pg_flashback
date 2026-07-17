@@ -1,6 +1,12 @@
 [graph]
 all-features = true
 
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained transitive build/test dependency of pgrx; upstream offers no safe compatible upgrade" },
+    { id = "RUSTSEC-2021-0127", reason = "serde_cbor is an unmaintained transitive dependency of pgrx; it is not selected by pg_flashback application code and upstream offers no safe compatible upgrade" },
+]
+
 [licenses]
 confidence-threshold = 0.8
 unused-allowed-license = "allow"
