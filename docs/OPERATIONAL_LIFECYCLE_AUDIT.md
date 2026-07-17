@@ -308,6 +308,7 @@ generation retirement is durable, pinned and resumable. RB-08/RB-09 local
 capacity and write-stall admission are implemented and fail-closed. RB-10
 helper artifact lifecycle and RB-11 worker isolation are implemented in code;
 exact-RC soak and clean-host packaged-artifact qualification remain
-whole-project release gates. Backup-profile coverage anchoring is implemented
-for the FULL-after-marker contract; retained pre-marker FULL + continuous WAL
-reuse is PoC-only (see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)).
+whole-project release gates. Backup-profile coverage anchoring supports both
+fresh FULL-after-marker and retained FULL + continuous WAL activation
+(see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)). Differential /
+incremental chains remain out of scope.

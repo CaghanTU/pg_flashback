@@ -67,9 +67,10 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
       `scripts/run_local_capacity_e2e.sh`.
 - [ ] Slot/coverage health action E2E passes (integration
       `slot_health_actions` / WAL E2E health assertions).
-- [ ] Retained FULL + continuous WAL PoC is recorded as PoC-only evidence:
-      `scripts/run_retained_full_wal_poc.sh` (does not change the supported
-      FULL-after-marker contract).
+- [ ] Retained FULL + continuous WAL production path is exercised:
+      `scripts/run_retained_full_wal_poc.sh` and
+      `scripts/run_retained_full_adversarial_e2e.sh` (one FULL + continuous WAL;
+      no differential/incremental chains).
 - [ ] Record the exact suite/check counts in the qualification artifact for
       this commit; do not hard-code suite sizes in this checklist.
 

@@ -15,8 +15,12 @@ timestamp resolution, LSN restore/query/recovery, stream breaks and re-anchor.
 Legacy trigger/timestamp paths remain separate. Generation-aware cleanup is
 wired for qualified local generations. Backup-profile anchoring, authenticated
 proof activation, frontier attestation and post-swap re-anchor are covered by
-the real-repository helper E2E; retained pre-marker FULL + WAL reuse remains
-PoC-only (see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)).
+the real-repository helper E2E. Retained pre-marker FULL + continuous WAL
+activation is production-wired through `verify-anchor` (prefer fresh FULL after
+the marker when present; otherwise activate an eligible retained FULL with
+verified contiguous WAL through the marker). Differential/incremental chains
+remain unsupported. See [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)
+and `scripts/run_retained_full_adversarial_e2e.sh`.
 
 ## Why the legacy model is insufficient
 
@@ -387,20 +391,31 @@ Backup tracking starts without an eligible generation:
 
 1. Under the bootstrap and stable tracking locks, create the tracking identity,
    schema/DDL metadata, a `building` backup generation and a LOGGED transition
-   marker in the tracking transaction. Do not bind an existing backup.
+   marker in the tracking transaction. Do not bind a caller-supplied backup.
 2. After commit, resolve and persist the marker's real commit coordinate. Until
    that succeeds, health is `unanchored` and target admission finds zero active
    generations.
-3. Start a new full pgBackRest backup only after the resolved marker commit.
-   Its start LSN must be strictly later than the marker; a full
-   already in progress or completed before tracking is ineligible.
-4. Under the repository lock, verify the completed full backup and required
-   WAL evidence, then activate the generation at its stop boundary and
-   initialize the physical `valid_through_lsn` to that same anchor.
+3. Discover repository-derived eligible physical anchors (never forge them from
+   caller input):
+   - Prefer a completed FULL whose start LSN is strictly after the marker when
+     one already exists (shortest replay).
+   - Otherwise select a retained FULL with `backup_stop_lsn <= marker` plus
+     contiguous archived WAL through the marker (and later the verified
+     frontier). Overlapping backups (`start <= marker < stop`) are ineligible.
+   - If none are eligible, fail closed with an actionable health/action. Do not
+     silently start a cluster-sized FULL; operators may take an explicit fresh
+     FULL and retry `verify-anchor`.
+4. Under the repository lock, verify the selected FULL (system identifier,
+   timeline/history, immutable label/manifest digest) and required WAL
+   evidence, pin the FULL + WAL dependency set, then activate the generation.
+   Fresh activation uses the backup stop as boundary/`valid_through`. Retained
+   activation uses the tracking marker as boundary and the verified WAL
+   frontier as initial `valid_through`.
 
-The interval before the verified stop anchor is not advertised as tracked
-coverage. Marker resolution and backup verification are idempotent; neither
-may invent an in-transaction LSN or silently choose an overlapping backup.
+The interval before the verified coverage lower bound is not advertised as
+tracked coverage. Marker resolution and backup verification are idempotent;
+neither may invent an in-transaction LSN or silently choose an overlapping
+backup.
 
 ## Maintenance and retention
 
@@ -680,9 +695,10 @@ legacy coverage LSN columns as authoritative when that runtime phase lands.
   frontier advancement under repository lock, and permanent rejection of
   `[swap commit, backup stop)`;
 - initial backup tracking with a durable resolved marker, zero active
-  generations before anchoring, rejection of pre-existing/overlapping backups,
-  and activation only by a new full whose start LSN is strictly after
-  that marker;
+  generations before anchoring, rejection of overlapping backups, activation
+  by an eligible retained FULL with continuous WAL through the marker or by a
+  fresh FULL whose start LSN is strictly after that marker (never an automatic
+  surprise FULL);
 - backup post-swap resolution sealing the predecessor, preserving zero active
   generations while the gap is open, and refusing fallback to the predecessor;
 - trusted DDL pending metadata promoted only with its real COMMIT record, plus
