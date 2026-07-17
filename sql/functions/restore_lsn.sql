@@ -71,30 +71,36 @@ BEGIN
 END;
 $$;
 
--- Drain every already-committed WAL record for relations that are about to be
--- physically swapped. Logical decoding cannot reconstruct a relation after
--- its old pg_class row is dropped, so a restore must prove this queue empty
--- while ACCESS EXCLUSIVE prevents new writes to those exact OIDs.
-CREATE OR REPLACE FUNCTION flashback_drain_relation_wal(
+-- Prove that no committed logical change for the relations being swapped is
+-- still waiting in the slot. Slot advancement is transactional: repeatedly
+-- calling get_changes() inside the restore transaction can return the same
+-- prefix until that outer transaction commits. The restore path must therefore
+-- never attempt to drain here. It takes ACCESS EXCLUSIVE first, fixes one WAL
+-- barrier, and either proves the bounded prefix empty or aborts without
+-- changing the relation so the normal worker can catch up in another
+-- transaction and the caller can retry.
+CREATE OR REPLACE FUNCTION flashback_assert_relation_wal_drained(
     p_rel_oids oid[],
-    p_max_batches integer DEFAULT 1000
+    p_max_scan_bytes bigint DEFAULT 16777216
 )
-RETURNS bigint
+RETURNS pg_lsn
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_oid_list text;
+    v_slot_name text;
+    v_confirmed_flush_lsn pg_lsn;
+    v_barrier_lsn pg_lsn;
+    v_scan_bytes numeric;
     v_has_output boolean;
-    v_batches integer := 0;
-    v_events bigint := 0;
 BEGIN
     IF p_rel_oids IS NULL OR array_length(p_rel_oids, 1) IS NULL THEN
-        RAISE EXCEPTION 'flashback_drain_relation_wal: relation OID list is empty';
+        RAISE EXCEPTION 'flashback_assert_relation_wal_drained: relation OID list is empty';
     END IF;
-    IF p_max_batches < 1 THEN
-        RAISE EXCEPTION 'flashback_drain_relation_wal: max batches must be positive';
+    IF p_max_scan_bytes < 1 THEN
+        RAISE EXCEPTION 'flashback_assert_relation_wal_drained: max scan bytes must be positive';
     END IF;
 
     SELECT string_agg(DISTINCT rel_oid::text, ',' ORDER BY rel_oid::text)
@@ -102,31 +108,52 @@ BEGIN
     FROM unnest(p_rel_oids) AS ids(rel_oid)
     WHERE rel_oid IS NOT NULL;
     IF v_oid_list IS NULL THEN
-        RAISE EXCEPTION 'flashback_drain_relation_wal: relation OID list contains no usable OID';
+        RAISE EXCEPTION 'flashback_assert_relation_wal_drained: relation OID list contains no usable OID';
     END IF;
 
-    LOOP
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_logical_slot_peek_changes(
-                flashback_effective_slot_name(), NULL, 50000,
-                'tracked_oids', v_oid_list
-            ) AS ch(lsn, xid, data)
-            WHERE ch.data LIKE '{%'
-        ) INTO v_has_output;
-        EXIT WHEN NOT v_has_output;
+    v_slot_name := flashback_effective_slot_name();
+    SELECT confirmed_flush_lsn
+      INTO v_confirmed_flush_lsn
+    FROM pg_replication_slots
+    WHERE slot_name = v_slot_name
+      AND database = current_database();
+    IF v_confirmed_flush_lsn IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: logical slot % is unavailable during restore', v_slot_name
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
 
-        IF v_batches >= p_max_batches THEN
-            RAISE EXCEPTION 'pg_flashback: WAL backlog for relation OIDs % did not drain after % batches',
-                v_oid_list, p_max_batches
-                USING HINT = 'Reduce concurrent WAL pressure, verify logical-slot health, and retry the restore.';
-        END IF;
+    -- ACCESS EXCLUSIVE was acquired by the caller before this point, so every
+    -- writer that could have touched these OIDs has committed or aborted. This
+    -- insert position is therefore a stable upper bound for relation changes.
+    v_barrier_lsn := pg_current_wal_insert_lsn();
+    v_scan_bytes := GREATEST(
+        pg_wal_lsn_diff(v_barrier_lsn, v_confirmed_flush_lsn),
+        0
+    );
+    IF v_scan_bytes > p_max_scan_bytes THEN
+        RAISE EXCEPTION 'pg_flashback: logical slot is % bytes behind the locked restore barrier',
+            v_scan_bytes
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'Let the WAL worker catch up, then retry the restore. No table changes were made.';
+    END IF;
 
-        v_events := v_events + flashback_consume_wal(50000);
-        v_batches := v_batches + 1;
-    END LOOP;
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_logical_slot_peek_changes(
+            v_slot_name, v_barrier_lsn, 1,
+            'tracked_oids', v_oid_list
+        ) AS ch(lsn, xid, data)
+        WHERE ch.data LIKE '{%'
+    ) INTO v_has_output;
 
-    RETURN v_events;
+    IF v_has_output THEN
+        RAISE EXCEPTION 'pg_flashback: committed WAL for relation OIDs % is still pending at restore barrier %',
+            v_oid_list, v_barrier_lsn
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'Let the WAL worker consume the backlog, then retry the restore. No table changes were made.';
+    END IF;
+
+    RETURN v_barrier_lsn;
 END;
 $$;
 
@@ -486,12 +513,11 @@ BEGIN
         format('%I.%I', admission.schema_name, admission.table_name)::regclass
     );
 
-    -- Freeze the old physical relation before draining its logical backlog.
-    -- ensure_active_wal_stream() already owns the database-stream key, so the
-    -- background worker cannot race this preflight.
+    -- Freeze the old physical relation, then prove its bounded logical prefix
+    -- empty without trying to advance the slot in this transaction.
     EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
                    admission.schema_name, admission.table_name);
-    PERFORM flashback_drain_relation_wal(ARRAY[admission.rel_oid]);
+    PERFORM flashback_assert_relation_wal_drained(ARRAY[admission.rel_oid]);
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 

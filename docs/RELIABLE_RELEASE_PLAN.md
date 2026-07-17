@@ -41,7 +41,8 @@ The current `large-db-poc` baseline already contains:
 - slot-loss, replacement, external-advance and capture-configuration
   invalidation;
 - exact local base construction under the final relation lock;
-- local restore pre-drain, shadow swap and pending successor activation;
+- local restore bounded pre-swap drain proof with retry, shadow swap and
+  pending successor activation;
 - common lifecycle locking across restore, retention, re-anchor and untrack;
 - hardened runtime payload ownership and API-only delegated administration;
 - PostgreSQL 15–18 regression coverage;

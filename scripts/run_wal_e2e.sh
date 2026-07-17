@@ -63,6 +63,7 @@ RETENTION_BEGIN_PID=""
 RETENTION_BLOCKER_PID=""
 RETENTION_RESUME_PID=""
 STOPPED_WORKER_PID=""
+CONSUME_LOCK_PID=""
 
 q()  { $PSQL -d "$DB" -qAtc "$1"; }
 qp() { $PSQL -d postgres -qAtc "$1"; }
@@ -119,6 +120,7 @@ cleanup() {
     fi
     set +e
     [[ -n "$STOPPED_WORKER_PID" ]] && kill -CONT "$STOPPED_WORKER_PID" > /dev/null 2>&1
+    [[ -n "$CONSUME_LOCK_PID" ]] && kill "$CONSUME_LOCK_PID" > /dev/null 2>&1
     [[ -n "$RETENTION_RESUME_PID" ]] && kill "$RETENTION_RESUME_PID" > /dev/null 2>&1
     [[ -n "$RETENTION_BLOCKER_PID" ]] && kill "$RETENTION_BLOCKER_PID" > /dev/null 2>&1
     [[ -n "$RETENTION_BEGIN_PID" ]] && kill "$RETENTION_BEGIN_PID" > /dev/null 2>&1
@@ -156,6 +158,7 @@ cleanup() {
     rm -f /tmp/pg_flashback_track_race_1.out \
         /tmp/pg_flashback_track_race_2.out \
         /tmp/pg_flashback_boundary_writer.out \
+        /tmp/pg_flashback_consume_lock.out \
         /tmp/pg_flashback_slot_loss_lock.out \
         /tmp/pg_flashback_retention_pause.out \
         /tmp/pg_flashback_retention_pin.out \
@@ -336,6 +339,27 @@ assert_eq "building generation kalmadı" "0" \
 
 echo "━━━ 1a. Filtered WAL prefix slot'u bounded sürede ilerletiyor ━━━"
 SLOT_NAME="pg_flashback_${DB}"
+# A backup generation legitimately remains building after its tracking marker
+# is resolved while the controller waits for a later FULL backup.  That wait
+# must not pin unrelated filtered WAL in the database-wide logical slot.
+q "CREATE TABLE backup_wait(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null
+q "SELECT flashback_track_backup('backup_wait', 'wal_e2e_profile')" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.coverage_generations cg
+               JOIN flashback.tracked_tables tt USING (tracking_id)
+               WHERE tt.table_name='backup_wait'
+                 AND cg.state='building'
+                 AND cg.state_reason='marker_commit_observed'
+                 AND cg.details ? 'tracking_marker_lsn'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "backup FULL beklerken marker COMMIT LSN çözüldü" "1" \
+    "$(q "SELECT count(*) FROM flashback.coverage_generations cg
+           JOIN flashback.tracked_tables tt USING (tracking_id)
+           WHERE tt.table_name='backup_wait'
+             AND cg.state='building'
+             AND cg.state_reason='marker_commit_observed'
+             AND cg.details ? 'tracking_marker_lsn'")"
 FILTERED_DELTA_BEFORE=$(q "SELECT count(*) FROM flashback.delta_log")
 FILTERED_START_FLUSH=$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
                            WHERE slot_name='$SLOT_NAME'")
@@ -365,6 +389,10 @@ assert_eq "yalnız filtered WAL sonrası confirmed_flush sabit hedefe ulaştı" 
            FROM pg_replication_slots WHERE slot_name='$SLOT_NAME'")"
 assert_eq "empty-prefix consume delta_log satırı üretmedi" "$FILTERED_DELTA_BEFORE" \
     "$(q "SELECT count(*) FROM flashback.delta_log")"
+assert_eq "building backup generation filtered WAL ilerlemesini engellemedi" "building" \
+    "$(q "SELECT cg.state FROM flashback.coverage_generations cg
+           JOIN flashback.tracked_tables tt USING (tracking_id)
+           WHERE tt.table_name='backup_wait'")"
 echo "  ok: filtered_bytes=$FILTERED_GENERATED_BYTES target=$FILTERED_TARGET_LSN confirmed=$FILTERED_CONFIRMED"
 
 q "INSERT INTO filtered_relevant VALUES (1, 'after-filtered-prefix')" > /dev/null
@@ -418,6 +446,60 @@ for _ in $(seq 1 20); do
     sleep 0.5
 done
 assert_eq "worker bu veritabanına bağlı" "$DB" "$WORKER_DB"
+
+echo "━━━ 1b. Lifecycle lock çakışması slot ilerlemesini rollback ediyor ━━━"
+q "CREATE TABLE consume_lock_probe(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null
+q "SELECT flashback_track('consume_lock_probe')" > /dev/null
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT health FROM flashback_health()
+               WHERE table_name='public.consume_lock_probe'")" == "healthy" ]] && break
+    sleep 0.1
+done
+CONSUME_LOCK_TRACKING_ID=$(q "SELECT tracking_id FROM flashback.tracked_tables
+                               WHERE table_name='consume_lock_probe' AND is_active")
+PGAPPNAME=pgfb_consume_rollback $PSQL -d "$DB" -qAt \
+    > /tmp/pg_flashback_consume_lock.out 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(358944::integer, hashint8($CONSUME_LOCK_TRACKING_ID));
+SELECT pg_sleep(5);
+COMMIT;
+SQL
+CONSUME_LOCK_PID=$!
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM pg_locks l
+               JOIN pg_stat_activity a USING (pid)
+               WHERE a.application_name='pgfb_consume_rollback'
+                 AND l.locktype='advisory' AND l.classid=358944
+                 AND l.granted")" == "1" ]] && break
+    sleep 0.05
+done
+assert_eq "test lifecycle lock'u tutuluyor" "1" \
+    "$(q "SELECT count(*) FROM pg_locks l
+           JOIN pg_stat_activity a USING (pid)
+           WHERE a.application_name='pgfb_consume_rollback'
+             AND l.locktype='advisory' AND l.classid=358944
+             AND l.granted")"
+CONSUME_LOCK_XID=$(q "INSERT INTO consume_lock_probe VALUES (1, 'must-retry');
+                       SELECT txid_current()::text")
+CONSUME_LOCK_TARGET=$(q "SELECT pg_current_wal_flush_lsn()")
+sleep 1
+assert_eq "busy lifecycle sırasında decoded olay commit edilmedi" "0" \
+    "$(q "SELECT count(*) FROM flashback.delta_log
+           WHERE source_xid=$CONSUME_LOCK_XID")"
+assert_eq "busy lifecycle sırasında slot hedef commit'i geçmedi" "t" \
+    "$(q "SELECT confirmed_flush_lsn < '$CONSUME_LOCK_TARGET'::pg_lsn
+           FROM pg_replication_slots WHERE slot_name='$SLOT_NAME'")"
+wait "$CONSUME_LOCK_PID"
+CONSUME_LOCK_PID=""
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log
+               WHERE source_xid=$CONSUME_LOCK_XID")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "lock bırakılınca aynı olay kayıpsız retry edildi" "1" \
+    "$(q "SELECT count(*) FROM flashback.delta_log
+           WHERE source_xid=$CONSUME_LOCK_XID")"
+q "SELECT flashback_untrack('consume_lock_probe'); DROP TABLE consume_lock_probe" > /dev/null
 
 echo "━━━ 2. Commit edilen DML'in worker tarafından tüketilmesi ━━━"
 for _ in $(seq 1 100); do
@@ -557,12 +639,33 @@ BUFFERED_OLD_OID_XID=$(q "BEGIN;
     UPDATE orders SET amount=amount+7 WHERE id=1001;
     COMMIT")
 
+# Slot advancement cannot commit inside the restore transaction. With the
+# worker deliberately stopped, restore must fail without swapping either table
+# instead of looping over or discarding the same logical prefix.
+RESTORE_BLOCKED_RC=0
+$PSQL -d "$DB" -qc "SELECT flashback_restore_lsn(
+       ARRAY['orders', '\"we\"\"ird\"'], '$RESOLVED_LSN'
+   )" > /tmp/pg_flashback_restore_backlog.out 2>&1 || RESTORE_BLOCKED_RC=$?
+[[ "$RESTORE_BLOCKED_RC" != "0" ]] || {
+    echo "FAIL: restore buffered relation WAL varken fail-closed davranmadı"; exit 1; }
+grep -Eq "logical slot is .* behind|committed WAL .* is still pending" \
+    /tmp/pg_flashback_restore_backlog.out
+assert_eq "reddedilen restore canlı tabloyu değiştirmedi" "501" \
+    "$(q "SELECT count(*) FROM orders")"
+
+kill -CONT "$STOPPED_WORKER_PID"
+STOPPED_WORKER_PID=""
+for _ in $(seq 1 200); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")" == "1" ]] && break
+    sleep 0.05
+done
+assert_eq "worker retry öncesi buffered eski-OID WAL'ı tüketti" "1" \
+    "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")"
+
 q "SELECT flashback_restore_lsn(
        ARRAY['orders', '\"we\"\"ird\"'], '$RESOLVED_LSN'
    )" > /dev/null
 
-kill -CONT "$STOPPED_WORKER_PID"
-STOPPED_WORKER_PID=""
 assert_eq "restore sonrası satır sayısı" "1001" "$(q "SELECT count(*) FROM orders")"
 assert_eq "yeni_musteri kurtarıldı" "1" "$(q "SELECT count(*) FROM orders WHERE customer='yeni_musteri'")"
 assert_eq "güncellenmiş tutarlar korundu" "115.00" "$(q "SELECT max(amount) FROM orders WHERE id <= 10")"

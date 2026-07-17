@@ -51,9 +51,10 @@ The local profile is supported only after its coverage runtime gates pass:
   predecessor backlog drains through its upper coordinate
 - restore/query admission against immutable generation and persistent-gap
   metadata
-- restore takes the final target relation lock and drains its already-committed
-  logical WAL before replacing the relation OID; an unprovable or excessive
-  backlog aborts before the shadow swap
+- restore takes the final target relation lock and proves its bounded,
+  already-committed logical WAL prefix has drained before replacing the
+  relation OID; an unprovable, pending or excessive backlog aborts before the
+  shadow swap and must be retried after the normal worker catches up
 - two-phase post-restore finalization: the swap transaction creates the base,
   binds capture and writes a LOGGED pending marker; only post-commit resolution
   of the real commit time/COMMIT LSN may activate the successor
@@ -170,9 +171,12 @@ frozen generation.
    after commit. Backup restore remains unanchored until a new verified full
    backup stop anchor whose start LSN is strictly after that resolved
    commit.
-9. Before a local shadow swap can replace a relation OID, restore drains and
-   persists all already-committed WAL for the locked old relation. Historical
-   generation OIDs remain immutable; only the current relation binding changes.
+9. Before a local shadow swap can replace a relation OID, restore proves that
+   all already-committed WAL in its bounded locked-relation prefix has already
+   been persisted. Restore never advances the slot inside its own transaction;
+   it fails without table changes and is retried after worker catch-up when a
+   prefix remains. Historical generation OIDs remain immutable; only the
+   current relation binding changes.
 10. An initial or successor boundary whose stream breaks before activation is
    retained as an immutable `aborted` audit tombstone after its draft physical
    payload is removed. It can never be admitted as coverage.

@@ -67,7 +67,7 @@ write_result() {
   "run_id": "$RUN_ID",
 $(qualification_provenance_json "$finished_at"),
   "qualification_kind": "development_soak",
-  "config": {"worker_interval_ms": 25, "duration_seconds": $SOAK_SECONDS, "target_mib": $TARGET_MIB, "drain_timeout_seconds": ${DRAIN_TIMEOUT_SECONDS:-120}, "lag_slack_bytes": $LAG_NEAR_START_SLACK_BYTES},
+  "config": {"worker_interval_ms": 25, "duration_seconds": $SOAK_SECONDS, "target_mib": $TARGET_MIB, "drain_timeout_seconds": ${DRAIN_TIMEOUT_SECONDS:-600}, "lag_slack_bytes": $LAG_NEAR_START_SLACK_BYTES},
   "status": "$STATUS",
   "exit_code": $rc,
   "duration_seconds": $elapsed,
@@ -200,7 +200,11 @@ done
 # table-level capture correctness and global slot advancement through this
 # exact prefix, with remaining lag back inside the explicit baseline slack.
 FINAL_WAL_TARGET="$(q "SELECT pg_current_wal_flush_lsn();")"
-DRAIN_TIMEOUT_SECONDS="${PG_FLASHBACK_SOAK_DRAIN_TIMEOUT_SECONDS:-120}"
+# The default 2 GiB churn budget expands into substantially more logical JSON
+# because UPDATE records contain both full old and new rows.  Keep this a
+# bounded correctness gate, but give slower development hosts enough time to
+# prove exact counts and global-prefix catch-up instead of timing out midway.
+DRAIN_TIMEOUT_SECONDS="${PG_FLASHBACK_SOAK_DRAIN_TIMEOUT_SECONDS:-600}"
 LAG_NEAR_START_SLACK_BYTES="${PG_FLASHBACK_SOAK_LAG_NEAR_START_SLACK_BYTES:-1048576}"
 drain_started=$(date +%s)
 drain_deadline=$(( $(date +%s) + DRAIN_TIMEOUT_SECONDS ))

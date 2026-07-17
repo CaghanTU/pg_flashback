@@ -117,9 +117,10 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
 - [ ] Local swap rollback, crash after commit but before activation, duplicate
       resolver retry and DML committed during the pending window all preserve
       exactly-once activation and successor payload routing.
-- [ ] With the worker stopped, committed WAL for the old relation is drained
-      under the final relation lock before restore swaps the OID; the event is
-      owned by the sealed predecessor and historical OIDs are not rewritten.
+- [ ] With the worker stopped, committed WAL for the old relation makes restore
+      fail before any table change; after worker catch-up, retry proves the
+      bounded prefix empty and swaps the OID. The event is owned by the sealed
+      predecessor and historical OIDs are not rewritten.
 - [ ] A stream break during the very first `building` boundary removes its
       draft payload, leaves an immutable `aborted` tombstone, and permits only
       a new explicit re-anchor generation while the missing interval remains

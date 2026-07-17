@@ -68,7 +68,7 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 | `delta_log` | Generation/stream-bound JSONB event store, partitioned by `committed_at`; qualified events carry row-change and transaction COMMIT LSNs. |
 | Coverage generations | Exact locked base + one immutable WAL stream epoch + an inclusive complete-commit watermark. Slot discontinuity freezes the old frontier and opens a durable gap; `flashback_reanchor()` creates a new exact base. |
 | `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
-| `flashback_restore_lsn()` | Admits one COMMIT-LSN prefix, locks and drains committed WAL for the old relation, materializes it, swaps atomically, then leaves a successor base pending until its real commit record is consumed. |
+| `flashback_restore_lsn()` | Admits one COMMIT-LSN prefix, locks the old relation and proves its bounded logical prefix already drained, materializes it, swaps atomically, then leaves a successor base pending until its real commit record is consumed. A pending backlog causes a retryable failure before any table change. |
 | `flashback_query_lsn()` / `flashback_recover_deleted_lsn()` | Read or recover from the same admitted immutable generation without nearest-snapshot fallback. |
 | `flashback_restore_parallel()` | Restore with parallel query hints (`max_parallel_workers_per_gather`). Emits per‑partition guidance for partitioned tables. |
 | `flashback_query_lsn()` | Reconstructs one admitted COMMIT-LSN state in a temporary table; caller-side filtering remains SECURITY INVOKER. |
@@ -369,7 +369,7 @@ then establish a new exact boundary with `flashback_reanchor()`.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_restore_lsn(table, pg_lsn)` | `bigint` | Correctness-qualified single-table restore. Pins one generation, locks the live relation, drains its committed WAL, replays one contiguous COMMIT-LSN prefix and creates a pending post-restore successor base. |
+| `flashback_restore_lsn(table, pg_lsn)` | `bigint` | Correctness-qualified single-table restore. Pins one generation, locks the live relation, proves its bounded committed-WAL prefix already drained, replays one contiguous COMMIT-LSN prefix and creates a pending post-restore successor base. Retry after the worker catches up if the pre-swap proof fails. |
 | `flashback_restore_lsn(tables[], pg_lsn)` | `bigint` | Multi-table qualified restore. Acquires stable lifecycle locks in ID order, orders FK parents before children and rejects cycles. |
 | `flashback_resolve_target(table, timestamptz)` | `SETOF record` | Convenience planner returning one `resolved_lsn` only when the timestamp is a unique, complete WAL-prefix cut inside one pinned frontier. Collisions/inversions fail closed. |
 | `flashback_restore(table, timestamptz)` | `bigint` | Legacy compatibility API; explicitly rejects a correctness-qualified WAL lifecycle. Resolve the timestamp and call `flashback_restore_lsn()` instead. |
@@ -792,11 +792,13 @@ The atomic shadow swap (`DROP original → RENAME shadow`) requires an `AccessEx
 SET lock_timeout = '5s';
 SELECT flashback_restore_lsn('orders', '0/8F12340'::pg_lsn);
 ```
-After acquiring that lock, the qualified path drains already-committed logical
-WAL for the old relation before replacing its OID. A large relation-specific
-backlog therefore extends the write pause; if the bounded drain cannot prove
-completion, restore fails before the swap. Keep worker lag within the release
-SLO and inspect slot health before a production restore.
+After acquiring that lock, the qualified path fixes a bounded WAL barrier and
+proves that already-committed logical WAL for the old relation was consumed
+before replacing its OID. Slot advancement cannot be committed inside the
+restore transaction itself. A pending or excessive prefix therefore aborts
+before the swap, releases the lock and asks the caller to retry after the normal
+worker catches up. Keep worker lag within the release SLO and inspect slot
+health before a production restore.
 
 **4. `flashback_track()` on a large table is expensive**
 `flashback_track()` takes an immediate full-table snapshot. The current local

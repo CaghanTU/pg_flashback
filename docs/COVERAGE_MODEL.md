@@ -457,10 +457,12 @@ even if PostgreSQL reuses an OID or the schema/table name is identical.
 Restore pins a source generation before reading its base or deltas. Retention
 cannot retire that generation while the restore holds the coverage lock/pin.
 A qualified local restore then takes the target relation's final
-`ACCESS EXCLUSIVE` lock and synchronously drains every already-committed WAL
-change for that relation through the trusted decoder before materialization or
-shadow swap. If the relation backlog cannot be proven drained within the
-bounded guard, the restore fails closed and leaves the live relation intact.
+`ACCESS EXCLUSIVE` lock, fixes a bounded WAL barrier and proves every
+already-committed change for that relation was previously consumed through the
+trusted decoder before materialization or shadow swap. Logical-slot advancement
+cannot be committed from inside the restore transaction. If the bounded prefix
+is pending or cannot be proven drained, restore fails closed, leaves the live
+relation intact and is retried after the normal worker catches up.
 This prevents a committed change from becoming undecodable when the old
 relation is dropped and replaced with a new OID.
 

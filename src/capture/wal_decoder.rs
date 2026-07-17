@@ -21,6 +21,7 @@ static EMITTED_TRANSACTIONS: OnceLock<Mutex<HashSet<TransactionId>>> = OnceLock:
 
 struct DecoderState {
     tracked_relations: HashSet<u32>,
+    metadata_only: bool,
 }
 
 fn emitted_transactions() -> &'static Mutex<HashSet<TransactionId>> {
@@ -61,6 +62,7 @@ fn parse_tracked_oids(value: &str) -> HashSet<u32> {
 
 unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
     let mut tracked_relations = HashSet::new();
+    let mut metadata_only = false;
 
     if !options.is_null() {
         let options_ref = unsafe { &*options };
@@ -75,20 +77,24 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
                 let name = unsafe { CStr::from_ptr((*elem).defname) }
                     .to_str()
                     .unwrap_or("");
-                if name != "tracked_oids" {
+                let value_ptr = unsafe { pg_sys::defGetString(elem) };
+                if value_ptr.is_null() {
                     continue;
                 }
-
-                let value_ptr = unsafe { pg_sys::defGetString(elem) };
-                if !value_ptr.is_null() {
-                    let value = unsafe { CStr::from_ptr(value_ptr) }.to_str().unwrap_or("");
-                    tracked_relations.extend(parse_tracked_oids(value));
+                let value = unsafe { CStr::from_ptr(value_ptr) }.to_str().unwrap_or("");
+                match name {
+                    "tracked_oids" => tracked_relations.extend(parse_tracked_oids(value)),
+                    "metadata_only" => metadata_only = value == "true",
+                    _ => {}
                 }
             }
         }
     }
 
-    DecoderState { tracked_relations }
+    DecoderState {
+        tracked_relations,
+        metadata_only,
+    }
 }
 
 unsafe fn relation_is_tracked(ctx: *mut LogicalDecodingContext, oid: u32) -> bool {
@@ -98,6 +104,15 @@ unsafe fn relation_is_tracked(ctx: *mut LogicalDecodingContext, oid: u32) -> boo
 
     let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
     state.tracked_relations.contains(&oid)
+}
+
+unsafe fn metadata_only(ctx: *mut LogicalDecodingContext) -> bool {
+    if ctx.is_null() || unsafe { (*ctx).output_plugin_private }.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
+    state.metadata_only
 }
 
 // ─── Output Plugin Entry Point ──────────────────────────────────────
@@ -196,13 +211,15 @@ unsafe extern "C-unwind" fn fb_decode_change(
         .unwrap_or("unknown")
         .to_owned();
 
+    let metadata_only = unsafe { metadata_only(ctx) };
     let tupdesc = rel.rd_att;
     let reloid: pg_sys::Oid = rd_rel.oid;
     let tp = unsafe { change_ref.data.tp };
 
     // PG15/PG16: oldtuple/newtuple are *mut ReorderBufferTupleBuf; extract inner HeapTupleData.
     // PG17+: they are already HeapTuple (*mut HeapTupleData).
-    let old_json = if (op == "UPDATE" || op == "DELETE") && !tp.oldtuple.is_null() {
+    let old_json = if !metadata_only && (op == "UPDATE" || op == "DELETE") && !tp.oldtuple.is_null()
+    {
         #[cfg(any(feature = "pg15", feature = "pg16"))]
         let ht: HeapTuple = unsafe { &raw mut (*tp.oldtuple).tuple };
         #[cfg(not(any(feature = "pg15", feature = "pg16")))]
@@ -212,7 +229,8 @@ unsafe extern "C-unwind" fn fb_decode_change(
         None
     };
 
-    let new_json = if (op == "INSERT" || op == "UPDATE") && !tp.newtuple.is_null() {
+    let new_json = if !metadata_only && (op == "INSERT" || op == "UPDATE") && !tp.newtuple.is_null()
+    {
         #[cfg(any(feature = "pg15", feature = "pg16"))]
         let ht: HeapTuple = unsafe { &raw mut (*tp.newtuple).tuple };
         #[cfg(not(any(feature = "pg15", feature = "pg16")))]

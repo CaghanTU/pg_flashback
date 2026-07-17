@@ -83,8 +83,10 @@ local checkpoints remain research, not a first-release promise.
    tracking lock happen without an unlocked interval, and the relation OID is
    then locked/revalidated. Metadata is reread after locking. Multi-table
    operations acquire all stable tracking locks in ascending ID order.
-   A qualified local restore also takes the final relation lock and drains all
-   already-committed WAL for the old relation before its OID can be replaced.
+   A qualified local restore also takes the final relation lock and proves that
+   the bounded, already-committed WAL prefix for the old relation has already
+   drained before its OID can be replaced. A pending prefix aborts the restore
+   without table changes; the normal worker drains it and the caller retries.
    Historical payload keeps its boundary OID; only the current binding moves.
 3. A continuous local handoff activates the new generation and seals its
    predecessor atomically. The backup post-restore transition is the explicit
