@@ -6,7 +6,12 @@
   "adversarial_result": "20260717T164603Z-364161.json",
   "poc_result": "20260717T164623Z-364710.json",
   "dev_soak_60s": "dev-soak-20260717T165109Z-383079.json",
-  "pgrx_matrix": {"pg15": "skipped_no_pg_config", "pg16": "75_passed", "pg17": "75_passed", "pg18": "75_passed"},
+  "pgrx_matrix": {
+    "pg15": "skipped_no_pg_config",
+    "pg16": "75_passed",
+    "pg17": "75_passed",
+    "pg18": "75_passed"
+  },
   "e2e": {
     "run_retained_full_adversarial_e2e": "passed",
     "run_retained_full_wal_poc": "passed_14",
@@ -19,9 +24,17 @@
     "run_capture_maintenance_isolation_slo": "passed",
     "run_dev_soak_60s": "passed"
   },
-  "known_transitive_advisories": ["RUSTSEC-2024-0436 paste (pgrx)", "RUSTSEC-2021-0127 serde_cbor (pgrx)"],
+  "known_transitive_advisories": [
+    "RUSTSEC-2024-0436 paste (pgrx)",
+    "RUSTSEC-2021-0127 serde_cbor (pgrx)"
+  ],
   "shellcheck": "not_installed",
   "clean_host_smoke": "not_run",
   "exact_rc_24h_soak": "not_run",
-  "unsupported": ["differential_incremental_chains", "non_pgbackrest_providers", "pg15_on_this_host"]
+  "unsupported": [
+    "differential_incremental_chains",
+    "non_pgbackrest_providers",
+    "pg15_on_this_host"
+  ],
+  "tested_commit": "bdd2be07c2142d02c307bb3259d2c0ffeb67ba1a"
 }
