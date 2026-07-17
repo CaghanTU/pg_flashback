@@ -659,12 +659,14 @@ import/swap:
 ./scripts/run_recovery_helper_e2e.sh
 ```
 
-A bounded PoC compares FULL-after-marker activation with recovery from an older
-retained FULL plus contiguous WAL (including through a production shadow-swap).
-It does **not** change the supported v0.1 activation contract:
+Tracking can activate an eligible retained FULL completed before the marker
+when continuous archived WAL covers through the marker; otherwise an existing
+fresh FULL after the marker is preferred. Neither path auto-starts a
+cluster-sized backup:
 
 ```bash
 ./scripts/run_retained_full_wal_poc.sh
+./scripts/run_retained_full_adversarial_e2e.sh
 ```
 
 See [`docs/RETAINED_FULL_WAL_POC.md`](docs/RETAINED_FULL_WAL_POC.md).

@@ -65,10 +65,11 @@ Current implementation status on `work/v0.1.0-overnight`:
    `pg_flashback_action_required` NOTIFY) is implemented;
 4. the recovery helper exposes an internal, unstable physical-recovery
    provider seam; pgBackRest remains the only qualified provider;
-5. a bounded real-repository PoC proves retained pre-marker FULL + contiguous
-   WAL recovery (including through shadow-swap) without changing the
-   production FULL-after-marker activation contract — see
-   `docs/RETAINED_FULL_WAL_POC.md`;
+5. retained pre-marker FULL + contiguous WAL activation is production-wired
+   through `verify-anchor` (prefer existing fresh FULL after the marker;
+   otherwise activate an eligible retained FULL with continuous WAL; never
+   auto-start a cluster-sized FULL) — see `docs/RETAINED_FULL_WAL_POC.md` and
+   `scripts/run_retained_full_adversarial_e2e.sh`;
 6. capture and bounded maintenance run in separate per-database workers; the
    exact-commit qualification harness enforces the stated p95/max SLOs;
 7. release-mode packages build for PostgreSQL 15–18 and the helper; release
