@@ -40,7 +40,8 @@ database. The decision made after the evidence review is recorded in
 A successful restore cannot be treated as proof of recoverability until every
 remaining open release gate is closed or explicitly removed from the supported
 contract. Section 6 records which WAL-local correctness blockers are already
-closed; RB-08 through RB-11 remain open.
+closed. RB-08/RB-09 local admission is implemented; RB-10/RB-11 are implemented
+in code but still require exact-RC evidence before publish.
 
 ## 2. Capacity model and measurements
 
@@ -222,10 +223,15 @@ for non-blocking MVCC-aware checkpoints.
   and common-lock protocol in [`COVERAGE_MODEL.md`](COVERAGE_MODEL.md). For the
   qualified WAL-local profile those blockers are closed; see Section 6.
   Backup-profile coverage still needs the same model wired end-to-end.
-- RB-08 through RB-10 remain open and require the bounded capacity, retention
-  and artifact lifecycle in [`STORAGE_POLICY.md`](STORAGE_POLICY.md).
-- RB-11 remains open and requires capture draining to be separated from
-  maintenance work.
+- RB-08 through RB-09 local capacity/write-stall admission for track,
+  re-anchor and restore are implemented as fail-closed budgets with an
+  explicit privileged override; free-space checks remain estimates with a
+  documented race against concurrent writers.
+- RB-10 helper artifact lifecycle remains a release gate for exact-RC
+  evidence even though aggregate work-root quotas, GC and expire pinning are
+  implemented in code.
+- RB-11 capture/maintenance isolation is implemented (separate per-database
+  workers); exact-commit p95/max SLO evidence must accompany the RC.
 
 Generation ownership is half-open: a sealed generation serves targets from its
 inclusive boundary up to, but excluding, its successor boundary; the active
@@ -262,10 +268,11 @@ physical-backup anchor. This anchor is not the exact write-locked local-base
 boundary used by `local_delta`.
 
 The schema scaffold alone never satisfied these blockers. WAL-local runtime
-wiring, fail-closed target admission and generation-aware local retention have
-landed for the qualified profile. Backup-profile generation wiring, capacity
-preflight/artifact GC, worker isolation and the remaining regression evidence
-must still land before the release status can change.
+wiring, fail-closed target admission, generation-aware local retention, local
+capacity/write-stall admission, backup-profile generation wiring and helper
+capacity controls have landed. Exact-RC soak, clean-host packaged-artifact
+qualification and remaining matrix evidence must still land before the release
+status can change.
 
 ## 6. WAL-local milestone update
 
@@ -297,7 +304,10 @@ the extension owner's identity only for its internal metadata call, while the
 ordinary table owner remains the actor for PostgreSQL's DDL permission check.
 
 This update also closes RB-02 for qualified local generations: whole sealed-
-generation retirement is durable, pinned and resumable. RB-08/RB-09 automated
-capacity preflight, RB-10 helper artifact lifecycle and RB-11 worker isolation
-remain whole-project release gates. Backup-profile coverage anchoring is still
-open and is tracked separately from the original local retention reproduction.
+generation retirement is durable, pinned and resumable. RB-08/RB-09 local
+capacity and write-stall admission are implemented and fail-closed. RB-10
+helper artifact lifecycle and RB-11 worker isolation are implemented in code;
+exact-RC soak and clean-host packaged-artifact qualification remain
+whole-project release gates. Backup-profile coverage anchoring is implemented
+for the FULL-after-marker contract; retained pre-marker FULL + continuous WAL
+reuse is PoC-only (see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)).

@@ -10,8 +10,9 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 
 > **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
 > qualified, including generation-aware local retention, but the project as a
-> whole is still pre-release. Automated capacity/write-stall admission,
-> exact-RC soak and clean-host artifact installation remain release gates.
+> whole is still pre-release. Fail-closed local capacity/write-stall admission
+> is enforced for qualified local track, re-anchor and restore; exact-RC soak
+> and clean-host artifact installation remain release gates.
 > The initial release establishes the baseline from which later releases must
 > provide versioned update scripts. Read the binding
 > [storage policy](docs/STORAGE_POLICY.md),
@@ -658,6 +659,16 @@ import/swap:
 ./scripts/run_recovery_helper_e2e.sh
 ```
 
+A bounded PoC compares FULL-after-marker activation with recovery from an older
+retained FULL plus contiguous WAL (including through a production shadow-swap).
+It does **not** change the supported v0.1 activation contract:
+
+```bash
+./scripts/run_retained_full_wal_poc.sh
+```
+
+See [`docs/RETAINED_FULL_WAL_POC.md`](docs/RETAINED_FULL_WAL_POC.md).
+
 ## 13. Operations & Integration
 
 ### Common Tasks
@@ -815,11 +826,14 @@ worker catches up. Keep worker lag within the release SLO and inspect slot
 health before a production restore.
 
 **4. `flashback_track()` on a large table is expensive**
-`flashback_track()` takes an immediate full-table snapshot. The current local
-path takes the exact-base write lock, but automated capacity/write-stall
-admission is not implemented yet. Do not select a profile from size alone: use
-the backup profile when local headroom, observed change rate, write-stall or
-RTO budgets do not fit.
+`flashback_track()` takes an immediate full-table snapshot. The qualified local
+path takes the exact-base write lock only after fail-closed capacity and
+write-stall admission (`flashback_advise()` is advisory; the hard guard
+rejects unsafe budgets). Do not select a profile from size alone: use the
+backup profile when local headroom, observed change rate, write-stall or RTO
+budgets do not fit. An explicit privileged
+`pg_flashback.local_capacity_override` escape hatch exists for operators and is
+visible in health/advise output; it is not the default.
 
 **5. `wal_level = logical` is cluster-wide**
 Setting `wal_level = logical` affects **all databases** on the cluster — not

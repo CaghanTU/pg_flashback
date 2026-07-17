@@ -1,7 +1,8 @@
 # Coverage generation model
 
-Status: **T-01/A WAL-local runtime and generation-aware local retention
-implemented; backup-profile runtime phase remains open**
+Status: **T-01/A WAL-local runtime, generation-aware local retention, and
+backup-profile anchoring/runtime are implemented; exact-RC soak and clean-host
+packaged-artifact qualification remain open**
 
 This document turns the policy in [`STORAGE_POLICY.md`](STORAGE_POLICY.md)
 into a data model and transaction protocol. It addresses RB-01, RB-02, RB-03,
@@ -12,8 +13,10 @@ Legacy rows are never backfilled as valid. The WAL-local runtime now creates
 and consumes the model atomically for tracking, capture, target admission,
 timestamp resolution, LSN restore/query/recovery, stream breaks and re-anchor.
 Legacy trigger/timestamp paths remain separate. Generation-aware cleanup is
-now wired for qualified local generations; backup-profile anchoring still must
-land with its own regression tests.
+wired for qualified local generations. Backup-profile anchoring, authenticated
+proof activation, frontier attestation and post-swap re-anchor are covered by
+the real-repository helper E2E; retained pre-marker FULL + WAL reuse remains
+PoC-only (see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)).
 
 ## Why the legacy model is insufficient
 

@@ -56,13 +56,26 @@ Current implementation status on `work/v0.1.0-overnight`:
    post-swap FULL re-anchor, durable coordinated expire, newer-timeline freeze
    and periodic missing-anchor detection are implemented and covered by the
    real-repository E2E;
-2. bounded local/helper capacity and artifact garbage collection are
-   implemented, with exact-RC qualification still required;
-3. capture and bounded maintenance run in separate per-database workers; the
+2. fail-closed local capacity/write-stall admission
+   (`flashback_advise` / shared budgets / OS free-space probe) and helper
+   work-root capacity plus artifact GC are implemented; exact-RC qualification
+   still required;
+3. actionable `flashback_health()` slot/coverage reporting (including lag
+   warning, post-swap `backup_reanchor_required`, and transactional
+   `pg_flashback_action_required` NOTIFY) is implemented;
+4. the recovery helper exposes an internal, unstable physical-recovery
+   provider seam; pgBackRest remains the only qualified provider;
+5. a bounded real-repository PoC proves retained pre-marker FULL + contiguous
+   WAL recovery (including through shadow-swap) without changing the
+   production FULL-after-marker activation contract — see
+   `docs/RETAINED_FULL_WAL_POC.md`;
+6. capture and bounded maintenance run in separate per-database workers; the
    exact-commit qualification harness enforces the stated p95/max SLOs;
-4. release-mode packages build for PostgreSQL 15–18 and the helper; release
+7. release-mode packages build for PostgreSQL 15–18 and the helper; release
    versioning and clean-host installation remain open;
-5. exact-RC 24-hour soak remains open.
+8. exact-RC 24-hour soak remains open;
+9. aarch64 remains source-build only / not release-qualified;
+10. do not claim 100+ GiB performance from current evidence.
 
 ## 3. Milestone 0 — Freeze the release contract
 
@@ -203,6 +216,10 @@ The backup profile cannot report recoverability from an unverified backup,
 ambiguous timeline, incomplete archive prefix or unanchored post-swap state.
 
 ## 5. Milestone 2 — Bound capacity and artifact retention
+
+Implementation status: **local capacity/write-stall admission and helper
+work-root/GC controls are implemented; exact-RC soak and clean-host
+packaged-artifact qualification remain open.**
 
 Estimated duration: **3–5 working days**
 
