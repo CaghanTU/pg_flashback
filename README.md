@@ -58,7 +58,11 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
   validated one-table artifact through snapshot-direct or classic pgBackRest
   restore. Authenticated anchors, post-swap FULL re-anchor, timeline freeze,
   durable expiration leases and missing-anchor audits are wired and covered by
-  the real-repository E2E. Exact-RC and clean-host release qualification remain.
+  the real-repository E2E. Tracking reuses an existing FULL when eligible and
+  never auto-starts FULL backups; schedule `pg-flashback-recovery
+  reconcile-anchors` externally to advance to newer operator-created FULLs and
+  retire sealed predecessors only after retention. Exact-RC and clean-host
+  release qualification remain.
 
 ## 2. Architecture Overview
 

@@ -310,5 +310,7 @@ helper artifact lifecycle and RB-11 worker isolation are implemented in code;
 exact-RC soak and clean-host packaged-artifact qualification remain
 whole-project release gates. Backup-profile coverage anchoring supports both
 fresh FULL-after-marker and retained FULL + continuous WAL activation
-(see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)). Differential /
-incremental chains remain out of scope.
+(see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)), plus external
+`reconcile-anchors` advancement to newer operator-scheduled FULLs with
+retention-gated predecessor retirement. Differential / incremental chains
+remain out of scope. pg_flashback never auto-creates FULL backups.

@@ -70,15 +70,19 @@ activated only by consuming a one-time verified FULL backup proof installed by
 the recovery helper through its least-privilege recovery-agent connection.
 `verify-anchor` and `verify-frontier` derive proof values from a locked plain
 pgBackRest repository and authenticate the canonical values with an OS-held
-HMAC key that is unavailable through SQL; `expire` rejects active generation
-pins and holds a crash-durable database lease that blocks concurrent generation
-activation. `audit-anchors` detects anchors removed outside the supported lock
-protocol and durably freezes the affected generation. The real-repository E2E
-also covers a newer timeline, missing anchors, an expire/activation race and a
-failed-expire lease resume, plus a new FULL re-anchor after the production
-swap. Release status remains **PARTIAL** until the exact-RC 24-hour and
+HMAC key that is unavailable through SQL; `expire` rejects active and sealed
+generation pins and holds a crash-durable database lease that blocks concurrent
+generation activation. `reconcile-anchors` discovers newer scheduled FULL
+backups and advances preferred anchors without creating backups; sealed
+predecessors remain pinned until retention retires their exclusive range.
+`audit-anchors` detects anchors removed outside the supported lock protocol and
+durably freezes the affected generation. The real-repository E2E also covers a
+newer timeline, missing anchors, an expire/activation race and a failed-expire
+lease resume, plus post-swap fresh-FULL re-anchor and automatic FULL
+advancement. Release status remains **PARTIAL** until the exact-RC 24-hour and
 clean-host packaged-artifact gates pass. Do not report recoverability from an
-unverified or frozen generation.
+unverified or frozen generation. Differential/incremental chains and
+non-pgBackRest providers remain unsupported.
 
 - local POSIX pgBackRest repository
 - completed full backups

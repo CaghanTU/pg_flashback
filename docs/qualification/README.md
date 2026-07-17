@@ -57,6 +57,18 @@ these scripts nor accepted as release evidence. Exact-commit evidence belongs
 in immutable CI/qualification-runner artifacts outside the source tree, which
 avoids a commit self-reference.
 
+Honest provenance fields (see `scripts/qualification_provenance.sh` and
+`scripts/verify_qualification_provenance.sh`):
+
+- `source_commit` / `source_tree` — the tree that was actually tested
+- `qualification_artifact_sha256` / `helper_binary_sha256` / `package_sha256`
+- `run_started_at` / `run_completed_at` and `tree_clean_at_start`/`end`
+- optional later `evidence_summary_commit` that differs only in docs/evidence
+
+Never claim final HEAD was tested if later commits changed executable code,
+SQL, tests, packaging or scripts. Do not embed a commit's own hash inside that
+same commit.
+
 Set `PG_FLASHBACK_REQUIRE_CLEAN_TREE=1` for a release-gate invocation. This
 rejects a dirty checkout before cluster creation. Exact-RC tests must run from
 a clean checkout/tag and archive `target/qualification/` externally.

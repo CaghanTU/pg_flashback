@@ -22,6 +22,10 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
 - Backup profile for large ordinary tables without an in-database base copy or
   row-delta duplication, with authenticated repository anchors, post-swap FULL
   re-anchor, contiguous archived-WAL frontiers and durable gap admission.
+- External `reconcile-anchors` helper command (plus example systemd timer) that
+  discovers newer scheduled pgBackRest FULL backups, advances preferred
+  anchors without creating backups, and retires sealed predecessors only after
+  their exclusive retention window expires.
 - External `pg-flashback-recovery` executor with pgBackRest full-backup
   selection, real XFS reflink capability probing, classic restore fallback and
   private native PostgreSQL LSN recovery.
@@ -38,6 +42,9 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
 
 ### Correctness fixes
 
+- Retained FULL restore admission now uses the advertised coverage lower bound
+  (tracking marker), not the earlier physical FULL stop; post-swap /
+  `full_reanchor` boundaries reject retained pre-marker FULL reactivation.
 - Prevented retention from dropping the active monthly delta partition.
 - Made logical slot creation database-aware and fail-closed.
 - Escaped decoded identifiers and represented non-finite numeric values as
