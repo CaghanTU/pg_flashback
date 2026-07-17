@@ -181,6 +181,8 @@ BEGIN
             ('flashback_recovery_agent', 'public.flashback_active_backup_labels()'),
             ('flashback_recovery_agent', 'public.flashback_begin_backup_expire(text,text,text)'),
             ('flashback_recovery_agent', 'public.flashback_complete_backup_expire(bigint,text,text,text)'),
+            ('flashback_recovery_agent', 'public.flashback_begin_backup_anchor_advancement(bigint)'),
+            ('flashback_recovery_agent', 'public.flashback_retire_sealed_backup_generation(bigint)'),
             ('flashback_recovery_agent', 'public.flashback_active_backup_anchor_contexts()'),
             ('flashback_recovery_agent', 'public.flashback_freeze_missing_backup_anchor(bigint,bigint,jsonb)'),
             ('flashback_recovery_agent', 'public.flashback_freeze_backup_generation(bigint,text,jsonb)'),
