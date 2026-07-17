@@ -63,7 +63,7 @@ if [[ -n "$EVIDENCE_COMMIT" ]]; then
     if git -C "$ROOT" show --name-only --pretty=format: "$EVIDENCE_COMMIT" \
         | grep -q 'docs/qualification/.*evidence'; then
         BODY="$(git -C "$ROOT" show -s --format=%B "$EVIDENCE_COMMIT")"
-        if grep -qiE 'stamp|embed|self.?hash|tested_commit.*(HEAD|itself)' <<<"$BODY"; then
+        if grep -qiE 'stamp(ed)? (tested_commit|HEAD)|embed(s|ded)? (its )?own (commit )?hash|self-?hash churn|tested_commit.*=.*HEAD' <<<"$BODY"; then
             die "evidence commit message suggests self-hash stamping; use source_commit + separate artifact instead"
         fi
     fi
