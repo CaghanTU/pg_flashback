@@ -246,6 +246,7 @@ max_replication_slots = 10
 shared_preload_libraries = 'pg_flashback'
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
+pg_flashback.target_databases = '$DB_NAME'
 pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
