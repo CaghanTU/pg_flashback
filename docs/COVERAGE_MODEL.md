@@ -408,9 +408,10 @@ Backup tracking starts without an eligible generation:
 4. Under the repository lock, verify the selected FULL (system identifier,
    timeline/history, immutable label/manifest digest) and required WAL
    evidence, pin the FULL + WAL dependency set, then activate the generation.
-   Fresh activation uses the backup stop as boundary/`valid_through`. Retained
-   activation uses the tracking marker as boundary and the verified WAL
-   frontier as initial `valid_through`.
+   The physical generation boundary is always the FULL stop LSN. Fresh
+   activation initializes `valid_through` to that stop; retained activation
+   initializes `valid_through` from the verified WAL frontier and records the
+   marker as tracked `coverage_start_lsn`.
 
 The interval before the verified coverage lower bound is not advertised as
 tracked coverage. Marker resolution and backup verification are idempotent;

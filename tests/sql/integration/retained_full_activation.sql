@@ -137,12 +137,18 @@ BEGIN
     IF v_mode IS DISTINCT FROM 'retained_full_plus_wal' THEN
         RAISE EXCEPTION 'activation_mode not retained: %', v_mode;
     END IF;
-    IF v_boundary IS DISTINCT FROM v_marker_lsn THEN
-        RAISE EXCEPTION 'retained boundary must be marker %, got %',
-            v_marker_lsn, v_boundary;
+    IF v_boundary IS DISTINCT FROM (v_marker_lsn - 20) THEN
+        RAISE EXCEPTION 'retained boundary must equal backup_stop %, got %',
+            v_marker_lsn - 20, v_boundary;
     END IF;
     IF v_valid_through IS DISTINCT FROM (v_marker_lsn + 30) THEN
         RAISE EXCEPTION 'valid_through must be WAL frontier, got %', v_valid_through;
+    END IF;
+    IF (
+        SELECT coverage_start_lsn FROM flashback.tracked_tables
+        WHERE tracking_id = v_tracking_id
+    ) IS DISTINCT FROM v_marker_lsn THEN
+        RAISE EXCEPTION 'tracked coverage_start must be marker for retained activation';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM flashback.backup_anchors

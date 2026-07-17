@@ -1263,17 +1263,11 @@ BEGIN
             v_proof.backup_label;
     END IF;
 
-    -- Intended coverage lower bound: fresh FULL activates at backup stop;
-    -- retained FULL+WAL advertises coverage from the tracking marker (with
-    -- backup_stop <= marker already proven above).
-    IF v_activation_mode = 'retained_full_plus_wal' THEN
-        IF v_pending.boundary_lsn IS NOT NULL
-           AND v_pending.boundary_lsn IS DISTINCT FROM v_marker_lsn
-        THEN
-            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
-                v_pending.boundary_lsn;
-        END IF;
-    ELSIF v_pending.boundary_lsn IS NOT NULL
+    -- Physical generation boundary is always the FULL stop LSN (FK to
+    -- backup_anchors). Retained mode still requires stop <= marker and proves
+    -- WAL through the marker; coverage_start on tracked_tables reflects the
+    -- advertised tracking lower bound (marker).
+    IF v_pending.boundary_lsn IS NOT NULL
        AND v_pending.boundary_lsn IS DISTINCT FROM v_proof.backup_stop_lsn
     THEN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
@@ -1306,10 +1300,7 @@ BEGIN
 
     UPDATE flashback.coverage_generations
        SET backup_anchor_id = v_anchor_id,
-           boundary_lsn = CASE
-               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
-               ELSE v_proof.backup_stop_lsn
-           END,
+           boundary_lsn = v_proof.backup_stop_lsn,
            boundary_time = v_proof.verified_at,
            valid_through_lsn = v_valid_through,
            valid_through_time = v_proof.verified_at,

@@ -404,7 +404,10 @@ MODE=$(primary_sql "SELECT details->>'activation_mode'
 BOUNDARY=$(primary_sql "SELECT boundary_lsn::text
                        FROM flashback.coverage_generations
                        WHERE tracking_id=$TRACKING_ID AND state='active';")
-[[ "$BOUNDARY" == "$MARKER" ]] || die "retained boundary must equal marker"
+[[ "$BOUNDARY" == "$FULL0_STOP" ]] || die "retained boundary must equal FULL stop"
+MARKER_COV=$(primary_sql "SELECT coverage_start_lsn::text FROM flashback.tracked_tables
+                          WHERE tracking_id=$TRACKING_ID;")
+[[ "$MARKER_COV" == "$MARKER" ]] || die "tracked coverage_start must equal marker"
 pass "production retained activation: FULL0 + continuous WAL without a new FULL"
 
 # Expire must remain protected while the retained FULL is pinned by an active generation.

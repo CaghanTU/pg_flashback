@@ -33,9 +33,11 @@ activate that path without requiring a newly created FULL after the marker?
 3. If neither exists, fail closed — do not auto-start a cluster-sized FULL.
    Operators may take an explicit fresh FULL and retry.
 
-Retained activation advertises coverage from the tracking marker through the
-verified WAL frontier. Fresh activation still uses the FULL stop as the
-initial boundary/`valid_through`.
+Retained activation keeps the physical generation boundary at the FULL stop
+(FK-bound to `backup_anchors`) and sets initial `valid_through` from the
+verified WAL frontier. Tracked `coverage_start_lsn` is the marker. Fresh
+activation still uses the FULL stop as both boundary and initial
+`valid_through`.
 
 ## Harnesses
 
