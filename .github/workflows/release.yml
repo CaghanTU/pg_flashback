@@ -106,14 +106,22 @@ jobs:
             -o "-p $port -k $socket -c shared_preload_libraries=pg_flashback -c wal_level=logical" \
             start -w >/dev/null
           result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "CREATE EXTENSION pg_flashback;
-              CREATE TABLE package_smoke(id integer PRIMARY KEY);
-              SELECT flashback_track_backup('public.package_smoke', 'default');
-              SELECT extversion || ':' ||
+            -qAtc "CREATE EXTENSION pg_flashback;")
+          "$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
+            -qAtc "CREATE TABLE package_smoke(id integer PRIMARY KEY);" >/dev/null
+          track_result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
+            -qAtc "SELECT flashback_track_backup('public.package_smoke', 'default');")"
+          test "$track_result" = "t"
+          result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
+            -qAtc "SELECT extversion || ':' ||
                 (SELECT recovery_profile FROM flashback.tracked_tables
                  WHERE table_name = 'package_smoke')
               FROM pg_extension WHERE extname = 'pg_flashback';")"
-          test "$result" = $'t\n0.1.0:backup'
+          test "$result" = "0.1.0:backup"
+          gen_state="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
+            -qAtc "SELECT state FROM flashback.coverage_generations
+                   WHERE recovery_profile = 'backup' ORDER BY generation_id LIMIT 1;")"
+          test "$gen_state" = "building"
 
       - name: Upload extension archive
         uses: actions/upload-artifact@v4

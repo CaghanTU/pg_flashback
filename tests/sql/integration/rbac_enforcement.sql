@@ -156,6 +156,8 @@ BEGIN
             ('flashback_admin', 'public.flashback_is_restore_in_progress(oid)'),
             ('flashback_admin', 'public.flashback_track_backup(text,text)'),
             ('flashback_admin', 'public.flashback_set_backup_coverage(text,pg_lsn,pg_lsn)'),
+            ('flashback_admin', 'public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),
+            ('flashback_admin', 'public.flashback_advance_backup_frontier(text,pg_lsn,bigint)'),
             ('flashback_admin', 'public.flashback_backup_disaster_points(text,interval)'),
             ('flashback_admin', 'public.flashback_prepare_backup_restore(text,pg_lsn)'),
             ('flashback_admin', 'public.flashback_finalize_backup_restore(text)'),
@@ -233,6 +235,7 @@ BEGIN
             ('public.flashback_health()'),
             ('public.flashback_history(text,interval)'),
             ('public.flashback_track_backup(text,text)'),
+            ('public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),
             ('public.flashback_prepare_backup_restore(text,pg_lsn)'),
             ('public.flashback_finalize_backup_restore(text)'),
             ('public.flashback_adopt_existing_payload_tables()')

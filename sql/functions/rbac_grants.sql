@@ -99,6 +99,11 @@ GRANT EXECUTE ON FUNCTION flashback_retention_status()                TO flashba
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)       TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_track_backup(text, text)          TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_set_backup_coverage(text, pg_lsn, pg_lsn) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_activate_backup_anchor(
+    text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz
+) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_advance_backup_frontier(text, pg_lsn, bigint)
+    TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_backup_disaster_points(text, interval) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_prepare_backup_restore(text, pg_lsn) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_finalize_backup_restore(text)     TO flashback_admin;

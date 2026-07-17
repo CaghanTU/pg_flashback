@@ -169,13 +169,28 @@ DECLARE
     v_schema_name text;
     v_table_name text;
     v_relkind "char";
-    v_existing_profile text;
+    v_tracking_id bigint;
+    v_bound_tracking_id bigint;
+    v_generation_id bigint;
+    v_boundary_xid bigint;
+    v_provisional_lsn pg_lsn;
     v_schema_def jsonb;
     v_schema_hash text;
     v_tracked_since timestamptz := clock_timestamp();
+    v_stream_id bigint;
 BEGIN
     IF helper_profile IS NULL OR helper_profile !~ '^[A-Za-z0-9_-]+$' THEN
         RAISE EXCEPTION 'flashback_track_backup: invalid helper profile';
+    END IF;
+    IF txid_current_if_assigned() IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track_backup() must run before any write in a dedicated transaction'
+            USING HINT = 'Commit or roll back the current transaction, then call flashback_track_backup() alone.';
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track_backup() requires READ COMMITTED isolation';
+    END IF;
+    IF current_setting('wal_level') <> 'logical' THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track_backup() requires wal_level=logical so the tracking marker COMMIT LSN can be resolved';
     END IF;
 
     v_rel_oid := to_regclass(target_table);
@@ -195,57 +210,128 @@ BEGIN
     IF v_schema_name IN ('pg_catalog', 'information_schema', 'flashback', 'flashback_import') THEN
         RAISE EXCEPTION 'flashback_track_backup: schema % is reserved', v_schema_name;
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_class WHERE oid = v_rel_oid AND relpersistence <> 'p') THEN
+        RAISE EXCEPTION 'flashback_track_backup: first release supports permanent LOGGED tables only';
+    END IF;
+
+    -- Create the marker-resolution slot before taking the stream lock so the
+    -- background worker cannot deadlock against slot creation.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_replication_slots
+        WHERE slot_name = flashback_effective_slot_name()
+          AND database = current_database()
+    ) THEN
+        IF EXISTS (
+            SELECT 1 FROM pg_replication_slots
+            WHERE slot_name = flashback_effective_slot_name()
+        ) THEN
+            RAISE EXCEPTION 'flashback_track_backup: replication slot % already exists but belongs to another database',
+                flashback_effective_slot_name();
+        END IF;
+        BEGIN
+            PERFORM pg_create_logical_replication_slot(
+                flashback_effective_slot_name(),
+                'pg_flashback'
+            );
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'flashback_track_backup: could not create logical slot %: %',
+                flashback_effective_slot_name(), SQLERRM
+                USING HINT = 'Call flashback_track_backup() as the first write in a dedicated READ COMMITTED transaction.';
+        END;
+    END IF;
 
     PERFORM pg_advisory_xact_lock(
-        hashtextextended('pg_flashback:backup:' || v_rel_oid::text, 0)
+        358945::integer,
+        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
     );
-    EXECUTE format('LOCK TABLE %I.%I IN SHARE MODE', v_schema_name, v_table_name);
+
+    -- Resolve the marker COMMIT through the database WAL stream without binding
+    -- the backup generation to that stream (backup gens keep stream_id NULL).
+    v_stream_id := flashback_ensure_active_wal_stream();
+    IF v_stream_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_track_backup: WAL stream could not be activated for marker resolution';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(
+        358943::integer,
+        hashtext(format(
+            '%s:%s.%s',
+            (SELECT oid FROM pg_database WHERE datname = current_database()),
+            v_schema_name,
+            v_table_name
+        ))
+    );
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND (tt.rel_oid = v_rel_oid
+               OR (tt.schema_name = v_schema_name AND tt.table_name = v_table_name))
+    ) THEN
+        RAISE EXCEPTION 'flashback_track_backup: %.% already has a tracking lifecycle; untrack it before creating a new generation',
+            v_schema_name, v_table_name;
+    END IF;
+
+    v_tracking_id := nextval('flashback.tracking_id_seq');
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+
+    EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE', v_schema_name, v_table_name);
     IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS DISTINCT FROM v_rel_oid THEN
         RAISE EXCEPTION 'flashback_track_backup: table identity changed while tracking';
     END IF;
 
-    SELECT recovery_profile INTO v_existing_profile
-    FROM flashback.tracked_tables
-    WHERE rel_oid = v_rel_oid AND is_active;
-    IF v_existing_profile IS NOT NULL AND v_existing_profile <> 'backup' THEN
-        RAISE EXCEPTION 'flashback_track_backup: table is already tracked with profile %; untrack it first', v_existing_profile;
-    END IF;
-
     v_schema_def := COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
     v_schema_hash := flashback_helper_schema_sha256(v_rel_oid);
+    v_boundary_xid := (txid_current() % 4294967296)::bigint;
+    v_provisional_lsn := pg_current_wal_insert_lsn();
 
     INSERT INTO flashback.tracked_tables (
-        rel_oid, schema_name, table_name, base_snapshot_table,
+        tracking_id, rel_oid, schema_name, table_name, base_snapshot_table,
         schema_version, recovery_profile, helper_profile,
         coverage_start_lsn, coverage_end_lsn,
         tracked_since, checkpoint_interval, retention_interval, is_active
     ) VALUES (
-        v_rel_oid, v_schema_name, v_table_name, NULL,
+        v_tracking_id, v_rel_oid, v_schema_name, v_table_name, NULL,
         1, 'backup', helper_profile,
         NULL, NULL,
         v_tracked_since, interval '15 minutes', interval '7 days', true
-    )
-    ON CONFLICT (rel_oid) DO UPDATE SET
-        schema_name = EXCLUDED.schema_name,
-        table_name = EXCLUDED.table_name,
-        base_snapshot_table = NULL,
-        schema_version = 1,
-        recovery_profile = 'backup',
-        helper_profile = EXCLUDED.helper_profile,
-        coverage_start_lsn = NULL,
-        coverage_end_lsn = NULL,
-        tracked_since = EXCLUDED.tracked_since,
-        is_active = true;
+    );
+
+    SELECT tracking_id INTO v_bound_tracking_id
+    FROM flashback.tracked_tables
+    WHERE rel_oid = v_rel_oid AND is_active;
+    IF v_bound_tracking_id IS DISTINCT FROM v_tracking_id THEN
+        RAISE EXCEPTION 'pg_flashback: concurrent first-track bound table % to lifecycle %, expected %',
+            target_table, v_bound_tracking_id, v_tracking_id;
+    END IF;
+
+    INSERT INTO flashback.coverage_generations (
+        tracking_id, generation_no, stream_id, recovery_profile, state,
+        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id, backup_anchor_id,
+        boundary_xid, boundary_marker, details
+    ) VALUES (
+        v_tracking_id, 1, NULL, 'backup', 'building',
+        'initial_track', v_rel_oid, NULL, NULL,
+        v_boundary_xid,
+        format('initial-backup-track:%s:%s', v_tracking_id, v_boundary_xid),
+        jsonb_build_object(
+            'provisional_insert_lsn', v_provisional_lsn,
+            'helper_profile', helper_profile,
+            'marker_stream_id', v_stream_id
+        )
+    ) RETURNING generation_id INTO v_generation_id;
 
     DELETE FROM flashback.schema_versions WHERE rel_oid = v_rel_oid;
     DELETE FROM flashback.delta_log WHERE rel_oid = v_rel_oid;
     DELETE FROM flashback.staging_events WHERE rel_oid = v_rel_oid;
 
     INSERT INTO flashback.schema_versions (
-        rel_oid, schema_version, applied_at, applied_lsn,
+        rel_oid, tracking_id, generation_id, stream_id, source_xid,
+        schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
         columns, primary_key, constraints, helper_schema_sha256
     ) VALUES (
-        v_rel_oid, 1, v_tracked_since, pg_current_wal_insert_lsn(),
+        v_rel_oid, v_tracking_id, v_generation_id, NULL, v_boundary_xid,
+        1, v_tracked_since, v_provisional_lsn, NULL, NULL,
         COALESCE(v_schema_def -> 'columns', '[]'::jsonb),
         COALESCE(v_schema_def -> 'primary_key', '[]'::jsonb),
         jsonb_build_object(
@@ -260,10 +346,23 @@ BEGIN
         v_schema_hash
     );
 
+    PERFORM pg_logical_emit_message(
+        true,
+        'pg_flashback',
+        jsonb_build_object(
+            'op', 'BOUNDARY',
+            'kind', 'initial_backup_track',
+            'tracking_id', v_tracking_id,
+            'generation_id', v_generation_id
+        )::text
+    );
+
     RETURN true;
 END;
 $$;
 
+-- Legacy controller assertion. Fail closed: recoverability requires a verified
+-- FULL backup anchor activated after the tracking marker COMMIT LSN.
 CREATE OR REPLACE FUNCTION flashback_set_backup_coverage(
     target_table text,
     first_lsn pg_lsn,
@@ -274,23 +373,298 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-DECLARE
-    v_rel_oid oid;
 BEGIN
-    IF first_lsn IS NULL OR latest_lsn IS NULL OR first_lsn > latest_lsn THEN
-        RAISE EXCEPTION 'flashback_set_backup_coverage: invalid LSN range % .. %', first_lsn, latest_lsn;
+    RAISE EXCEPTION 'flashback_set_backup_coverage: legacy coverage assertion is rejected'
+        USING ERRCODE = 'feature_not_supported',
+              HINT = 'Call flashback_activate_backup_anchor() with a verified FULL backup whose start LSN is strictly after the resolved tracking marker COMMIT LSN.';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_activate_backup_anchor(
+    p_target_table text,
+    p_repository_key text,
+    p_stanza text,
+    p_backup_label text,
+    p_database_system_identifier numeric,
+    p_timeline_id bigint,
+    p_manifest_reference text,
+    p_manifest_sha256 text,
+    p_backup_start_lsn pg_lsn,
+    p_backup_stop_lsn pg_lsn,
+    p_verified_at timestamptz DEFAULT clock_timestamp()
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_tracked record;
+    v_pending record;
+    v_anchor_id bigint;
+    v_generation_id bigint;
+    v_sysid numeric;
+    v_timeline bigint;
+    v_marker_lsn pg_lsn;
+BEGIN
+    IF p_repository_key IS NULL OR btrim(p_repository_key) = ''
+       OR p_stanza IS NULL OR btrim(p_stanza) = ''
+       OR p_backup_label IS NULL OR btrim(p_backup_label) = ''
+       OR p_manifest_reference IS NULL OR btrim(p_manifest_reference) = ''
+       OR p_manifest_sha256 IS NULL OR p_manifest_sha256 !~ '^[0-9a-f]{64}$'
+       OR p_backup_start_lsn IS NULL OR p_backup_stop_lsn IS NULL
+       OR p_backup_stop_lsn < p_backup_start_lsn
+       OR p_database_system_identifier IS NULL
+       OR p_timeline_id IS NULL OR p_timeline_id <= 0
+    THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: incomplete or invalid backup identity';
     END IF;
 
-    v_rel_oid := flashback_resolve_tracked_backup(target_table);
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.rel_oid = flashback_resolve_tracked_backup(p_target_table)
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup';
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup profile is not active for %', p_target_table;
+    END IF;
 
-    IF v_rel_oid IS NULL THEN
-        RAISE EXCEPTION 'flashback_set_backup_coverage: backup profile is not active for %', target_table;
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
+
+    SELECT system_identifier INTO v_sysid FROM pg_control_system();
+    SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
+    IF p_database_system_identifier IS DISTINCT FROM v_sysid THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup system identifier % does not match live cluster %',
+            p_database_system_identifier, v_sysid;
+    END IF;
+    IF p_timeline_id IS DISTINCT FROM v_timeline THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup timeline % does not match live timeline %',
+            p_timeline_id, v_timeline;
+    END IF;
+
+    SELECT cg.* INTO v_pending
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracked.tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'building'
+    ORDER BY cg.generation_no DESC
+    LIMIT 1
+    FOR UPDATE;
+
+    IF v_pending.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: no building backup generation for %', p_target_table;
+    END IF;
+
+    v_marker_lsn := COALESCE(
+        (v_pending.details ->> 'tracking_marker_lsn')::pg_lsn,
+        v_pending.boundary_lsn
+    );
+    IF v_marker_lsn IS NULL THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: tracking marker COMMIT LSN is not resolved yet'
+            USING HINT = 'Wait for the worker to consume the BOUNDARY commit, then retry.';
+    END IF;
+    IF p_backup_start_lsn <= v_marker_lsn THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: FULL backup start % must be strictly after marker COMMIT %',
+            p_backup_start_lsn, v_marker_lsn;
+    END IF;
+
+    -- Idempotent retry: identical verified identity reuses the existing anchor.
+    SELECT ba.backup_anchor_id, cg.generation_id
+      INTO v_anchor_id, v_generation_id
+    FROM flashback.backup_anchors ba
+    JOIN flashback.coverage_generations cg
+      ON cg.backup_anchor_id = ba.backup_anchor_id
+     AND cg.tracking_id = ba.tracking_id
+    WHERE ba.tracking_id = v_tracked.tracking_id
+      AND ba.backup_label = p_backup_label
+      AND ba.manifest_sha256 = p_manifest_sha256
+      AND ba.backup_start_lsn = p_backup_start_lsn
+      AND ba.backup_stop_lsn = p_backup_stop_lsn
+      AND cg.state = 'active'
+    LIMIT 1;
+    IF v_generation_id IS NOT NULL THEN
+        RETURN v_generation_id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_generations cg
+        WHERE cg.tracking_id = v_tracked.tracking_id
+          AND cg.state = 'active'
+          AND cg.recovery_profile = 'backup'
+    ) THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: an active backup generation already exists';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.backup_anchors ba
+        WHERE ba.tracking_id = v_tracked.tracking_id
+          AND ba.backup_label = p_backup_label
+          AND ba.manifest_sha256 IS DISTINCT FROM p_manifest_sha256
+    ) THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup label % already bound to a different manifest digest',
+            p_backup_label;
+    END IF;
+
+    IF v_pending.boundary_lsn IS NOT NULL
+       AND v_pending.boundary_lsn IS DISTINCT FROM p_backup_stop_lsn
+    THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: building generation already has immutable boundary %',
+            v_pending.boundary_lsn;
+    END IF;
+
+    INSERT INTO flashback.backup_anchors (
+        tracking_id, helper_profile, repository_key, stanza, backup_label,
+        backup_type, database_system_identifier, timeline_id,
+        manifest_reference, manifest_sha256,
+        tracking_marker_lsn, backup_start_lsn, backup_stop_lsn,
+        verified_at, verified_by, details
+    ) VALUES (
+        v_tracked.tracking_id, v_tracked.helper_profile,
+        p_repository_key, p_stanza, p_backup_label,
+        'full', p_database_system_identifier, p_timeline_id,
+        p_manifest_reference, p_manifest_sha256,
+        v_marker_lsn, p_backup_start_lsn, p_backup_stop_lsn,
+        COALESCE(p_verified_at, clock_timestamp()), session_user,
+        jsonb_build_object(
+            'activation_kind', COALESCE(v_pending.boundary_kind, 'initial_track'),
+            'source_generation_id', v_pending.generation_id
+        )
+    ) RETURNING backup_anchor_id INTO v_anchor_id;
+
+    UPDATE flashback.coverage_generations
+       SET backup_anchor_id = v_anchor_id,
+           boundary_lsn = p_backup_stop_lsn,
+           boundary_time = COALESCE(p_verified_at, clock_timestamp()),
+           valid_through_lsn = p_backup_stop_lsn,
+           valid_through_time = COALESCE(p_verified_at, clock_timestamp()),
+           state = 'active',
+           activated_at = clock_timestamp(),
+           state_reason = 'verified_full_backup',
+           details = COALESCE(details, '{}'::jsonb)
+               || jsonb_build_object('tracking_marker_lsn', v_marker_lsn)
+     WHERE generation_id = v_pending.generation_id
+       AND state = 'building'
+    RETURNING generation_id INTO v_generation_id;
+
+    IF v_generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_activate_backup_anchor: generation % could not be activated',
+            v_pending.generation_id;
     END IF;
 
     UPDATE flashback.tracked_tables
-       SET coverage_start_lsn = first_lsn,
-           coverage_end_lsn = latest_lsn
-     WHERE rel_oid = v_rel_oid;
+       SET coverage_start_lsn = p_backup_stop_lsn,
+           coverage_end_lsn = p_backup_stop_lsn
+     WHERE tracking_id = v_tracked.tracking_id;
+
+    UPDATE flashback.coverage_gaps
+       SET gap_end_lsn = p_backup_stop_lsn,
+           gap_end_time = COALESCE(p_verified_at, clock_timestamp()),
+           reanchored_by_generation_id = v_generation_id,
+           reanchored_at = clock_timestamp()
+     WHERE tracking_id = v_tracked.tracking_id
+       AND reanchored_by_generation_id IS NULL
+       AND gap_start_lsn < p_backup_stop_lsn;
+
+    RETURN v_generation_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_advance_backup_frontier(
+    p_target_table text,
+    p_valid_through_lsn pg_lsn,
+    p_timeline_id bigint DEFAULT NULL
+)
+RETURNS pg_lsn
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_tracked record;
+    v_active record;
+    v_timeline bigint;
+BEGIN
+    IF p_valid_through_lsn IS NULL THEN
+        RAISE EXCEPTION 'flashback_advance_backup_frontier: valid_through_lsn is required';
+    END IF;
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.rel_oid = flashback_resolve_tracked_backup(p_target_table)
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup';
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_advance_backup_frontier: backup profile is not active for %', p_target_table;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
+
+    SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
+    IF p_timeline_id IS NOT NULL AND p_timeline_id IS DISTINCT FROM v_timeline THEN
+        UPDATE flashback.coverage_generations cg
+           SET state_reason = 'timeline_mismatch_frontier_frozen'
+          FROM flashback.backup_anchors ba
+         WHERE cg.tracking_id = v_tracked.tracking_id
+           AND cg.state = 'active'
+           AND ba.backup_anchor_id = cg.backup_anchor_id;
+
+        INSERT INTO flashback.coverage_gaps (
+            tracking_id, source_generation_id, reason,
+            gap_start_lsn, gap_start_time, lower_bound_inclusive, details
+        )
+        SELECT
+            v_tracked.tracking_id, cg.generation_id, 'timeline_mismatch',
+            cg.valid_through_lsn, cg.valid_through_time, false,
+            jsonb_build_object(
+                'expected_timeline', ba.timeline_id,
+                'observed_timeline', p_timeline_id
+            )
+        FROM flashback.coverage_generations cg
+        JOIN flashback.backup_anchors ba ON ba.backup_anchor_id = cg.backup_anchor_id
+        WHERE cg.tracking_id = v_tracked.tracking_id
+          AND cg.state = 'active'
+          AND NOT EXISTS (
+              SELECT 1 FROM flashback.coverage_gaps g
+              WHERE g.tracking_id = v_tracked.tracking_id
+                AND g.source_generation_id = cg.generation_id
+                AND g.reanchored_by_generation_id IS NULL
+                AND g.reason = 'timeline_mismatch'
+          );
+        RAISE EXCEPTION 'flashback_advance_backup_frontier: timeline mismatch freezes the frontier';
+    END IF;
+
+    SELECT cg.* INTO v_active
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracked.tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'active'
+    FOR UPDATE;
+    IF v_active.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_advance_backup_frontier: no active backup generation for %', p_target_table;
+    END IF;
+    IF p_valid_through_lsn < v_active.valid_through_lsn THEN
+        RAISE EXCEPTION 'flashback_advance_backup_frontier: frontier % is before current valid_through %',
+            p_valid_through_lsn, v_active.valid_through_lsn;
+    END IF;
+    IF p_valid_through_lsn = v_active.valid_through_lsn THEN
+        RETURN v_active.valid_through_lsn;
+    END IF;
+
+    -- Contiguous advance only: refuse holes relative to the proven frontier.
+    -- Callers must revalidate the archive prefix under the repository shared
+    -- lock before invoking this function.
+    UPDATE flashback.coverage_generations
+       SET valid_through_lsn = p_valid_through_lsn,
+           valid_through_time = clock_timestamp(),
+           state_reason = 'physical_wal_frontier_advanced'
+     WHERE generation_id = v_active.generation_id
+       AND state = 'active';
+
+    UPDATE flashback.tracked_tables
+       SET coverage_end_lsn = p_valid_through_lsn
+     WHERE tracking_id = v_tracked.tracking_id;
+
+    RETURN p_valid_through_lsn;
 END;
 $$;
 
@@ -344,6 +718,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_tracked record;
+    v_generation record;
     v_schema record;
     v_request_id text;
     v_request jsonb;
@@ -355,20 +730,47 @@ BEGIN
     IF v_tracked.rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_prepare_backup_restore: backup profile is not active for %', target_table;
     END IF;
-    IF v_tracked.coverage_start_lsn IS NULL OR v_tracked.coverage_end_lsn IS NULL THEN
-        RAISE EXCEPTION 'flashback_prepare_backup_restore: verified backup/WAL coverage is unknown';
+
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
+
+    SELECT cg.* INTO v_generation
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracked.tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state IN ('active', 'sealed')
+      AND cg.backup_anchor_id IS NOT NULL
+      AND cg.boundary_lsn IS NOT NULL
+      AND cg.valid_through_lsn IS NOT NULL
+      AND target_lsn >= cg.boundary_lsn
+      AND target_lsn <= cg.valid_through_lsn
+      AND (cg.superseded_before_lsn IS NULL OR target_lsn < cg.superseded_before_lsn)
+    ORDER BY cg.generation_no DESC
+    LIMIT 1
+    FOR UPDATE;
+
+    IF v_generation.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_prepare_backup_restore: no admissible backup generation covers target %',
+            target_lsn
+            USING HINT = 'Targets require an active/sealed generation with a verified FULL backup anchor; unanchored or gap intervals are rejected.';
     END IF;
-    IF target_lsn < v_tracked.coverage_start_lsn OR target_lsn > v_tracked.coverage_end_lsn THEN
-        RAISE EXCEPTION 'flashback_prepare_backup_restore: target % is outside verified coverage % .. %',
-            target_lsn, v_tracked.coverage_start_lsn, v_tracked.coverage_end_lsn;
+
+    IF EXISTS (
+        SELECT 1
+        FROM flashback.coverage_gaps g
+        WHERE g.tracking_id = v_tracked.tracking_id
+          AND target_lsn > g.gap_start_lsn
+          AND (g.gap_end_lsn IS NULL OR target_lsn < g.gap_end_lsn)
+    ) THEN
+        RAISE EXCEPTION 'flashback_prepare_backup_restore: target % falls inside a coverage gap',
+            target_lsn;
     END IF;
 
     SELECT sv.schema_version, sv.helper_schema_sha256
       INTO v_schema
     FROM flashback.schema_versions sv
     WHERE sv.rel_oid = v_tracked.rel_oid
-      AND sv.applied_lsn <= target_lsn
-    ORDER BY sv.applied_lsn DESC, sv.schema_version DESC
+      AND (sv.applied_lsn IS NULL OR sv.applied_lsn <= target_lsn)
+    ORDER BY sv.applied_lsn DESC NULLS LAST, sv.schema_version DESC
     LIMIT 1;
 
     IF v_schema.schema_version IS NULL OR v_schema.helper_schema_sha256 IS NULL THEN
@@ -396,15 +798,20 @@ BEGIN
         ),
         'expected_schema_version', v_schema.schema_version,
         'expected_schema_sha256', v_schema.helper_schema_sha256,
-        'expected_fingerprint', NULL
+        'expected_fingerprint', NULL,
+        'tracking_id', v_tracked.tracking_id,
+        'generation_id', v_generation.generation_id,
+        'backup_anchor_id', v_generation.backup_anchor_id
     );
 
     INSERT INTO flashback.backup_restore_requests (
-        request_id, rel_oid, schema_name, table_name, target_lsn,
+        request_id, rel_oid, tracking_id, generation_id,
+        schema_name, table_name, target_lsn,
         expected_schema_version, expected_schema_sha256,
         helper_profile, request_json, requested_by
     ) VALUES (
-        v_request_id, v_tracked.rel_oid, v_tracked.schema_name, v_tracked.table_name,
+        v_request_id, v_tracked.rel_oid, v_tracked.tracking_id, v_generation.generation_id,
+        v_tracked.schema_name, v_tracked.table_name,
         target_lsn, v_schema.schema_version, v_schema.helper_schema_sha256,
         v_tracked.helper_profile, v_request, session_user
     );
@@ -535,6 +942,12 @@ DECLARE
     v_owner_name text;
     v_acl_rec record;
     v_existing_acl_rec record;
+    v_tracking_id bigint;
+    v_parent_generation_id bigint;
+    v_generation_no bigint;
+    v_boundary_xid bigint;
+    v_provisional_lsn pg_lsn;
+    v_successor_id bigint;
 BEGIN
     SELECT * INTO v_request
     FROM flashback.backup_restore_requests
@@ -544,6 +957,13 @@ BEGIN
     IF v_request.request_id IS NULL OR v_request.status <> 'artifact_ready' THEN
         RAISE EXCEPTION 'flashback_finalize_backup_restore: request % is not artifact_ready', p_request_id;
     END IF;
+    IF v_request.tracking_id IS NULL OR v_request.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_finalize_backup_restore: request % is not pinned to an admitted generation',
+            p_request_id;
+    END IF;
+
+    v_tracking_id := v_request.tracking_id;
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
 
     v_owner_name := v_request.result_json ->> 'recovered_owner';
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_owner_name) THEN
@@ -570,10 +990,6 @@ BEGIN
                 v_acl_rec.privilege;
         END IF;
     END LOOP;
-
-    PERFORM pg_advisory_xact_lock(
-        hashtextextended('pg_flashback:backup:' || v_request.rel_oid::text, 0)
-    );
 
     v_current_oid := to_regclass(format('%I.%I', v_request.schema_name, v_request.table_name));
     IF v_current_oid IS NOT NULL AND v_current_oid <> v_request.rel_oid THEN
@@ -714,11 +1130,62 @@ BEGIN
     UPDATE flashback.tracked_tables
        SET rel_oid = v_new_oid,
            schema_name = v_request.schema_name,
-           table_name = v_request.table_name
-     WHERE rel_oid = v_request.rel_oid;
+           table_name = v_request.table_name,
+           coverage_start_lsn = NULL,
+           coverage_end_lsn = NULL
+     WHERE tracking_id = v_tracking_id;
     UPDATE flashback.schema_versions SET rel_oid = v_new_oid WHERE rel_oid = v_request.rel_oid;
     UPDATE flashback.delta_log SET rel_oid = v_new_oid WHERE rel_oid = v_request.rel_oid;
     UPDATE flashback.staging_events SET rel_oid = v_new_oid WHERE rel_oid = v_request.rel_oid;
+
+    SELECT generation_id INTO v_parent_generation_id
+    FROM flashback.coverage_generations
+    WHERE tracking_id = v_tracking_id
+      AND recovery_profile = 'backup'
+      AND state = 'active'
+    FOR UPDATE;
+    IF v_parent_generation_id IS NULL THEN
+        v_parent_generation_id := v_request.generation_id;
+    END IF;
+
+    SELECT COALESCE(MAX(generation_no), 0) + 1
+      INTO v_generation_no
+    FROM flashback.coverage_generations
+    WHERE tracking_id = v_tracking_id;
+
+    v_boundary_xid := (txid_current() % 4294967296)::bigint;
+    v_provisional_lsn := pg_current_wal_insert_lsn();
+
+    INSERT INTO flashback.coverage_generations (
+        tracking_id, generation_no, parent_generation_id, stream_id,
+        recovery_profile, state, boundary_kind, rel_oid_at_boundary,
+        boundary_snapshot_id, backup_anchor_id,
+        boundary_xid, boundary_marker, restored_target_lsn, details
+    ) VALUES (
+        v_tracking_id, v_generation_no, v_parent_generation_id, NULL,
+        'backup', 'building', 'post_restore', v_new_oid,
+        NULL, NULL,
+        v_boundary_xid,
+        format('post-restore-backup:%s:%s:%s', v_tracking_id, v_boundary_xid, v_generation_no),
+        v_request.target_lsn,
+        jsonb_build_object(
+            'source_generation_id', v_parent_generation_id,
+            'request_id', p_request_id,
+            'provisional_insert_lsn', v_provisional_lsn
+        )
+    ) RETURNING generation_id INTO v_successor_id;
+
+    PERFORM pg_logical_emit_message(
+        true,
+        'pg_flashback',
+        jsonb_build_object(
+            'op', 'BOUNDARY',
+            'kind', 'post_restore',
+            'tracking_id', v_tracking_id,
+            'generation_id', v_successor_id,
+            'parent_generation_id', v_parent_generation_id
+        )::text
+    );
 
     UPDATE flashback.backup_restore_requests
        SET status = 'completed',
