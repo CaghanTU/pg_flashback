@@ -36,6 +36,11 @@
     "non_pgbackrest_providers",
     "pg15_on_this_host"
   ],
-  "tested_commit": "16dc896917457cdc293f487edf58795b788d5713",
-  "note": "Evidence commands were executed on this branch through ded7e17; adversarial/PoC result JSONs bind their own run commits."
+  "tested_commit": "2b6b45b87eb42a0d160e65e82e16d4df7e3b2690",
+  "note": "Historical retained-full evidence; use provenance.source_commit. Later docs-only commits must not claim they were the tested tree.",
+  "provenance": {
+    "source_commit": "2b6b45b87eb42a0d160e65e82e16d4df7e3b2690",
+    "source_tree": "f60332559c639fd9215eb59ec2e049781cfa95aa",
+    "note": "Superseded for advancement work by v0.1.0-overnight-anchor-advancement-evidence.json; tested_commit field below is historical"
+  }
 }
