@@ -36,6 +36,6 @@
     "non_pgbackrest_providers",
     "pg15_on_this_host"
   ],
-  "tested_commit": "ded7e179b5a5b2687f963d6388152f5ebf18a13f",
+  "tested_commit": "16dc896917457cdc293f487edf58795b788d5713",
   "note": "Evidence commands were executed on this branch through ded7e17; adversarial/PoC result JSONs bind their own run commits."
 }
