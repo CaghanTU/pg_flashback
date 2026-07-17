@@ -11,8 +11,9 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 > **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
 > qualified, including generation-aware local retention, but the project as a
 > whole is still pre-release. Automated capacity/write-stall admission,
-> remaining backup-profile negative/race qualification, exact-RC soak,
-> and versioned upgrade packaging remain release gates. Read the binding
+> exact-RC soak and clean-host artifact installation remain release gates.
+> The initial release establishes the baseline from which later releases must
+> provide versioned update scripts. Read the binding
 > [storage policy](docs/STORAGE_POLICY.md),
 > [coverage design](docs/COVERAGE_MODEL.md) and
 > [release scope](docs/RELEASE_SCOPE.md) before evaluating the project.
@@ -54,8 +55,9 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 - **Backup profile for local-budget-ineligible tables:** no base-table copy and no row-delta
   duplication; native PostgreSQL PITR runs in a private cluster and returns a
   validated one-table artifact through snapshot-direct or classic pgBackRest
-  restore. Helper recovery is implemented; coverage-generation integration is
-  still a release gate and is not yet release-qualified.
+  restore. Authenticated anchors, post-swap FULL re-anchor, timeline freeze,
+  durable expiration leases and missing-anchor audits are wired and covered by
+  the real-repository E2E. Exact-RC and clean-host release qualification remain.
 
 ## 2. Architecture Overview
 
@@ -208,8 +210,11 @@ pg-flashback-recovery expire --config helper.json
 
 Verification requests contain only `request_id` and `tracking_id`. The helper
 holds the repository lock while reading pgBackRest metadata, manifests, and
-contiguous archived WAL. Direct uncoordinated `pgbackrest expire` is outside
-the supported operating model.
+contiguous archived WAL. Coordinated expiration also commits a durable database
+lease before calling pgBackRest; every backup-generation lifecycle mutation is
+rejected until that lease completes. A helper crash leaves the lease in place
+and the next invocation resumes it. Direct uncoordinated `pgbackrest expire`
+is outside the supported operating model.
 
 ### Install a tagged binary archive
 
@@ -785,12 +790,15 @@ runtime freezes the old stream watermark and opens a persistent gap when the
 missing/replaced/externally advanced slot is observed; restore beyond that
 frontier is rejected until `flashback_reanchor()` establishes a new boundary.
 
-**2. Capture visibility can be delayed by maintenance head-of-line blocking**
+**2. Capture and maintenance require two worker slots per database**
 `staging_events` is LOGGED, so committed trigger events survive a PostgreSQL
-crash. However, the current worker serializes WAL consumption, staging flush,
-checkpoint and retention work. A slow checkpoint or lock wait can delay when
-events become visible in `delta_log`, and in WAL mode it can grow slot lag.
-Separating capture drain from maintenance is a release gate.
+crash. Capture drain and maintenance now run in dedicated background workers;
+a slow checkpoint or lifecycle lock on one table does not serialize WAL
+consumption behind maintenance. Configure two available
+`max_worker_processes` slots for every database admitted by
+`pg_flashback.max_workers`. PostgreSQL may be unable to start one half of the
+pair when this capacity is missing, so monitor the server log and
+`flashback_health()` rather than assuming registration succeeded.
 
 **3. `flashback_restore` exclusive lock can pause under a long-running query**
 The atomic shadow swap (`DROP original → RENAME shadow`) requires an `AccessExclusiveLock`. If there is a long-running `SELECT`, `VACUUM`, or open transaction on the table at restore time, the lock acquisition will block — and will in turn block all subsequent reads/writes behind it. Always restore during a low-traffic window or set a `lock_timeout` in your session first:
@@ -890,7 +898,11 @@ cluster-level recovery.
   [RELEASE_SCOPE.md](docs/RELEASE_SCOPE.md).
 - **Backup/expire coordination:** Snapshot-direct reads a completed backup tree
   directly. Every backup/expire job for that repository must use the supplied
-  exclusive lock wrapper; otherwise the helper refuses to claim race safety.
+  exclusive lock wrapper. The helper `expire` command additionally holds a
+  durable database lease across pgBackRest expiration, preventing generation
+  activation after the pin check. Wrapped backup commands must specify
+  `--no-expire-auto`; retention runs separately through the helper after
+  generation pins are released. External lock-bypassing expiration remains unsupported.
 
 ## 16. License
 

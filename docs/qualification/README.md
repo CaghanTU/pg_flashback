@@ -22,17 +22,16 @@ PG_FLASHBACK_SOAK_SECONDS=20 PG_FLASHBACK_SOAK_TARGET_MIB=64 ./scripts/run_dev_s
 
 `run_capture_maintenance_isolation_slo.sh` is the M3 isolation measurement.
 It holds the locked table's lifecycle advisory lock while committing at least
-200 individual transactions to the unblocked table. Capture and maintenance
-still share one background-worker loop (including its cadence and timeouts);
-this test demonstrates capture progress despite a blocked unrelated lifecycle,
-not separate workers. It records monotonic commit-ack to first
-`flashback.delta_log` visibility at 20 ms polling resolution and reports
-p50/p95/p99/max milliseconds. PASS requires p95 below 2000 ms, max below
-5000 ms, capture progress during the hold, tracked-prefix catch-up, fixed global
-prefix catch-up, and global slot lag below the explicit target. The JSON keeps
-`tracked_prefix_caught_up` and `global_slot_lag_within_target` separate. A
-single polling observation can stamp many commit samples; the report records
-both sample and polling-cycle counts.
+200 individual transactions to the unblocked table. Each configured database
+has a dedicated capture worker and a dedicated maintenance worker; the harness
+asserts both processes are present before applying the maintenance lock. It
+records each transaction's monotonic commit acknowledgement and immediately
+polls for that exact event's first `flashback.delta_log` visibility at 20 ms
+resolution, then reports p50/p95/p99/max milliseconds. PASS requires p95 below
+1000 ms, max below 5000 ms, capture progress during the hold, tracked-prefix
+catch-up, fixed global-prefix catch-up, and global slot lag below the explicit
+target. The JSON keeps `tracked_prefix_caught_up` and
+`global_slot_lag_within_target` separate.
 
 `run_dev_soak.sh` is a bounded **development soak**, not a 24-hour or
 exact-RC qualification. It defaults to 90 seconds. Set

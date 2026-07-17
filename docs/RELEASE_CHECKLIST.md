@@ -141,9 +141,11 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
       and downtime bounds and a maintenance runbook. A real `pg_dump`/restore
       round trip proves that no tracking, payload or coverage state is silently
       transported and that the restored database requires fresh tracking.
-- [ ] The extension version is bumped and a versioned update script migrates an
-      installed release. Re-running base SQL or drop/create is not an upgrade
-      strategy; drop/create would now delete extension-owned recovery payload.
+- [ ] For the initial `v0.1.0`, the packaged base SQL is tested as the canonical
+      fresh-install baseline. For every later release, the extension version is
+      bumped and a versioned update script migrates the previous public
+      release. Re-running base SQL or drop/create is never an upgrade strategy;
+      drop/create would delete extension-owned recovery payload.
 - [ ] Capture drain remains within its latency/WAL-lag SLO while maintenance is
       blocked on another table.
 

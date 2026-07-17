@@ -659,6 +659,54 @@ PRODUCTION_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb 
 [[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb -v request_id="$SUCCESS_REQUEST_ID" -f <(printf '%s\n' "SELECT status FROM flashback.backup_restore_requests WHERE request_id = :'request_id';"))" == "completed" ]]
 pass "reference controller verifies the artifact and completes the extension shadow swap"
 
+# The swap intentionally leaves zero active generations and a building
+# successor. Resolve its real marker, take a new FULL strictly after it, and
+# prove that repository verification reanchors coverage at the new backup stop.
+POST_SWAP_TRACKING_ID="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT tracking_id FROM flashback.tracked_tables WHERE schema_name='public' AND table_name='target_table' AND is_active;")"
+[[ -n "$POST_SWAP_TRACKING_ID" ]] || die "post-swap tracking lifecycle is missing"
+for _ in $(seq 1 200); do
+    POST_SWAP_MARKER="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+        -c "SELECT details->>'tracking_marker_lsn' FROM flashback.coverage_generations WHERE tracking_id=$POST_SWAP_TRACKING_ID AND state='building' ORDER BY generation_no DESC LIMIT 1;")"
+    [[ -n "$POST_SWAP_MARKER" ]] && break
+    "$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+        -c "SELECT flashback_consume_wal(4096);" > /dev/null || true
+    sleep 0.05
+done
+[[ -n "${POST_SWAP_MARKER:-}" ]] || die "post-swap backup marker did not resolve"
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) FROM flashback.coverage_generations WHERE tracking_id=$POST_SWAP_TRACKING_ID AND state='active';")" == "0" ]]
+
+"$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null
+PRIMARY_STARTED=0
+"$PG_CTL" -D "$RUN_ROOT/primary" -l "$RUN_ROOT/log/post-swap-reanchor.log" \
+    -o "-p $VERIFY_PORT -k $VERIFY_SOCKET" start -w -t 60 > /dev/null
+PRIMARY_STARTED=1
+"$PGBACKREST" --config="$RUN_ROOT/pgbackrest.conf" --stanza=large_db_poc --repo=1 \
+    --pg1-port="$VERIFY_PORT" --pg1-socket-path="$VERIFY_SOCKET" \
+    --type=full --compress-type=none --no-expire-auto backup > "$RUN_ROOT/post-swap-backup.log"
+[[ "$(find "$RUN_ROOT/repo/backup/large_db_poc" -mindepth 2 -maxdepth 2 \
+    -name backup.manifest | wc -l)" -ge "2" ]] \
+    || die "post-swap backup auto-expired a retained predecessor anchor"
+POST_SWAP_CONFIG="$RUN_ROOT/helper-post-swap-reanchor.json"
+jq --arg host "$VERIFY_SOCKET" --argjson port "$VERIFY_PORT" \
+    '.controller.host = $host | .controller.port = $port' \
+    "$RUN_ROOT/helper-verifier.json" > "$POST_SWAP_CONFIG"
+chmod 600 "$POST_SWAP_CONFIG"
+POST_SWAP_VERIFY_REQUEST="$RUN_ROOT/request-post-swap-reanchor.json"
+jq -n --arg request_id "e2e-post-swap-reanchor" \
+    --argjson tracking_id "$POST_SWAP_TRACKING_ID" \
+    '{request_id: $request_id, tracking_id: $tracking_id}' > "$POST_SWAP_VERIFY_REQUEST"
+chmod 600 "$POST_SWAP_VERIFY_REQUEST"
+"$HELPER" verify-anchor --config "$POST_SWAP_CONFIG" \
+    --request "$POST_SWAP_VERIFY_REQUEST" > "$RUN_ROOT/post-swap-reanchor.result.json"
+[[ "$(jq -r '.status' "$RUN_ROOT/post-swap-reanchor.result.json")" == "verified" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) FROM flashback.coverage_generations WHERE tracking_id=$POST_SWAP_TRACKING_ID AND state='active' AND boundary_lsn > '$POST_SWAP_MARKER'::pg_lsn;")" == "1" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) FROM flashback.coverage_gaps WHERE tracking_id=$POST_SWAP_TRACKING_ID AND reanchored_by_generation_id IS NOT NULL;")" -ge "1" ]]
+pass "post-swap FULL backup reanchors the building successor with no fallback gap"
+
 "$PG_BIN/dropdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" --if-exists helper_verify > /dev/null
 "$PG_BIN/createdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" helper_verify
 "$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify -c 'CREATE SCHEMA flashback_import;' > /dev/null
@@ -679,6 +727,43 @@ HEALTHY_AUDIT_JSON="$RUN_ROOT/anchor-audit-healthy.json"
 [[ "$(jq -r '.checked' "$HEALTHY_AUDIT_JSON")" -ge 1 ]]
 pass "periodic anchor audit verifies every retained repository anchor"
 
+# A newer PostgreSQL timeline in the retained archive is not ordinary missing
+# WAL. Verify it from a CoW repository copy so the live fixture remains intact,
+# and require a durable timeline gap rather than a generic transient error.
+WRONG_TIMELINE_REPO="$RUN_ROOT/repo-wrong-timeline"
+cp -a --reflink=always "$RUN_ROOT/repo" "$WRONG_TIMELINE_REPO"
+ARCHIVE_SEGMENT="$(find "$WRONG_TIMELINE_REPO/archive/large_db_poc" -type f \
+    -regextype posix-extended -regex '.*/[0-9A-Fa-f]{24}-[0-9a-f]{40}' | sort | tail -1)"
+[[ -f "$ARCHIVE_SEGMENT" ]] || die "wrong-timeline fixture found no archived WAL segment"
+ARCHIVE_NAME="$(basename "$ARCHIVE_SEGMENT")"
+ANCHOR_TIMELINE="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT min(timeline_id) FROM flashback.backup_anchors;")"
+FUTURE_TIMELINE_HEX="$(printf '%08X' $((ANCHOR_TIMELINE + 1)))"
+FUTURE_SEGMENT="$(dirname "$ARCHIVE_SEGMENT")/$FUTURE_TIMELINE_HEX${ARCHIVE_NAME:8}"
+cp --reflink=always "$ARCHIVE_SEGMENT" "$FUTURE_SEGMENT"
+WRONG_TIMELINE_TRACKING_ID="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT min(tracking_id) FROM flashback.coverage_generations WHERE recovery_profile='backup' AND state='active';")"
+WRONG_TIMELINE_CONFIG="$RUN_ROOT/helper-wrong-timeline.json"
+jq --arg repository "$WRONG_TIMELINE_REPO" \
+    '.repository_path = $repository' "$ANCHOR_AUDIT_CONFIG" > "$WRONG_TIMELINE_CONFIG"
+chmod 600 "$WRONG_TIMELINE_CONFIG"
+WRONG_TIMELINE_REQUEST="$RUN_ROOT/request-wrong-timeline.json"
+jq -n --arg request_id "e2e-wrong-timeline" \
+    --argjson tracking_id "$WRONG_TIMELINE_TRACKING_ID" \
+    '{request_id: $request_id, tracking_id: $tracking_id}' > "$WRONG_TIMELINE_REQUEST"
+chmod 600 "$WRONG_TIMELINE_REQUEST"
+set +e
+"$HELPER" verify-frontier --config "$WRONG_TIMELINE_CONFIG" \
+    --request "$WRONG_TIMELINE_REQUEST" \
+    > "$RUN_ROOT/wrong-timeline.out" 2> "$RUN_ROOT/wrong-timeline.err"
+WRONG_TIMELINE_RC=$?
+set -e
+[[ "$WRONG_TIMELINE_RC" != "0" ]]
+[[ "$(jq -r '.code' "$RUN_ROOT/wrong-timeline.err")" == "timeline_mismatch" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) FROM flashback.coverage_gaps WHERE tracking_id=$WRONG_TIMELINE_TRACKING_ID AND reason='timeline_mismatch' AND reanchored_by_generation_id IS NULL;")" == "1" ]]
+pass "newer repository timeline is detected and durably freezes coverage"
+
 ANCHOR_MANIFEST="$(find "$RUN_ROOT/repo/backup/large_db_poc" -mindepth 2 -maxdepth 2 -name backup.manifest -print -quit)"
 [[ -f "$ANCHOR_MANIFEST" ]] || die "anchor audit fixture manifest is missing"
 mv "$ANCHOR_MANIFEST" "$ANCHOR_MANIFEST.audit-missing"
@@ -690,6 +775,101 @@ mv "$ANCHOR_MANIFEST.audit-missing" "$ANCHOR_MANIFEST"
 [[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
     -c "SELECT count(*) > 0 FROM flashback_health() WHERE health = 'degraded' AND reason LIKE '%repository proof%';")" == "t" ]]
 pass "externally removed anchor is detected, durably frozen and surfaced by health"
+
+# Prove the database-side lease closes the expire/admission race. This uses a
+# separate extension database with no retained anchors so expiration may start,
+# then attempts to create a backup generation while a deliberately slow
+# pgBackRest wrapper keeps the lease open.
+"$PG_BIN/dropdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" --if-exists expire_e2e > /dev/null
+"$PG_BIN/createdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" expire_e2e
+"$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_e2e \
+    -c 'CREATE EXTENSION pg_flashback; CREATE TABLE public.expire_candidate(id bigint PRIMARY KEY);' \
+    > /dev/null
+SLOW_EXPIRE="$RUN_ROOT/slow-pgbackrest-expire.sh"
+cat > "$SLOW_EXPIRE" <<SLOW_EXPIRE_EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+sleep 3
+exec "$PGBACKREST" "\$@"
+SLOW_EXPIRE_EOF
+chmod 700 "$SLOW_EXPIRE"
+EXPIRE_E2E_CONFIG="$RUN_ROOT/helper-expire-e2e.json"
+jq --arg host "$VERIFY_SOCKET" \
+   --argjson port "$VERIFY_PORT" \
+   --arg pgbackrest "$SLOW_EXPIRE" \
+   '.controller.host = $host
+    | .controller.port = $port
+    | .controller.database = "expire_e2e"
+    | .pgbackrest_bin = $pgbackrest
+    | .profile = "expire_e2e"' \
+   "$RUN_ROOT/helper-verifier.json" > "$EXPIRE_E2E_CONFIG"
+chmod 600 "$EXPIRE_E2E_CONFIG"
+"$HELPER" expire --config "$EXPIRE_E2E_CONFIG" \
+    > "$RUN_ROOT/expire-e2e.result.json" 2> "$RUN_ROOT/expire-e2e.err" &
+ACTIVE_HELPER_PID=$!
+EXPIRE_LEASE_ACTIVE="f"
+for _ in $(seq 1 100); do
+    EXPIRE_LEASE_ACTIVE="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" \
+        -d expire_e2e -c "SELECT EXISTS (SELECT 1 FROM flashback.backup_expire_leases WHERE state='active');")"
+    [[ "$EXPIRE_LEASE_ACTIVE" == "t" ]] && break
+    sleep 0.05
+done
+[[ "$EXPIRE_LEASE_ACTIVE" == "t" ]] || die "durable expire lease was not observed"
+set +e
+"$PSQL" -X -qAt -v ON_ERROR_STOP=1 -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" \
+    -d expire_e2e \
+    -c "SELECT flashback_track_backup('public.expire_candidate', 'expire_e2e');" \
+    > "$RUN_ROOT/expire-race-track.out" 2> "$RUN_ROOT/expire-race-track.err"
+EXPIRE_RACE_RC=$?
+set -e
+[[ "$EXPIRE_RACE_RC" != "0" ]] || die "backup generation activated during expiration"
+grep -q 'blocked by repository expiration' "$RUN_ROOT/expire-race-track.err" \
+    || die "expire race did not fail with the durable lease guard"
+wait "$ACTIVE_HELPER_PID" || die "coordinated expiration failed"
+ACTIVE_HELPER_PID=""
+[[ "$(jq -r '.status' "$RUN_ROOT/expire-e2e.result.json")" == "expired" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_e2e \
+    -c "SELECT count(*) FROM flashback.backup_expire_leases WHERE state='completed';")" == "1" ]]
+"$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_e2e \
+    -c "SELECT flashback_track_backup('public.expire_candidate', 'expire_e2e');" > /dev/null
+pass "durable expire lease blocks generation activation and completes after pgBackRest"
+
+# A helper/pgBackRest failure must leave the lease active. A later invocation
+# with the corrected binary resumes the same lease, reruns expire, and only
+# then reopens backup lifecycle admission.
+"$PG_BIN/dropdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" --if-exists expire_resume_e2e > /dev/null
+"$PG_BIN/createdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" expire_resume_e2e
+"$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_resume_e2e \
+    -c 'CREATE EXTENSION pg_flashback;' > /dev/null
+EXPIRE_RESUME_CONFIG="$RUN_ROOT/helper-expire-resume.json"
+jq --arg host "$VERIFY_SOCKET" --argjson port "$VERIFY_PORT" \
+   '.controller.host = $host
+    | .controller.port = $port
+    | .controller.database = "expire_resume_e2e"
+    | .pgbackrest_bin = "/bin/false"
+    | .profile = "expire_resume_e2e"' \
+   "$RUN_ROOT/helper-verifier.json" > "$EXPIRE_RESUME_CONFIG"
+chmod 600 "$EXPIRE_RESUME_CONFIG"
+set +e
+"$HELPER" expire --config "$EXPIRE_RESUME_CONFIG" \
+    > "$RUN_ROOT/expire-resume-fail.out" 2> "$RUN_ROOT/expire-resume-fail.err"
+EXPIRE_RESUME_RC=$?
+set -e
+[[ "$EXPIRE_RESUME_RC" != "0" ]]
+[[ "$(jq -r '.code' "$RUN_ROOT/expire-resume-fail.err")" == "command_failed" ]]
+EXPIRE_RESUME_LEASE_ID="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" \
+    -d expire_resume_e2e \
+    -c "SELECT lease_id FROM flashback.backup_expire_leases WHERE state='active';")"
+[[ -n "$EXPIRE_RESUME_LEASE_ID" ]] || die "failed expire did not retain its durable lease"
+jq --arg pgbackrest "$PGBACKREST" '.pgbackrest_bin = $pgbackrest' \
+    "$EXPIRE_RESUME_CONFIG" > "$EXPIRE_RESUME_CONFIG.retry"
+mv "$EXPIRE_RESUME_CONFIG.retry" "$EXPIRE_RESUME_CONFIG"
+chmod 600 "$EXPIRE_RESUME_CONFIG"
+"$HELPER" expire --config "$EXPIRE_RESUME_CONFIG" > "$RUN_ROOT/expire-resume.result.json"
+[[ "$(jq -r '.status' "$RUN_ROOT/expire-resume.result.json")" == "expired" ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_resume_e2e \
+    -c "SELECT state FROM flashback.backup_expire_leases WHERE lease_id=$EXPIRE_RESUME_LEASE_ID;")" == "completed" ]]
+pass "failed expiration retains and safely resumes its durable lease"
 
 "$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null
 PRIMARY_STARTED=0

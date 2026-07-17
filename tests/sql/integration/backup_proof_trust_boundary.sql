@@ -15,6 +15,7 @@ DECLARE
     v_schema_def jsonb;
     v_schema_hash text;
     v_failed boolean;
+    v_expire_lease jsonb;
 BEGIN
     DROP TABLE IF EXISTS public.it_proof_a CASCADE;
     DROP TABLE IF EXISTS public.it_proof_b CASCADE;
@@ -135,6 +136,24 @@ BEGIN
         'proof-ok-a', v_tracking_id, 'proof_helper', 'repo', 'stanza',
         '20260717ProofAF', v_sysid, v_timeline, 'manifest-a', repeat('22', 32),
         v_marker_lsn + 1, v_marker_lsn + 50
+    );
+
+    -- Expire admission and generation activation are serialized in the
+    -- database, not only by a helper-local file lock. The durable lease must
+    -- survive transactions and block activation until explicitly completed.
+    v_expire_lease := flashback_begin_backup_expire('proof_helper', 'repo', 'stanza');
+    IF v_expire_lease ->> 'status' IS DISTINCT FROM 'started' THEN
+        RAISE EXCEPTION 'expire lease did not start: %', v_expire_lease;
+    END IF;
+    BEGIN
+        PERFORM flashback_consume_verified_backup_proof(v_proof_id);
+        RAISE EXCEPTION 'active expire lease must block generation activation';
+    EXCEPTION WHEN object_in_use THEN
+        NULL;
+    END;
+    PERFORM flashback_complete_backup_expire(
+        (v_expire_lease ->> 'lease_id')::bigint,
+        'proof_helper', 'repo', 'stanza'
     );
     v_generation_id := flashback_consume_verified_backup_proof(v_proof_id);
     IF NOT EXISTS (

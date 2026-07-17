@@ -189,10 +189,16 @@ parent traversal are rejected.
 
 pgBackRest's own locks do not cover a direct filesystem clone. Verify and
 restore take the shared side of `expire_lock_path`. The helper's `expire`
-command takes the exclusive side and refuses to run while an active/sealed
-generation pins any backup label. Direct, uncoordinated `pgbackrest expire`
-is outside the supported operating model. The lock order is profile, request
-when present, then repository; no code path acquires these in reverse.
+command takes the exclusive side and atomically creates a durable database
+lease after refusing active/sealed backup labels. The coverage-generation
+guard rejects every backup lifecycle mutation until the lease completes. A
+failed command retains the lease and a corrected retry resumes it, closing the
+pin-check/expire activation race even across helper crashes. Direct,
+uncoordinated `pgbackrest expire` is outside the supported operating model.
+The supplied backup lock wrapper also requires `--no-expire-auto`; retention
+is applied later only through the lease-aware helper command.
+The lock order is profile, request when present, then repository, then the
+database lease; no code path acquires these in reverse.
 
 The same-stanza deployment is preferred: keep the normal long-retention
 repository, and add a local short-retention repository key configured without

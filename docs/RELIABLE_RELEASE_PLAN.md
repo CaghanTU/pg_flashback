@@ -53,13 +53,16 @@ The current `large-db-poc` baseline already contains:
 Current implementation status on `work/v0.1.0-overnight`:
 
 1. backup-profile generation wiring, authenticated proof installation,
-   coordinated expire and periodic missing-anchor detection are implemented;
+   post-swap FULL re-anchor, durable coordinated expire, newer-timeline freeze
+   and periodic missing-anchor detection are implemented and covered by the
+   real-repository E2E;
 2. bounded local/helper capacity and artifact garbage collection are
    implemented, with exact-RC qualification still required;
 3. capture and bounded maintenance run in separate per-database workers; the
    exact-commit qualification harness enforces the stated p95/max SLOs;
-4. release versioning, packaging and clean-host installation remain open;
-5. exact-RC 24-hour soak and the final negative/race matrix remain open.
+4. release-mode packages build for PostgreSQL 15–18 and the helper; release
+   versioning and clean-host installation remain open;
+5. exact-RC 24-hour soak remains open.
 
 ## 3. Milestone 0 — Freeze the release contract
 

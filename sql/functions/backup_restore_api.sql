@@ -567,6 +567,122 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_begin_backup_expire(
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_labels text[];
+    v_lease flashback.backup_expire_leases%ROWTYPE;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'backup expiration lease requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_helper_profile IS NULL OR btrim(p_helper_profile) = ''
+       OR p_repository_key IS NULL OR btrim(p_repository_key) = ''
+       OR p_stanza IS NULL OR btrim(p_stanza) = ''
+    THEN
+        RAISE EXCEPTION 'backup expiration lease identity is incomplete';
+    END IF;
+
+    -- Serialize atomically with the shared lock in the generation guard.
+    PERFORM pg_advisory_xact_lock(358946::integer, 0);
+    SELECT ARRAY(
+        SELECT DISTINCT ba.backup_label
+        FROM flashback.coverage_generations cg
+        JOIN flashback.backup_anchors ba
+          ON ba.backup_anchor_id = cg.backup_anchor_id
+         AND ba.tracking_id = cg.tracking_id
+        JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = cg.tracking_id
+        WHERE tt.is_active
+          AND cg.state IN ('active', 'sealed')
+        ORDER BY ba.backup_label
+    ) INTO v_labels;
+    IF cardinality(v_labels) > 0 THEN
+        RETURN jsonb_build_object('status', 'protected', 'labels', to_jsonb(v_labels));
+    END IF;
+
+    SELECT * INTO v_lease
+    FROM flashback.backup_expire_leases
+    WHERE state = 'active'
+    FOR UPDATE;
+    IF v_lease.lease_id IS NOT NULL THEN
+        IF v_lease.helper_profile IS DISTINCT FROM p_helper_profile
+           OR v_lease.repository_key IS DISTINCT FROM p_repository_key
+           OR v_lease.stanza IS DISTINCT FROM p_stanza
+        THEN
+            RETURN jsonb_build_object(
+                'status', 'busy',
+                'lease_id', v_lease.lease_id,
+                'helper_profile', v_lease.helper_profile,
+                'repository_key', v_lease.repository_key,
+                'stanza', v_lease.stanza
+            );
+        END IF;
+        RETURN jsonb_build_object('status', 'resumed', 'lease_id', v_lease.lease_id);
+    END IF;
+
+    INSERT INTO flashback.backup_expire_leases (
+        helper_profile, repository_key, stanza
+    ) VALUES (
+        p_helper_profile, p_repository_key, p_stanza
+    ) RETURNING * INTO v_lease;
+    RETURN jsonb_build_object('status', 'started', 'lease_id', v_lease.lease_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_complete_backup_expire(
+    p_lease_id bigint,
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_lease flashback.backup_expire_leases%ROWTYPE;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'backup expiration lease completion requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM pg_advisory_xact_lock(358946::integer, 0);
+    SELECT * INTO v_lease
+    FROM flashback.backup_expire_leases
+    WHERE lease_id = p_lease_id
+    FOR UPDATE;
+    IF v_lease.lease_id IS NULL
+       OR v_lease.helper_profile IS DISTINCT FROM p_helper_profile
+       OR v_lease.repository_key IS DISTINCT FROM p_repository_key
+       OR v_lease.stanza IS DISTINCT FROM p_stanza
+    THEN
+        RAISE EXCEPTION 'backup expiration lease identity mismatch';
+    END IF;
+    IF v_lease.state = 'completed' THEN
+        RETURN jsonb_build_object('status', 'completed', 'lease_id', p_lease_id);
+    END IF;
+
+    UPDATE flashback.backup_expire_leases
+       SET state = 'completed',
+           completed_at = clock_timestamp(),
+           completed_by = session_user
+     WHERE lease_id = p_lease_id
+       AND state = 'active';
+    RETURN jsonb_build_object('status', 'completed', 'lease_id', p_lease_id);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_active_backup_anchor_contexts()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -702,7 +818,7 @@ BEGIN
         RAISE EXCEPTION 'backup generation freeze requires flashback_recovery_agent'
             USING ERRCODE = 'insufficient_privilege';
     END IF;
-    IF p_reason NOT IN ('repository_verification_failed', 'anchor_missing') THEN
+    IF p_reason NOT IN ('repository_verification_failed', 'anchor_missing', 'timeline_mismatch') THEN
         RAISE EXCEPTION 'unsupported backup generation freeze reason %', p_reason;
     END IF;
 
@@ -718,7 +834,10 @@ BEGIN
     END IF;
 
     UPDATE flashback.coverage_generations
-       SET state_reason = p_reason
+       SET state_reason = CASE p_reason
+             WHEN 'timeline_mismatch' THEN 'timeline_mismatch_frontier_frozen'
+             ELSE p_reason
+           END
      WHERE generation_id = v_generation.generation_id;
 
     INSERT INTO flashback.coverage_gaps (

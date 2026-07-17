@@ -57,6 +57,9 @@ pub enum RecoveryError {
     #[error("backup verification failed: {0}")]
     VerificationFailed(String),
 
+    #[error("repository timeline changed: expected={expected}, observed={observed}")]
+    TimelineMismatch { expected: u32, observed: u32 },
+
     #[error("backup expiration is blocked by active generation pins: {0}")]
     ProtectedBackups(String),
 
@@ -118,6 +121,7 @@ impl RecoveryError {
             Self::RecoveryBusy(_) => "recovery_busy",
             Self::RequestConflict(_) => "request_conflict",
             Self::VerificationFailed(_) => "verification_failed",
+            Self::TimelineMismatch { .. } => "timeline_mismatch",
             Self::ProtectedBackups(_) => "protected_backups",
             Self::Cancelled => "cancelled",
             Self::CommandTimeout { .. } => "command_timeout",

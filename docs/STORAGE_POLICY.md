@@ -227,8 +227,9 @@ recovery coordinate must not be mislabeled as the DDL transaction's commit
 LSN. Each backup generation persists a separate inclusive physical-WAL
 `valid_through_lsn`. It advances only while the repository shared lock is held
 and the selected backup plus every required archive segment is revalidated;
-expire takes the matching exclusive lock. Missing or contradictory archive
-evidence freezes this frontier. The helper performs native PostgreSQL recovery
+expire takes the matching exclusive lock plus a durable database lease that
+blocks backup-generation lifecycle mutations across helper crashes. Missing or
+contradictory archive evidence freezes this frontier. The helper performs native PostgreSQL recovery
 in a private cluster, validates table identity and content, extracts one
 artifact, and never mutates production. The extension owns the final
 validation and transactional swap.
@@ -250,7 +251,8 @@ globally ordered.
 Snapshot-direct is an acceleration of private cluster materialization. It does
 not remove WAL replay or table extraction cost. Classic pgBackRest restore is
 the portable fallback. Repository backup/expire operations must honor the
-shared/exclusive lock protocol in the operator runbook.
+shared/exclusive lock protocol in the operator runbook; supported expiration
+must also use the helper's durable lease protocol.
 
 ## Admission and capacity
 

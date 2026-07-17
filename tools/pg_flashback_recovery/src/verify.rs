@@ -108,6 +108,7 @@ struct FrontierContext {
     backup_label: String,
     backup_stop_lsn: String,
     anchor_timeline_id: u32,
+    live_timeline_id: u32,
     database_system_identifier: String,
     wal_segment_size_bytes: u64,
 }
@@ -124,6 +125,14 @@ struct InstalledFrontier {
     status: String,
     generation_id: i64,
     valid_through_lsn: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpireLease {
+    status: String,
+    lease_id: Option<i64>,
+    #[serde(default)]
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +387,19 @@ pub fn verify_frontier(
             "active anchor repository identity differs from helper configuration".to_owned(),
         ));
     }
+    if context.live_timeline_id != context.anchor_timeline_id {
+        freeze_timeline_mismatch(
+            config,
+            request.tracking_id,
+            context.anchor_timeline_id,
+            context.live_timeline_id,
+            "live PostgreSQL timeline differs from the retained backup anchor",
+        );
+        return Err(RecoveryError::TimelineMismatch {
+            expected: context.anchor_timeline_id,
+            observed: context.live_timeline_id,
+        });
+    }
 
     let metadata = match read_repository_metadata(config) {
         Ok(metadata) => metadata,
@@ -409,6 +431,16 @@ pub fn verify_frontier(
         context.anchor_timeline_id,
     ) {
         Ok(frontier) => frontier,
+        Err(error @ RecoveryError::TimelineMismatch { expected, observed }) => {
+            freeze_timeline_mismatch(
+                config,
+                request.tracking_id,
+                expected,
+                observed,
+                "archived WAL contains a newer PostgreSQL timeline",
+            );
+            return Err(error);
+        }
         Err(error) => {
             freeze_repository_failure(
                 config,
@@ -508,13 +540,32 @@ pub fn expire_backups(config: &RecoveryConfig) -> Result<ExpireResult, RecoveryE
     prepare_secure_directory(&config.work_root)?;
     let _profile_lock = acquire_profile_lock(config)?;
     let _repository_lock = acquire_repository_lock(config, true)?;
-    let labels: Vec<String> = query_json(
+    let lease: ExpireLease = query_json(
         config,
-        "SELECT to_json(flashback_active_backup_labels())::text",
+        &format!(
+            "SELECT flashback_begin_backup_expire({}, {}, {})::text",
+            sql_literal(&config.profile),
+            sql_literal(&config.repository_key.to_string()),
+            sql_literal(&config.stanza)
+        ),
     )?;
-    if !labels.is_empty() {
-        return Err(RecoveryError::ProtectedBackups(labels.join(",")));
+    if lease.status == "protected" {
+        return Err(RecoveryError::ProtectedBackups(lease.labels.join(",")));
     }
+    if lease.status == "busy" {
+        return Err(RecoveryError::RepositoryBusy);
+    }
+    if lease.status != "started" && lease.status != "resumed" {
+        return Err(RecoveryError::VerificationFailed(format!(
+            "controller returned unexpected expiration lease status {}",
+            lease.status
+        )));
+    }
+    let lease_id = lease.lease_id.ok_or_else(|| {
+        RecoveryError::VerificationFailed(
+            "controller expiration lease has no lease_id".to_owned(),
+        )
+    })?;
     let output = Command::new(&config.pgbackrest_bin)
         .arg(format!("--config={}", config.pgbackrest_config.display()))
         .arg(format!("--stanza={}", config.stanza))
@@ -526,10 +577,28 @@ pub fn expire_backups(config: &RecoveryConfig) -> Result<ExpireResult, RecoveryE
             message: error.to_string(),
         })?;
     if !output.status.success() {
+        // Deliberately retain the durable lease. A corrected retry resumes it
+        // and reruns pgBackRest expire idempotently; allowing generation
+        // activation after an uncertain partial expiration would be unsafe.
         return Err(RecoveryError::CommandFailed {
             program: config.pgbackrest_bin.clone(),
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
+    }
+    let completion: ExpireLease = query_json(
+        config,
+        &format!(
+            "SELECT flashback_complete_backup_expire({}, {}, {}, {})::text",
+            lease_id,
+            sql_literal(&config.profile),
+            sql_literal(&config.repository_key.to_string()),
+            sql_literal(&config.stanza)
+        ),
+    )?;
+    if completion.status != "completed" || completion.lease_id != Some(lease_id) {
+        return Err(RecoveryError::VerificationFailed(
+            "controller did not durably complete the expiration lease".to_owned(),
+        ));
     }
     Ok(ExpireResult {
         status: "expired".to_owned(),
@@ -749,6 +818,27 @@ fn freeze_repository_failure(config: &RecoveryConfig, tracking_id: i64, detail: 
     let _: Result<serde_json::Value, RecoveryError> = query_json(config, &sql);
 }
 
+fn freeze_timeline_mismatch(
+    config: &RecoveryConfig,
+    tracking_id: i64,
+    expected: u32,
+    observed: u32,
+    detail: &str,
+) {
+    let sql = format!(
+        "SELECT flashback_freeze_backup_generation(
+           {tracking_id}, 'timeline_mismatch',
+           jsonb_build_object(
+             'expected_timeline', {expected},
+             'observed_timeline', {observed},
+             'helper_detail', {detail}
+           )
+         )::text",
+        detail = sql_literal(detail),
+    );
+    let _: Result<serde_json::Value, RecoveryError> = query_json(config, &sql);
+}
+
 fn query_json<T: for<'de> Deserialize<'de>>(
     config: &RecoveryConfig,
     sql: &str,
@@ -929,9 +1019,21 @@ fn contiguous_archive_frontier_at(
     let mut segments = BTreeMap::new();
     collect_archive_segments(root, root, 0, &mut segments)?;
     let start = parse_lsn(start_lsn).map_err(RecoveryError::VerificationFailed)?;
+    let start_segment = start - (start % segment_size);
+    if let Some(observed) = segments.keys().find_map(|name| {
+        let timeline = segment_timeline(name)?;
+        let segment_start = segment_start_lsn(name, segment_size).ok()?;
+        (timeline > expected_timeline && segment_start + segment_size > start_segment)
+            .then_some(timeline)
+    }) {
+        return Err(RecoveryError::TimelineMismatch {
+            expected: expected_timeline,
+            observed,
+        });
+    }
     let mut segment = segment_name(
         expected_timeline,
-        start - (start % segment_size),
+        start_segment,
         segment_size,
     );
     let mut proof = Sha256::new();
@@ -1139,6 +1241,7 @@ mod tests {
 
     use sha1::{Digest, Sha1};
 
+    use crate::error::RecoveryError;
     use crate::model::BackupVerificationRequest;
     use crate::pgbackrest::SelectedBackup;
 
@@ -1231,6 +1334,28 @@ mod tests {
             contiguous_archive_frontier_at(&root, &format_lsn(start), segment_size, 1).unwrap();
         assert_eq!(frontier, format_lsn(start + segment_size));
         assert_eq!(proof.len(), 64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_frontier_rejects_a_newer_timeline() {
+        let root = temp_test_dir("archive-newer-timeline");
+        let segment_size = 1024_u64 * 1024;
+        let start = 0x0000_000A_1200_0000_u64;
+        let bytes = vec![0x24_u8; usize::try_from(segment_size).unwrap()];
+        let checksum = format!("{:x}", Sha1::digest(&bytes));
+        for timeline in [1, 2] {
+            let segment = segment_name(timeline, start, segment_size);
+            fs::write(root.join(format!("{segment}-{checksum}")), &bytes).unwrap();
+        }
+
+        assert!(matches!(
+            contiguous_archive_frontier_at(&root, &format_lsn(start), segment_size, 1),
+            Err(RecoveryError::TimelineMismatch {
+                expected: 1,
+                observed: 2
+            })
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 

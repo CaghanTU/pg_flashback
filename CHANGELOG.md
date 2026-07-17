@@ -20,8 +20,8 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
   deleted-row recovery using local snapshots plus logical-WAL capture for the
   qualified local profile; trigger capture remains legacy/experimental.
 - Backup profile for large ordinary tables without an in-database base copy or
-  row-delta duplication. Helper recovery is implemented; coverage-generation
-  integration remains a release gate.
+  row-delta duplication, with authenticated repository anchors, post-swap FULL
+  re-anchor, contiguous archived-WAL frontiers and durable gap admission.
 - External `pg-flashback-recovery` executor with pgBackRest full-backup
   selection, real XFS reflink capability probing, classic restore fallback and
   private native PostgreSQL LSN recovery.
@@ -31,7 +31,8 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
   `ALTER`, using the WAL insertion position so pre/post schema boundaries are
   strictly ordered.
 - Crash reconciliation, cancellation and timeout handling, work quotas,
-  repository backup/expire coordination and stable machine-readable errors.
+  repository backup/expire coordination, crash-durable expiration leases and
+  stable machine-readable errors.
 - Reference controller, pgBackRest lock wrapper, operator runbook, explicit
   first-release support contract and a real recovery E2E suite.
 
@@ -43,6 +44,9 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
   valid JSON.
 - Preserved logical-decoding commit time/change LSN and deterministic event
   ordering.
+- Isolated capture drain from maintenance workers, rejected newer repository
+  timelines, detected missing retained anchors, and prevented pgBackRest
+  automatic expiration from deleting generation-pinned FULL backups.
 - Rejected writable/symlinked helper configuration, symlinked recovery config
   files and non-XFS snapshot-direct roots; added classic-restore disk
   preflight.

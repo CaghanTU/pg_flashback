@@ -80,12 +80,11 @@ through the exclusive wrapper:
 scripts/pgbackrest_with_flashback_lock.sh \
   /run/pg_flashback/app-repo2.lock -- \
   /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf \
-  --stanza=app --repo=2 --type=full --compress-type=none backup
+  --stanza=app --repo=2 --type=full --compress-type=none \
+  --no-expire-auto backup
 
-scripts/pgbackrest_with_flashback_lock.sh \
-  /run/pg_flashback/app-repo2.lock -- \
-  /usr/bin/pgbackrest --config=/etc/pgbackrest/pgbackrest.conf \
-  --stanza=app --repo=2 expire
+pg-flashback-recovery expire \
+  --config /etc/pg_flashback/app-repo2.json
 ```
 
 Do not wrap `archive-push`: WAL must continue arriving while a recovery holds
@@ -106,6 +105,16 @@ This does not make an uncoordinated external `pgbackrest expire` safe. It
 limits the failure mode: the next audit durably freezes every missing/corrupt
 generation, and restore admission rejects its interval instead of claiming
 coverage from metadata alone.
+
+The supplied wrapper rejects a backup without `--no-expire-auto`: pgBackRest's
+automatic post-backup expire has no knowledge of generation pins and could
+delete a still-retained predecessor anchor. For scheduled expiration use
+`pg-flashback-recovery expire`. The helper first commits a database-side expire
+lease while atomically checking active/sealed generation pins, then runs
+pgBackRest under the exclusive repository lock. Backup generation creation,
+activation, freeze and retirement are fail-closed while that lease is active.
+If the helper or pgBackRest fails, the lease deliberately remains active; fix
+the cause and rerun the same configured helper to resume and complete it.
 
 ## 4. Configure the helper
 
