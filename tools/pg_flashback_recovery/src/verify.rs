@@ -1,10 +1,12 @@
-use std::collections::BTreeSet;
-use std::fs;
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::error::RecoveryError;
@@ -74,6 +76,13 @@ struct DurableProof {
     verified_lsn: String,
     status: Option<String>,
     consumed: bool,
+}
+
+#[derive(Debug)]
+struct ArchiveSegment {
+    path: PathBuf,
+    stored_name: String,
+    checksum_sha1: String,
 }
 
 /// Verify and consume one repository-derived FULL backup anchor.
@@ -151,7 +160,7 @@ pub fn verify_anchor(
         .join(&config.stanza)
         .join(&backup.label)
         .join("backup.manifest");
-    let manifest_sha256 = verify_manifest(&manifest, backup, system_id)?;
+    let manifest_sha256 = verify_manifest(&manifest, &config.repository_path, backup, system_id)?;
     let manifest_reference = manifest
         .strip_prefix(&config.repository_path)
         .map_err(|_| {
@@ -289,11 +298,12 @@ pub fn verify_frontier(
             "archive system identifier differs from the active PostgreSQL cluster".to_owned(),
         ));
     }
-    let (frontier_lsn, timeline, archive_sha) = match contiguous_archive_frontier(
+    let (frontier_lsn, archive_sha) = match contiguous_archive_frontier(
         config,
         &metadata.archive.archive_id,
         &context.backup_stop_lsn,
         context.wal_segment_size_bytes,
+        context.anchor_timeline_id,
     ) {
         Ok(frontier) => frontier,
         Err(error) => {
@@ -333,7 +343,7 @@ pub fn verify_frontier(
         profile = sql_literal(&config.profile),
         repository_key = sql_literal(&config.repository_key.to_string()),
         stanza = sql_literal(&config.stanza),
-        timeline = timeline,
+        timeline = context.anchor_timeline_id,
         frontier = sql_literal(&frontier_lsn),
         archive_sha = sql_literal(&archive_sha),
     );
@@ -349,14 +359,14 @@ pub fn verify_frontier(
         repository_key: config.repository_key,
         stanza: config.stanza.clone(),
         backup_label: context.backup_label,
-        timeline_id: timeline,
+        timeline_id: context.anchor_timeline_id,
         manifest_reference: String::new(),
         manifest_sha256: archive_sha,
         verified_lsn: installed.valid_through_lsn,
         proof_id: installed.proof_id,
     };
     persist_result(config, &result)?;
-    if installed.status == "timeline_mismatch" || timeline != context.anchor_timeline_id {
+    if installed.status == "timeline_mismatch" {
         return Err(RecoveryError::VerificationFailed(
             "repository timeline mismatches the active anchor; coverage was frozen".to_owned(),
         ));
@@ -575,6 +585,7 @@ fn query_json<T: for<'de> Deserialize<'de>>(
 
 fn verify_manifest(
     path: &Path,
+    repository_root: &Path,
     backup: &SelectedBackup,
     system_id: u64,
 ) -> Result<String, RecoveryError> {
@@ -582,19 +593,70 @@ fn verify_manifest(
         operation: "reading backup manifest metadata",
         message: error.to_string(),
     })?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > MAX_CONTRACT_BYTES
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(RecoveryError::VerificationFailed(
-            "manifest must be a bounded regular non-symlink file".to_owned(),
+            "manifest must be a regular non-symlink file".to_owned(),
         ));
     }
-    let bytes = fs::read(path).map_err(|error| RecoveryError::Io {
-        operation: "reading backup manifest",
+    let canonical_repository =
+        fs::canonicalize(repository_root).map_err(|error| RecoveryError::Io {
+            operation: "canonicalizing repository root",
+            message: error.to_string(),
+        })?;
+    let canonical_manifest = fs::canonicalize(path).map_err(|error| RecoveryError::Io {
+        operation: "canonicalizing backup manifest",
         message: error.to_string(),
     })?;
-    let text = String::from_utf8_lossy(&bytes);
+    if !canonical_manifest.starts_with(&canonical_repository) {
+        return Err(RecoveryError::VerificationFailed(
+            "manifest escaped the configured repository".to_owned(),
+        ));
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| RecoveryError::Io {
+            operation: "opening backup manifest",
+            message: error.to_string(),
+        })?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut header = Vec::new();
+    let mut line = Vec::new();
+    let mut in_header = true;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| RecoveryError::Io {
+                operation: "streaming backup manifest",
+                message: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if line.len() as u64 > MAX_CONTRACT_BYTES {
+            return Err(RecoveryError::VerificationFailed(
+                "manifest contains an unbounded line".to_owned(),
+            ));
+        }
+        digest.update(&line);
+        if in_header {
+            if line.starts_with(b"[target:file]") {
+                in_header = false;
+            } else {
+                if header.len().saturating_add(line.len()) as u64 > MAX_CONTRACT_BYTES {
+                    return Err(RecoveryError::VerificationFailed(
+                        "manifest header exceeds the verification limit".to_owned(),
+                    ));
+                }
+                header.extend_from_slice(&line);
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&header);
     for expected in [
         format!("backup-label=\"{}\"", backup.label),
         "backup-type=\"full\"".to_owned(),
@@ -608,7 +670,7 @@ fn verify_manifest(
             )));
         }
     }
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn contiguous_archive_frontier(
@@ -616,7 +678,8 @@ fn contiguous_archive_frontier(
     archive_id: &str,
     start_lsn: &str,
     segment_size: u64,
-) -> Result<(String, u32, String), RecoveryError> {
+    expected_timeline: u32,
+) -> Result<(String, String), RecoveryError> {
     if segment_size == 0 || (u64::from(u32::MAX) + 1) % segment_size != 0 {
         return Err(RecoveryError::VerificationFailed(
             "invalid WAL segment size".to_owned(),
@@ -627,48 +690,49 @@ fn contiguous_archive_frontier(
         .join("archive")
         .join(&config.stanza)
         .join(archive_id);
-    let mut segments = BTreeSet::new();
-    collect_archive_segments(&root, &root, 0, &mut segments)?;
+    contiguous_archive_frontier_at(&root, start_lsn, segment_size, expected_timeline)
+}
+
+fn contiguous_archive_frontier_at(
+    root: &Path,
+    start_lsn: &str,
+    segment_size: u64,
+    expected_timeline: u32,
+) -> Result<(String, String), RecoveryError> {
+    let mut segments = BTreeMap::new();
+    collect_archive_segments(root, root, 0, &mut segments)?;
     let start = parse_lsn(start_lsn).map_err(RecoveryError::VerificationFailed)?;
-    let mut segment = segment_name(1, start - (start % segment_size), segment_size);
-    let timeline = segments
-        .iter()
-        .find(|name| name[8..] == segment[8..])
-        .and_then(|name| segment_timeline(name))
-        .ok_or_else(|| {
-            RecoveryError::VerificationFailed(
-                "archive does not contain the backup stop WAL segment".to_owned(),
-            )
-        })?;
-    segment.replace_range(..8, &format!("{timeline:08X}"));
+    let mut segment = segment_name(
+        expected_timeline,
+        start - (start % segment_size),
+        segment_size,
+    );
     let mut proof = Sha256::new();
     let mut frontier = start;
     for _ in 0..1_000_000 {
-        if !segments.contains(&segment) {
+        let Some(archived) = segments.get(&segment) else {
             break;
-        }
-        proof.update(segment.as_bytes());
+        };
+        verify_archive_segment(archived, segment_size)?;
+        proof.update(archived.stored_name.as_bytes());
+        proof.update([0]);
         let segment_start = segment_start_lsn(&segment, segment_size)?;
         frontier = segment_start + segment_size;
-        segment = segment_name(timeline, frontier, segment_size);
+        segment = segment_name(expected_timeline, frontier, segment_size);
     }
     if frontier <= start {
         return Err(RecoveryError::VerificationFailed(
             "no contiguous archived WAL frontier was proven".to_owned(),
         ));
     }
-    Ok((
-        format_lsn(frontier),
-        timeline,
-        format!("{:x}", proof.finalize()),
-    ))
+    Ok((format_lsn(frontier), format!("{:x}", proof.finalize())))
 }
 
 fn collect_archive_segments(
     root: &Path,
     path: &Path,
     depth: usize,
-    segments: &mut BTreeSet<String>,
+    segments: &mut BTreeMap<String, ArchiveSegment>,
 ) -> Result<(), RecoveryError> {
     if depth > 4 {
         return Err(RecoveryError::VerificationFailed(
@@ -696,13 +760,83 @@ fn collect_archive_segments(
             collect_archive_segments(root, &entry.path(), depth + 1, segments)?;
         } else if metadata.is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.len() >= 24
-                && name[..24].bytes().all(|byte| byte.is_ascii_hexdigit())
-                && entry.path().starts_with(root)
-            {
-                segments.insert(name[..24].to_ascii_uppercase());
+            if let Some((segment, checksum_sha1)) = parse_archive_segment_name(&name) {
+                if !entry.path().starts_with(root) {
+                    return Err(RecoveryError::VerificationFailed(
+                        "archive segment escaped the configured archive root".to_owned(),
+                    ));
+                }
+                let archived = ArchiveSegment {
+                    path: entry.path(),
+                    stored_name: name,
+                    checksum_sha1,
+                };
+                if segments.insert(segment.clone(), archived).is_some() {
+                    return Err(RecoveryError::VerificationFailed(format!(
+                        "archive contains duplicate WAL segment {segment}"
+                    )));
+                }
             }
         }
+    }
+    Ok(())
+}
+
+fn parse_archive_segment_name(name: &str) -> Option<(String, String)> {
+    if name.len() != 65 || name.as_bytes().get(24) != Some(&b'-') {
+        return None;
+    }
+    let segment = &name[..24];
+    let checksum = &name[25..];
+    if !segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((segment.to_ascii_uppercase(), checksum.to_ascii_lowercase()))
+}
+
+fn verify_archive_segment(
+    archived: &ArchiveSegment,
+    segment_size: u64,
+) -> Result<(), RecoveryError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&archived.path)
+        .map_err(|error| RecoveryError::Io {
+            operation: "opening archived WAL segment",
+            message: error.to_string(),
+        })?;
+    let metadata = file.metadata().map_err(|error| RecoveryError::Io {
+        operation: "reading archived WAL metadata",
+        message: error.to_string(),
+    })?;
+    if !metadata.is_file() || metadata.len() != segment_size {
+        return Err(RecoveryError::VerificationFailed(format!(
+            "archived WAL segment {} has size {}, expected {segment_size}",
+            archived.stored_name,
+            metadata.len()
+        )));
+    }
+    let mut digest = Sha1::new();
+    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| RecoveryError::Io {
+            operation: "hashing archived WAL segment",
+            message: error.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != archived.checksum_sha1 {
+        return Err(RecoveryError::VerificationFailed(format!(
+            "archived WAL segment {} failed checksum verification",
+            archived.stored_name
+        )));
     }
     Ok(())
 }
@@ -772,9 +906,33 @@ fn persist_result(
 
 #[cfg(test)]
 mod tests {
-    use crate::model::BackupVerificationRequest;
+    use std::fmt::Write as FmtWrite;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{format_lsn, segment_name, segment_start_lsn, validate_request};
+    use sha1::{Digest, Sha1};
+
+    use crate::model::BackupVerificationRequest;
+    use crate::pgbackrest::SelectedBackup;
+
+    use super::{
+        contiguous_archive_frontier_at, format_lsn, parse_archive_segment_name, segment_name,
+        segment_start_lsn, validate_request, verify_archive_segment, verify_manifest,
+        ArchiveSegment,
+    };
+
+    fn temp_test_dir(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pg-flashback-verifier-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn verification_request_binds_safe_id_and_positive_tracking_id() {
@@ -803,5 +961,80 @@ mod tests {
         assert_eq!(segment, "000000070000000A00000012");
         assert_eq!(segment_start_lsn(&segment, segment_size).unwrap(), lsn);
         assert_eq!(format_lsn(lsn + segment_size), "A/13000000");
+    }
+
+    #[test]
+    fn archive_parser_rejects_history_files_and_verifies_wal_checksum() {
+        let root = temp_test_dir("archive");
+        let segment_size = 1024_usize * 1024;
+        let segment = "000000020000000A00000012";
+        assert!(parse_archive_segment_name(&format!("{segment}.00000028.backup")).is_none());
+
+        let bytes = vec![0x5a_u8; segment_size];
+        let checksum = format!("{:x}", Sha1::digest(&bytes));
+        let stored_name = format!("{segment}-{checksum}");
+        let path = root.join(&stored_name);
+        fs::write(&path, &bytes).unwrap();
+        let archived = ArchiveSegment {
+            path: path.clone(),
+            stored_name,
+            checksum_sha1: checksum,
+        };
+        verify_archive_segment(&archived, u64::try_from(segment_size).unwrap()).unwrap();
+
+        fs::write(&path, vec![0_u8; segment_size]).unwrap();
+        assert!(verify_archive_segment(&archived, u64::try_from(segment_size).unwrap()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_frontier_requires_the_anchor_timeline() {
+        let root = temp_test_dir("archive-timeline");
+        let segment_size = 1024_u64 * 1024;
+        let start = 0x0000_000A_1200_0000_u64;
+        let timeline_one = segment_name(1, start, segment_size);
+        let bytes = vec![0x42_u8; usize::try_from(segment_size).unwrap()];
+        let checksum = format!("{:x}", Sha1::digest(&bytes));
+        fs::write(root.join(format!("{timeline_one}-{checksum}")), bytes).unwrap();
+
+        assert!(
+            contiguous_archive_frontier_at(&root, &format_lsn(start), segment_size, 2).is_err()
+        );
+        let (frontier, proof) =
+            contiguous_archive_frontier_at(&root, &format_lsn(start), segment_size, 1).unwrap();
+        assert_eq!(frontier, format_lsn(start + segment_size));
+        assert_eq!(proof.len(), 64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_manifest_is_streamed_instead_of_rejected_by_contract_limit() {
+        let root = temp_test_dir("manifest");
+        let label = "20260717-120000F";
+        let backup_dir = root.join("backup").join("stanza").join(label);
+        fs::create_dir_all(&backup_dir).unwrap();
+        let path = backup_dir.join("backup.manifest");
+        let mut manifest = format!(
+            "[backup]\nbackup-label=\"{label}\"\nbackup-lsn-start=\"0/100\"\nbackup-lsn-stop=\"0/200\"\nbackup-type=\"full\"\n\n[backup:db]\ndb-system-id=42\n\n[target:file]\n"
+        );
+        for index in 0..40_000 {
+            writeln!(manifest, "pg_data/base/1/{index}={{\"size\":8192}}").unwrap();
+        }
+        assert!(manifest.len() > 1024 * 1024);
+        fs::write(&path, manifest).unwrap();
+        let backup = SelectedBackup {
+            label: label.to_owned(),
+            backup_type: "full".to_owned(),
+            start_lsn: "0/100".to_owned(),
+            stop_lsn: "0/200".to_owned(),
+            archive_start: Some("000000010000000000000001".to_owned()),
+            archive_stop: Some("000000010000000000000002".to_owned()),
+            database_id: 1,
+            database_system_id: 42,
+            size_bytes: Some(1),
+        };
+        let digest = verify_manifest(&path, &root, &backup, 42).unwrap();
+        assert_eq!(digest.len(), 64);
+        fs::remove_dir_all(root).unwrap();
     }
 }
