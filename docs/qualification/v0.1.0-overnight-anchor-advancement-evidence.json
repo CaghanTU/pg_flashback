@@ -8,7 +8,8 @@
     "extension_binary_sha256": "c1269f78c1565673a8303d319667614a5db13f847d265ed3610ef2d2bfb12e60",
     "run_completed_at": "2026-07-17T17:39:29Z",
     "tree_clean_at_start": true,
-    "note": "Product/SQL/tests were exercised at tested_product_commit; source_commit adds only the provenance verifier script. evidence_summary_commit may differ only in docs/evidence."
+    "note": "Product/SQL/tests were exercised at tested_product_commit; source_commit adds only the provenance verifier script. evidence_summary_commit may differ only in docs/evidence.",
+    "evidence_summary_commit": "07c3be5cd3676f82d4c5901ada68b96d37c6f250"
   },
   "pgrx_matrix": {
     "pg15": "76_passed",
