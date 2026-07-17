@@ -69,7 +69,9 @@ caller-supplied activation/frontier APIs are fail-closed. Coverage may be
 activated only by consuming a one-time verified FULL backup proof installed by
 the recovery helper through its least-privilege recovery-agent connection.
 `verify-anchor` and `verify-frontier` derive proof values from a locked plain
-pgBackRest repository; `expire` rejects active generation pins. Release status
+pgBackRest repository and authenticate the canonical values with an OS-held
+HMAC key that is unavailable through SQL; `expire` rejects active generation
+pins. Release status
 remains **PARTIAL** until the exact-RC, negative verifier, expiration-race, and
 24-hour gates below pass. Do not report recoverability from an unverified or
 frozen generation.

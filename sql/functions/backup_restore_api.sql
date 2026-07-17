@@ -726,6 +726,43 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_backup_proof_attestation_payload(
+    p_verification_request_id text,
+    p_tracking_id bigint,
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text,
+    p_backup_label text,
+    p_database_system_identifier numeric,
+    p_timeline_id bigint,
+    p_manifest_reference text,
+    p_manifest_sha256 text,
+    p_backup_start_lsn pg_lsn,
+    p_backup_stop_lsn pg_lsn
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path = pg_catalog
+AS $$
+    SELECT jsonb_build_object(
+        'kind', 'backup-anchor-v1',
+        'verification_request_id', p_verification_request_id,
+        'tracking_id', p_tracking_id,
+        'helper_profile', p_helper_profile,
+        'repository_key', p_repository_key,
+        'stanza', p_stanza,
+        'backup_label', p_backup_label,
+        'database_system_identifier', p_database_system_identifier,
+        'timeline_id', p_timeline_id,
+        'manifest_reference', p_manifest_reference,
+        'manifest_sha256', p_manifest_sha256,
+        'backup_start_lsn', p_backup_start_lsn::text,
+        'backup_stop_lsn', p_backup_stop_lsn::text
+    )::text;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_install_verified_backup_proof(
     p_verification_request_id text,
     p_tracking_id bigint,
@@ -740,7 +777,8 @@ CREATE OR REPLACE FUNCTION flashback_install_verified_backup_proof(
     p_backup_start_lsn pg_lsn,
     p_backup_stop_lsn pg_lsn,
     p_verified_at timestamptz DEFAULT clock_timestamp(),
-    p_details jsonb DEFAULT '{}'::jsonb
+    p_details jsonb DEFAULT '{}'::jsonb,
+    p_attestation_hmac text DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -750,6 +788,8 @@ AS $$
 DECLARE
     v_tracked record;
     v_proof_id bigint;
+    v_is_superuser boolean;
+    v_payload text;
 BEGIN
     IF NOT flashback_caller_may_install_backup_proof() THEN
         RAISE EXCEPTION 'flashback_install_verified_backup_proof: only flashback_recovery_agent or a superuser may install proofs'
@@ -783,6 +823,25 @@ BEGIN
     IF v_tracked.helper_profile IS DISTINCT FROM p_helper_profile THEN
         RAISE EXCEPTION 'flashback_install_verified_backup_proof: helper profile % does not match tracked profile %',
             p_helper_profile, v_tracked.helper_profile;
+    END IF;
+
+    SELECT COALESCE(rolsuper, false) INTO v_is_superuser
+    FROM pg_roles WHERE rolname = session_user;
+    IF NOT COALESCE(v_is_superuser, false) THEN
+        v_payload := flashback_backup_proof_attestation_payload(
+            p_verification_request_id, p_tracking_id, p_helper_profile,
+            p_repository_key, p_stanza, p_backup_label,
+            p_database_system_identifier, p_timeline_id,
+            p_manifest_reference, p_manifest_sha256,
+            p_backup_start_lsn, p_backup_stop_lsn
+        );
+        IF p_attestation_hmac IS NULL
+           OR NOT flashback_verify_proof_hmac(v_payload, p_attestation_hmac)
+        THEN
+            RAISE EXCEPTION 'flashback_install_verified_backup_proof: valid helper HMAC attestation is required'
+                USING ERRCODE = 'insufficient_privilege',
+                      HINT = 'Run verify-anchor through the configured recovery helper; raw recovery-agent proof installation is forbidden.';
+        END IF;
     END IF;
 
     INSERT INTO flashback.verified_backup_proofs (
@@ -1007,6 +1066,37 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_wal_frontier_attestation_payload(
+    p_verification_request_id text,
+    p_tracking_id bigint,
+    p_generation_id bigint,
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text,
+    p_timeline_id bigint,
+    p_valid_through_lsn pg_lsn,
+    p_archive_proof_sha256 text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path = pg_catalog
+AS $$
+    SELECT jsonb_build_object(
+        'kind', 'wal-frontier-v1',
+        'verification_request_id', p_verification_request_id,
+        'tracking_id', p_tracking_id,
+        'generation_id', p_generation_id,
+        'helper_profile', p_helper_profile,
+        'repository_key', p_repository_key,
+        'stanza', p_stanza,
+        'timeline_id', p_timeline_id,
+        'valid_through_lsn', p_valid_through_lsn::text,
+        'archive_proof_sha256', p_archive_proof_sha256
+    )::text;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_install_verified_wal_frontier_proof(
     p_verification_request_id text,
     p_tracking_id bigint,
@@ -1018,7 +1108,8 @@ CREATE OR REPLACE FUNCTION flashback_install_verified_wal_frontier_proof(
     p_valid_through_lsn pg_lsn,
     p_archive_proof_sha256 text,
     p_verified_at timestamptz DEFAULT clock_timestamp(),
-    p_details jsonb DEFAULT '{}'::jsonb
+    p_details jsonb DEFAULT '{}'::jsonb,
+    p_attestation_hmac text DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -1029,6 +1120,8 @@ DECLARE
     v_tracked record;
     v_gen record;
     v_proof_id bigint;
+    v_is_superuser boolean;
+    v_payload text;
 BEGIN
     IF NOT flashback_caller_may_install_backup_proof() THEN
         RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: only flashback_recovery_agent or a superuser may install proofs'
@@ -1067,6 +1160,23 @@ BEGIN
     IF v_gen.generation_id IS NULL THEN
         RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: generation % is not bound to tracking_id %',
             p_generation_id, p_tracking_id;
+    END IF;
+
+    SELECT COALESCE(rolsuper, false) INTO v_is_superuser
+    FROM pg_roles WHERE rolname = session_user;
+    IF NOT COALESCE(v_is_superuser, false) THEN
+        v_payload := flashback_wal_frontier_attestation_payload(
+            p_verification_request_id, p_tracking_id, p_generation_id,
+            p_helper_profile, p_repository_key, p_stanza, p_timeline_id,
+            p_valid_through_lsn, p_archive_proof_sha256
+        );
+        IF p_attestation_hmac IS NULL
+           OR NOT flashback_verify_proof_hmac(v_payload, p_attestation_hmac)
+        THEN
+            RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: valid helper HMAC attestation is required'
+                USING ERRCODE = 'insufficient_privilege',
+                      HINT = 'Run verify-frontier through the configured recovery helper; raw recovery-agent proof installation is forbidden.';
+        END IF;
     END IF;
 
     INSERT INTO flashback.verified_wal_frontier_proofs (

@@ -97,6 +97,7 @@ write_config() {
     local artifact_ttl_seconds="${11:-86400}"
     local max_retained_artifacts="${12:-64}"
     local max_retained_artifact_bytes="${13:-1099511627776}"
+    local proof_hmac_key_file="$RUN_ROOT/proof-hmac.key"
     jq -n \
         --arg profile "$profile" \
         --arg pgbackrest "$PGBACKREST" \
@@ -110,6 +111,7 @@ write_config() {
         --arg recovery_user "$(id -un)" \
         --arg provider "$provider" \
         --arg expire_lock "$EXPIRE_LOCK" \
+        --arg proof_hmac_key_file "$proof_hmac_key_file" \
         --argjson port "$port" \
         --argjson command_timeout "$command_timeout" \
         --argjson recovery_timeout "$recovery_timeout" \
@@ -142,6 +144,7 @@ write_config() {
           max_retained_artifact_bytes: $max_retained_artifact_bytes,
           command_timeout_seconds: $command_timeout,
           recovery_timeout_seconds: $recovery_timeout
+          ,proof_hmac_key_file: $proof_hmac_key_file
         }' > "$path"
 }
 

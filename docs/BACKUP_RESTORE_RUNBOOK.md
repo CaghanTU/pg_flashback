@@ -123,9 +123,25 @@ override any of these paths or options.
   "max_retained_artifacts": 32,
   "max_retained_artifact_bytes": 1099511627776,
   "command_timeout_seconds": 3600,
-  "recovery_timeout_seconds": 7200
+  "recovery_timeout_seconds": 7200,
+  "proof_hmac_key_file": "/etc/pg_flashback/proof-hmac.key",
+  "controller": {
+    "host": "/run/postgresql",
+    "port": 5432,
+    "database": "app",
+    "user": "pg_flashback_recovery"
+  }
 }
 ```
+
+Create `proof-hmac.key` as 32 random bytes encoded as 64 hexadecimal
+characters, mode 0600, readable by the PostgreSQL/helper operating-system
+account. Configure the same absolute path as
+`pg_flashback.proof_hmac_key_file` in `postgresql.conf` and reload. The key is
+never stored in SQL. A recovery-agent login can ask PostgreSQL for the
+canonical payload, but cannot install a proof without the helper's HMAC; raw,
+missing, replayed-against-different-fields and malformed attestations fail
+closed. Rotate the key only while no verification request is in flight.
 
 `max_work_bytes` is a logical request-tree ceiling. Set it above the selected
 full backup's logical size even when reflinks make the additional physical

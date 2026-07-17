@@ -166,6 +166,7 @@ mod tests {
             command_timeout_seconds: 1,
             recovery_timeout_seconds: 1,
             controller: None,
+            proof_hmac_key_file: None,
         }
     }
 

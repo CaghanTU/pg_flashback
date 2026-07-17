@@ -42,6 +42,7 @@ PGBACKREST_CONFIG="$RUN_ROOT/pgbackrest.conf"
 RESULT_JSON="$RESULT_DIR/$RUN_ID.json"
 VERIFIER_CONFIG="$RUN_ROOT/helper-verifier.json"
 VERIFIER_WORK_ROOT="$RUN_ROOT/helper-verifier-work"
+PROOF_HMAC_KEY_FILE="$RUN_ROOT/proof-hmac.key"
 
 INITDB="$PG_BIN/initdb"
 PG_CTL="$PG_BIN/pg_ctl"
@@ -325,6 +326,9 @@ require_executable "$(command -v cp)"
 
 mkdir -p "$RUN_ROOT" "$RESULT_DIR" "$REPO_DIR" "$SOCKET_DIR" "$SPOOL_DIR" "$LOG_DIR" "$DUMP_DIR"
 chmod 700 "$SOCKET_DIR"
+umask 077
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$PROOF_HMAC_KEY_FILE"
+chmod 600 "$PROOF_HMAC_KEY_FILE"
 
 log "run=$RUN_ID requested_size=${SIZE_MB}MiB target_share=${TARGET_PERCENT}% churn=${CHURN_PERCENT}%"
 
@@ -354,6 +358,7 @@ max_wal_senders = 10
 shared_preload_libraries = 'pg_flashback'
 pg_flashback.capture_mode = 'wal'
 pg_flashback.enabled = on
+pg_flashback.proof_hmac_key_file = '$PROOF_HMAC_KEY_FILE'
 EOF
 fi
 
@@ -432,6 +437,7 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
             --arg controller_database "$DB_NAME" \
             --arg controller_user "pgfb_backup_verifier" \
             --arg recovery_user "$(id -un)" \
+            --arg proof_hmac_key_file "$PROOF_HMAC_KEY_FILE" \
             --argjson controller_port "$PRIMARY_PORT" \
             '{
               profile: $profile,
@@ -456,6 +462,7 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
               max_retained_artifact_bytes: 1073741824,
               command_timeout_seconds: 60,
               recovery_timeout_seconds: 120,
+              proof_hmac_key_file: $proof_hmac_key_file,
               controller: {
                 host: $controller_host,
                 port: $controller_port,
@@ -499,6 +506,26 @@ MANIFEST_PATH="$REPO_DIR/backup/$STANZA/$BACKUP_LABEL/backup.manifest"
 MANIFEST_SHA=$(sha256sum "$MANIFEST_PATH" | awk '{print $1}')
 SYSID=$(primary_sql "SELECT system_identifier FROM pg_control_system();")
 TIMELINE=$(primary_sql "SELECT timeline_id FROM pg_control_checkpoint();")
+
+if [[ -n "$VERIFIER_BIN" ]]; then
+    RAW_TRACKING_ID=$(primary_sql "SELECT tracking_id FROM flashback.tracked_tables
+        WHERE is_active AND recovery_profile = 'backup'
+          AND rel_oid = 'public.target_table'::regclass;")
+    set +e
+    "$PSQL" -X -v ON_ERROR_STOP=1 -qAt -h "$SOCKET_DIR" -p "$PRIMARY_PORT" \
+        -U pgfb_backup_verifier -d "$DB_NAME" \
+        -c "SELECT flashback_install_verified_backup_proof(
+              'raw-agent-forge', $RAW_TRACKING_ID, 'e2e_snapshot', '1', '$STANZA',
+              '$BACKUP_LABEL', $SYSID, $TIMELINE, '$MANIFEST_PATH', '$MANIFEST_SHA',
+              '$BACKUP_START_LSN'::pg_lsn, '$BACKUP_STOP_LSN'::pg_lsn);" \
+        > /dev/null 2> "$RUN_ROOT/raw-agent-forge.err"
+    RAW_FORGE_RC=$?
+    set -e
+    [[ "$RAW_FORGE_RC" != "0" ]] \
+        || die "recovery-agent installed an unsigned caller-supplied backup proof"
+    grep -q "valid helper HMAC attestation is required" "$RUN_ROOT/raw-agent-forge.err" \
+        || die "unsigned recovery-agent proof did not fail at the attestation boundary"
+fi
 
 TARGET_TRACKING_ID=""
 QUOTED_TRACKING_ID=""

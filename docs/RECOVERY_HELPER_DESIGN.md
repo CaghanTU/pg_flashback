@@ -121,6 +121,11 @@ digest, start/stop LSNs, and archive frontier are read by the helper from the
 configured repository while holding its shared lock. The least-privilege
 controller connection uses `flashback_recovery_agent`; passwords remain in
 the process environment/PGPASSFILE rather than command arguments or logs.
+Repository-derived anchor/frontier values are HMAC-SHA256 authenticated with
+the mode-0600 `proof_hmac_key_file`; PostgreSQL independently recomputes the
+canonical payload using `pg_flashback.proof_hmac_key_file`. Consequently the
+database role alone cannot forge raw proof values even if its credentials are
+compromised.
 Consumed proof results are queryable through a restricted controller API, so
 a retry after helper termination reconstructs the same proof/generation
 result instead of installing a second proof.

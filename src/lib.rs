@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 
 mod api;
 mod capture;
+mod proof_attestation;
 mod restore;
 mod runtime_guard;
 mod storage;

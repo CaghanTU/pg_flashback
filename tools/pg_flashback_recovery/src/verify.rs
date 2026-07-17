@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -21,6 +24,68 @@ use crate::pgbackrest::{parse_lsn, read_repository_metadata, SelectedBackup};
 use crate::{load_json, MAX_CONTRACT_BYTES};
 
 const RESULT_FORMAT_VERSION: u32 = 1;
+type HmacSha256 = Hmac<Sha256>;
+
+fn proof_hmac(config: &RecoveryConfig, payload: &str) -> Result<String, RecoveryError> {
+    let path = config.proof_hmac_key_file.as_ref().ok_or_else(|| {
+        RecoveryError::InvalidConfig(
+            "proof_hmac_key_file is required for repository proof verification".to_owned(),
+        )
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| RecoveryError::Io {
+        operation: "inspecting proof HMAC key",
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RecoveryError::InvalidConfig(
+            "proof_hmac_key_file must be a regular non-symlink file".to_owned(),
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(RecoveryError::InvalidConfig(
+            "proof_hmac_key_file must not grant group or other permissions".to_owned(),
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| RecoveryError::Io {
+            operation: "opening proof HMAC key",
+            message: error.to_string(),
+        })?;
+    let mut encoded = String::new();
+    file.take(4097)
+        .read_to_string(&mut encoded)
+        .map_err(|error| RecoveryError::Io {
+            operation: "reading proof HMAC key",
+            message: error.to_string(),
+        })?;
+    let encoded = encoded.trim();
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RecoveryError::InvalidConfig(
+            "proof_hmac_key_file must contain exactly 64 hexadecimal characters".to_owned(),
+        ));
+    }
+    let mut key = [0_u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).map_err(|_| {
+            RecoveryError::InvalidConfig("proof_hmac_key_file contains invalid hex".to_owned())
+        })?;
+    }
+    let mut mac = HmacSha256::new_from_slice(&key).map_err(|_| {
+        RecoveryError::InvalidConfig("proof HMAC key has invalid length".to_owned())
+    })?;
+    mac.update(payload.as_bytes());
+    Ok(mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        }))
+}
 
 #[derive(Debug, Deserialize)]
 struct AnchorContext {
@@ -171,6 +236,28 @@ pub fn verify_anchor(
         .to_string_lossy()
         .into_owned();
 
+    let payload: String = query_json(
+        config,
+        &format!(
+            "SELECT to_json(flashback_backup_proof_attestation_payload(
+              {request_id}, {tracking_id}, {profile}, {repository_key}, {stanza},
+              {label}, {system_id}, {timeline}, {manifest_reference}, {manifest_sha},
+              {start_lsn}::pg_lsn, {stop_lsn}::pg_lsn))::text",
+            request_id = sql_literal(&request.request_id),
+            tracking_id = request.tracking_id,
+            profile = sql_literal(&config.profile),
+            repository_key = sql_literal(&config.repository_key.to_string()),
+            stanza = sql_literal(&config.stanza),
+            label = sql_literal(&backup.label),
+            system_id = system_id,
+            timeline = context.timeline_id,
+            manifest_reference = sql_literal(&manifest_reference),
+            manifest_sha = sql_literal(&manifest_sha256),
+            start_lsn = sql_literal(&backup.start_lsn),
+            stop_lsn = sql_literal(&backup.stop_lsn),
+        ),
+    )?;
+    let attestation = proof_hmac(config, &payload)?;
     let sql = format!(
         "WITH installed AS (
            SELECT flashback_install_verified_backup_proof(
@@ -179,7 +266,8 @@ pub fn verify_anchor(
              {start_lsn}::pg_lsn, {stop_lsn}::pg_lsn, clock_timestamp(),
              jsonb_build_object('verification_source','recovery_helper',
                                 'repository_lock','shared',
-                                'manifest_verified',true)
+                                'manifest_verified',true),
+             {attestation}
            ) AS proof_id
          )
          SELECT jsonb_build_object(
@@ -198,6 +286,7 @@ pub fn verify_anchor(
         manifest_sha = sql_literal(&manifest_sha256),
         start_lsn = sql_literal(&backup.start_lsn),
         stop_lsn = sql_literal(&backup.stop_lsn),
+        attestation = sql_literal(&attestation),
     );
     let installed: InstalledAnchor = query_json(config, &sql)?;
     if installed.generation_id != context.generation_id {
@@ -316,6 +405,25 @@ pub fn verify_frontier(
         }
     };
 
+    let payload: String = query_json(
+        config,
+        &format!(
+            "SELECT to_json(flashback_wal_frontier_attestation_payload(
+              {request_id}, {tracking_id}, {generation_id}, {profile},
+              {repository_key}, {stanza}, {timeline}, {frontier}::pg_lsn,
+              {archive_sha}))::text",
+            request_id = sql_literal(&request.request_id),
+            tracking_id = request.tracking_id,
+            generation_id = context.generation_id,
+            profile = sql_literal(&config.profile),
+            repository_key = sql_literal(&config.repository_key.to_string()),
+            stanza = sql_literal(&config.stanza),
+            timeline = context.anchor_timeline_id,
+            frontier = sql_literal(&frontier_lsn),
+            archive_sha = sql_literal(&archive_sha),
+        ),
+    )?;
+    let attestation = proof_hmac(config, &payload)?;
     let sql = format!(
         "WITH installed AS (
            SELECT flashback_install_verified_wal_frontier_proof(
@@ -324,7 +432,8 @@ pub fn verify_frontier(
              {archive_sha}, clock_timestamp(),
              jsonb_build_object('verification_source','recovery_helper',
                                 'repository_lock','shared',
-                                'archive_contiguous',true)
+                                'archive_contiguous',true),
+             {attestation}
            ) AS proof_id
          ), consumed AS (
            SELECT proof_id,
@@ -346,6 +455,7 @@ pub fn verify_frontier(
         timeline = context.anchor_timeline_id,
         frontier = sql_literal(&frontier_lsn),
         archive_sha = sql_literal(&archive_sha),
+        attestation = sql_literal(&attestation),
     );
     let installed: InstalledFrontier = query_json(config, &sql)?;
     let result = BackupVerificationResult {

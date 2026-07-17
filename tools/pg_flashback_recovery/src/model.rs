@@ -45,6 +45,10 @@ pub struct RecoveryConfig {
     /// (for example in an operator-owned PGPASSFILE).
     #[serde(default)]
     pub controller: Option<ControllerConnection>,
+    /// 0600 file containing the same 32-byte hex HMAC key configured in
+    /// `PostgreSQL` as `pg_flashback.proof_hmac_key_file`.
+    #[serde(default)]
+    pub proof_hmac_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
