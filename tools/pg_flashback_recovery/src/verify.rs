@@ -96,6 +96,7 @@ struct AnchorContext {
     marker_commit_lsn: String,
     database_system_identifier: String,
     timeline_id: u32,
+    wal_segment_size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,7 +221,16 @@ pub fn verify_anchor(
         })?;
 
     let metadata = read_repository_metadata(config)?;
-    let mut eligible = metadata
+    if metadata.archive.database_system_id != system_id {
+        return Err(RecoveryError::VerificationFailed(
+            "archive system identifier differs from the active PostgreSQL cluster".to_owned(),
+        ));
+    }
+
+    // Prefer a fresh FULL after the marker (shortest replay). Otherwise select
+    // the newest retained FULL with stop <= marker and continuous WAL through
+    // the marker. Never auto-start a cluster-sized backup here.
+    let mut fresh = metadata
         .backups
         .iter()
         .filter(|backup| backup.backup_type == "full")
@@ -235,12 +245,65 @@ pub fn verify_anchor(
                 .then_some((start, backup))
         })
         .collect::<Vec<_>>();
-    eligible.sort_unstable_by_key(|(start, _)| *start);
-    let backup = eligible.first().map(|(_, backup)| *backup).ok_or_else(|| {
-        RecoveryError::VerificationFailed(
-            "no repository-derived FULL backup starts after the resolved marker".to_owned(),
-        )
-    })?;
+    fresh.sort_unstable_by_key(|(start, _)| *start);
+
+    let mut selected_mode = "fresh_full_after_marker";
+    let mut wal_through: Option<String> = None;
+    let backup = if let Some((_, backup)) = fresh.first() {
+        *backup
+    } else {
+        let mut retained = metadata
+            .backups
+            .iter()
+            .filter(|backup| backup.backup_type == "full")
+            .filter_map(|backup| {
+                let start = parse_lsn(&backup.start_lsn).ok()?;
+                let stop = parse_lsn(&backup.stop_lsn).ok()?;
+                let timeline = backup.archive_start.as_deref().and_then(segment_timeline)?;
+                // Reject overlapping backups (start <= marker < stop).
+                (stop <= marker
+                    && stop >= start
+                    && backup.database_system_id == system_id
+                    && timeline == context.timeline_id)
+                    .then_some((stop, backup))
+            })
+            .collect::<Vec<_>>();
+        retained.sort_unstable_by_key(|(stop, _)| std::cmp::Reverse(*stop));
+
+        let mut chosen = None;
+        for (_, candidate) in retained {
+            match contiguous_archive_frontier(
+                config,
+                &metadata.archive.archive_id,
+                &candidate.stop_lsn,
+                context.wal_segment_size_bytes,
+                context.timeline_id,
+            ) {
+                Ok((frontier, _)) => {
+                    let frontier_lsn =
+                        parse_lsn(&frontier).map_err(RecoveryError::VerificationFailed)?;
+                    if frontier_lsn >= marker {
+                        selected_mode = "retained_full_plus_wal";
+                        wal_through = Some(frontier);
+                        chosen = Some(candidate);
+                        break;
+                    }
+                }
+                Err(RecoveryError::TimelineMismatch { .. }) => {
+                    return Err(RecoveryError::VerificationFailed(
+                        "retained FULL archive timeline/history mismatches the live cluster"
+                            .to_owned(),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        chosen.ok_or_else(|| {
+            RecoveryError::VerificationFailed(
+                "no eligible retained FULL with continuous WAL through the marker, and no fresh FULL after the marker; take an explicit FULL backup then retry verify-anchor".to_owned(),
+            )
+        })?
+    };
 
     let manifest = config
         .repository_path
@@ -259,13 +322,58 @@ pub fn verify_anchor(
         .to_string_lossy()
         .into_owned();
 
+    // For fresh activation, still prove contiguous archive from backup stop so
+    // activation does not advertise recoverability without WAL evidence.
+    if selected_mode == "fresh_full_after_marker" {
+        let (frontier, _) = contiguous_archive_frontier(
+            config,
+            &metadata.archive.archive_id,
+            &backup.stop_lsn,
+            context.wal_segment_size_bytes,
+            context.timeline_id,
+        )?;
+        let frontier_lsn = parse_lsn(&frontier).map_err(RecoveryError::VerificationFailed)?;
+        let stop_lsn = parse_lsn(&backup.stop_lsn).map_err(RecoveryError::VerificationFailed)?;
+        if frontier_lsn < stop_lsn {
+            return Err(RecoveryError::VerificationFailed(
+                "archived WAL is not continuous through the selected FULL stop LSN".to_owned(),
+            ));
+        }
+    }
+
+    let wal_through_sql = match &wal_through {
+        Some(lsn) => format!("{}::pg_lsn", sql_literal(lsn)),
+        None => "NULL::pg_lsn".to_owned(),
+    };
+    let pin_id = format!(
+        "anchor-{}-{}-{}",
+        request.tracking_id, backup.label, selected_mode
+    );
+    let required_dependencies = serde_json::json!([
+        {
+            "kind": "full_backup",
+            "label": backup.label,
+            "start_lsn": backup.start_lsn,
+            "stop_lsn": backup.stop_lsn,
+            "manifest_sha256": manifest_sha256,
+        },
+        {
+            "kind": "archived_wal_range",
+            "start_lsn": backup.stop_lsn,
+            "stop_lsn": wal_through.as_deref().unwrap_or(backup.stop_lsn.as_str()),
+            "timeline_id": context.timeline_id,
+        }
+    ]);
+    write_dependency_pin(config, &pin_id, &required_dependencies)?;
+
     let payload: String = query_json(
         config,
         &format!(
             "SELECT to_json(flashback_backup_proof_attestation_payload(
               {request_id}, {tracking_id}, {profile}, {repository_key}, {stanza},
               {label}, {system_id}, {timeline}, {manifest_reference}, {manifest_sha},
-              {start_lsn}::pg_lsn, {stop_lsn}::pg_lsn))::text",
+              {start_lsn}::pg_lsn, {stop_lsn}::pg_lsn,
+              {activation_mode}, {wal_through}))::text",
             request_id = sql_literal(&request.request_id),
             tracking_id = request.tracking_id,
             profile = sql_literal(&config.profile),
@@ -278,18 +386,33 @@ pub fn verify_anchor(
             manifest_sha = sql_literal(&manifest_sha256),
             start_lsn = sql_literal(&backup.start_lsn),
             stop_lsn = sql_literal(&backup.stop_lsn),
+            activation_mode = sql_literal(selected_mode),
+            wal_through = wal_through_sql,
         ),
     )?;
     let attestation = proof_hmac(config, &payload)?;
+    let details = format!(
+        "jsonb_build_object(
+            'verification_source','recovery_helper',
+            'repository_lock','shared',
+            'manifest_verified',true,
+            'activation_mode',{activation_mode},
+            'wal_verified_through_lsn',{wal_through},
+            'dependency_pin_id',{pin_id},
+            'required_dependencies',{deps}::jsonb
+         )",
+        activation_mode = sql_literal(selected_mode),
+        wal_through = wal_through_sql,
+        pin_id = sql_literal(&pin_id),
+        deps = sql_literal(&required_dependencies.to_string()),
+    );
     let sql = format!(
         "WITH installed AS (
            SELECT flashback_install_verified_backup_proof(
              {request_id}, {tracking_id}, {profile}, {repository_key}, {stanza},
              {label}, {system_id}, {timeline}, {manifest_reference}, {manifest_sha},
              {start_lsn}::pg_lsn, {stop_lsn}::pg_lsn, clock_timestamp(),
-             jsonb_build_object('verification_source','recovery_helper',
-                                'repository_lock','shared',
-                                'manifest_verified',true),
+             {details},
              {attestation}
            ) AS proof_id
          )
@@ -309,6 +432,7 @@ pub fn verify_anchor(
         manifest_sha = sql_literal(&manifest_sha256),
         start_lsn = sql_literal(&backup.start_lsn),
         stop_lsn = sql_literal(&backup.stop_lsn),
+        details = details,
         attestation = sql_literal(&attestation),
     );
     let installed: InstalledAnchor = query_json(config, &sql)?;
@@ -317,6 +441,9 @@ pub fn verify_anchor(
             "consumed anchor generation differs from verification context".to_owned(),
         ));
     }
+    let verified_lsn = wal_through
+        .clone()
+        .unwrap_or_else(|| backup.stop_lsn.clone());
     let result = BackupVerificationResult {
         result_format_version: RESULT_FORMAT_VERSION,
         status: "verified".to_owned(),
@@ -331,11 +458,30 @@ pub fn verify_anchor(
         timeline_id: context.timeline_id,
         manifest_reference,
         manifest_sha256,
-        verified_lsn: backup.stop_lsn.clone(),
+        verified_lsn,
         proof_id: installed.proof_id,
     };
     persist_result(config, &result)?;
     Ok(result)
+}
+
+fn write_dependency_pin(
+    config: &RecoveryConfig,
+    pin_id: &str,
+    dependencies: &serde_json::Value,
+) -> Result<(), RecoveryError> {
+    let pin_dir = config.work_root.join("dependency-pins");
+    prepare_secure_directory(&pin_dir)?;
+    let path = pin_dir.join(format!("{pin_id}.json"));
+    let body = serde_json::json!({
+        "pin_id": pin_id,
+        "pinned_at_unix_seconds": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "dependencies": dependencies,
+    });
+    write_json_atomic(&path, &body)
 }
 
 /// Verify and consume the contiguous archived-WAL frontier.

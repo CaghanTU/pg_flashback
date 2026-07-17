@@ -935,9 +935,11 @@ CREATE TABLE IF NOT EXISTS flashback.backup_anchors (
     manifest_reference         TEXT NOT NULL CHECK (btrim(manifest_reference) <> ''),
     manifest_sha256            TEXT NOT NULL
                                CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
-    -- pgBackRest obtains the backup start LSN only after its backup-start
-    -- checkpoint. It must be strictly after the durable lifecycle marker.
-    -- This rejects a pre-track or swap-overlapping backup.
+    -- Fresh FULL: start strictly after the durable lifecycle marker.
+    -- Retained FULL: completed at/before the marker (stop <= marker); continuous
+    -- archived WAL must cover from stop through the marker (enforced at proof
+    -- consumption, not by this CHECK alone). Overlapping backups
+    -- (start <= marker < stop) are rejected.
     tracking_marker_lsn        PG_LSN NOT NULL,
     backup_start_lsn           PG_LSN NOT NULL,
     backup_stop_lsn            PG_LSN NOT NULL,
@@ -956,11 +958,12 @@ CREATE TABLE IF NOT EXISTS flashback.backup_anchors (
         ),
     CONSTRAINT backup_anchors_anchor_tracking_stop_key
         UNIQUE (backup_anchor_id, tracking_id, backup_stop_lsn),
-    CONSTRAINT backup_anchors_after_marker_check CHECK (
-        backup_start_lsn > tracking_marker_lsn
-    ),
-    CONSTRAINT backup_anchors_stop_order_check CHECK (
+    CONSTRAINT backup_anchors_eligible_anchor_check CHECK (
         backup_stop_lsn >= backup_start_lsn
+        AND (
+            backup_start_lsn > tracking_marker_lsn
+            OR backup_stop_lsn <= tracking_marker_lsn
+        )
     )
 );
 

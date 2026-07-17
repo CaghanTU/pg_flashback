@@ -188,7 +188,7 @@ BEGIN
             ('flashback_recovery_agent', 'public.flashback_frontier_proof_result(text,bigint)'),
             ('flashback_recovery_agent', 'public.flashback_install_verified_backup_proof(text,bigint,text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone,jsonb,text)'),
             ('flashback_recovery_agent', 'public.flashback_install_verified_wal_frontier_proof(text,bigint,bigint,text,text,text,bigint,pg_lsn,text,timestamp with time zone,jsonb,text)'),
-            ('flashback_recovery_agent', 'public.flashback_backup_proof_attestation_payload(text,bigint,text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn)'),
+            ('flashback_recovery_agent', 'public.flashback_backup_proof_attestation_payload(text,bigint,text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,text,pg_lsn)'),
             ('flashback_recovery_agent', 'public.flashback_wal_frontier_attestation_payload(text,bigint,bigint,text,text,text,bigint,pg_lsn,text)'),
             ('flashback_recovery_agent', 'public.flashback_consume_verified_backup_proof(bigint)'),
             ('flashback_recovery_agent', 'public.flashback_consume_verified_wal_frontier_proof(bigint)'),
