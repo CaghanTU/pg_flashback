@@ -398,6 +398,12 @@ BEGIN
             WHEN v_stream.plugin_name IS DISTINCT FROM v_slot.plugin THEN 'output_plugin_changed'
             WHEN v_stream.timeline_id IS DISTINCT FROM v_timeline THEN 'timeline_changed'
             WHEN v_stream.confirmed_flush_lsn IS DISTINCT FROM v_slot.confirmed_flush_lsn
+                 AND v_slot.confirmed_flush_lsn >= v_stream.confirmed_flush_lsn
+                 AND v_slot.confirmed_flush_lsn <= NULLIF(
+                        v_stream.details->>'safe_slot_advance_upto_lsn', ''
+                     )::pg_lsn
+                THEN NULL
+            WHEN v_stream.confirmed_flush_lsn IS DISTINCT FROM v_slot.confirmed_flush_lsn
                 THEN 'replication_slot_advanced_externally'
             ELSE NULL
         END;
@@ -1008,7 +1014,11 @@ AS $$
         tt.recovery_profile,
         CASE
             WHEN pending.generation_id IS NOT NULL THEN 'pending'
-            WHEN COALESCE(cg.state_reason, '') = 'timeline_mismatch_frontier_frozen'
+            WHEN COALESCE(cg.state_reason, '') IN (
+                   'timeline_mismatch_frontier_frozen',
+                   'repository_verification_failed',
+                   'anchor_missing'
+                 )
               OR COALESCE(gaps.timeline_gap_count, 0) > 0
             THEN 'degraded'
             WHEN cs.state = 'broken' OR COALESCE(gaps.open_gap_count, 0) > 0 THEN 'degraded'
@@ -1031,6 +1041,12 @@ AS $$
         COALESCE(cs.invalidation_reason,
                  CASE WHEN COALESCE(cg.state_reason, '') = 'timeline_mismatch_frontier_frozen'
                       THEN 'backup frontier frozen after timeline mismatch; requires a new verified FULL anchor'
+                 END,
+                 CASE WHEN COALESCE(cg.state_reason, '') IN (
+                                'repository_verification_failed',
+                                'anchor_missing'
+                            )
+                      THEN 'backup repository proof is unavailable; restore admission is frozen'
                  END,
                  CASE WHEN COALESCE(gaps.timeline_gap_count, 0) > 0
                       THEN 'open timeline_mismatch coverage gap; requires a new verified FULL anchor'

@@ -205,6 +205,7 @@ echo "  ok: instance yeniden başladı (target_databases=$DB, capture_mode=wal)"
 echo "━━━ 1. Extension + track (per-DB slot, ayrı transaction'lar) ━━━"
 q "CREATE EXTENSION pg_flashback" > /dev/null
 q "CREATE TABLE orders (id serial PRIMARY KEY, customer text, amount numeric(10,2))" > /dev/null
+q "CREATE TABLE filtered_relevant(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null
 q "CREATE TABLE track_race (id integer PRIMARY KEY, payload text)" > /dev/null
 q "CREATE TABLE track_boundary (id integer PRIMARY KEY, payload text);
    INSERT INTO track_boundary VALUES (1, 'old')" > /dev/null
@@ -311,6 +312,7 @@ done
 q "SELECT flashback_untrack('track_boundary'); DROP TABLE track_boundary" > /dev/null
 
 q "SELECT flashback_track('orders')" > /dev/null
+q "SELECT flashback_track('filtered_relevant')" > /dev/null
 q "SELECT flashback_track('wal_batch_probe')" > /dev/null
 q "SELECT flashback_track('ddl_probe')" > /dev/null
 $PSQL -d "$DB" -q <<'SQL'
@@ -324,13 +326,62 @@ assert_eq "WAL track REPLICA IDENTITY FULL yaptı" "f" \
     "$(q "SELECT relreplident FROM pg_class WHERE oid = 'orders'::regclass")"
 
 for _ in $(seq 1 100); do
-    [[ "$(q "SELECT count(*) FROM flashback_health() WHERE health='healthy'")" == "4" ]] && break
+    [[ "$(q "SELECT count(*) FROM flashback_health() WHERE health='healthy'")" == "5" ]] && break
     sleep 0.1
 done
-assert_eq "dört WAL generation aktif ve sağlıklı" "4" \
+assert_eq "beş WAL generation aktif ve sağlıklı" "5" \
     "$(q "SELECT count(*) FROM flashback_health() WHERE health='healthy'")"
 assert_eq "building generation kalmadı" "0" \
     "$(q "SELECT count(*) FROM flashback.coverage_generations WHERE state='building'")"
+
+echo "━━━ 1a. Filtered WAL prefix slot'u bounded sürede ilerletiyor ━━━"
+SLOT_NAME="pg_flashback_${DB}"
+FILTERED_DELTA_BEFORE=$(q "SELECT count(*) FROM flashback.delta_log")
+FILTERED_START_FLUSH=$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
+                           WHERE slot_name='$SLOT_NAME'")
+q "CREATE TABLE untracked_wal_noise(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null
+for chunk in $(seq 1 16); do
+    q "INSERT INTO untracked_wal_noise
+       SELECT (($chunk - 1) * 128) + g,
+              string_agg(md5(($chunk::text || ':' || g::text || ':' || s::text ||
+                              ':' || random()::text)), '' ORDER BY s)
+       FROM generate_series(1, 128) AS g
+       CROSS JOIN generate_series(1, 64) AS s
+       GROUP BY g" > /dev/null
+done
+FILTERED_TARGET_LSN=$(q "SELECT pg_current_wal_flush_lsn()")
+FILTERED_GENERATED_BYTES=$(q "SELECT pg_wal_lsn_diff(
+    '$FILTERED_TARGET_LSN'::pg_lsn, '$FILTERED_START_FLUSH'::pg_lsn)::bigint")
+for _ in $(seq 1 200); do
+    q "SELECT flashback_consume_wal(4096)" > /dev/null
+    FILTERED_CONFIRMED=$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
+                             WHERE slot_name='$SLOT_NAME'")
+    [[ "$(q "SELECT '$FILTERED_CONFIRMED'::pg_lsn >=
+                       '$FILTERED_TARGET_LSN'::pg_lsn")" == "t" ]] && break
+    sleep 0.02
+done
+assert_eq "yalnız filtered WAL sonrası confirmed_flush sabit hedefe ulaştı" "t" \
+    "$(q "SELECT confirmed_flush_lsn >= '$FILTERED_TARGET_LSN'::pg_lsn
+           FROM pg_replication_slots WHERE slot_name='$SLOT_NAME'")"
+assert_eq "empty-prefix consume delta_log satırı üretmedi" "$FILTERED_DELTA_BEFORE" \
+    "$(q "SELECT count(*) FROM flashback.delta_log")"
+echo "  ok: filtered_bytes=$FILTERED_GENERATED_BYTES target=$FILTERED_TARGET_LSN confirmed=$FILTERED_CONFIRMED"
+
+q "INSERT INTO filtered_relevant VALUES (1, 'after-filtered-prefix')" > /dev/null
+for _ in $(seq 1 200); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log
+               WHERE rel_oid='filtered_relevant'::regclass
+                 AND event_type='INSERT'
+                 AND new_data->>'payload'='after-filtered-prefix'")" == "1" ]] && break
+    q "SELECT flashback_consume_wal(4096)" > /dev/null
+    sleep 0.02
+done
+assert_eq "filtered prefix arkasındaki relevant commit kaybolmadı" "1" \
+    "$(q "SELECT count(*) FROM flashback.delta_log
+           WHERE rel_oid='filtered_relevant'::regclass
+             AND event_type='INSERT'
+             AND new_data->>'payload'='after-filtered-prefix'")"
+q "SELECT flashback_untrack('filtered_relevant'); DROP TABLE filtered_relevant" > /dev/null
 
 # pg_logical_emit_message() is PUBLIC. A non-admin may send a payload that
 # looks exactly like a DELETE event, but the decoder must ignore the body and

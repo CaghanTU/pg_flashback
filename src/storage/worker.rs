@@ -507,21 +507,56 @@ fn ensure_replication_slot() -> bool {
 /// the extension is not (yet) installed in this database.
 fn consume_wal_changes() {
     let batch_size = effective_worker_batch_size() as i32;
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+    let locked: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
         let fn_exists = Spi::get_one::<bool>(
             "SELECT to_regprocedure('flashback_consume_wal(integer)') IS NOT NULL",
         )?
         .unwrap_or(false);
         if !fn_exists {
-            return Ok(());
+            return Ok(false);
         }
 
+        // Use a session lock so the transaction that waited for a concurrent
+        // track/re-anchor can commit before decoding starts. The next
+        // BackgroundWorker::transaction gets a fresh READ COMMITTED snapshot
+        // while this backend still owns the stream lock.
+        Spi::run(
+            "SELECT pg_advisory_lock(
+                 358945::integer,
+                 (SELECT oid::integer FROM pg_database
+                  WHERE datname = current_database())
+             )",
+        )?;
+        Ok(true)
+    });
+
+    let Ok(true) = locked else {
+        if let Err(err) = locked {
+            log!("pg_flashback WAL_CONSUME_LOCK_ERROR error={err:?}");
+        }
+        return;
+    };
+
+    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         Spi::run_with_args("SELECT flashback_consume_wal($1)", &[batch_size.into()])?;
         Ok(())
     });
 
+    let unlock_result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+        Spi::run(
+            "SELECT pg_advisory_unlock(
+                 358945::integer,
+                 (SELECT oid::integer FROM pg_database
+                  WHERE datname = current_database())
+             )",
+        )
+    });
+
     if let Err(err) = result {
         log!("pg_flashback WAL_CONSUME_ERROR error={err:?}");
+    }
+    if let Err(err) = unlock_result {
+        log!("pg_flashback WAL_CONSUME_UNLOCK_ERROR error={err:?}");
     }
 }
 

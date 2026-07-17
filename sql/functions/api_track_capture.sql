@@ -1194,6 +1194,13 @@ DECLARE
     v_missing_commits integer;
     v_has_output boolean;
     v_tracked_oids text;
+    v_slot_name text;
+    v_scan_start_lsn pg_lsn;
+    v_upto_lsn pg_lsn;
+    v_scan_window_bytes constant bigint := 16777216;
+    v_empty_min_advance_bytes constant bigint := 65536;
+    v_discarded integer;
+    v_peek jsonb;
     pending record;
     lock_rec record;
 BEGIN
@@ -1203,6 +1210,30 @@ BEGIN
 
     v_stream_id := flashback_ensure_active_wal_stream();
     IF v_stream_id IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    -- Freeze the upper bound before reading lifecycle metadata. A tracking or
+    -- re-anchor transaction that commits after this point is beyond the fixed
+    -- prefix even if a later READ COMMITTED statement can already see its
+    -- catalog rows. Conversely, every commit included by this bound was
+    -- visible before the tracked-OID snapshot below.
+    v_slot_name := flashback_effective_slot_name();
+    SELECT confirmed_flush_lsn
+      INTO v_scan_start_lsn
+    FROM pg_replication_slots
+    WHERE slot_name = v_slot_name
+      AND database = current_database();
+
+    IF v_scan_start_lsn IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    v_upto_lsn := LEAST(
+        pg_current_wal_insert_lsn(),
+        v_scan_start_lsn + v_scan_window_bytes
+    );
+    IF v_upto_lsn <= v_scan_start_lsn THEN
         RETURN 0;
     END IF;
 
@@ -1225,10 +1256,91 @@ BEGIN
           AND cg.state IN ('building', 'active', 'sealed')
     ) recoverable_relations;
 
-    -- Do not advance the slot (or create temp/catalog WAL) when the output
-    -- plugin has no user-table message.  get_changes() advances across
-    -- filtered flashback.* WAL too; recording that advancement would itself
-    -- generate more WAL and create a permanent worker feedback loop.
+    -- Freeze one bounded prefix before peeking. Both peek and get_changes use
+    -- this exact upper LSN, so a relevant transaction that commits between
+    -- them is necessarily beyond the consumed prefix. The byte window keeps
+    -- one worker cycle from scanning an unbounded amount of filtered WAL.
+    -- Materialize the bounded peek in backend memory. Empty-prefix calls do
+    -- not create/drop/truncate a temp relation and therefore generate no
+    -- catalog or extension-table WAL before consuming the fixed prefix.
+    SELECT COALESCE(
+               jsonb_agg(
+                   jsonb_build_object(
+                       'change_lsn', ch.lsn::text,
+                       'source_xid', ch.xid::text::bigint,
+                       'data', ch.data::jsonb,
+                       'ord', ch.ord
+                   )
+                   ORDER BY ch.ord
+               ),
+               '[]'::jsonb
+           )
+      INTO v_peek
+    FROM pg_logical_slot_peek_changes(
+             v_slot_name, v_upto_lsn, batch_size,
+             'tracked_oids', v_tracked_oids
+         )
+         WITH ORDINALITY AS ch(lsn, xid, data, ord)
+    WHERE ch.data LIKE '{%'
+    ;
+
+    v_has_output := jsonb_array_length(v_peek) > 0;
+    IF NOT v_has_output THEN
+        -- Never advance an apparently empty prefix while a boundary or
+        -- protected DDL transaction is unresolved. Its transactional logical
+        -- marker may have WAL before confirmed_flush_lsn but a COMMIT record
+        -- after the current bound. Waiting is bounded by the lifecycle
+        -- operation and fails closed if the marker never becomes decodable.
+        IF EXISTS (
+            SELECT 1
+            FROM flashback.coverage_generations
+            WHERE state = 'building'
+        ) OR EXISTS (
+            SELECT 1
+            FROM flashback.pending_wal_events
+            WHERE stream_id = v_stream_id
+        ) THEN
+            RETURN 0;
+        END IF;
+
+        -- Avoid a self-sustaining metadata-WAL loop for tiny internal tails.
+        -- Low-volume relevant commits are still handled immediately because
+        -- this threshold applies only after the fixed-prefix peek was empty.
+        IF pg_wal_lsn_diff(v_upto_lsn, v_scan_start_lsn)
+               < v_empty_min_advance_bytes
+        THEN
+            RETURN 0;
+        END IF;
+
+        -- Persist the exact safe bound before advancing. This is the one
+        -- necessary metadata write for an empty prefix: on the next worker
+        -- transaction ensure_active can distinguish this function's atomic
+        -- advancement from an unsupported external slot consumer. The write's
+        -- own WAL is beyond the already-frozen bound and is left as a small,
+        -- bounded tail instead of generating a feedback loop.
+        UPDATE flashback.capture_streams
+           SET details = COALESCE(details, '{}'::jsonb)
+               || jsonb_build_object(
+                    'safe_slot_advance_start_lsn', v_scan_start_lsn,
+                    'safe_slot_advance_upto_lsn', v_upto_lsn,
+                    'safe_slot_advance_recorded_at', clock_timestamp()
+                  )
+         WHERE stream_id = v_stream_id
+           AND state = 'active';
+
+        -- Advance across this exact empty prefix without writing extension
+        -- event rows. Slot advancement and its durable safe bound are in one
+        -- transaction: a crash or rollback causes PostgreSQL to deliver the
+        -- prefix again.
+        SELECT count(*)::integer
+          INTO v_discarded
+        FROM pg_logical_slot_get_changes(
+            v_slot_name, v_upto_lsn, batch_size,
+            'tracked_oids', v_tracked_oids
+        );
+        RETURN 0;
+    END IF;
+
     DROP TABLE IF EXISTS pg_temp._fb_wal_peek;
     CREATE TEMP TABLE _fb_wal_peek (
         change_lsn pg_lsn,
@@ -1238,19 +1350,18 @@ BEGIN
     ) ON COMMIT DROP;
 
     INSERT INTO _fb_wal_peek(change_lsn, source_xid, data, ord)
-    SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
-    FROM pg_logical_slot_peek_changes(
-             flashback_effective_slot_name(), NULL, batch_size,
-             'tracked_oids', v_tracked_oids
-         )
-         WITH ORDINALITY AS ch(lsn, xid, data, ord)
-    WHERE ch.data LIKE '{%'
-    ORDER BY ch.ord;
-
-    SELECT EXISTS (SELECT 1 FROM _fb_wal_peek) INTO v_has_output;
-    IF NOT v_has_output THEN
-        RETURN 0;
-    END IF;
+    SELECT
+        item.change_lsn::pg_lsn,
+        item.source_xid,
+        item.data,
+        item.ord
+    FROM jsonb_to_recordset(v_peek) AS item(
+        change_lsn text,
+        source_xid bigint,
+        data jsonb,
+        ord bigint
+    )
+    ORDER BY item.ord;
 
     -- Pin only lifecycles touched by this peeked batch (plus building boundary
     -- resolutions and pending protected DDL for commits in the batch). Waiting
@@ -1353,12 +1464,32 @@ BEGIN
     INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
     SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
     FROM pg_logical_slot_get_changes(
-             flashback_effective_slot_name(), NULL, batch_size,
+             v_slot_name, v_upto_lsn, batch_size,
              'tracked_oids', v_tracked_oids
          )
          WITH ORDINALITY AS ch(lsn, xid, data, ord)
     WHERE ch.data LIKE '{%'
     ORDER BY ch.ord;
+
+    -- The fixed prefix and identical plugin options make peek/get deterministic.
+    -- Treat any divergence as a transaction error so slot advancement rolls
+    -- back rather than admitting an unpinned or reordered event.
+    IF EXISTS (
+        (SELECT change_lsn, source_xid, data, ord FROM _fb_wal_peek
+         EXCEPT ALL
+         SELECT change_lsn, source_xid, data, ord FROM _fb_wal_batch)
+        UNION ALL
+        (SELECT change_lsn, source_xid, data, ord FROM _fb_wal_batch
+         EXCEPT ALL
+         SELECT change_lsn, source_xid, data, ord FROM _fb_wal_peek)
+    ) THEN
+        RAISE EXCEPTION 'flashback_consume_wal: peek/get prefix mismatch'
+            USING ERRCODE = 'data_exception',
+                  DETAIL = format(
+                      'slot=%s start_lsn=%s upto_lsn=%s',
+                      v_slot_name, v_scan_start_lsn, v_upto_lsn
+                  );
+    END IF;
 
     CREATE TEMP TABLE _fb_wal_commits ON COMMIT DROP AS
     SELECT
@@ -1698,7 +1829,7 @@ BEGIN
     SELECT confirmed_flush_lsn, restart_lsn
       INTO v_confirmed_flush_lsn, v_restart_lsn
     FROM pg_replication_slots
-    WHERE slot_name = flashback_effective_slot_name()
+    WHERE slot_name = v_slot_name
       AND database = current_database();
 
     IF v_frontier_lsn IS NOT NULL THEN
@@ -1706,7 +1837,11 @@ BEGIN
            SET valid_through_lsn = GREATEST(valid_through_lsn, v_frontier_lsn),
                valid_through_time = v_frontier_time,
                confirmed_flush_lsn = v_confirmed_flush_lsn,
-               restart_lsn = v_restart_lsn
+               restart_lsn = v_restart_lsn,
+               details = COALESCE(details, '{}'::jsonb)
+                   - 'safe_slot_advance_start_lsn'
+                   - 'safe_slot_advance_upto_lsn'
+                   - 'safe_slot_advance_recorded_at'
          WHERE stream_id = v_stream_id
            AND state = 'active';
 
@@ -1749,7 +1884,11 @@ BEGIN
     ELSE
         UPDATE flashback.capture_streams
            SET confirmed_flush_lsn = v_confirmed_flush_lsn,
-               restart_lsn = v_restart_lsn
+               restart_lsn = v_restart_lsn,
+               details = COALESCE(details, '{}'::jsonb)
+                   - 'safe_slot_advance_start_lsn'
+                   - 'safe_slot_advance_upto_lsn'
+                   - 'safe_slot_advance_recorded_at'
          WHERE stream_id = v_stream_id
            AND state = 'active';
     END IF;
