@@ -69,6 +69,9 @@ jobs:
           key: ${{ runner.os }}-candidate-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-candidate-
 
+      - name: Drop cached candidate archives
+        run: rm -rf target/candidate
+
       - name: Install cargo-pgrx and PostgreSQL 17
         run: |
           cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
@@ -92,8 +95,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pg-flashback-candidate-${{ steps.manifest.outputs.source_commit }}
-          path: |
-            target/candidate/*/
+          path: target/candidate/${{ steps.manifest.outputs.source_commit }}/
           if-no-files-found: error
 
   clean-host:
@@ -136,8 +138,11 @@ jobs:
       - name: Locate candidate directory
         id: cand
         run: |
-          manifest="$(find /tmp/candidate-dl -name MANIFEST.json -print -quit)"
+          expected="${{ needs.build-candidate.outputs.source_commit }}"
+          manifest="$(find /tmp/candidate-dl -path "*/${expected}/MANIFEST.json" -print -quit \
+            || find /tmp/candidate-dl -name MANIFEST.json -print -quit)"
           test -n "$manifest"
+          test "$(jq -r '.provenance.source_commit' "$manifest")" = "$expected"
           echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
           jq . "$manifest"
 

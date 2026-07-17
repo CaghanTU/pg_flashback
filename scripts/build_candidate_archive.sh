@@ -35,7 +35,8 @@ SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
 SHORT="$(git rev-parse --short=12 HEAD)"
 OUT_ROOT="${CANDIDATE_OUT:-$ROOT/target/candidate/$SOURCE_COMMIT}"
 STAGE="$OUT_ROOT/stage"
-rm -rf "$OUT_ROOT"
+# Drop every prior candidate tree so CI cache/uploads cannot mix digests.
+rm -rf "$ROOT/target/candidate"
 mkdir -p "$STAGE" "$OUT_ROOT"
 
 if [[ -z "$PG_CONFIG" ]]; then
