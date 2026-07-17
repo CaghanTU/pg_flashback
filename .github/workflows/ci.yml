@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, work/v0.1.0-overnight]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

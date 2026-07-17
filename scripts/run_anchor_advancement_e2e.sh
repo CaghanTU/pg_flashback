@@ -141,7 +141,7 @@ write_helper_config() {
             host: $controller_host,
             port: $controller_port,
             database: $controller_database,
-            user: "'$(id -un)'"
+            user: $recovery_user
           }
         }' > "$path"
     chmod 600 "$path"
@@ -269,7 +269,6 @@ primary_sql "INSERT INTO public.target_table(marker, payload)
              SELECT 'after0', decode(repeat(md5(('a'||g)::text), 8), 'hex')
              FROM generate_series(1, 20) g;"
 TARGET0_LSN=$(primary_sql "SELECT pg_current_wal_lsn()::text;")
-TARGET0_FP=$(fingerprint)
 force_archive
 TARGET_OID=$(primary_sql "SELECT 'public.target_table'::regclass::oid;")
 write_helper_config "$HELPER_CONFIG" "$REPO_DIR" "$PGBACKREST_CONFIG" 120
@@ -480,7 +479,6 @@ pass "predecessors retired after retention cutoff"
 sed -i 's/repo1-retention-full=99/repo1-retention-full=1/' "$PGBACKREST_CONFIG"
 set +e
 "$HELPER" expire --config "$HELPER_CONFIG" >"$RUN_ROOT/expire-after.out" 2>"$RUN_ROOT/expire-after.err"
-EXPIRE_AFTER_RC=$?
 set -e
 [[ -d "$REPO_DIR/backup/$STANZA/$FULL1_LABEL" ]] || die "FULL1 must remain after expire"
 # FULL0 may be removed by expire once unpinned; if retention still keeps it, that is ok
@@ -510,7 +508,7 @@ PROD_BEFORE=$(primary_sql "SELECT ba.backup_label
                            JOIN flashback.backup_anchors ba USING (backup_anchor_id, tracking_id)
                            WHERE cg.tracking_id=$TRACKING_ID AND cg.state='active';")
 # Begin a building successor against the live DB, then verify against corrupt clone.
-BEGIN_BAD=$(primary_sql "SELECT flashback_begin_backup_anchor_advancement($TRACKING_ID)::text;")
+primary_sql "SELECT flashback_begin_backup_anchor_advancement($TRACKING_ID);" >/dev/null
 # If no newer FULL exists in the live repo metadata path, begin may still create
 # building; corrupt verify must not activate it.
 set +e

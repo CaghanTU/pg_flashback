@@ -141,7 +141,7 @@ write_helper_config() {
             host: $controller_host,
             port: $controller_port,
             database: $controller_database,
-            user: "'$(id -un)'"
+            user: $recovery_user
           }
         }' > "$path"
     chmod 600 "$path"
