@@ -444,24 +444,41 @@ MANIFEST_SHA=$(sha256sum "$MANIFEST_PATH" | awk '{print $1}')
 SYSID=$(primary_sql "SELECT system_identifier FROM pg_control_system();")
 TIMELINE=$(primary_sql "SELECT timeline_id FROM pg_control_checkpoint();")
 
+TARGET_TRACKING_ID=""
+QUOTED_TRACKING_ID=""
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     activate_backup_table() {
         local table_ref=$1
-        primary_sql "SELECT flashback_activate_backup_anchor(
-            '$table_ref',
-            '$REPO_DIR',
-            '$STANZA',
-            '$BACKUP_LABEL',
-            $SYSID,
-            $TIMELINE,
-            '$MANIFEST_PATH',
-            '$MANIFEST_SHA',
-            '$BACKUP_START_LSN'::pg_lsn,
-            '$BACKUP_STOP_LSN'::pg_lsn
+        local tracking_id helper_profile
+        # Resolve while the relation still exists.
+        tracking_id=$(primary_sql "SELECT tracking_id FROM flashback.tracked_tables
+            WHERE is_active
+              AND recovery_profile = 'backup'
+              AND rel_oid = to_regclass('$table_ref');")
+        [[ -n "$tracking_id" ]] || die "no tracking_id for $table_ref"
+        helper_profile=$(primary_sql "SELECT helper_profile FROM flashback.tracked_tables WHERE tracking_id = $tracking_id;")
+        primary_sql "SELECT flashback_consume_verified_backup_proof(
+            flashback_install_verified_backup_proof(
+                'poc-activate-$tracking_id-$BACKUP_LABEL',
+                $tracking_id,
+                '$helper_profile',
+                '$REPO_DIR',
+                '$STANZA',
+                '$BACKUP_LABEL',
+                $SYSID,
+                $TIMELINE,
+                '$MANIFEST_PATH',
+                '$MANIFEST_SHA',
+                '$BACKUP_START_LSN'::pg_lsn,
+                '$BACKUP_STOP_LSN'::pg_lsn
+            )
         );" > /dev/null
+        printf '%s\n' "$tracking_id"
     }
-    activate_backup_table 'public.target_table'
-    activate_backup_table '"odd schema"."we""ird"'
+    TARGET_TRACKING_ID=$(activate_backup_table 'public.target_table')
+    QUOTED_TRACKING_ID=$(activate_backup_table '"odd schema"."we""ird"')
+    [[ -n "$TARGET_TRACKING_ID" && -n "$QUOTED_TRACKING_ID" ]] \
+        || die "backup activation did not return tracking ids"
 fi
 
 log "creating post-backup state and DROP timeline"
@@ -496,8 +513,33 @@ EXTENSION_TARGET_REQUEST=null
 EXTENSION_QUOTED_REQUEST=null
 EXTENSION_ALTER_REQUEST=null
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
-    primary_sql "SELECT flashback_advance_backup_frontier('public.target_table', '$TARGET_LSN'::pg_lsn);
-                 SELECT flashback_advance_backup_frontier('\"odd schema\".\"we\"\"ird\"', '$TARGET_LSN'::pg_lsn);" > /dev/null
+    advance_backup_table() {
+        local tracking_id=$1
+        local through_lsn=$2
+        local generation_id helper_profile repo_key stanza
+        [[ -n "$tracking_id" ]] || die "advance_backup_table: tracking_id required"
+        generation_id=$(primary_sql "SELECT generation_id FROM flashback.coverage_generations
+            WHERE tracking_id = $tracking_id AND state = 'active';")
+        [[ -n "$generation_id" ]] || die "no active generation for tracking_id=$tracking_id"
+        helper_profile=$(primary_sql "SELECT helper_profile FROM flashback.tracked_tables WHERE tracking_id = $tracking_id;")
+        repo_key=$(primary_sql "SELECT repository_key FROM flashback.backup_anchors WHERE tracking_id = $tracking_id ORDER BY backup_anchor_id DESC LIMIT 1;")
+        stanza=$(primary_sql "SELECT stanza FROM flashback.backup_anchors WHERE tracking_id = $tracking_id ORDER BY backup_anchor_id DESC LIMIT 1;")
+        primary_sql "SELECT flashback_consume_verified_wal_frontier_proof(
+            flashback_install_verified_wal_frontier_proof(
+                'poc-frontier-$tracking_id-$through_lsn',
+                $tracking_id,
+                $generation_id,
+                '$helper_profile',
+                '$repo_key',
+                '$stanza',
+                $TIMELINE,
+                '$through_lsn'::pg_lsn,
+                repeat('ab', 32)
+            )
+        );" > /dev/null
+    }
+    advance_backup_table "$TARGET_TRACKING_ID" "$TARGET_LSN"
+    advance_backup_table "$QUOTED_TRACKING_ID" "$TARGET_LSN"
 fi
 sleep 2
 primary_sql "DROP TABLE target_table;" > /dev/null
@@ -511,8 +553,8 @@ primary_sql "SELECT pg_switch_wal();" > /dev/null
 sleep 3
 pgbr check
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
-    primary_sql "SELECT flashback_advance_backup_frontier('public.target_table', '$AFTER_DROP_LSN'::pg_lsn);
-                 SELECT flashback_advance_backup_frontier('\"odd schema\".\"we\"\"ird\"', '$AFTER_DROP_LSN'::pg_lsn);" > /dev/null
+    advance_backup_table "$TARGET_TRACKING_ID" "$AFTER_DROP_LSN"
+    advance_backup_table "$QUOTED_TRACKING_ID" "$AFTER_DROP_LSN"
     EXTENSION_TARGET_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
     EXTENSION_QUOTED_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('\"odd schema\".\"we\"\"ird\"', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
     EXTENSION_ALTER_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$ALTER_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")

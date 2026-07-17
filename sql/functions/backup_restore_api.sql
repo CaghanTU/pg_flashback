@@ -361,8 +361,8 @@ BEGIN
 END;
 $$;
 
--- Legacy controller assertion. Fail closed: recoverability requires a verified
--- FULL backup anchor activated after the tracking marker COMMIT LSN.
+-- Legacy controller assertion. Fail closed: recoverability requires a
+-- one-time verified FULL backup proof consumed after the tracking marker.
 CREATE OR REPLACE FUNCTION flashback_set_backup_coverage(
     target_table text,
     first_lsn pg_lsn,
@@ -376,10 +376,12 @@ AS $$
 BEGIN
     RAISE EXCEPTION 'flashback_set_backup_coverage: legacy coverage assertion is rejected'
         USING ERRCODE = 'feature_not_supported',
-              HINT = 'Call flashback_activate_backup_anchor() with a verified FULL backup whose start LSN is strictly after the resolved tracking marker COMMIT LSN.';
+              HINT = 'Install a verified FULL backup proof via flashback_install_verified_backup_proof() then consume it with flashback_consume_verified_backup_proof().';
 END;
 $$;
 
+-- Public raw activation is intentionally closed. Caller-supplied LSNs and
+-- manifest digests are not recoverability evidence.
 CREATE OR REPLACE FUNCTION flashback_activate_backup_anchor(
     p_target_table text,
     p_repository_key text,
@@ -398,177 +400,14 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-DECLARE
-    v_tracked record;
-    v_pending record;
-    v_anchor_id bigint;
-    v_generation_id bigint;
-    v_sysid numeric;
-    v_timeline bigint;
-    v_marker_lsn pg_lsn;
 BEGIN
-    IF p_repository_key IS NULL OR btrim(p_repository_key) = ''
-       OR p_stanza IS NULL OR btrim(p_stanza) = ''
-       OR p_backup_label IS NULL OR btrim(p_backup_label) = ''
-       OR p_manifest_reference IS NULL OR btrim(p_manifest_reference) = ''
-       OR p_manifest_sha256 IS NULL OR p_manifest_sha256 !~ '^[0-9a-f]{64}$'
-       OR p_backup_start_lsn IS NULL OR p_backup_stop_lsn IS NULL
-       OR p_backup_stop_lsn < p_backup_start_lsn
-       OR p_database_system_identifier IS NULL
-       OR p_timeline_id IS NULL OR p_timeline_id <= 0
-    THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: incomplete or invalid backup identity';
-    END IF;
-
-    SELECT tt.* INTO v_tracked
-    FROM flashback.tracked_tables tt
-    WHERE tt.rel_oid = flashback_resolve_tracked_backup(p_target_table)
-      AND tt.is_active
-      AND tt.recovery_profile = 'backup';
-    IF v_tracked.tracking_id IS NULL THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup profile is not active for %', p_target_table;
-    END IF;
-
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
-
-    SELECT system_identifier INTO v_sysid FROM pg_control_system();
-    SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
-    IF p_database_system_identifier IS DISTINCT FROM v_sysid THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup system identifier % does not match live cluster %',
-            p_database_system_identifier, v_sysid;
-    END IF;
-    IF p_timeline_id IS DISTINCT FROM v_timeline THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup timeline % does not match live timeline %',
-            p_timeline_id, v_timeline;
-    END IF;
-
-    SELECT cg.* INTO v_pending
-    FROM flashback.coverage_generations cg
-    WHERE cg.tracking_id = v_tracked.tracking_id
-      AND cg.recovery_profile = 'backup'
-      AND cg.state = 'building'
-    ORDER BY cg.generation_no DESC
-    LIMIT 1
-    FOR UPDATE;
-
-    IF v_pending.generation_id IS NULL THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: no building backup generation for %', p_target_table;
-    END IF;
-
-    v_marker_lsn := COALESCE(
-        (v_pending.details ->> 'tracking_marker_lsn')::pg_lsn,
-        v_pending.boundary_lsn
-    );
-    IF v_marker_lsn IS NULL THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: tracking marker COMMIT LSN is not resolved yet'
-            USING HINT = 'Wait for the worker to consume the BOUNDARY commit, then retry.';
-    END IF;
-    IF p_backup_start_lsn <= v_marker_lsn THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: FULL backup start % must be strictly after marker COMMIT %',
-            p_backup_start_lsn, v_marker_lsn;
-    END IF;
-
-    -- Idempotent retry: identical verified identity reuses the existing anchor.
-    SELECT ba.backup_anchor_id, cg.generation_id
-      INTO v_anchor_id, v_generation_id
-    FROM flashback.backup_anchors ba
-    JOIN flashback.coverage_generations cg
-      ON cg.backup_anchor_id = ba.backup_anchor_id
-     AND cg.tracking_id = ba.tracking_id
-    WHERE ba.tracking_id = v_tracked.tracking_id
-      AND ba.backup_label = p_backup_label
-      AND ba.manifest_sha256 = p_manifest_sha256
-      AND ba.backup_start_lsn = p_backup_start_lsn
-      AND ba.backup_stop_lsn = p_backup_stop_lsn
-      AND cg.state = 'active'
-    LIMIT 1;
-    IF v_generation_id IS NOT NULL THEN
-        RETURN v_generation_id;
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM flashback.coverage_generations cg
-        WHERE cg.tracking_id = v_tracked.tracking_id
-          AND cg.state = 'active'
-          AND cg.recovery_profile = 'backup'
-    ) THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: an active backup generation already exists';
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM flashback.backup_anchors ba
-        WHERE ba.tracking_id = v_tracked.tracking_id
-          AND ba.backup_label = p_backup_label
-          AND ba.manifest_sha256 IS DISTINCT FROM p_manifest_sha256
-    ) THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: backup label % already bound to a different manifest digest',
-            p_backup_label;
-    END IF;
-
-    IF v_pending.boundary_lsn IS NOT NULL
-       AND v_pending.boundary_lsn IS DISTINCT FROM p_backup_stop_lsn
-    THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: building generation already has immutable boundary %',
-            v_pending.boundary_lsn;
-    END IF;
-
-    INSERT INTO flashback.backup_anchors (
-        tracking_id, helper_profile, repository_key, stanza, backup_label,
-        backup_type, database_system_identifier, timeline_id,
-        manifest_reference, manifest_sha256,
-        tracking_marker_lsn, backup_start_lsn, backup_stop_lsn,
-        verified_at, verified_by, details
-    ) VALUES (
-        v_tracked.tracking_id, v_tracked.helper_profile,
-        p_repository_key, p_stanza, p_backup_label,
-        'full', p_database_system_identifier, p_timeline_id,
-        p_manifest_reference, p_manifest_sha256,
-        v_marker_lsn, p_backup_start_lsn, p_backup_stop_lsn,
-        COALESCE(p_verified_at, clock_timestamp()), session_user,
-        jsonb_build_object(
-            'activation_kind', COALESCE(v_pending.boundary_kind, 'initial_track'),
-            'source_generation_id', v_pending.generation_id
-        )
-    ) RETURNING backup_anchor_id INTO v_anchor_id;
-
-    UPDATE flashback.coverage_generations
-       SET backup_anchor_id = v_anchor_id,
-           boundary_lsn = p_backup_stop_lsn,
-           boundary_time = COALESCE(p_verified_at, clock_timestamp()),
-           valid_through_lsn = p_backup_stop_lsn,
-           valid_through_time = COALESCE(p_verified_at, clock_timestamp()),
-           state = 'active',
-           activated_at = clock_timestamp(),
-           state_reason = 'verified_full_backup',
-           details = COALESCE(details, '{}'::jsonb)
-               || jsonb_build_object('tracking_marker_lsn', v_marker_lsn)
-     WHERE generation_id = v_pending.generation_id
-       AND state = 'building'
-    RETURNING generation_id INTO v_generation_id;
-
-    IF v_generation_id IS NULL THEN
-        RAISE EXCEPTION 'flashback_activate_backup_anchor: generation % could not be activated',
-            v_pending.generation_id;
-    END IF;
-
-    UPDATE flashback.tracked_tables
-       SET coverage_start_lsn = p_backup_stop_lsn,
-           coverage_end_lsn = p_backup_stop_lsn
-     WHERE tracking_id = v_tracked.tracking_id;
-
-    UPDATE flashback.coverage_gaps
-       SET gap_end_lsn = p_backup_stop_lsn,
-           gap_end_time = COALESCE(p_verified_at, clock_timestamp()),
-           reanchored_by_generation_id = v_generation_id,
-           reanchored_at = clock_timestamp()
-     WHERE tracking_id = v_tracked.tracking_id
-       AND reanchored_by_generation_id IS NULL
-       AND gap_start_lsn < p_backup_stop_lsn;
-
-    RETURN v_generation_id;
+    RAISE EXCEPTION 'flashback_activate_backup_anchor: raw caller-supplied activation is rejected'
+        USING ERRCODE = 'feature_not_supported',
+              HINT = 'Only flashback_consume_verified_backup_proof() may activate coverage from a one-time recovery-agent proof.';
 END;
 $$;
 
+-- Public raw frontier advance is intentionally closed.
 CREATE OR REPLACE FUNCTION flashback_advance_backup_frontier(
     p_target_table text,
     p_valid_through_lsn pg_lsn,
@@ -579,92 +418,548 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
+BEGIN
+    RAISE EXCEPTION 'flashback_advance_backup_frontier: raw caller-supplied frontier advance is rejected'
+        USING ERRCODE = 'feature_not_supported',
+              HINT = 'Only flashback_consume_verified_wal_frontier_proof() may advance coverage from a one-time archive verification proof.';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_caller_may_install_backup_proof()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+    SELECT COALESCE(
+        (SELECT rolsuper FROM pg_roles WHERE rolname = session_user),
+        false
+    )
+    OR pg_has_role(session_user, 'flashback_recovery_agent', 'member');
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_install_verified_backup_proof(
+    p_verification_request_id text,
+    p_tracking_id bigint,
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text,
+    p_backup_label text,
+    p_database_system_identifier numeric,
+    p_timeline_id bigint,
+    p_manifest_reference text,
+    p_manifest_sha256 text,
+    p_backup_start_lsn pg_lsn,
+    p_backup_stop_lsn pg_lsn,
+    p_verified_at timestamptz DEFAULT clock_timestamp(),
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
 DECLARE
     v_tracked record;
-    v_active record;
-    v_timeline bigint;
+    v_proof_id bigint;
 BEGIN
-    IF p_valid_through_lsn IS NULL THEN
-        RAISE EXCEPTION 'flashback_advance_backup_frontier: valid_through_lsn is required';
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'flashback_install_verified_backup_proof: only flashback_recovery_agent or a superuser may install proofs'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_verification_request_id IS NULL OR btrim(p_verification_request_id) = ''
+       OR p_tracking_id IS NULL
+       OR p_helper_profile IS NULL OR btrim(p_helper_profile) = ''
+       OR p_repository_key IS NULL OR btrim(p_repository_key) = ''
+       OR p_stanza IS NULL OR btrim(p_stanza) = ''
+       OR p_backup_label IS NULL OR btrim(p_backup_label) = ''
+       OR p_manifest_reference IS NULL OR btrim(p_manifest_reference) = ''
+       OR p_manifest_sha256 IS NULL OR p_manifest_sha256 !~ '^[0-9a-f]{64}$'
+       OR p_backup_start_lsn IS NULL OR p_backup_stop_lsn IS NULL
+       OR p_backup_stop_lsn < p_backup_start_lsn
+       OR p_database_system_identifier IS NULL
+       OR p_timeline_id IS NULL OR p_timeline_id <= 0
+    THEN
+        RAISE EXCEPTION 'flashback_install_verified_backup_proof: incomplete or invalid proof identity';
     END IF;
 
     SELECT tt.* INTO v_tracked
     FROM flashback.tracked_tables tt
-    WHERE tt.rel_oid = flashback_resolve_tracked_backup(p_target_table)
+    WHERE tt.tracking_id = p_tracking_id
       AND tt.is_active
       AND tt.recovery_profile = 'backup';
     IF v_tracked.tracking_id IS NULL THEN
-        RAISE EXCEPTION 'flashback_advance_backup_frontier: backup profile is not active for %', p_target_table;
+        RAISE EXCEPTION 'flashback_install_verified_backup_proof: no active backup lifecycle for tracking_id %',
+            p_tracking_id;
+    END IF;
+    IF v_tracked.helper_profile IS DISTINCT FROM p_helper_profile THEN
+        RAISE EXCEPTION 'flashback_install_verified_backup_proof: helper profile % does not match tracked profile %',
+            p_helper_profile, v_tracked.helper_profile;
+    END IF;
+
+    INSERT INTO flashback.verified_backup_proofs (
+        verification_request_id, tracking_id, helper_profile,
+        repository_key, stanza, backup_label, backup_type,
+        database_system_identifier, timeline_id,
+        manifest_reference, manifest_sha256,
+        backup_start_lsn, backup_stop_lsn,
+        verified_at, installed_by, details
+    ) VALUES (
+        p_verification_request_id, p_tracking_id, p_helper_profile,
+        p_repository_key, p_stanza, p_backup_label, 'full',
+        p_database_system_identifier, p_timeline_id,
+        p_manifest_reference, p_manifest_sha256,
+        p_backup_start_lsn, p_backup_stop_lsn,
+        COALESCE(p_verified_at, clock_timestamp()), session_user,
+        COALESCE(p_details, '{}'::jsonb)
+    )
+    RETURNING proof_id INTO v_proof_id;
+
+    RETURN v_proof_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_consume_verified_backup_proof(p_proof_id bigint)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_proof record;
+    v_tracked record;
+    v_pending record;
+    v_anchor_id bigint;
+    v_generation_id bigint;
+    v_sysid numeric;
+    v_timeline bigint;
+    v_marker_lsn pg_lsn;
+BEGIN
+    IF p_proof_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof_id is required';
+    END IF;
+
+    SELECT * INTO v_proof
+    FROM flashback.verified_backup_proofs
+    WHERE proof_id = p_proof_id
+    FOR UPDATE;
+    IF v_proof.proof_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof % does not exist', p_proof_id;
+    END IF;
+    IF v_proof.consumed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof % was already consumed',
+            p_proof_id;
+    END IF;
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_proof.tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup';
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof % is not bound to an active backup lifecycle',
+            p_proof_id;
+    END IF;
+    IF v_tracked.helper_profile IS DISTINCT FROM v_proof.helper_profile THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof profile mismatch';
     END IF;
 
     PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
 
+    SELECT system_identifier INTO v_sysid FROM pg_control_system();
     SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
-    IF p_timeline_id IS NOT NULL AND p_timeline_id IS DISTINCT FROM v_timeline THEN
-        UPDATE flashback.coverage_generations cg
+    IF v_proof.database_system_identifier IS DISTINCT FROM v_sysid THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof system identifier % does not match live cluster %',
+            v_proof.database_system_identifier, v_sysid;
+    END IF;
+    IF v_proof.timeline_id IS DISTINCT FROM v_timeline THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof timeline % does not match live timeline %',
+            v_proof.timeline_id, v_timeline;
+    END IF;
+
+    SELECT cg.* INTO v_pending
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracked.tracking_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state = 'building'
+    ORDER BY cg.generation_no DESC
+    LIMIT 1
+    FOR UPDATE;
+    IF v_pending.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: no building backup generation for tracking_id %',
+            v_tracked.tracking_id;
+    END IF;
+
+    v_marker_lsn := COALESCE(
+        (v_pending.details ->> 'tracking_marker_lsn')::pg_lsn,
+        v_pending.boundary_lsn
+    );
+    IF v_marker_lsn IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: tracking marker COMMIT LSN is not resolved yet'
+            USING HINT = 'Wait for the worker to consume the BOUNDARY commit, then retry.';
+    END IF;
+    IF v_proof.backup_start_lsn <= v_marker_lsn THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: FULL backup start % must be strictly after marker COMMIT %',
+            v_proof.backup_start_lsn, v_marker_lsn;
+    END IF;
+
+    SELECT ba.backup_anchor_id, cg.generation_id
+      INTO v_anchor_id, v_generation_id
+    FROM flashback.backup_anchors ba
+    JOIN flashback.coverage_generations cg
+      ON cg.backup_anchor_id = ba.backup_anchor_id
+     AND cg.tracking_id = ba.tracking_id
+    WHERE ba.tracking_id = v_tracked.tracking_id
+      AND ba.backup_label = v_proof.backup_label
+      AND ba.manifest_sha256 = v_proof.manifest_sha256
+      AND ba.backup_start_lsn = v_proof.backup_start_lsn
+      AND ba.backup_stop_lsn = v_proof.backup_stop_lsn
+      AND cg.state = 'active'
+    LIMIT 1;
+    IF v_generation_id IS NOT NULL THEN
+        UPDATE flashback.verified_backup_proofs
+           SET consumed_at = clock_timestamp(),
+               consumed_generation_id = v_generation_id
+         WHERE proof_id = p_proof_id
+           AND consumed_at IS NULL;
+        RETURN v_generation_id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_generations cg
+        WHERE cg.tracking_id = v_tracked.tracking_id
+          AND cg.state = 'active'
+          AND cg.recovery_profile = 'backup'
+    ) THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: an active backup generation already exists';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.backup_anchors ba
+        WHERE ba.tracking_id = v_tracked.tracking_id
+          AND ba.backup_label = v_proof.backup_label
+          AND ba.manifest_sha256 IS DISTINCT FROM v_proof.manifest_sha256
+    ) THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: backup label % already bound to a different manifest digest',
+            v_proof.backup_label;
+    END IF;
+
+    IF v_pending.boundary_lsn IS NOT NULL
+       AND v_pending.boundary_lsn IS DISTINCT FROM v_proof.backup_stop_lsn
+    THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
+            v_pending.boundary_lsn;
+    END IF;
+
+    INSERT INTO flashback.backup_anchors (
+        tracking_id, helper_profile, repository_key, stanza, backup_label,
+        backup_type, database_system_identifier, timeline_id,
+        manifest_reference, manifest_sha256,
+        tracking_marker_lsn, backup_start_lsn, backup_stop_lsn,
+        verified_at, verified_by, details
+    ) VALUES (
+        v_tracked.tracking_id, v_proof.helper_profile,
+        v_proof.repository_key, v_proof.stanza, v_proof.backup_label,
+        'full', v_proof.database_system_identifier, v_proof.timeline_id,
+        v_proof.manifest_reference, v_proof.manifest_sha256,
+        v_marker_lsn, v_proof.backup_start_lsn, v_proof.backup_stop_lsn,
+        v_proof.verified_at, session_user,
+        jsonb_build_object(
+            'activation_kind', COALESCE(v_pending.boundary_kind, 'initial_track'),
+            'source_generation_id', v_pending.generation_id,
+            'verification_request_id', v_proof.verification_request_id,
+            'proof_id', v_proof.proof_id
+        )
+    ) RETURNING backup_anchor_id INTO v_anchor_id;
+
+    UPDATE flashback.coverage_generations
+       SET backup_anchor_id = v_anchor_id,
+           boundary_lsn = v_proof.backup_stop_lsn,
+           boundary_time = v_proof.verified_at,
+           valid_through_lsn = v_proof.backup_stop_lsn,
+           valid_through_time = v_proof.verified_at,
+           state = 'active',
+           activated_at = clock_timestamp(),
+           state_reason = 'verified_full_backup',
+           details = COALESCE(details, '{}'::jsonb)
+               || jsonb_build_object(
+                   'tracking_marker_lsn', v_marker_lsn,
+                   'verification_request_id', v_proof.verification_request_id
+               )
+     WHERE generation_id = v_pending.generation_id
+       AND state = 'building'
+    RETURNING generation_id INTO v_generation_id;
+
+    IF v_generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: generation % could not be activated',
+            v_pending.generation_id;
+    END IF;
+
+    UPDATE flashback.tracked_tables
+       SET coverage_start_lsn = v_proof.backup_stop_lsn,
+           coverage_end_lsn = v_proof.backup_stop_lsn
+     WHERE tracking_id = v_tracked.tracking_id;
+
+    UPDATE flashback.coverage_gaps
+       SET gap_end_lsn = v_proof.backup_stop_lsn,
+           gap_end_time = v_proof.verified_at,
+           reanchored_by_generation_id = v_generation_id,
+           reanchored_at = clock_timestamp()
+     WHERE tracking_id = v_tracked.tracking_id
+       AND reanchored_by_generation_id IS NULL
+       AND gap_start_lsn < v_proof.backup_stop_lsn;
+
+    UPDATE flashback.verified_backup_proofs
+       SET consumed_at = clock_timestamp(),
+           consumed_generation_id = v_generation_id
+     WHERE proof_id = p_proof_id
+       AND consumed_at IS NULL;
+
+    RETURN v_generation_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_install_verified_wal_frontier_proof(
+    p_verification_request_id text,
+    p_tracking_id bigint,
+    p_generation_id bigint,
+    p_helper_profile text,
+    p_repository_key text,
+    p_stanza text,
+    p_timeline_id bigint,
+    p_valid_through_lsn pg_lsn,
+    p_archive_proof_sha256 text,
+    p_verified_at timestamptz DEFAULT clock_timestamp(),
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_tracked record;
+    v_gen record;
+    v_proof_id bigint;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: only flashback_recovery_agent or a superuser may install proofs'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF p_verification_request_id IS NULL OR btrim(p_verification_request_id) = ''
+       OR p_tracking_id IS NULL OR p_generation_id IS NULL
+       OR p_helper_profile IS NULL OR btrim(p_helper_profile) = ''
+       OR p_repository_key IS NULL OR btrim(p_repository_key) = ''
+       OR p_stanza IS NULL OR btrim(p_stanza) = ''
+       OR p_timeline_id IS NULL OR p_timeline_id <= 0
+       OR p_valid_through_lsn IS NULL
+       OR p_archive_proof_sha256 IS NULL OR p_archive_proof_sha256 !~ '^[0-9a-f]{64}$'
+    THEN
+        RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: incomplete or invalid proof identity';
+    END IF;
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = p_tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup';
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: no active backup lifecycle for tracking_id %',
+            p_tracking_id;
+    END IF;
+    IF v_tracked.helper_profile IS DISTINCT FROM p_helper_profile THEN
+        RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: helper profile mismatch';
+    END IF;
+
+    SELECT cg.* INTO v_gen
+    FROM flashback.coverage_generations cg
+    WHERE cg.generation_id = p_generation_id
+      AND cg.tracking_id = p_tracking_id
+      AND cg.recovery_profile = 'backup';
+    IF v_gen.generation_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_install_verified_wal_frontier_proof: generation % is not bound to tracking_id %',
+            p_generation_id, p_tracking_id;
+    END IF;
+
+    INSERT INTO flashback.verified_wal_frontier_proofs (
+        verification_request_id, tracking_id, generation_id,
+        helper_profile, repository_key, stanza, timeline_id,
+        valid_through_lsn, archive_proof_sha256,
+        verified_at, installed_by, details
+    ) VALUES (
+        p_verification_request_id, p_tracking_id, p_generation_id,
+        p_helper_profile, p_repository_key, p_stanza, p_timeline_id,
+        p_valid_through_lsn, p_archive_proof_sha256,
+        COALESCE(p_verified_at, clock_timestamp()), session_user,
+        COALESCE(p_details, '{}'::jsonb)
+    )
+    RETURNING proof_id INTO v_proof_id;
+
+    RETURN v_proof_id;
+END;
+$$;
+
+-- Structured frontier consume: timeline mismatch freezes coverage and returns
+-- a durable status without raising, so the controller can COMMIT the freeze.
+CREATE OR REPLACE FUNCTION flashback_consume_verified_wal_frontier_proof(p_proof_id bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_proof record;
+    v_tracked record;
+    v_active record;
+    v_anchor record;
+    v_timeline bigint;
+    v_gap_id bigint;
+BEGIN
+    IF p_proof_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: proof_id is required';
+    END IF;
+
+    SELECT * INTO v_proof
+    FROM flashback.verified_wal_frontier_proofs
+    WHERE proof_id = p_proof_id
+    FOR UPDATE;
+    IF v_proof.proof_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: proof % does not exist', p_proof_id;
+    END IF;
+    IF v_proof.consumed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: proof % was already consumed',
+            p_proof_id;
+    END IF;
+
+    SELECT tt.* INTO v_tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_proof.tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'backup';
+    IF v_tracked.tracking_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: proof is not bound to an active backup lifecycle';
+    END IF;
+    IF v_tracked.helper_profile IS DISTINCT FROM v_proof.helper_profile THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: helper profile mismatch';
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracked.tracking_id));
+
+    SELECT cg.* INTO v_active
+    FROM flashback.coverage_generations cg
+    WHERE cg.generation_id = v_proof.generation_id
+      AND cg.tracking_id = v_proof.tracking_id
+      AND cg.recovery_profile = 'backup'
+    FOR UPDATE;
+    IF v_active.generation_id IS NULL OR v_active.state <> 'active' THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: generation % is not an active backup generation',
+            v_proof.generation_id;
+    END IF;
+    IF COALESCE(v_active.state_reason, '') = 'timeline_mismatch_frontier_frozen' THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: frontier is frozen after timeline mismatch';
+    END IF;
+
+    SELECT ba.* INTO v_anchor
+    FROM flashback.backup_anchors ba
+    WHERE ba.backup_anchor_id = v_active.backup_anchor_id
+      AND ba.tracking_id = v_active.tracking_id;
+    IF v_anchor.backup_anchor_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: active generation has no backup anchor';
+    END IF;
+    IF v_anchor.helper_profile IS DISTINCT FROM v_proof.helper_profile
+       OR v_anchor.repository_key IS DISTINCT FROM v_proof.repository_key
+       OR v_anchor.stanza IS DISTINCT FROM v_proof.stanza
+    THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: repository/profile identity mismatch';
+    END IF;
+
+    SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
+    IF v_proof.timeline_id IS DISTINCT FROM v_timeline
+       OR v_proof.timeline_id IS DISTINCT FROM v_anchor.timeline_id
+    THEN
+        UPDATE flashback.coverage_generations
            SET state_reason = 'timeline_mismatch_frontier_frozen'
-          FROM flashback.backup_anchors ba
-         WHERE cg.tracking_id = v_tracked.tracking_id
-           AND cg.state = 'active'
-           AND ba.backup_anchor_id = cg.backup_anchor_id;
+         WHERE generation_id = v_active.generation_id
+           AND state = 'active';
 
         INSERT INTO flashback.coverage_gaps (
             tracking_id, source_generation_id, reason,
             gap_start_lsn, gap_start_time, lower_bound_inclusive, details
         )
         SELECT
-            v_tracked.tracking_id, cg.generation_id, 'timeline_mismatch',
-            cg.valid_through_lsn, cg.valid_through_time, false,
+            v_tracked.tracking_id, v_active.generation_id, 'timeline_mismatch',
+            v_active.valid_through_lsn, v_active.valid_through_time, false,
             jsonb_build_object(
-                'expected_timeline', ba.timeline_id,
-                'observed_timeline', p_timeline_id
+                'expected_timeline', v_anchor.timeline_id,
+                'observed_timeline', v_proof.timeline_id,
+                'live_timeline', v_timeline,
+                'verification_request_id', v_proof.verification_request_id,
+                'proof_id', v_proof.proof_id,
+                'frontier_at_freeze', v_active.valid_through_lsn
             )
-        FROM flashback.coverage_generations cg
-        JOIN flashback.backup_anchors ba ON ba.backup_anchor_id = cg.backup_anchor_id
-        WHERE cg.tracking_id = v_tracked.tracking_id
-          AND cg.state = 'active'
-          AND NOT EXISTS (
-              SELECT 1 FROM flashback.coverage_gaps g
-              WHERE g.tracking_id = v_tracked.tracking_id
-                AND g.source_generation_id = cg.generation_id
-                AND g.reanchored_by_generation_id IS NULL
-                AND g.reason = 'timeline_mismatch'
-          );
-        RAISE EXCEPTION 'flashback_advance_backup_frontier: timeline mismatch freezes the frontier';
+        WHERE NOT EXISTS (
+            SELECT 1 FROM flashback.coverage_gaps g
+            WHERE g.tracking_id = v_tracked.tracking_id
+              AND g.source_generation_id = v_active.generation_id
+              AND g.reanchored_by_generation_id IS NULL
+              AND g.reason = 'timeline_mismatch'
+        )
+        RETURNING gap_id INTO v_gap_id;
+
+        UPDATE flashback.verified_wal_frontier_proofs
+           SET consumed_at = clock_timestamp(),
+               details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+                   'consume_status', 'timeline_mismatch',
+                   'gap_id', v_gap_id
+               )
+         WHERE proof_id = p_proof_id
+           AND consumed_at IS NULL;
+
+        RETURN jsonb_build_object(
+            'status', 'timeline_mismatch',
+            'tracking_id', v_tracked.tracking_id,
+            'generation_id', v_active.generation_id,
+            'valid_through_lsn', v_active.valid_through_lsn,
+            'gap_id', v_gap_id,
+            'expected_timeline', v_anchor.timeline_id,
+            'observed_timeline', v_proof.timeline_id,
+            'live_timeline', v_timeline
+        );
     END IF;
 
-    SELECT cg.* INTO v_active
-    FROM flashback.coverage_generations cg
-    WHERE cg.tracking_id = v_tracked.tracking_id
-      AND cg.recovery_profile = 'backup'
-      AND cg.state = 'active'
-    FOR UPDATE;
-    IF v_active.generation_id IS NULL THEN
-        RAISE EXCEPTION 'flashback_advance_backup_frontier: no active backup generation for %', p_target_table;
-    END IF;
-    IF p_valid_through_lsn < v_active.valid_through_lsn THEN
-        RAISE EXCEPTION 'flashback_advance_backup_frontier: frontier % is before current valid_through %',
-            p_valid_through_lsn, v_active.valid_through_lsn;
-    END IF;
-    IF p_valid_through_lsn = v_active.valid_through_lsn THEN
-        RETURN v_active.valid_through_lsn;
+    IF v_proof.valid_through_lsn < v_active.valid_through_lsn THEN
+        RAISE EXCEPTION 'flashback_consume_verified_wal_frontier_proof: frontier % is before current valid_through %',
+            v_proof.valid_through_lsn, v_active.valid_through_lsn;
     END IF;
 
-    -- Contiguous advance only: refuse holes relative to the proven frontier.
-    -- Callers must revalidate the archive prefix under the repository shared
-    -- lock before invoking this function.
-    UPDATE flashback.coverage_generations
-       SET valid_through_lsn = p_valid_through_lsn,
-           valid_through_time = clock_timestamp(),
-           state_reason = 'physical_wal_frontier_advanced'
-     WHERE generation_id = v_active.generation_id
-       AND state = 'active';
+    IF v_proof.valid_through_lsn > v_active.valid_through_lsn THEN
+        UPDATE flashback.coverage_generations
+           SET valid_through_lsn = v_proof.valid_through_lsn,
+               valid_through_time = clock_timestamp(),
+               state_reason = 'physical_wal_frontier_advanced'
+         WHERE generation_id = v_active.generation_id
+           AND state = 'active';
 
-    UPDATE flashback.tracked_tables
-       SET coverage_end_lsn = p_valid_through_lsn
-     WHERE tracking_id = v_tracked.tracking_id;
+        UPDATE flashback.tracked_tables
+           SET coverage_end_lsn = v_proof.valid_through_lsn
+         WHERE tracking_id = v_tracked.tracking_id;
+    END IF;
 
-    RETURN p_valid_through_lsn;
+    UPDATE flashback.verified_wal_frontier_proofs
+       SET consumed_at = clock_timestamp(),
+           details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+               'consume_status', 'ok'
+           )
+     WHERE proof_id = p_proof_id
+       AND consumed_at IS NULL;
+
+    RETURN jsonb_build_object(
+        'status', 'ok',
+        'tracking_id', v_tracked.tracking_id,
+        'generation_id', v_active.generation_id,
+        'valid_through_lsn', GREATEST(v_active.valid_through_lsn, v_proof.valid_through_lsn)
+    );
 END;
 $$;
 
@@ -752,6 +1047,11 @@ BEGIN
         RAISE EXCEPTION 'flashback_prepare_backup_restore: no admissible backup generation covers target %',
             target_lsn
             USING HINT = 'Targets require an active/sealed generation with a verified FULL backup anchor; unanchored or gap intervals are rejected.';
+    END IF;
+
+    IF COALESCE(v_generation.state_reason, '') = 'timeline_mismatch_frontier_frozen' THEN
+        RAISE EXCEPTION 'flashback_prepare_backup_restore: backup frontier is frozen after timeline mismatch'
+            USING HINT = 'Consume a new verified FULL backup proof before preparing restore.';
     END IF;
 
     IF EXISTS (

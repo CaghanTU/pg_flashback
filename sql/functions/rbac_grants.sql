@@ -101,10 +101,14 @@ GRANT EXECUTE ON FUNCTION flashback_retention_status()                TO flashba
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)       TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_track_backup(text, text)          TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_set_backup_coverage(text, pg_lsn, pg_lsn) TO flashback_admin;
+-- Raw activate/advance remain present only as fail-closed stubs.
 GRANT EXECUTE ON FUNCTION flashback_activate_backup_anchor(
     text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz
 ) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_advance_backup_frontier(text, pg_lsn, bigint)
+    TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_consume_verified_backup_proof(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_consume_verified_wal_frontier_proof(bigint)
     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_backup_disaster_points(text, interval) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_prepare_backup_restore(text, pg_lsn) TO flashback_admin;
@@ -115,6 +119,16 @@ GRANT EXECUTE ON FUNCTION flashback_adopt_existing_payload_tables()          TO 
 GRANT EXECUTE ON FUNCTION flashback_claim_backup_restore(text)        TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_accept_backup_restore(text, jsonb) TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_fail_backup_restore(text, text, boolean) TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_install_verified_backup_proof(
+    text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz, jsonb
+) TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_install_verified_wal_frontier_proof(
+    text, bigint, bigint, text, text, text, bigint, pg_lsn, text, timestamptz, jsonb
+) TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_consume_verified_backup_proof(bigint)
+    TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_consume_verified_wal_frontier_proof(bigint)
+    TO flashback_recovery_agent;
 
 -- NOTE: Internal helpers (build_predicate, build_insert_parts,
 -- collect_schema_def, recreate_table_from_ddl, finalize_shadow_swap)

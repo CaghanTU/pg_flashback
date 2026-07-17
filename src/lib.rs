@@ -304,6 +304,10 @@ mod tests {
         "../tests/sql/integration/backup_profile_contract.sql"
     );
     sql_test!(
+        it_backup_proof_trust_boundary,
+        "../tests/sql/integration/backup_proof_trust_boundary.sql"
+    );
+    sql_test!(
         it_coverage_schema_contract,
         "../tests/sql/integration/coverage_schema_contract.sql"
     );

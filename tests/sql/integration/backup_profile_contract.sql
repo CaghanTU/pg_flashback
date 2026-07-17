@@ -5,8 +5,9 @@
 -- impossible here by design. This file verifies:
 --   1. track_backup fails closed on a write-dirty transaction
 --   2. legacy set_backup_coverage is rejected
---   3. activate / prepare / finalize against a seeded building marker + FULL
---      anchor, including post-swap zero-active unanchored successor behavior
+--   3. verified proof consume / prepare / finalize against a seeded building
+--      marker + FULL anchor, including post-swap zero-active unanchored successor
+--   3b. raw activate/advance remain feature_not_supported
 --   4. identity protection on finalize
 --
 -- Real marker COMMIT resolution and worker-driven post-swap sealing run in
@@ -75,6 +76,25 @@ BEGIN
             'public.it_backup_profile', '0/1'::pg_lsn, '0/2'::pg_lsn
         );
         RAISE EXCEPTION 'legacy set_backup_coverage must fail closed';
+    EXCEPTION WHEN feature_not_supported THEN
+        NULL;
+    END;
+
+    BEGIN
+        PERFORM flashback_activate_backup_anchor(
+            'public.it_backup_profile', 'repo', 'stanza', 'rawF',
+            1, 1, 'manifest', repeat('aa', 32), '0/1'::pg_lsn, '0/2'::pg_lsn
+        );
+        RAISE EXCEPTION 'raw activate_backup_anchor must fail closed';
+    EXCEPTION WHEN feature_not_supported THEN
+        NULL;
+    END;
+
+    BEGIN
+        PERFORM flashback_advance_backup_frontier(
+            'public.it_backup_profile', '0/2'::pg_lsn, 1
+        );
+        RAISE EXCEPTION 'raw advance_backup_frontier must fail closed';
     EXCEPTION WHEN feature_not_supported THEN
         NULL;
     END;
@@ -153,17 +173,21 @@ BEGIN
     SELECT system_identifier INTO v_sysid FROM pg_control_system();
     SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
     v_target_lsn := v_marker_lsn + 100;
-    v_generation_id := flashback_activate_backup_anchor(
-        'public.it_backup_profile',
-        'test-repo',
-        'test-stanza',
-        '20260717-000001F',
-        v_sysid,
-        v_timeline,
-        'backup/20260717-000001F/backup.manifest',
-        repeat('ab', 32),
-        v_marker_lsn + 1,
-        v_target_lsn
+    v_generation_id := flashback_consume_verified_backup_proof(
+        flashback_install_verified_backup_proof(
+            'proof-it-backup-profile-1',
+            v_tracking_id,
+            'test_helper',
+            'test-repo',
+            'test-stanza',
+            '20260717-000001F',
+            v_sysid,
+            v_timeline,
+            'backup/20260717-000001F/backup.manifest',
+            repeat('ab', 32),
+            v_marker_lsn + 1,
+            v_target_lsn
+        )
     );
     IF NOT EXISTS (
         SELECT 1 FROM flashback.coverage_generations
@@ -176,17 +200,21 @@ BEGIN
     END IF;
 
     BEGIN
-        PERFORM flashback_activate_backup_anchor(
-            'public.it_backup_profile',
-            'test-repo',
-            'test-stanza',
-            '20260717-overlapF',
-            v_sysid,
-            v_timeline,
-            'backup/20260717-overlapF/backup.manifest',
-            repeat('cd', 32),
-            v_marker_lsn,
-            v_marker_lsn + 10
+        PERFORM flashback_consume_verified_backup_proof(
+            flashback_install_verified_backup_proof(
+                'proof-it-backup-profile-overlap',
+                v_tracking_id,
+                'test_helper',
+                'test-repo',
+                'test-stanza',
+                '20260717-overlapF',
+                v_sysid,
+                v_timeline,
+                'backup/20260717-overlapF/backup.manifest',
+                repeat('cd', 32),
+                v_marker_lsn,
+                v_marker_lsn + 10
+            )
         );
         RAISE EXCEPTION 'overlapping backup start must be rejected';
     EXCEPTION WHEN OTHERS THEN
@@ -420,17 +448,21 @@ BEGIN
     SELECT system_identifier INTO v_sysid FROM pg_control_system();
     SELECT timeline_id INTO v_timeline FROM pg_control_checkpoint();
     v_target_lsn := v_marker_lsn + 50;
-    PERFORM flashback_activate_backup_anchor(
-        'public.it_backup_identity',
-        'test-repo',
-        'test-stanza',
-        '20260717-identityF',
-        v_sysid,
-        v_timeline,
-        'backup/20260717-identityF/backup.manifest',
-        repeat('ef', 32),
-        v_marker_lsn + 1,
-        v_target_lsn
+    PERFORM flashback_consume_verified_backup_proof(
+        flashback_install_verified_backup_proof(
+            'proof-it-backup-identity-1',
+            v_tracking_id,
+            'test_helper',
+            'test-repo',
+            'test-stanza',
+            '20260717-identityF',
+            v_sysid,
+            v_timeline,
+            'backup/20260717-identityF/backup.manifest',
+            repeat('ef', 32),
+            v_marker_lsn + 1,
+            v_target_lsn
+        )
     );
     v_request := flashback_prepare_backup_restore(
         'public.it_backup_identity', v_target_lsn

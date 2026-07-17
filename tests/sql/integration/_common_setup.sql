@@ -4,6 +4,8 @@
 TRUNCATE
     flashback.pending_wal_events,
     flashback.generation_payload_retirements,
+    flashback.verified_wal_frontier_proofs,
+    flashback.verified_backup_proofs,
     flashback.coverage_gaps,
     flashback.coverage_generations,
     flashback.backup_anchors,

@@ -1008,12 +1008,17 @@ AS $$
         tt.recovery_profile,
         CASE
             WHEN pending.generation_id IS NOT NULL THEN 'pending'
+            WHEN COALESCE(cg.state_reason, '') = 'timeline_mismatch_frontier_frozen'
+              OR COALESCE(gaps.timeline_gap_count, 0) > 0
+            THEN 'degraded'
             WHEN cs.state = 'broken' OR COALESCE(gaps.open_gap_count, 0) > 0 THEN 'degraded'
             WHEN COALESCE(retirement.retiring_count, 0) > 0
               OR COALESCE(retention_block.blocked, false)
             THEN 'maintenance_required'
             WHEN cg.generation_id IS NULL THEN 'unanchored'
-            WHEN cs.state = 'active' THEN 'healthy'
+            WHEN cs.state = 'active'
+              OR (tt.recovery_profile = 'backup' AND cg.state = 'active')
+            THEN 'healthy'
             ELSE 'unavailable'
         END,
         cg.generation_id,
@@ -1024,6 +1029,12 @@ AS $$
         cg.valid_through_time,
         COALESCE(gaps.open_gap_count, 0),
         COALESCE(cs.invalidation_reason,
+                 CASE WHEN COALESCE(cg.state_reason, '') = 'timeline_mismatch_frontier_frozen'
+                      THEN 'backup frontier frozen after timeline mismatch; requires a new verified FULL anchor'
+                 END,
+                 CASE WHEN COALESCE(gaps.timeline_gap_count, 0) > 0
+                      THEN 'open timeline_mismatch coverage gap; requires a new verified FULL anchor'
+                 END,
                  CASE WHEN pending.generation_id IS NOT NULL THEN 'generation boundary awaiting COMMIT LSN' END,
                  CASE WHEN COALESCE(retirement.retiring_count, 0) > 0 THEN 'generation payload retirement in progress' END,
                  CASE WHEN COALESCE(retention_block.blocked, false) THEN 'sealed generation retention is blocked pending complete drain/new anchor' END,
@@ -1041,7 +1052,10 @@ AS $$
         LIMIT 1
     ) pending ON true
     LEFT JOIN LATERAL (
-        SELECT count(*) AS open_gap_count FROM flashback.coverage_gaps gap
+        SELECT
+            count(*) AS open_gap_count,
+            count(*) FILTER (WHERE gap.reason = 'timeline_mismatch') AS timeline_gap_count
+        FROM flashback.coverage_gaps gap
         WHERE gap.tracking_id = tt.tracking_id
           AND gap.reanchored_by_generation_id IS NULL
     ) gaps ON true
