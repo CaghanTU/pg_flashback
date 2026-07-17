@@ -24,7 +24,9 @@ use crate::pgbackrest::{direct_backup_tree, parse_lsn, read_backup_catalog, sele
 
 pub use crate::gc::{run_gc, unpin_artifact};
 pub use crate::probe::run_probe;
-pub use crate::verify::{audit_anchors, expire_backups, verify_anchor, verify_frontier};
+pub use crate::verify::{
+    audit_anchors, expire_backups, reconcile_anchors, verify_anchor, verify_frontier,
+};
 
 use crate::provider::{qualified_provider, PhysicalRecoveryProvider, WalFrontierEvidence};
 
@@ -107,6 +109,18 @@ pub fn provider_expire_backups(
     config: &RecoveryConfig,
 ) -> Result<model::ExpireResult, RecoveryError> {
     qualified_provider().expire_unpinned(config)
+}
+
+/// Reconcile newer FULL anchors / retire predecessors without creating backups.
+///
+/// # Errors
+///
+/// Returns reconcile failures from the qualified pgBackRest provider.
+pub fn provider_reconcile_anchors(
+    config: &RecoveryConfig,
+    dry_run: bool,
+) -> Result<model::ReconcileAnchorsReport, RecoveryError> {
+    reconcile_anchors(config, dry_run)
 }
 
 const MAX_CONTRACT_BYTES: u64 = 1024 * 1024;

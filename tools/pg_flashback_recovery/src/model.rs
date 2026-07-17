@@ -295,6 +295,27 @@ pub struct AnchorAuditReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileAnchorAction {
+    pub tracking_id: i64,
+    pub action: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileAnchorsReport {
+    pub status: String,
+    pub profile: String,
+    pub stanza: String,
+    pub dry_run: bool,
+    pub created_backup: bool,
+    pub actions: Vec<ReconcileAnchorAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GcAction {
     Keep,

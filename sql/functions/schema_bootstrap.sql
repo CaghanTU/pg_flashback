@@ -967,6 +967,27 @@ CREATE TABLE IF NOT EXISTS flashback.backup_anchors (
     )
 );
 
+-- Upgrade path: older installs only allowed start > marker.
+DO $$
+BEGIN
+    IF to_regclass('flashback.backup_anchors') IS NULL THEN
+        RETURN;
+    END IF;
+    ALTER TABLE flashback.backup_anchors
+        DROP CONSTRAINT IF EXISTS backup_anchors_after_marker_check;
+    ALTER TABLE flashback.backup_anchors
+        DROP CONSTRAINT IF EXISTS backup_anchors_eligible_anchor_check;
+    ALTER TABLE flashback.backup_anchors
+        ADD CONSTRAINT backup_anchors_eligible_anchor_check CHECK (
+            backup_stop_lsn >= backup_start_lsn
+            AND (
+                backup_start_lsn > tracking_marker_lsn
+                OR backup_stop_lsn <= tracking_marker_lsn
+            )
+        );
+END
+$$;
+
 -- One-time verified coverage proofs. Only the recovery agent (or a superuser
 -- installing on behalf of a locked helper verification) may insert rows.
 -- flashback_admin cannot forge coverage by supplying raw LSNs/manifests.
@@ -1765,8 +1786,20 @@ BEGIN
            AND (NEW.valid_through_lsn IS NULL
                 OR NEW.valid_through_lsn < OLD.valid_through_lsn)
         THEN
-            RAISE EXCEPTION 'pg_flashback: generation % watermark cannot move backward', OLD.generation_id
-                USING ERRCODE = 'integrity_constraint_violation';
+            -- Sealing a backup predecessor may clamp the watermark down to the
+            -- exclusive superseded_before bound after the frontier was inherited
+            -- by the successor. All other backward moves remain forbidden.
+            IF NOT (
+                OLD.state = 'active'
+                AND NEW.state = 'sealed'
+                AND NEW.superseded_before_lsn IS NOT NULL
+                AND NEW.valid_through_lsn IS NOT NULL
+                AND NEW.valid_through_lsn = NEW.superseded_before_lsn
+                AND NEW.valid_through_lsn <= OLD.valid_through_lsn
+            ) THEN
+                RAISE EXCEPTION 'pg_flashback: generation % watermark cannot move backward', OLD.generation_id
+                    USING ERRCODE = 'integrity_constraint_violation';
+            END IF;
         END IF;
 
         IF NEW.superseded_before_time IS DISTINCT FROM OLD.superseded_before_time

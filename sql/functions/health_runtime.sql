@@ -163,6 +163,7 @@ BEGIN
             ba.details AS anchor_details,
             pending.generation_id AS pending_generation_id,
             pending.state_reason AS pending_state_reason,
+            pending.boundary_kind AS pending_boundary_kind,
             COALESCE(gaps.open_gap_count, 0) AS open_gap_count,
             COALESCE(gaps.timeline_gap_count, 0) AS timeline_gap_count,
             COALESCE(gaps.post_restore_gap_count, 0) AS post_restore_gap_count,
@@ -181,9 +182,10 @@ BEGIN
          AND ba.tracking_id = cg.tracking_id
         LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         LEFT JOIN LATERAL (
-            SELECT g.generation_id, g.state_reason
+            SELECT g.generation_id, g.state_reason, g.boundary_kind
             FROM flashback.coverage_generations g
             WHERE g.tracking_id = tt.tracking_id AND g.state = 'building'
+            ORDER BY g.generation_no DESC
             LIMIT 1
         ) pending ON true
         LEFT JOIN LATERAL (
@@ -333,9 +335,9 @@ BEGIN
            )
         THEN
             v_health := 'backup_reanchor_required';
-            v_action := 'activate_eligible_retained_or_fresh_full';
+            v_action := 'take_and_verify_fresh_full_after_marker';
             v_reason := format(
-                'tracking_id %s is unanchored after production swap; activate an eligible retained FULL with continuous WAL or take and verify a fresh FULL after the marker',
+                'tracking_id %s is unanchored after production swap; a fresh FULL started after the swap marker is required (retained pre-swap FULLs are ineligible)',
                 rec.tracking_id
             );
         ELSIF slot.safe_wal_size IS NOT NULL
@@ -393,17 +395,23 @@ BEGIN
         THEN
             v_health := 'maintenance_required';
             v_action := CASE
-                WHEN rec.pending_generation_id IS NOT NULL THEN 'wait_for_boundary_commit_resolution'
-                WHEN rec.retention_blocked THEN 'complete_drain_or_establish_new_anchor'
+                WHEN rec.pending_boundary_kind = 'full_reanchor'
+                    THEN 'run_reconcile_anchors_or_verify_anchor'
+                WHEN rec.pending_generation_id IS NOT NULL
+                    THEN 'wait_for_boundary_commit_resolution'
+                WHEN rec.retention_blocked
+                    THEN 'run_reconcile_anchors_to_retire_predecessors'
                 ELSE 'wait_for_payload_retirement'
             END;
             v_reason := COALESCE(
+                CASE WHEN rec.pending_boundary_kind = 'full_reanchor'
+                     THEN 'backup FULL re-anchor building; run helper reconcile-anchors (never creates a FULL)' END,
                 CASE WHEN rec.pending_generation_id IS NOT NULL
                      THEN 'generation boundary awaiting COMMIT LSN' END,
                 CASE WHEN rec.retiring_count > 0
                      THEN 'generation payload retirement in progress' END,
                 CASE WHEN rec.retention_blocked
-                     THEN 'sealed generation retention is blocked pending complete drain/new anchor' END
+                     THEN 'sealed predecessor exclusive range is past retention; run reconcile-anchors to retire' END
             );
         ELSIF rec.generation_id IS NULL THEN
             IF rec.recovery_profile = 'backup' THEN
@@ -435,7 +443,7 @@ BEGIN
                 v_health := 'healthy';
                 v_action := 'none';
                 v_reason := format(
-                    'active FULL %s mode=%s valid_through=%s',
+                    'preferred FULL %s mode=%s valid_through=%s; schedule helper reconcile-anchors to discover newer FULLs (never creates backups)',
                     rec.backup_label,
                     COALESCE(
                         rec.generation_details->>'activation_mode',

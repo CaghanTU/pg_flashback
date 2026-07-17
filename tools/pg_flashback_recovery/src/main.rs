@@ -8,8 +8,8 @@ use pg_flashback_recovery::model::{
 };
 use pg_flashback_recovery::{
     load_json, load_recovery_config, provider_audit_anchors, provider_expire_backups,
-    provider_plan, provider_probe, provider_restore_table, provider_verify_anchor,
-    provider_verify_frontier, run_gc, unpin_artifact,
+    provider_plan, provider_probe, provider_reconcile_anchors, provider_restore_table,
+    provider_verify_anchor, provider_verify_frontier, run_gc, unpin_artifact,
 };
 use serde::Serialize;
 
@@ -82,6 +82,14 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Discover newer FULL backups and advance/retire anchors (never creates backups).
+    ReconcileAnchors {
+        #[arg(long)]
+        config: PathBuf,
+        /// Report proposed actions without mutating coverage or the repository.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -146,6 +154,10 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
         Commands::AuditAnchors { config } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             to_value(provider_audit_anchors(&config)?)
+        }
+        Commands::ReconcileAnchors { config, dry_run } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            to_value(provider_reconcile_anchors(&config, dry_run)?)
         }
     }
 }

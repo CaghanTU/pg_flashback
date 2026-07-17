@@ -135,7 +135,7 @@ BEGIN
         RAISE EXCEPTION 'post-restore gap did not project backup_reanchor_required: %',
             v_health;
     END IF;
-    IF v_action IS DISTINCT FROM 'activate_eligible_retained_or_fresh_full' THEN
+    IF v_action IS DISTINCT FROM 'take_and_verify_fresh_full_after_marker' THEN
         RAISE EXCEPTION 'unexpected recommended_action: %', v_action;
     END IF;
 
