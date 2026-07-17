@@ -70,13 +70,19 @@ Current implementation status on `work/v0.1.0-overnight`:
    otherwise activate an eligible retained FULL with continuous WAL; never
    auto-start a cluster-sized FULL) — see `docs/RETAINED_FULL_WAL_POC.md` and
    `scripts/run_retained_full_adversarial_e2e.sh`;
-6. capture and bounded maintenance run in separate per-database workers; the
+6. automatic advancement to newer operator-scheduled FULL anchors is available
+   via external `pg-flashback-recovery reconcile-anchors` (never spawned from
+   the PostgreSQL backend; never creates backups; predecessors stay pinned
+   until retention retires their exclusive range) — see
+   `scripts/run_anchor_advancement_e2e.sh` and
+   `deploy/pg-flashback-reconcile-anchors.{service,timer}`;
+7. capture and bounded maintenance run in separate per-database workers; the
    exact-commit qualification harness enforces the stated p95/max SLOs;
-7. release-mode packages build for PostgreSQL 15–18 and the helper; release
+8. release-mode packages build for PostgreSQL 15–18 and the helper; release
    versioning and clean-host installation remain open;
-8. exact-RC 24-hour soak remains open;
-9. aarch64 remains source-build only / not release-qualified;
-10. do not claim 100+ GiB performance from current evidence.
+9. exact-RC 24-hour soak remains open;
+10. aarch64 remains source-build only / not release-qualified;
+11. do not claim 100+ GiB performance from current evidence.
 
 ## 3. Milestone 0 — Freeze the release contract
 

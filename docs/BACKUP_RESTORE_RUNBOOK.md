@@ -231,6 +231,38 @@ pg-flashback-recovery verify-frontier \
   --request frontier-req-001.json
 ```
 
+### Automatic advancement to newer scheduled FULL anchors
+
+`pg_flashback` never creates FULL backups. Operators keep their normal
+pgBackRest FULL schedule. The helper discovers newer eligible FULL backups and
+advances coverage with:
+
+```bash
+# Report proposed successor without mutating coverage or the repository.
+pg-flashback-recovery reconcile-anchors \
+  --config /etc/pg_flashback/app_repo2.json \
+  --dry-run
+
+# Activate a newer FULL when eligible; retire sealed predecessors only after
+# their exclusive target range falls outside retention_interval.
+pg-flashback-recovery reconcile-anchors \
+  --config /etc/pg_flashback/app_repo2.json
+```
+
+Advancement rules:
+
+1. Prefer a fresh FULL with `start > tracking marker`, `stop > predecessor
+   boundary`, and `stop <= predecessor valid_through` (no coverage gap).
+2. Pin FULL + required WAL, activate a successor generation, and seal the
+   predecessor with `superseded_before = successor.stop`.
+3. Do **not** release the predecessor merely because a newer FULL exists.
+   Retire only after `sealed_at + retention_interval` and only while a verified
+   successor remains. Supported `expire` then may remove unpinned labels.
+4. PostgreSQL never spawns the helper. Schedule the oneshot externally
+   (example units under `deploy/pg-flashback-reconcile-anchors.{service,timer}`
+   or cron). The default timer is conservative and performs verification /
+   advancement only.
+
 The helper obtains label/type/system identifier/timeline/manifest/start-stop
 LSNs from `pgbackrest info` plus the repository manifest under the shared
 lock. Frontier verification scans contiguous archived WAL segments beginning
@@ -241,7 +273,7 @@ the helper exits unsuccessfully.
 This implementation still requires exact-RC qualification before v0.1.0
 release status. In particular, uncontrolled external `pgbackrest expire` is
 unsupported; use `pg-flashback-recovery expire`, which takes the exclusive
-repository lock and rejects active generation pins.
+repository lock and rejects active **and sealed** generation pins.
 
 Coverage metadata is an admission-control assertion, not a substitute for the
 helper's real backup/WAL checks. Never advance `valid_through_lsn` beyond WAL

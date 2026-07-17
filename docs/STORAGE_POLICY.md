@@ -228,11 +228,15 @@ LSN. Each backup generation persists a separate inclusive physical-WAL
 `valid_through_lsn`. It advances only while the repository shared lock is held
 and the selected backup plus every required archive segment is revalidated;
 expire takes the matching exclusive lock plus a durable database lease that
-blocks backup-generation lifecycle mutations across helper crashes. Missing or
-contradictory archive evidence freezes this frontier. The helper performs native PostgreSQL recovery
-in a private cluster, validates table identity and content, extracts one
-artifact, and never mutates production. The extension owns the final
-validation and transactional swap.
+blocks backup-generation lifecycle mutations across helper crashes. Active and
+sealed generations pin their FULL labels against supported expire; retirement
+after the retention cutoff is required before those pins are released. Missing
+or contradictory archive evidence freezes this frontier. The helper performs
+native PostgreSQL recovery in a private cluster, validates table identity and
+content, extracts one artifact, and never mutates production. The extension
+owns the final validation and transactional swap. Anchor advancement is an
+external helper concern (`reconcile-anchors`); PostgreSQL never spawns it and
+never initiates FULL backups.
 
 The chosen full backup is not represented by a profile name or LSN alone. An
 immutable anchor binds its lifecycle, repository key, stanza, backup label,

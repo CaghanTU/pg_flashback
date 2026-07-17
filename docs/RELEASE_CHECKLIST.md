@@ -71,6 +71,12 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
       `scripts/run_retained_full_wal_poc.sh` and
       `scripts/run_retained_full_adversarial_e2e.sh` (one FULL + continuous WAL;
       no differential/incremental chains).
+- [ ] Automatic anchor advancement E2E passes:
+      `scripts/run_anchor_advancement_e2e.sh` (discovers operator FULL without
+      helper-created backups; predecessor pin/retire/expire; crash resume).
+- [ ] Qualification provenance is mechanically honest:
+      `scripts/verify_qualification_provenance.sh` (source_commit/tree vs
+      docs-only evidence summary; no self-hash churn).
 - [ ] Record the exact suite/check counts in the qualification artifact for
       this commit; do not hard-code suite sizes in this checklist.
 

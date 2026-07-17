@@ -411,12 +411,34 @@ Backup tracking starts without an eligible generation:
    The physical generation boundary is always the FULL stop LSN. Fresh
    activation initializes `valid_through` to that stop; retained activation
    initializes `valid_through` from the verified WAL frontier and records the
-   marker as tracked `coverage_start_lsn`.
+   marker as tracked `coverage_start_lsn` / `coverage_lower_lsn`. Restore
+   admission uses that advertised lower bound, not the earlier physical FULL
+   stop, so retained generations reject targets between FULL stop and marker.
+5. Post-swap / `full_reanchor` building generations require a fresh FULL after
+   the marker. Retained pre-marker FULLs are ineligible for those boundaries.
+
+### Automatic successor FULL advancement
+
+When the operator's normal schedule creates a newer FULL, the external helper
+command `reconcile-anchors` (never the PostgreSQL backend) may:
+
+1. Discover eligible newer FULL backups (FULL only; diff/incremental ignored).
+2. Begin a `full_reanchor` building generation and verify/activate it under the
+   same proof path as initial activation.
+3. Seal the predecessor with `superseded_before = successor.backup_stop_lsn`
+   and inherit the already-proven WAL frontier so there is no coverage gap.
+4. Keep predecessor FULL/WAL pins until retention decides the exclusive range
+   `[coverage_lower, superseded_before)` no longer needs that generation, then
+   retire metadata and allow supported expire to drop unpinned repository
+   labels.
+
+Target routing selects the newest covering active/sealed generation. Silent
+fallback to a non-covering predecessor is rejected.
 
 The interval before the verified coverage lower bound is not advertised as
 tracked coverage. Marker resolution and backup verification are idempotent;
 neither may invent an in-transaction LSN or silently choose an overlapping
-backup.
+backup. Advancement never creates a FULL backup.
 
 ## Maintenance and retention
 
