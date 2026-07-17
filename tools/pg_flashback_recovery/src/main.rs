@@ -7,8 +7,9 @@ use pg_flashback_recovery::model::{
     BackupVerificationRequest, ErrorResponse, RecoveryConfig, RestoreRequest,
 };
 use pg_flashback_recovery::{
-    audit_anchors, build_plan, expire_backups, load_json, load_recovery_config, restore_table,
-    run_gc, run_probe, unpin_artifact, verify_anchor, verify_frontier,
+    load_json, load_recovery_config, provider_audit_anchors, provider_expire_backups,
+    provider_plan, provider_probe, provider_restore_table, provider_verify_anchor,
+    provider_verify_frontier, run_gc, unpin_artifact,
 };
 use serde::Serialize;
 
@@ -103,17 +104,17 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
     match cli.command {
         Commands::Probe { config } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
-            to_value(run_probe(&config)?)
+            to_value(provider_probe(&config)?)
         }
         Commands::Plan { config, request } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: RestoreRequest = load_json(&request)?;
-            to_value(build_plan(&config, &request)?)
+            to_value(provider_plan(&config, &request)?)
         }
         Commands::RestoreTable { config, request } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: RestoreRequest = load_json(&request)?;
-            to_value(restore_table(&config, &request)?)
+            to_value(provider_restore_table(&config, &request)?)
         }
         Commands::Gc { config, dry_run } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
@@ -131,20 +132,20 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
         Commands::VerifyAnchor { config, request } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: BackupVerificationRequest = load_json(&request)?;
-            to_value(verify_anchor(&config, &request)?)
+            to_value(provider_verify_anchor(&config, &request)?)
         }
         Commands::VerifyFrontier { config, request } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: BackupVerificationRequest = load_json(&request)?;
-            to_value(verify_frontier(&config, &request)?)
+            to_value(provider_verify_frontier(&config, &request)?)
         }
         Commands::Expire { config } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
-            to_value(expire_backups(&config)?)
+            to_value(provider_expire_backups(&config)?)
         }
         Commands::AuditAnchors { config } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
-            to_value(audit_anchors(&config)?)
+            to_value(provider_audit_anchors(&config)?)
         }
     }
 }

@@ -5,6 +5,7 @@ mod gc;
 pub mod model;
 mod pgbackrest;
 mod probe;
+mod provider;
 mod verify;
 
 use std::fs;
@@ -24,6 +25,89 @@ use crate::pgbackrest::{direct_backup_tree, parse_lsn, read_backup_catalog, sele
 pub use crate::gc::{run_gc, unpin_artifact};
 pub use crate::probe::run_probe;
 pub use crate::verify::{audit_anchors, expire_backups, verify_anchor, verify_frontier};
+
+use crate::provider::{qualified_provider, PhysicalRecoveryProvider, WalFrontierEvidence};
+
+pub use crate::provider::WalFrontierEvidence as ProviderWalFrontierEvidence;
+
+/// Probe through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns provider or probe failures from the qualified pgBackRest provider.
+pub fn provider_probe(config: &RecoveryConfig) -> Result<model::ProbeReport, RecoveryError> {
+    qualified_provider().probe(config)
+}
+
+/// Plan through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns planning failures from the qualified pgBackRest provider.
+pub fn provider_plan(
+    config: &RecoveryConfig,
+    request: &RestoreRequest,
+) -> Result<RestorePlan, RecoveryError> {
+    qualified_provider().plan(config, request)
+}
+
+/// Restore through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns materialization failures from the qualified pgBackRest provider.
+pub fn provider_restore_table(
+    config: &RecoveryConfig,
+    request: &RestoreRequest,
+) -> Result<RestoreResult, RecoveryError> {
+    qualified_provider().materialize_cluster_at_target(config, request)
+}
+
+/// Verify an anchor through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns verification failures from the qualified pgBackRest provider.
+pub fn provider_verify_anchor(
+    config: &RecoveryConfig,
+    request: &model::BackupVerificationRequest,
+) -> Result<model::BackupVerificationResult, RecoveryError> {
+    qualified_provider().activate_anchor(config, request)
+}
+
+/// Verify a WAL frontier through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns frontier verification failures from the qualified pgBackRest provider.
+pub fn provider_verify_frontier(
+    config: &RecoveryConfig,
+    request: &model::BackupVerificationRequest,
+) -> Result<WalFrontierEvidence, RecoveryError> {
+    qualified_provider().verify_wal_frontier(config, request)
+}
+
+/// Audit anchors through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns audit failures from the qualified pgBackRest provider.
+pub fn provider_audit_anchors(
+    config: &RecoveryConfig,
+) -> Result<model::AnchorAuditReport, RecoveryError> {
+    qualified_provider().health_audit(config)
+}
+
+/// Expire unpinned backups through the internal physical recovery provider seam.
+///
+/// # Errors
+///
+/// Returns expire failures from the qualified pgBackRest provider.
+pub fn provider_expire_backups(
+    config: &RecoveryConfig,
+) -> Result<model::ExpireResult, RecoveryError> {
+    qualified_provider().expire_unpinned(config)
+}
 
 const MAX_CONTRACT_BYTES: u64 = 1024 * 1024;
 
