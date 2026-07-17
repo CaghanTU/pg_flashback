@@ -93,6 +93,20 @@ the shared lock. The helper holds its shared lock from backup revalidation
 through PostgreSQL promotion, so expire cannot remove either the base backup
 or required WAL mid-recovery.
 
+Schedule the fail-closed anchor audit independently of backup jobs (for
+example every five minutes) and alert on a non-zero exit or
+`status=degraded`:
+
+```bash
+pg-flashback-recovery audit-anchors \
+  --config /etc/pg_flashback/app-repo2.json
+```
+
+This does not make an uncoordinated external `pgbackrest expire` safe. It
+limits the failure mode: the next audit durably freezes every missing/corrupt
+generation, and restore admission rejects its interval instead of claiming
+coverage from metadata alone.
+
 ## 4. Configure the helper
 
 Create a service-account-owned mode-0600 JSON file, or a root-managed

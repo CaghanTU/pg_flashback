@@ -277,6 +277,24 @@ pub struct ExpireResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnchorAuditFinding {
+    pub tracking_id: i64,
+    pub generation_id: i64,
+    pub backup_label: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnchorAuditReport {
+    pub status: String,
+    pub profile: String,
+    pub stanza: String,
+    pub checked: u64,
+    pub findings: Vec<AnchorAuditFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GcAction {
     Keep,

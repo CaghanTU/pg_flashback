@@ -107,6 +107,7 @@ pg-flashback-recovery plan --config helper.json --request request.json
 pg-flashback-recovery restore-table --config helper.json --request request.json
 pg-flashback-recovery verify-anchor --config helper.json --request verification.json
 pg-flashback-recovery verify-frontier --config helper.json --request verification.json
+pg-flashback-recovery audit-anchors --config helper.json
 pg-flashback-recovery expire --config helper.json
 ```
 
@@ -129,6 +130,14 @@ compromised.
 Consumed proof results are queryable through a restricted controller API, so
 a retry after helper termination reconstructs the same proof/generation
 result instead of installing a second proof.
+
+`audit-anchors` is the periodic safety net for repository changes made outside
+the coordinated `expire` command. Under the shared repository lock it checks
+every active/sealed anchor against the pgBackRest catalog and streams its
+manifest digest again. A definitely missing or corrupt anchor freezes exactly
+that generation, records a coverage gap, and makes `flashback_health()` report
+degraded coverage. A repository command outage returns an error without
+inventing a missing-anchor finding; operators retry after the outage.
 
 ## Planning and execution
 

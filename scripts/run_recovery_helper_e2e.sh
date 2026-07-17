@@ -668,6 +668,29 @@ ACTUAL_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_ver
 "$PG_RESTORE" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify --no-owner --no-acl "$QUOTED_ARTIFACT"
 ACTUAL_QUOTED_FP="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d helper_verify -c "SELECT count(*)::text || '|' || COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text FROM flashback_import.\"$QUOTED_ARTIFACT_TABLE\" AS t;")"
 [[ "$ACTUAL_QUOTED_FP" == "$QUOTED_FINGERPRINT" ]]
+ANCHOR_AUDIT_CONFIG="$RUN_ROOT/helper-anchor-audit.json"
+jq --arg host "$VERIFY_SOCKET" --argjson port "$VERIFY_PORT" \
+    '.controller.host = $host | .controller.port = $port' \
+    "$RUN_ROOT/helper-verifier.json" > "$ANCHOR_AUDIT_CONFIG"
+chmod 600 "$ANCHOR_AUDIT_CONFIG"
+HEALTHY_AUDIT_JSON="$RUN_ROOT/anchor-audit-healthy.json"
+"$HELPER" audit-anchors --config "$ANCHOR_AUDIT_CONFIG" > "$HEALTHY_AUDIT_JSON"
+[[ "$(jq -r '.status' "$HEALTHY_AUDIT_JSON")" == "ok" ]]
+[[ "$(jq -r '.checked' "$HEALTHY_AUDIT_JSON")" -ge 1 ]]
+pass "periodic anchor audit verifies every retained repository anchor"
+
+ANCHOR_MANIFEST="$(find "$RUN_ROOT/repo/backup/large_db_poc" -mindepth 2 -maxdepth 2 -name backup.manifest -print -quit)"
+[[ -f "$ANCHOR_MANIFEST" ]] || die "anchor audit fixture manifest is missing"
+mv "$ANCHOR_MANIFEST" "$ANCHOR_MANIFEST.audit-missing"
+MISSING_AUDIT_JSON="$RUN_ROOT/anchor-audit-missing.json"
+"$HELPER" audit-anchors --config "$ANCHOR_AUDIT_CONFIG" > "$MISSING_AUDIT_JSON"
+mv "$ANCHOR_MANIFEST.audit-missing" "$ANCHOR_MANIFEST"
+[[ "$(jq -r '.status' "$MISSING_AUDIT_JSON")" == "degraded" ]]
+[[ "$(jq '[.findings[] | select(.status == "frozen")] | length' "$MISSING_AUDIT_JSON")" -ge 1 ]]
+[[ "$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
+    -c "SELECT count(*) > 0 FROM flashback_health() WHERE health = 'degraded' AND reason LIKE '%repository proof%';")" == "t" ]]
+pass "externally removed anchor is detected, durably frozen and surfaced by health"
+
 "$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null
 PRIMARY_STARTED=0
 pass "returned artifacts restore into a separate database with matching fingerprints"

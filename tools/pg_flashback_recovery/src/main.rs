@@ -7,8 +7,8 @@ use pg_flashback_recovery::model::{
     BackupVerificationRequest, ErrorResponse, RecoveryConfig, RestoreRequest,
 };
 use pg_flashback_recovery::{
-    build_plan, expire_backups, load_json, load_recovery_config, restore_table, run_gc, run_probe,
-    unpin_artifact, verify_anchor, verify_frontier,
+    audit_anchors, build_plan, expire_backups, load_json, load_recovery_config, restore_table,
+    run_gc, run_probe, unpin_artifact, verify_anchor, verify_frontier,
 };
 use serde::Serialize;
 
@@ -76,6 +76,11 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Audit retained repository anchors and freeze missing/corrupt coverage.
+    AuditAnchors {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -136,6 +141,10 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
         Commands::Expire { config } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             to_value(expire_backups(&config)?)
+        }
+        Commands::AuditAnchors { config } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            to_value(audit_anchors(&config)?)
         }
     }
 }

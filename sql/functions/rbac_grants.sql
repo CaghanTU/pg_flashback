@@ -125,6 +125,10 @@ GRANT EXECUTE ON FUNCTION flashback_backup_frontier_verification_context(bigint)
     TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_active_backup_labels()
     TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_active_backup_anchor_contexts()
+    TO flashback_recovery_agent;
+GRANT EXECUTE ON FUNCTION flashback_freeze_missing_backup_anchor(bigint, bigint, jsonb)
+    TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_freeze_backup_generation(bigint, text, jsonb)
     TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_backup_proof_result(text, bigint)

@@ -173,6 +173,8 @@ BEGIN
             ('flashback_recovery_agent', 'public.flashback_backup_anchor_verification_context(bigint)'),
             ('flashback_recovery_agent', 'public.flashback_backup_frontier_verification_context(bigint)'),
             ('flashback_recovery_agent', 'public.flashback_active_backup_labels()'),
+            ('flashback_recovery_agent', 'public.flashback_active_backup_anchor_contexts()'),
+            ('flashback_recovery_agent', 'public.flashback_freeze_missing_backup_anchor(bigint,bigint,jsonb)'),
             ('flashback_recovery_agent', 'public.flashback_freeze_backup_generation(bigint,text,jsonb)'),
             ('flashback_recovery_agent', 'public.flashback_backup_proof_result(text,bigint)'),
             ('flashback_recovery_agent', 'public.flashback_frontier_proof_result(text,bigint)'),

@@ -1020,6 +1020,7 @@ AS $$
                    'anchor_missing'
                  )
               OR COALESCE(gaps.timeline_gap_count, 0) > 0
+              OR COALESCE(frozen_history.frozen_count, 0) > 0
             THEN 'degraded'
             WHEN cs.state = 'broken' OR COALESCE(gaps.open_gap_count, 0) > 0 THEN 'degraded'
             WHEN COALESCE(retirement.retiring_count, 0) > 0
@@ -1051,6 +1052,9 @@ AS $$
                  CASE WHEN COALESCE(gaps.timeline_gap_count, 0) > 0
                       THEN 'open timeline_mismatch coverage gap; requires a new verified FULL anchor'
                  END,
+                 CASE WHEN COALESCE(frozen_history.frozen_count, 0) > 0
+                      THEN 'one or more retained backup generations lost their repository anchor'
+                 END,
                  CASE WHEN pending.generation_id IS NOT NULL THEN 'generation boundary awaiting COMMIT LSN' END,
                  CASE WHEN COALESCE(retirement.retiring_count, 0) > 0 THEN 'generation payload retirement in progress' END,
                  CASE WHEN COALESCE(retention_block.blocked, false) THEN 'sealed generation retention is blocked pending complete drain/new anchor' END,
@@ -1075,6 +1079,13 @@ AS $$
         WHERE gap.tracking_id = tt.tracking_id
           AND gap.reanchored_by_generation_id IS NULL
     ) gaps ON true
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS frozen_count
+        FROM flashback.coverage_generations frozen
+        WHERE frozen.tracking_id = tt.tracking_id
+          AND frozen.state IN ('active', 'sealed')
+          AND frozen.state_reason = 'anchor_missing'
+    ) frozen_history ON true
     LEFT JOIN LATERAL (
         SELECT count(*) AS retiring_count
         FROM flashback.generation_payload_retirements r

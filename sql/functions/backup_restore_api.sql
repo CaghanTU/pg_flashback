@@ -567,6 +567,123 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_active_backup_anchor_contexts()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'active backup anchor contexts require flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'tracking_id', cg.tracking_id,
+            'generation_id', cg.generation_id,
+            'generation_state', cg.state,
+            'helper_profile', tt.helper_profile,
+            'repository_key', ba.repository_key,
+            'stanza', ba.stanza,
+            'backup_label', ba.backup_label,
+            'database_system_identifier', ba.database_system_identifier::text,
+            'timeline_id', ba.timeline_id,
+            'manifest_reference', ba.manifest_reference,
+            'manifest_sha256', ba.manifest_sha256
+        ) ORDER BY cg.tracking_id, cg.generation_no)
+        FROM flashback.coverage_generations cg
+        JOIN flashback.backup_anchors ba
+          ON ba.backup_anchor_id = cg.backup_anchor_id
+         AND ba.tracking_id = cg.tracking_id
+        JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = cg.tracking_id
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'backup'
+          AND cg.recovery_profile = 'backup'
+          AND cg.state IN ('active', 'sealed')
+    ), '[]'::jsonb);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_freeze_missing_backup_anchor(
+    p_tracking_id bigint,
+    p_generation_id bigint,
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_generation record;
+    v_successor record;
+    v_gap_id bigint;
+BEGIN
+    IF NOT flashback_caller_may_install_backup_proof() THEN
+        RAISE EXCEPTION 'missing backup anchor freeze requires flashback_recovery_agent'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    SELECT cg.* INTO v_generation
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = p_tracking_id
+      AND cg.generation_id = p_generation_id
+      AND cg.recovery_profile = 'backup'
+      AND cg.state IN ('active', 'sealed')
+    FOR UPDATE;
+    IF v_generation.generation_id IS NULL THEN
+        RAISE EXCEPTION 'active/sealed backup generation % is not bound to tracking_id %',
+            p_generation_id, p_tracking_id;
+    END IF;
+
+    SELECT cg.generation_id, cg.boundary_lsn, cg.boundary_time
+      INTO v_successor
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = p_tracking_id
+      AND cg.generation_no > v_generation.generation_no
+      AND cg.state IN ('active', 'sealed')
+      AND cg.boundary_lsn IS NOT NULL
+    ORDER BY cg.generation_no
+    LIMIT 1;
+
+    UPDATE flashback.coverage_generations
+       SET state_reason = 'anchor_missing'
+     WHERE generation_id = p_generation_id;
+
+    INSERT INTO flashback.coverage_gaps (
+        tracking_id, source_generation_id, reason,
+        gap_start_lsn, gap_start_time, lower_bound_inclusive,
+        gap_end_lsn, gap_end_time, reanchored_by_generation_id,
+        reanchored_at, details
+    )
+    SELECT
+        p_tracking_id, p_generation_id, 'anchor_missing',
+        v_generation.boundary_lsn, v_generation.boundary_time, true,
+        v_successor.boundary_lsn, v_successor.boundary_time,
+        v_successor.generation_id,
+        CASE WHEN v_successor.generation_id IS NOT NULL THEN clock_timestamp() END,
+        COALESCE(p_details, '{}'::jsonb)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM flashback.coverage_gaps g
+        WHERE g.tracking_id = p_tracking_id
+          AND g.source_generation_id = p_generation_id
+          AND g.reason = 'anchor_missing'
+    )
+    RETURNING gap_id INTO v_gap_id;
+
+    RETURN jsonb_build_object(
+        'status', 'frozen',
+        'tracking_id', p_tracking_id,
+        'generation_id', p_generation_id,
+        'reason', 'anchor_missing',
+        'gap_id', v_gap_id
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_freeze_backup_generation(
     p_tracking_id bigint,
     p_reason text,

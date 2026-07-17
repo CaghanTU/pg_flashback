@@ -23,7 +23,7 @@ use crate::pgbackrest::{direct_backup_tree, parse_lsn, read_backup_catalog, sele
 
 pub use crate::gc::{run_gc, unpin_artifact};
 pub use crate::probe::run_probe;
-pub use crate::verify::{expire_backups, verify_anchor, verify_frontier};
+pub use crate::verify::{audit_anchors, expire_backups, verify_anchor, verify_frontier};
 
 const MAX_CONTRACT_BYTES: u64 = 1024 * 1024;
 

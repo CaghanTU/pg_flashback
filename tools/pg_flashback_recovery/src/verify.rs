@@ -18,7 +18,8 @@ use crate::executor::{
     prepare_secure_directory, write_json_atomic,
 };
 use crate::model::{
-    BackupVerificationRequest, BackupVerificationResult, ExpireResult, RecoveryConfig,
+    AnchorAuditFinding, AnchorAuditReport, BackupVerificationRequest, BackupVerificationResult,
+    ExpireResult, RecoveryConfig,
 };
 use crate::pgbackrest::{parse_lsn, read_repository_metadata, SelectedBackup};
 use crate::{load_json, MAX_CONTRACT_BYTES};
@@ -123,6 +124,19 @@ struct InstalledFrontier {
     status: String,
     generation_id: i64,
     valid_through_lsn: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnchorAuditContext {
+    tracking_id: i64,
+    generation_id: i64,
+    helper_profile: String,
+    repository_key: String,
+    stanza: String,
+    backup_label: String,
+    database_system_identifier: String,
+    manifest_reference: String,
+    manifest_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,6 +537,109 @@ pub fn expire_backups(config: &RecoveryConfig) -> Result<ExpireResult, RecoveryE
         stanza: config.stanza.clone(),
         protected_backup_labels: Vec::new(),
     })
+}
+
+/// Audit every retained backup anchor and durably freeze missing/corrupt ones.
+///
+/// # Errors
+///
+/// Returns an error when the controller, repository lock, or repository
+/// catalog cannot be inspected. Definite per-anchor failures are returned as
+/// degraded findings after their generations are frozen in the database.
+pub fn audit_anchors(config: &RecoveryConfig) -> Result<AnchorAuditReport, RecoveryError> {
+    prepare_secure_directory(&config.work_root)?;
+    let _profile_lock = acquire_profile_lock(config)?;
+    let _repository_lock = acquire_repository_lock(config, false)?;
+    let contexts: Vec<AnchorAuditContext> = query_json(
+        config,
+        "SELECT flashback_active_backup_anchor_contexts()::text",
+    )?;
+    let metadata = read_repository_metadata(config)?;
+    let mut findings = Vec::with_capacity(contexts.len());
+    for context in &contexts {
+        if context.helper_profile != config.profile
+            || context.repository_key != config.repository_key.to_string()
+            || context.stanza != config.stanza
+        {
+            return Err(RecoveryError::VerificationFailed(format!(
+                "anchor {} belongs to a different helper/repository profile",
+                context.generation_id
+            )));
+        }
+        let verification = metadata
+            .backups
+            .iter()
+            .find(|backup| backup.label == context.backup_label)
+            .ok_or_else(|| "backup label is absent from the repository catalog".to_owned())
+            .and_then(|backup| {
+                if backup.backup_type != "full" {
+                    return Err("anchor label no longer identifies a FULL backup".to_owned());
+                }
+                let expected_system_id = context
+                    .database_system_identifier
+                    .parse::<u64>()
+                    .map_err(|_| "anchor system identifier is invalid".to_owned())?;
+                let manifest = config.repository_path.join(&context.manifest_reference);
+                let actual = verify_manifest(
+                    &manifest,
+                    &config.repository_path,
+                    backup,
+                    expected_system_id,
+                )
+                .map_err(|error| error.to_string())?;
+                if actual != context.manifest_sha256 {
+                    return Err("manifest digest differs from the installed anchor".to_owned());
+                }
+                Ok(())
+            });
+        match verification {
+            Ok(()) => findings.push(AnchorAuditFinding {
+                tracking_id: context.tracking_id,
+                generation_id: context.generation_id,
+                backup_label: context.backup_label.clone(),
+                status: "ok".to_owned(),
+                detail: "repository anchor and manifest verified".to_owned(),
+            }),
+            Err(detail) => {
+                freeze_missing_anchor(config, context, &detail)?;
+                findings.push(AnchorAuditFinding {
+                    tracking_id: context.tracking_id,
+                    generation_id: context.generation_id,
+                    backup_label: context.backup_label.clone(),
+                    status: "frozen".to_owned(),
+                    detail,
+                });
+            }
+        }
+    }
+    let degraded = findings.iter().any(|finding| finding.status == "frozen");
+    Ok(AnchorAuditReport {
+        status: if degraded { "degraded" } else { "ok" }.to_owned(),
+        profile: config.profile.clone(),
+        stanza: config.stanza.clone(),
+        checked: contexts.len() as u64,
+        findings,
+    })
+}
+
+fn freeze_missing_anchor(
+    config: &RecoveryConfig,
+    context: &AnchorAuditContext,
+    detail: &str,
+) -> Result<(), RecoveryError> {
+    let sql = format!(
+        "SELECT flashback_freeze_missing_backup_anchor(
+           {tracking_id}, {generation_id},
+           jsonb_build_object('helper_detail', {detail},
+                              'backup_label', {backup_label})
+         )::text",
+        tracking_id = context.tracking_id,
+        generation_id = context.generation_id,
+        detail = sql_literal(detail),
+        backup_label = sql_literal(&context.backup_label),
+    );
+    let _: serde_json::Value = query_json(config, &sql)?;
+    Ok(())
 }
 
 fn validate_request(request: &BackupVerificationRequest) -> Result<(), RecoveryError> {
