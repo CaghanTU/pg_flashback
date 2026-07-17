@@ -70,6 +70,10 @@ pg_flashback.worker_interval_ms = 50
 pg_flashback.maintenance_every_n_cycles = 1
 pg_flashback.maintenance_lock_timeout_ms = 100
 pg_flashback.maintenance_statement_timeout_ms = 1000
+pg_flashback.local_max_snapshot_bytes = 8GB
+pg_flashback.local_max_restore_peak_bytes = 16GB
+pg_flashback.local_min_filesystem_bytes = 64MB
+pg_flashback.local_safety_reserve_bytes = 16MB
 EOF
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK_ROOT/postgresql.log" \
     -o "-p $PORT -k $SOCKET" start -w >/dev/null
