@@ -197,6 +197,19 @@ cargo build --release --locked \
   --manifest-path tools/pg_flashback_recovery/Cargo.toml
 ```
 
+Backup coverage proof values are repository-derived, not operator inputs:
+
+```bash
+pg-flashback-recovery verify-anchor --config helper.json --request verification.json
+pg-flashback-recovery verify-frontier --config helper.json --request verification.json
+pg-flashback-recovery expire --config helper.json
+```
+
+Verification requests contain only `request_id` and `tracking_id`. The helper
+holds the repository lock while reading pgBackRest metadata, manifests, and
+contiguous archived WAL. Direct uncoordinated `pgbackrest expire` is outside
+the supported operating model.
+
 ### Install a tagged binary archive
 
 The PostgreSQL-major release archives use a prefix-independent layout. Check

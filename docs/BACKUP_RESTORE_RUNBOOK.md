@@ -176,42 +176,33 @@ shared lock, the helper/controller installs an immutable proof
 manifest reference + SHA-256, start/stop LSN) and consumes it exactly once for
 that tracking lifecycle.
 
-**Status: PARTIAL.** Proof install/consume SQL exists and raw admin forging is
-closed, but a production helper path that verifies pgBackRest under the
-repository lock and installs proofs is not yet release-qualified. Do not treat
-SQL-only smoke activation as a COMPLETE backup coverage gate.
+The recovery helper now implements the supported verification path. A request
+contains only a request ID and tracking ID:
 
-After that qualifying full backup, read its start and stop LSNs from
-`pgbackrest info --output=json`. The reported `lsn.start` is established only
-after pgBackRest's backup-start checkpoint completes. Verify the ordering above
-under the repository shared lock, then install and consume a proof (recovery
-agent / trusted controller only):
-
-```sql
--- recovery agent / trusted controller after repo-lock verification
-SELECT flashback_consume_verified_backup_proof(
-    flashback_install_verified_backup_proof(
-        'verify-req-001',           -- unique verification_request_id
-        :tracking_id,
-        'app_repo2',                -- helper_profile
-        'repo-key',
-        'stanza',
-        '20260717-000001F',
-        :sysid,
-        :timeline,
-        'backup/.../backup.manifest',
-        :manifest_sha256,
-        :backup_start_lsn,
-        :backup_stop_lsn
-    )
-);
+```json
+{"request_id":"verify-req-001","tracking_id":42}
 ```
 
-Frontier advances likewise require a one-time verified archive proof via
-`flashback_install_verified_wal_frontier_proof` +
-`flashback_consume_verified_wal_frontier_proof` (structured status; timeline
-mismatch freezes coverage durably without rolling back the gap). Never advance
-coverage from caller-supplied LSNs alone.
+```bash
+pg-flashback-recovery verify-anchor \
+  --config /etc/pg_flashback/app_repo2.json \
+  --request verify-req-001.json
+pg-flashback-recovery verify-frontier \
+  --config /etc/pg_flashback/app_repo2.json \
+  --request frontier-req-001.json
+```
+
+The helper obtains label/type/system identifier/timeline/manifest/start-stop
+LSNs from `pgbackrest info` plus the repository manifest under the shared
+lock. Frontier verification scans contiguous archived WAL segments beginning
+at the anchor. The SQL install/consume functions are controller internals, not
+an operator procedure. Timeline mismatch commits a durable freeze/gap before
+the helper exits unsuccessfully.
+
+This implementation still requires exact-RC qualification before v0.1.0
+release status. In particular, uncontrolled external `pgbackrest expire` is
+unsupported; use `pg-flashback-recovery expire`, which takes the exclusive
+repository lock and rejects active generation pins.
 
 Coverage metadata is an admission-control assertion, not a substitute for the
 helper's real backup/WAL checks. Never advance `valid_through_lsn` beyond WAL

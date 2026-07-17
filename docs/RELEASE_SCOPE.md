@@ -66,11 +66,12 @@ The local profile is supported only after its coverage runtime gates pass:
 The backup profile is part of the first-release contract. Raw
 caller-supplied activation/frontier APIs are fail-closed. Coverage may be
 activated only by consuming a one-time verified FULL backup proof installed by
-the recovery agent (or a superuser acting for a locked helper verification).
-Helper/controller repository-lock verification that installs those proofs is
-still **PARTIAL** until the release gates below pass; until then do not report
-recoverability from an unverified generation. The bullets below are the
-release-required behavior.
+the recovery helper through its least-privilege recovery-agent connection.
+`verify-anchor` and `verify-frontier` derive proof values from a locked plain
+pgBackRest repository; `expire` rejects active generation pins. Release status
+remains **PARTIAL** until the exact-RC, negative verifier, expiration-race, and
+24-hour gates below pass. Do not report recoverability from an unverified or
+frozen generation.
 
 - local POSIX pgBackRest repository
 - completed full backups

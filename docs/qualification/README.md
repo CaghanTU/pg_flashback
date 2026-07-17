@@ -1,8 +1,11 @@
 # Development qualification harnesses
 
 These bounded scripts create an isolated temporary PostgreSQL cluster and
-write machine-readable summaries to `target/qualification/` by default. Install
-the current extension for the selected PostgreSQL build first:
+write machine-readable summaries to `target/qualification/` by default. Each
+artifact records `tested_commit`, source-tree cleanliness, branch/exact tag,
+PostgreSQL version, installed extension SHA-256, optional release-helper
+SHA-256, configuration summary, and start/end timestamps. Install the current
+extension for the selected PostgreSQL build first:
 
 ```bash
 cargo pgrx install --pg-config /usr/local/pgsql-17/bin/pg_config
@@ -25,9 +28,11 @@ this test demonstrates capture progress despite a blocked unrelated lifecycle,
 not separate workers. It records monotonic commit-ack to first
 `flashback.delta_log` visibility at 20 ms polling resolution and reports
 p50/p95/p99/max milliseconds. PASS requires p95 below 2000 ms, max below
-5000 ms, capture progress during the hold, and bounded slot-lag drain after
-the hold. Its latest written PASS/FAIL/PARTIAL report is copied to
-`docs/qualification/capture-maintenance-isolation-latest.json`.
+5000 ms, capture progress during the hold, tracked-prefix catch-up, fixed global
+prefix catch-up, and global slot lag below the explicit target. The JSON keeps
+`tracked_prefix_caught_up` and `global_slot_lag_within_target` separate. A
+single polling observation can stamp many commit samples; the report records
+both sample and polling-cycle counts.
 
 `run_dev_soak.sh` is a bounded **development soak**, not a 24-hour or
 exact-RC qualification. It defaults to 90 seconds. Set
@@ -35,10 +40,9 @@ exact-RC qualification. It defaults to 90 seconds. Set
 run. It inserts, updates, and deletes each cycle, then must drain capture
 within a bounded deadline: decoded INSERT/UPDATE/DELETE event counts must
 match the expected counts exactly, every inserted id must appear in
-`delta_log`, and `confirmed_flush_lsn` must reach the table's max captured
-commit LSN. Global slot lag may remain elevated when filtered non-output WAL
-blocks empty peeks from advancing; `lag_near_start` is recorded but is not
-the sole PASS gate. The JSON declares
+`delta_log`, `confirmed_flush_lsn` must reach the fixed final WAL boundary,
+and final global slot lag must return to baseline plus the configured slack.
+`lag_near_start=false` can never PASS. The JSON declares
 `qualification_kind: "development_soak"`.
 
 `run_fault_injection_smoke.sh` exercises a postmaster restart and a fast
@@ -48,7 +52,17 @@ update workload with default replica identity, `REPLICA IDENTITY FULL`, and
 tracked capture. Its latency and WAL values are development measurements, not
 production capacity claims.
 
+Files named `docs/qualification/*-latest.json` are historical development
+examples only. They may describe an older commit and are neither updated by
+these scripts nor accepted as release evidence. Exact-commit evidence belongs
+in immutable CI/qualification-runner artifacts outside the source tree, which
+avoids a commit self-reference.
+
+Set `PG_FLASHBACK_REQUIRE_CLEAN_TREE=1` for a release-gate invocation. This
+rejects a dirty checkout before cluster creation. Exact-RC tests must run from
+a clean checkout/tag and archive `target/qualification/` externally.
+
 These are development-qualification harnesses only. The exact-RC 24-hour soak
-and its release evidence are Milestone 6 work and were not completed overnight.
+and its release evidence remain a separate release gate.
 If extension installation fails, record that prerequisite failure rather than
 treating an older installed extension as qualification evidence.

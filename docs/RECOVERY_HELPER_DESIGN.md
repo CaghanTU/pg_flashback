@@ -1,7 +1,8 @@
 # Backup-backed recovery architecture
 
-Status: **helper/result contract implemented (format 3); coverage-generation
-integration and post-restore re-anchor pending**
+Status: **helper/result contract and repository-derived anchor/frontier
+verification implemented; post-restore re-anchor and exact-RC qualification
+remain release gates**
 
 The backup profile is the path for tables that cannot satisfy the local
 profile's capacity, change-rate, write-stall or RTO budget. It does not copy
@@ -104,12 +105,22 @@ initial anchor.
 pg-flashback-recovery probe --config helper.json
 pg-flashback-recovery plan --config helper.json --request request.json
 pg-flashback-recovery restore-table --config helper.json --request request.json
+pg-flashback-recovery verify-anchor --config helper.json --request verification.json
+pg-flashback-recovery verify-frontier --config helper.json --request verification.json
+pg-flashback-recovery expire --config helper.json
 ```
 
 Successful output is JSON on stdout. Failures are JSON on stderr with a stable
 `code`. Requests never contain executable paths, repository credentials or
 arbitrary pgBackRest options; those are available only in the operator-owned
 configuration.
+
+Verification requests contain only an immutable `request_id` and
+`tracking_id`. Labels, backup type, system identifier, timeline, manifest
+digest, start/stop LSNs, and archive frontier are read by the helper from the
+configured repository while holding its shared lock. The least-privilege
+controller connection uses `flashback_recovery_agent`; passwords remain in
+the process environment/PGPASSFILE rather than command arguments or logs.
 
 ## Planning and execution
 
@@ -159,10 +170,12 @@ parent traversal are rejected.
 
 ## Repository coordination
 
-pgBackRest's own locks do not cover a direct filesystem clone. Scheduled
-`backup` and `expire` operations for the recovery repository must therefore
-take the exclusive side of `expire_lock_path`. The helper takes the shared
-side. `scripts/pgbackrest_with_flashback_lock.sh` is the reference wrapper.
+pgBackRest's own locks do not cover a direct filesystem clone. Verify and
+restore take the shared side of `expire_lock_path`. The helper's `expire`
+command takes the exclusive side and refuses to run while an active/sealed
+generation pins any backup label. Direct, uncoordinated `pgbackrest expire`
+is outside the supported operating model. The lock order is profile, request
+when present, then repository; no code path acquires these in reverse.
 
 The same-stanza deployment is preferred: keep the normal long-retention
 repository, and add a local short-retention repository key configured without
