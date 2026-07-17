@@ -558,14 +558,36 @@ BEGIN
 
     -- ACCESS EXCLUSIVE is intentionally taken from the outset: it blocks all
     -- writes while the exact base is scanned and avoids a later lock upgrade.
-    EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
-                   v_schema_name, v_table_name);
+    PERFORM flashback_admit_local_capacity(v_rel_oid, 'reanchor');
+    PERFORM flashback_apply_local_boundary_lock_timeout();
+    BEGIN
+        EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+                       v_schema_name, v_table_name);
+    EXCEPTION WHEN lock_not_available THEN
+        RAISE EXCEPTION 'pg_flashback: local re-anchor lock wait exceeded local_boundary_write_stall_ms'
+            USING ERRCODE = 'lock_not_available',
+                  HINT = 'Retry when the table is idle, raise the write-stall budget, or use the backup profile.';
+    END;
 
     IF to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid
            IS DISTINCT FROM v_rel_oid
     THEN
         RAISE EXCEPTION 'pg_flashback: table identity changed while acquiring the re-anchor lock';
     END IF;
+
+    -- Revalidate identity and capacity under the locked boundary before CTAS.
+    SELECT tt.rel_oid, tt.schema_name, tt.table_name
+      INTO v_rel_oid, v_schema_name, v_table_name
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'local_delta';
+    IF NOT FOUND OR to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid
+                       IS DISTINCT FROM v_rel_oid
+    THEN
+        RAISE EXCEPTION 'pg_flashback: tracked table identity changed under the re-anchor lock';
+    END IF;
+    PERFORM flashback_admit_local_capacity(v_rel_oid, 'reanchor');
 
     -- Preserve full old-row WAL images for the successor generation.
     EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',

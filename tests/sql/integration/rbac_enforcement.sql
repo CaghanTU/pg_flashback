@@ -156,6 +156,11 @@ BEGIN
             ('flashback_admin', 'public.flashback_is_restore_in_progress(oid)'),
             ('flashback_admin', 'public.flashback_local_restore_preflight(regclass)'),
             ('flashback_admin', 'public.flashback_estimate_local_restore_peak_bytes(regclass)'),
+            ('flashback_admin', 'public.flashback_measure_local_capacity(regclass)'),
+            ('flashback_admin', 'public.flashback_admit_local_capacity(regclass,text)'),
+            ('flashback_admin', 'public.flashback_advise(regclass)'),
+            ('flashback_admin', 'public.flashback_relation_filesystem_available_bytes(regclass)'),
+            ('flashback_admin', 'public.flashback_tablespace_filesystem_available_bytes(oid)'),
             ('flashback_admin', 'public.flashback_track_backup(text,text)'),
             ('flashback_admin', 'public.flashback_set_backup_coverage(text,pg_lsn,pg_lsn)'),
             ('flashback_admin', 'public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),
@@ -189,7 +194,8 @@ BEGIN
             ('pg_monitor', 'public.flashback_history(text,interval)'),
             ('pg_monitor', 'public.flashback_retention_status()'),
             ('pg_monitor', 'public.flashback_is_restore_in_progress(oid)'),
-            ('pg_monitor', 'public.flashback_health()')
+            ('pg_monitor', 'public.flashback_health()'),
+            ('pg_monitor', 'public.flashback_advise(regclass)')
     ), actual AS (
         SELECT pg_get_userbyid(routine_acl.grantee) AS grantee,
                format('%I.%I(%s)',
@@ -253,6 +259,7 @@ BEGIN
             ('public.flashback_query_lsn(text,pg_lsn,text)'),
             ('public.flashback_resolve_target(text,timestamp with time zone)'),
             ('public.flashback_health()'),
+            ('public.flashback_advise(regclass)'),
             ('public.flashback_history(text,interval)'),
             ('public.flashback_track_backup(text,text)'),
             ('public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),

@@ -24,6 +24,7 @@ extension_sql_file!(
         "flashback_restore_lsn_api",
         "flashback_restore_replay_helpers",
         "flashback_payload_ownership_helpers",
+        "flashback_local_capacity",
         flashback_set_restore_in_progress,
         flashback_is_restore_in_progress,
     ],

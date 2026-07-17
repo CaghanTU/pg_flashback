@@ -30,12 +30,24 @@ static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> = GucSetting::<Option<C
 /// maintenance_work_mem override for deferred index builds during flashback_restore.
 static INDEX_BUILD_WORK_MEM_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
-/// Maximum projected local-restore peak size (pg_size_bytes text). Empty/0 disables.
-static LOCAL_RESTORE_MAX_PEAK_BYTES_GUC: GucSetting<Option<CString>> =
+/// Maximum projected local base/snapshot bytes (heap+TOAST). Empty/0 fail-closed.
+static LOCAL_MAX_SNAPSHOT_BYTES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
-/// Extra safety reserve included in local-restore peak estimates.
-static LOCAL_RESTORE_SAFETY_RESERVE_BYTES_GUC: GucSetting<Option<CString>> =
+/// Maximum projected local restore peak bytes. Empty/0 fail-closed.
+static LOCAL_MAX_RESTORE_PEAK_BYTES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
+/// Minimum filesystem free space that must remain after projected local writes.
+static LOCAL_MIN_FILESYSTEM_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Extra safety reserve included in local capacity estimates.
+static LOCAL_SAFETY_RESERVE_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Maximum lock-wait / write-stall budget for exact local boundaries (ms).
+static LOCAL_BOUNDARY_WRITE_STALL_MS_GUC: GucSetting<i32> = GucSetting::<i32>::new(30_000);
+/// Assumed local CTAS copy throughput used only for stall estimation (MiB/s).
+static LOCAL_ASSUMED_COPY_MIB_PER_SEC_GUC: GucSetting<i32> = GucSetting::<i32>::new(32);
+/// Privileged override that admits local capacity failures; never a silent default.
+static LOCAL_CAPACITY_OVERRIDE_GUC: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Root-owned/shared secret used to authenticate repository-derived proofs.
 static PROOF_HMAC_KEY_FILE_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
@@ -209,19 +221,68 @@ pub fn register_worker_and_guc() {
     );
 
     GucRegistry::define_string_guc(
-        c"pg_flashback.local_restore_max_peak_bytes",
-        c"Reject local restores whose projected peak exceeds this size",
-        c"Accepted by pg_size_bytes(). Empty or 0 disables the gate. Set a conservative filesystem headroom budget so local restore fails closed before ACCESS EXCLUSIVE.",
-        &LOCAL_RESTORE_MAX_PEAK_BYTES_GUC,
+        c"pg_flashback.local_max_snapshot_bytes",
+        c"Reject local track/re-anchor when projected base snapshot exceeds this size",
+        c"Accepted by pg_size_bytes(). Models CTAS heap+TOAST only (indexes are not copied). Empty or 0 fails closed for the qualified local profile.",
+        &LOCAL_MAX_SNAPSHOT_BYTES_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );
 
     GucRegistry::define_string_guc(
-        c"pg_flashback.local_restore_safety_reserve_bytes",
-        c"Safety reserve included in local restore peak estimates",
-        c"Accepted by pg_size_bytes() and added to twice the live relation size. Default when unset: 64MB.",
-        &LOCAL_RESTORE_SAFETY_RESERVE_BYTES_GUC,
+        c"pg_flashback.local_max_restore_peak_bytes",
+        c"Reject local restores whose projected peak exceeds this size",
+        c"Accepted by pg_size_bytes(). Empty or 0 fails closed. Budget shadow(with rebuilt indexes)+successor base(heap+TOAST)+reserve before ACCESS EXCLUSIVE.",
+        &LOCAL_MAX_RESTORE_PEAK_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.local_min_filesystem_bytes",
+        c"Minimum filesystem free space that must remain after projected local writes",
+        c"Accepted by pg_size_bytes(). Empty or 0 fails closed. Probed against the destination tablespace with an OS-backed free-space check.",
+        &LOCAL_MIN_FILESYSTEM_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.local_safety_reserve_bytes",
+        c"Safety reserve included in local capacity estimates",
+        c"Accepted by pg_size_bytes() and added to projected track/re-anchor/restore requirements. Default when unset: 64MB.",
+        &LOCAL_SAFETY_RESERVE_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.local_boundary_write_stall_ms",
+        c"Maximum lock-wait/write-stall budget for exact local boundaries",
+        c"Applied as transaction-local lock_timeout before the final relation lock, and compared with the estimated CTAS copy duration. Default 30000 ms.",
+        &LOCAL_BOUNDARY_WRITE_STALL_MS_GUC,
+        1,
+        3_600_000,
+        GucContext::Suset,
+        GucFlags::UNIT_MS,
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.local_assumed_copy_mib_per_sec",
+        c"Assumed local CTAS throughput for write-stall estimation",
+        c"Conservative MiB/s used only to estimate lock/copy risk. Does not replace size or filesystem budgets.",
+        &LOCAL_ASSUMED_COPY_MIB_PER_SEC_GUC,
+        1,
+        1024,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_flashback.local_capacity_override",
+        c"Privileged override that admits local capacity/write-stall failures",
+        c"Must be set explicitly by a privileged role. Visible in flashback_advise()/health and logged; never a silent default.",
+        &LOCAL_CAPACITY_OVERRIDE_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );

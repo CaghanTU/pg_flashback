@@ -19,6 +19,7 @@ extension_sql_file!(
         "flashback_payload_ownership_helpers",
         "flashback_restore_replay_helpers",
         "flashback_coverage_runtime",
-        "flashback_restore_planner_api"
+        "flashback_restore_planner_api",
+        "flashback_local_capacity"
     ],
 );

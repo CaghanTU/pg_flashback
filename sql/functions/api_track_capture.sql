@@ -741,7 +741,15 @@ BEGIN
         -- cross the exact base boundary. ALTER below takes a stronger lock,
         -- but acquiring the declared write lock first makes the ordering
         -- contract explicit and avoids a lock-upgrade window.
-        EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE', v_schema_name, v_table_name);
+        PERFORM flashback_admit_local_capacity(v_rel_oid, 'track');
+        PERFORM flashback_apply_local_boundary_lock_timeout();
+        BEGIN
+            EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE', v_schema_name, v_table_name);
+        EXCEPTION WHEN lock_not_available THEN
+            RAISE EXCEPTION 'pg_flashback: local track lock wait exceeded local_boundary_write_stall_ms'
+                USING ERRCODE = 'lock_not_available',
+                      HINT = 'Retry when the table is idle, raise the write-stall budget, or use the backup profile.';
+        END;
 
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name))::oid
                IS DISTINCT FROM v_rel_oid
@@ -749,6 +757,9 @@ BEGIN
             RAISE EXCEPTION 'pg_flashback: table identity changed while first-track lock was acquired'
                 USING HINT = 'Retry flashback_track() against the table''s current canonical name.';
         END IF;
+
+        -- Revalidate capacity under the relation lock immediately before CTAS.
+        PERFORM flashback_admit_local_capacity(v_rel_oid, 'track');
 
         -- WAL mode: enable REPLICA IDENTITY FULL so old_data is available in UPDATE events
         EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);

@@ -7,11 +7,18 @@ fn flashback_sha256(input: &str) -> String {
 }
 
 extension_sql_file!(
+    "../sql/functions/local_capacity.sql",
+    name = "flashback_local_capacity",
+    requires = ["flashback_storage_schema_bootstrap"],
+);
+
+extension_sql_file!(
     "../sql/functions/api_track_capture.sql",
     name = "flashback_api_track_capture",
     requires = [
         "flashback_storage_schema_bootstrap",
-        "flashback_payload_ownership_helpers"
+        "flashback_payload_ownership_helpers",
+        "flashback_local_capacity"
     ],
 );
 
@@ -20,7 +27,8 @@ extension_sql_file!(
     name = "flashback_coverage_runtime",
     requires = [
         "flashback_storage_schema_bootstrap",
-        "flashback_api_track_capture"
+        "flashback_api_track_capture",
+        "flashback_local_capacity"
     ],
 );
 

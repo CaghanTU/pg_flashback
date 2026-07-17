@@ -8,6 +8,10 @@ mod restore;
 mod runtime_guard;
 mod storage;
 
+// Ensure the capacity probe module is linked into the extension shared object.
+#[allow(unused_imports)]
+use storage::capacity;
+
 // Re-export so that the symbol is visible in the shared library.
 // PostgreSQL calls _PG_output_plugin_init when loading our .so as a
 // logical decoding output plugin (via pg_create_logical_replication_slot).
@@ -326,6 +330,10 @@ mod tests {
         it_lsn_target_adversarial,
         "../tests/sql/integration/lsn_target_adversarial.sql"
     );
+    sql_test!(
+        it_local_capacity_admission,
+        "../tests/sql/integration/local_capacity_admission.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.
@@ -344,6 +352,11 @@ pub mod pg_test {
             "max_replication_slots=10",
             "shared_preload_libraries='pg_flashback'",
             "pg_flashback.capture_mode='trigger'",
+            "pg_flashback.local_max_snapshot_bytes='8GB'",
+            "pg_flashback.local_max_restore_peak_bytes='16GB'",
+            "pg_flashback.local_min_filesystem_bytes='64MB'",
+            "pg_flashback.local_safety_reserve_bytes='16MB'",
+            "pg_flashback.local_boundary_write_stall_ms=60000",
         ]
     }
 }

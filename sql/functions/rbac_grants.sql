@@ -84,6 +84,11 @@ GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text, pg_lsn)         TO flashba
 GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text[], pg_lsn)       TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_estimate_local_restore_peak_bytes(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_local_restore_preflight(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_measure_local_capacity(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_admit_local_capacity(regclass, text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_advise(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_relation_filesystem_available_bytes(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_tablespace_filesystem_available_bytes(oid) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted_lsn(text, pg_lsn) TO flashback_admin;
@@ -179,6 +184,7 @@ GRANT EXECUTE ON FUNCTION flashback_history(text, interval)        TO pg_monitor
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)    TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_health()                       TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_advise(regclass)                TO pg_monitor;
 
 -- ================================================================
 -- COMMENT ON FUNCTION: \df+ documentation
