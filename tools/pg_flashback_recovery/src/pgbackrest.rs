@@ -13,6 +13,10 @@ struct StanzaInfo {
     status: StanzaStatus,
     #[serde(default)]
     backup: Vec<BackupInfo>,
+    #[serde(default)]
+    archive: Vec<ArchiveInfo>,
+    #[serde(default)]
+    db: Vec<DatabaseInfo>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -43,12 +47,45 @@ struct BackupInfo {
     #[serde(default)]
     error: bool,
     lsn: Option<BackupLsn>,
+    archive: Option<BackupArchive>,
+    database: Option<BackupDatabase>,
     info: Option<BackupSizeInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BackupLsn {
+    start: String,
     stop: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupArchive {
+    start: Option<String>,
+    stop: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupDatabase {
+    id: u64,
+    #[serde(rename = "repo-key")]
+    repo_key: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveInfo {
+    id: String,
+    min: Option<String>,
+    max: Option<String>,
+    database: BackupDatabase,
+}
+
+#[derive(Debug, Deserialize)]
+struct DatabaseInfo {
+    id: u64,
+    #[serde(rename = "repo-key")]
+    repo_key: u32,
+    #[serde(rename = "system-id")]
+    system_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,11 +97,36 @@ struct BackupSizeInfo {
 pub struct SelectedBackup {
     pub label: String,
     pub backup_type: String,
+    pub start_lsn: String,
     pub stop_lsn: String,
+    pub archive_start: Option<String>,
+    pub archive_stop: Option<String>,
+    pub database_id: u64,
+    pub database_system_id: u64,
     pub size_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveCatalog {
+    pub archive_id: String,
+    pub min_segment: Option<String>,
+    pub max_segment: Option<String>,
+    pub database_system_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryMetadata {
+    pub backups: Vec<SelectedBackup>,
+    pub archive: ArchiveCatalog,
+}
+
 pub fn read_backup_catalog(config: &RecoveryConfig) -> Result<Vec<SelectedBackup>, RecoveryError> {
+    Ok(read_repository_metadata(config)?.backups)
+}
+
+pub fn read_repository_metadata(
+    config: &RecoveryConfig,
+) -> Result<RepositoryMetadata, RecoveryError> {
     let repo_arg = format!("--repo={}", config.repository_key);
     let config_arg = format!("--config={}", config.pgbackrest_config.display());
     let stanza_arg = format!("--stanza={}", config.stanza);
@@ -106,22 +168,70 @@ pub fn read_backup_catalog(config: &RecoveryConfig) -> Result<Vec<SelectedBackup
         )));
     }
 
-    Ok(stanza
-        .backup
+    let databases = stanza.db;
+    let mut backups = Vec::new();
+    for backup in stanza.backup {
+        if backup.error || !safe_backup_label(&backup.label) {
+            continue;
+        }
+        let Some(lsn) = backup.lsn else {
+            continue;
+        };
+        let Some(database) = backup.database else {
+            continue;
+        };
+        if database.repo_key != config.repository_key {
+            continue;
+        }
+        let Some(database_system_id) = databases
+            .iter()
+            .find(|item| item.id == database.id && item.repo_key == database.repo_key)
+            .map(|item| item.system_id)
+        else {
+            continue;
+        };
+        backups.push(SelectedBackup {
+            label: backup.label,
+            backup_type: backup.backup_type,
+            start_lsn: lsn.start,
+            stop_lsn: lsn.stop,
+            archive_start: backup.archive.as_ref().and_then(|item| item.start.clone()),
+            archive_stop: backup.archive.and_then(|item| item.stop),
+            database_id: database.id,
+            database_system_id,
+            size_bytes: backup.info.and_then(|info| info.size),
+        });
+    }
+
+    let archive = stanza
+        .archive
         .into_iter()
-        .filter(|backup| {
-            !backup.error && backup.backup_type == "full" && safe_backup_label(&backup.label)
-        })
-        .filter_map(|backup| {
-            let lsn = backup.lsn?;
-            Some(SelectedBackup {
-                label: backup.label,
-                backup_type: backup.backup_type,
-                stop_lsn: lsn.stop,
-                size_bytes: backup.info.and_then(|info| info.size),
-            })
-        })
-        .collect())
+        .find(|item| item.database.repo_key == config.repository_key)
+        .ok_or_else(|| {
+            RecoveryError::InvalidPgBackRestJson(format!(
+                "stanza {} has no archive metadata for repo {}",
+                config.stanza, config.repository_key
+            ))
+        })?;
+    let database_system_id = databases
+        .iter()
+        .find(|item| item.id == archive.database.id && item.repo_key == archive.database.repo_key)
+        .map(|item| item.system_id)
+        .ok_or_else(|| {
+            RecoveryError::InvalidPgBackRestJson(
+                "archive database identity is absent from stanza db metadata".to_owned(),
+            )
+        })?;
+
+    Ok(RepositoryMetadata {
+        backups,
+        archive: ArchiveCatalog {
+            archive_id: archive.id,
+            min_segment: archive.min,
+            max_segment: archive.max,
+            database_system_id,
+        },
+    })
 }
 
 fn safe_backup_label(value: &str) -> bool {
@@ -138,6 +248,7 @@ pub fn select_backup(
     let target = parse_lsn(target_lsn).map_err(RecoveryError::InvalidRequest)?;
     let mut parsed = backups
         .iter()
+        .filter(|backup| backup.backup_type == "full")
         .filter_map(|backup| parse_lsn(&backup.stop_lsn).ok().map(|lsn| (lsn, backup)))
         .collect::<Vec<_>>();
 
@@ -191,7 +302,12 @@ mod tests {
         SelectedBackup {
             label: label.to_owned(),
             backup_type: "full".to_owned(),
+            start_lsn: "0/80".to_owned(),
             stop_lsn: stop_lsn.to_owned(),
+            archive_start: None,
+            archive_stop: None,
+            database_id: 1,
+            database_system_id: 1,
             size_bytes: Some(100),
         }
     }

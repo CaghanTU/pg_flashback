@@ -165,6 +165,7 @@ mod tests {
             max_retained_artifact_bytes: 4096,
             command_timeout_seconds: 1,
             recovery_timeout_seconds: 1,
+            controller: None,
         }
     }
 

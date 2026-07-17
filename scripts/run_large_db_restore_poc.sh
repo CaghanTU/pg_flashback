@@ -10,6 +10,7 @@ TARGET_PERCENT="${PGFB_POC_TARGET_PERCENT:-20}"
 CHURN_PERCENT="${PGFB_POC_CHURN_PERCENT:-0}"
 KEEP="${PGFB_POC_KEEP:-0}"
 EXTENSION_ENABLED="${PGFB_POC_EXTENSION:-0}"
+VERIFIER_BIN="${PGFB_POC_HELPER_VERIFIER_BIN:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -39,6 +40,8 @@ LOG_DIR="$RUN_ROOT/log"
 DUMP_DIR="$RUN_ROOT/dump"
 PGBACKREST_CONFIG="$RUN_ROOT/pgbackrest.conf"
 RESULT_JSON="$RESULT_DIR/$RUN_ID.json"
+VERIFIER_CONFIG="$RUN_ROOT/helper-verifier.json"
+VERIFIER_WORK_ROOT="$RUN_ROOT/helper-verifier-work"
 
 INITDB="$PG_BIN/initdb"
 PG_CTL="$PG_BIN/pg_ctl"
@@ -409,6 +412,59 @@ pgbr check
 
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     primary_sql "CREATE EXTENSION IF NOT EXISTS pg_flashback;" > /dev/null
+    if [[ -n "$VERIFIER_BIN" ]]; then
+        require_executable "$VERIFIER_BIN"
+        primary_sql "CREATE ROLE pgfb_backup_verifier LOGIN;
+                     GRANT flashback_recovery_agent TO pgfb_backup_verifier;" > /dev/null
+        mkdir -p "$VERIFIER_WORK_ROOT" "$RUN_ROOT/helper-verifier-sockets"
+        chmod 700 "$VERIFIER_WORK_ROOT" "$RUN_ROOT/helper-verifier-sockets"
+        jq -n \
+            --arg profile "e2e_snapshot" \
+            --arg pgbackrest "$PGBACKREST" \
+            --arg pgbackrest_config "$PGBACKREST_CONFIG" \
+            --arg pg_bin_dir "$PG_BIN" \
+            --arg repository_path "$REPO_DIR" \
+            --arg stanza "$STANZA" \
+            --arg work_root "$VERIFIER_WORK_ROOT" \
+            --arg socket_root "$RUN_ROOT/helper-verifier-sockets" \
+            --arg expire_lock "$RUN_ROOT/expire.lock" \
+            --arg controller_host "$SOCKET_DIR" \
+            --arg controller_database "$DB_NAME" \
+            --arg controller_user "pgfb_backup_verifier" \
+            --arg recovery_user "$(id -un)" \
+            --argjson controller_port "$PRIMARY_PORT" \
+            '{
+              profile: $profile,
+              pgbackrest_bin: $pgbackrest,
+              pgbackrest_config: $pgbackrest_config,
+              pg_bin_dir: $pg_bin_dir,
+              cp_bin: "/usr/bin/cp",
+              repository_path: $repository_path,
+              repository_key: 1,
+              stanza: $stanza,
+              work_root: $work_root,
+              socket_root: $socket_root,
+              recovery_port: 28999,
+              recovery_user: $recovery_user,
+              snapshot_provider: "disabled",
+              expire_lock_path: $expire_lock,
+              max_work_bytes: 1073741824,
+              max_work_root_bytes: 2147483648,
+              min_free_bytes: 1,
+              artifact_ttl_seconds: 86400,
+              max_retained_artifacts: 64,
+              max_retained_artifact_bytes: 1073741824,
+              command_timeout_seconds: 60,
+              recovery_timeout_seconds: 120,
+              controller: {
+                host: $controller_host,
+                port: $controller_port,
+                database: $controller_database,
+                user: $controller_user
+              }
+            }' > "$VERIFIER_CONFIG"
+        chmod 600 "$VERIFIER_CONFIG"
+    fi
     primary_sql "SELECT flashback_track_backup('public.target_table', 'e2e_snapshot');" > /dev/null
     primary_sql "SELECT flashback_track_backup('\"odd schema\".\"we\"\"ird\"', 'e2e_snapshot');" > /dev/null
     for _ in $(seq 1 100); do
@@ -449,13 +505,30 @@ QUOTED_TRACKING_ID=""
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     activate_backup_table() {
         local table_ref=$1
-        local tracking_id helper_profile
+        local tracking_id helper_profile request_file result_file
         # Resolve while the relation still exists.
         tracking_id=$(primary_sql "SELECT tracking_id FROM flashback.tracked_tables
             WHERE is_active
               AND recovery_profile = 'backup'
               AND rel_oid = to_regclass('$table_ref');")
         [[ -n "$tracking_id" ]] || die "no tracking_id for $table_ref"
+        if [[ -n "$VERIFIER_BIN" ]]; then
+            request_file="$RUN_ROOT/verify-anchor-$tracking_id.json"
+            result_file="$RUN_ROOT/verify-anchor-$tracking_id.result.json"
+            jq -n \
+                --arg request_id "poc-anchor-$tracking_id" \
+                --argjson tracking_id "$tracking_id" \
+                '{request_id: $request_id, tracking_id: $tracking_id}' \
+                > "$request_file"
+            chmod 600 "$request_file"
+            "$VERIFIER_BIN" verify-anchor \
+                --config "$VERIFIER_CONFIG" \
+                --request "$request_file" > "$result_file"
+            [[ "$(jq -r '.status' "$result_file")" == "verified" ]] \
+                || die "anchor verifier did not return verified for tracking_id=$tracking_id"
+            printf '%s\n' "$tracking_id"
+            return
+        fi
         helper_profile=$(primary_sql "SELECT helper_profile FROM flashback.tracked_tables WHERE tracking_id = $tracking_id;")
         primary_sql "SELECT flashback_consume_verified_backup_proof(
             flashback_install_verified_backup_proof(
@@ -479,6 +552,16 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     QUOTED_TRACKING_ID=$(activate_backup_table '"odd schema"."we""ird"')
     [[ -n "$TARGET_TRACKING_ID" && -n "$QUOTED_TRACKING_ID" ]] \
         || die "backup activation did not return tracking ids"
+    if [[ -n "$VERIFIER_BIN" ]]; then
+        set +e
+        "$VERIFIER_BIN" expire --config "$VERIFIER_CONFIG" \
+            > "$RUN_ROOT/pinned-expire.out" 2> "$RUN_ROOT/pinned-expire.err"
+        expire_rc=$?
+        set -e
+        [[ "$expire_rc" != "0" &&
+           "$(jq -r '.code' "$RUN_ROOT/pinned-expire.err")" == "protected_backups" ]] \
+            || die "coordinated expire did not reject active backup generation pins"
+    fi
 fi
 
 log "creating post-backup state and DROP timeline"
@@ -516,8 +599,25 @@ if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     advance_backup_table() {
         local tracking_id=$1
         local through_lsn=$2
-        local generation_id helper_profile repo_key stanza
+        local generation_id helper_profile repo_key stanza request_file result_file request_suffix
         [[ -n "$tracking_id" ]] || die "advance_backup_table: tracking_id required"
+        if [[ -n "$VERIFIER_BIN" ]]; then
+            request_suffix="${through_lsn//\//_}"
+            request_file="$RUN_ROOT/verify-frontier-$tracking_id-$request_suffix.json"
+            result_file="$RUN_ROOT/verify-frontier-$tracking_id-$request_suffix.result.json"
+            jq -n \
+                --arg request_id "poc-frontier-$tracking_id-$request_suffix" \
+                --argjson tracking_id "$tracking_id" \
+                '{request_id: $request_id, tracking_id: $tracking_id}' \
+                > "$request_file"
+            chmod 600 "$request_file"
+            "$VERIFIER_BIN" verify-frontier \
+                --config "$VERIFIER_CONFIG" \
+                --request "$request_file" > "$result_file"
+            [[ "$(jq -r '.status' "$result_file")" == "ok" ]] \
+                || die "frontier verifier did not return ok for tracking_id=$tracking_id"
+            return
+        fi
         generation_id=$(primary_sql "SELECT generation_id FROM flashback.coverage_generations
             WHERE tracking_id = $tracking_id AND state = 'active';")
         [[ -n "$generation_id" ]] || die "no active generation for tracking_id=$tracking_id"

@@ -54,6 +54,12 @@ pub enum RecoveryError {
     #[error("request ID {0} already belongs to a different restore contract")]
     RequestConflict(String),
 
+    #[error("backup verification failed: {0}")]
+    VerificationFailed(String),
+
+    #[error("backup expiration is blocked by active generation pins: {0}")]
+    ProtectedBackups(String),
+
     #[error("restore was cancelled")]
     Cancelled,
 
@@ -111,6 +117,8 @@ impl RecoveryError {
             Self::RequestAlreadyRunning(_) => "request_already_running",
             Self::RecoveryBusy(_) => "recovery_busy",
             Self::RequestConflict(_) => "request_conflict",
+            Self::VerificationFailed(_) => "verification_failed",
+            Self::ProtectedBackups(_) => "protected_backups",
             Self::Cancelled => "cancelled",
             Self::CommandTimeout { .. } => "command_timeout",
             Self::UnsupportedTopology(_) => "unsupported_topology",

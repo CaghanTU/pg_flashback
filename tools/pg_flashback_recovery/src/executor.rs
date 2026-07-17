@@ -274,6 +274,49 @@ pub(crate) fn acquire_profile_lock(config: &RecoveryConfig) -> Result<File, Reco
     Ok(lock)
 }
 
+pub(crate) fn acquire_repository_lock(
+    config: &RecoveryConfig,
+    exclusive: bool,
+) -> Result<File, RecoveryError> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .truncate(false)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&config.expire_lock_path)
+        .map_err(|error| RecoveryError::Io {
+            operation: "opening repository coordination lock",
+            message: error.to_string(),
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(config.command_timeout_seconds.max(1));
+    loop {
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(&lock)
+        } else {
+            FileExt::try_lock_shared(&lock)
+        };
+        match result {
+            Ok(()) => return Ok(lock),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(COMMAND_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(RecoveryError::RepositoryBusy);
+            }
+            Err(error) => {
+                return Err(RecoveryError::Io {
+                    operation: "locking repository",
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
 fn preserve_request_contract(
     config: &RecoveryConfig,
     request: &RestoreRequest,
@@ -519,28 +562,7 @@ fn validate_expected_recovery(
 }
 
 fn materialize(runtime: &mut Runtime<'_>) -> Result<File, RecoveryError> {
-    let repository_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .truncate(false)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&runtime.config.expire_lock_path)
-        .map_err(|error| RecoveryError::Io {
-            operation: "opening repository coordination lock",
-            message: error.to_string(),
-        })?;
-    FileExt::try_lock_shared(&repository_lock).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            RecoveryError::RepositoryBusy
-        } else {
-            RecoveryError::Io {
-                operation: "locking repository for restore",
-                message: error.to_string(),
-            }
-        }
-    })?;
+    let repository_lock = acquire_repository_lock(runtime.config, false)?;
 
     let current = select_backup(
         &read_backup_catalog(runtime.config)?,

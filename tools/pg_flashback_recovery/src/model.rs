@@ -40,6 +40,19 @@ pub struct RecoveryConfig {
     pub max_retained_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
     pub recovery_timeout_seconds: u64,
+    /// Least-privilege connection used only by proof verification and
+    /// coordinated expiration commands. Passwords stay outside this JSON
+    /// (for example in an operator-owned PGPASSFILE).
+    #[serde(default)]
+    pub controller: Option<ControllerConnection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerConnection {
+    pub host: PathBuf,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
 }
 
 fn default_max_work_root_bytes() -> u64 {
@@ -224,6 +237,39 @@ pub struct ArtifactPin {
     pub pinned_at_unix_seconds: u64,
     pub reason: String,
     pub artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupVerificationRequest {
+    pub request_id: String,
+    pub tracking_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupVerificationResult {
+    pub result_format_version: u32,
+    pub status: String,
+    pub verification_kind: String,
+    pub request_id: String,
+    pub tracking_id: i64,
+    pub generation_id: i64,
+    pub profile: String,
+    pub repository_key: u32,
+    pub stanza: String,
+    pub backup_label: String,
+    pub timeline_id: u32,
+    pub manifest_reference: String,
+    pub manifest_sha256: String,
+    pub verified_lsn: String,
+    pub proof_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpireResult {
+    pub status: String,
+    pub profile: String,
+    pub stanza: String,
+    pub protected_backup_labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

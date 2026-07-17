@@ -225,6 +225,7 @@ fi
 log "creating an isolated real pgBackRest repository and DROP timeline"
 PGFB_POC_KEEP=1 \
 PGFB_POC_EXTENSION=1 \
+PGFB_POC_HELPER_VERIFIER_BIN="$HELPER" \
 PGFB_POC_BASE="$POC_BASE" \
 PGFB_POC_PRIMARY_PORT="$PRIMARY_PORT" \
 PGFB_POC_CLASSIC_PORT="$CLASSIC_PORT" \
@@ -239,6 +240,13 @@ WORK_ROOT="$RUN_ROOT/helper-work"
 EXPIRE_LOCK="$RUN_ROOT/expire.lock"
 mkdir -p "$SOCKET_ROOT"
 chmod 700 "$SOCKET_ROOT"
+
+[[ "$(jq -r '.status' "$RUN_ROOT"/verify-anchor-*.result.json | sort -u)" == "verified" ]] \
+    || die "real repository anchor verifier evidence is missing"
+[[ "$(jq -r '.status' "$RUN_ROOT"/verify-frontier-*.result.json | sort -u)" == "ok" ]] \
+    || die "real repository frontier verifier evidence is missing"
+[[ "$(jq -r '.code' "$RUN_ROOT/pinned-expire.err")" == "protected_backups" ]] \
+    || die "active generation pin did not block coordinated expiration"
 
 TARGET_LSN="$(jq -r '.backup.target_lsn' "$POC_RESULT")"
 ALTER_MARKER_LSN="$(jq -r '.backup.alter_marker_lsn' "$POC_RESULT")"
@@ -362,10 +370,18 @@ write_request "$REPO_BUSY_REQUEST" "e2e-repo-busy" "public" "target_table" "$TAR
 flock -x "$EXPIRE_LOCK" -c 'sleep 3' &
 LOCK_PID=$!
 sleep 0.2
-expect_error "repository_busy" "$SNAPSHOT_CONFIG" "$REPO_BUSY_REQUEST"
+"$HELPER" restore-table --config "$SNAPSHOT_CONFIG" --request "$REPO_BUSY_REQUEST" \
+    > "$RUN_ROOT/repo-busy.result.json" 2> "$RUN_ROOT/repo-busy.err" &
+WAITING_HELPER_PID=$!
+sleep 0.5
+kill -0 "$WAITING_HELPER_PID" 2>/dev/null \
+    || die "restore did not wait for the exclusive expire lock"
 wait "$LOCK_PID"
-assert_request_clean "e2e-repo-busy"
-pass "backup/expire exclusive lock blocks recovery materialization"
+wait "$WAITING_HELPER_PID" \
+    || die "restore failed after the exclusive expire lock was released"
+[[ "$(jq -r '.status' "$RUN_ROOT/repo-busy.result.json")" == "completed" ]] \
+    || die "restore did not complete after waiting for expire"
+pass "backup/expire exclusive lock serializes recovery materialization"
 
 SLOW_CP="$RUN_ROOT/slow-cp.sh"
 cat > "$SLOW_CP" <<'SLOW_CP_EOF'
@@ -600,23 +616,23 @@ chmod 700 "$VERIFY_SOCKET"
     -o "-c archive_mode=off -p $VERIFY_PORT -k $VERIFY_SOCKET" start -w -t 60 > /dev/null
 PRIMARY_STARTED=1
 
-CONTROLLER_FAILURE_ERR="$RUN_ROOT/controller-repository-busy.err"
-flock -x "$EXPIRE_LOCK" -c 'sleep 3' &
-LOCK_PID=$!
-sleep 0.2
+CONTROLLER_FAILURE_ERR="$RUN_ROOT/controller-helper-failure.err"
+CONTROLLER_FAILURE_CONFIG="$RUN_ROOT/helper-controller-failure.json"
+jq '.pgbackrest_bin = "/bin/false"' "$SNAPSHOT_CONFIG" \
+    > "$CONTROLLER_FAILURE_CONFIG"
+chmod 600 "$CONTROLLER_FAILURE_CONFIG"
 set +e
 PGHOST="$VERIFY_SOCKET" PGPORT="$VERIFY_PORT" PGUSER="$(id -un)" \
     "$SCRIPT_DIR/pg_flashback_backup_restore.sh" \
-        --config "$SNAPSHOT_CONFIG" \
+        --config "$CONTROLLER_FAILURE_CONFIG" \
         --dbname pocdb \
         --table public.target_table \
         --target-lsn "$DROP_MARKER_LSN" \
         --helper "$HELPER" > /dev/null 2> "$CONTROLLER_FAILURE_ERR"
 CONTROLLER_FAILURE_RC=$?
 set -e
-wait "$LOCK_PID"
 [[ "$CONTROLLER_FAILURE_RC" != "0" ]]
-grep -q '"code":"repository_busy"' "$CONTROLLER_FAILURE_ERR"
+grep -q '"code":"command_failed"' "$CONTROLLER_FAILURE_ERR"
 FAILED_CONTROLLER_REQUEST="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d pocdb \
     -c "SELECT request_id FROM flashback.backup_restore_requests WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1;")"
 [[ -n "$FAILED_CONTROLLER_REQUEST" ]]

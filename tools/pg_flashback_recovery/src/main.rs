@@ -3,9 +3,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use pg_flashback_recovery::error::RecoveryError;
-use pg_flashback_recovery::model::{ErrorResponse, RecoveryConfig, RestoreRequest};
+use pg_flashback_recovery::model::{
+    BackupVerificationRequest, ErrorResponse, RecoveryConfig, RestoreRequest,
+};
 use pg_flashback_recovery::{
-    build_plan, load_json, load_recovery_config, restore_table, run_gc, run_probe, unpin_artifact,
+    build_plan, expire_backups, load_json, load_recovery_config, restore_table, run_gc, run_probe,
+    unpin_artifact, verify_anchor, verify_frontier,
 };
 use serde::Serialize;
 
@@ -54,6 +57,25 @@ enum Commands {
         #[arg(long)]
         request_id: String,
     },
+    /// Verify a repository-derived FULL backup and activate its one-time anchor.
+    VerifyAnchor {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Verify contiguous archived WAL and advance the active backup frontier.
+    VerifyFrontier {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Run coordinated pgBackRest expiration after rejecting active backup pins.
+    Expire {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -100,6 +122,20 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
                 "request_id": request_id,
                 "pin_released": true,
             }))
+        }
+        Commands::VerifyAnchor { config, request } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            let request: BackupVerificationRequest = load_json(&request)?;
+            to_value(verify_anchor(&config, &request)?)
+        }
+        Commands::VerifyFrontier { config, request } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            let request: BackupVerificationRequest = load_json(&request)?;
+            to_value(verify_frontier(&config, &request)?)
+        }
+        Commands::Expire { config } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            to_value(expire_backups(&config)?)
         }
     }
 }
