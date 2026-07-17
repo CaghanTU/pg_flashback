@@ -14,6 +14,11 @@
   "snapshot_provider": "xfs_reflink",
   "expire_lock_path": "/run/lock/pg_flashback/app_flashback.lock",
   "max_work_bytes": 536870912000,
+  "max_work_root_bytes": 1099511627776,
+  "min_free_bytes": 67108864,
+  "artifact_ttl_seconds": 86400,
+  "max_retained_artifacts": 32,
+  "max_retained_artifact_bytes": 1099511627776,
   "command_timeout_seconds": 3600,
   "recovery_timeout_seconds": 3600
 }

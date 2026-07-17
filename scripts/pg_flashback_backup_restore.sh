@@ -182,6 +182,9 @@ RESTORED_OID="$(printf '%s\n' \
     | psql_file --set=request_id="$REQUEST_ID")"
 COMPLETED=1
 
+# Release the awaiting-import pin so helper GC may retire the dump under TTL/caps.
+"$HELPER" unpin --config "$CONFIG" --request-id "$REQUEST_ID" > /dev/null
+
 jq -n \
     --arg request_id "$REQUEST_ID" \
     --arg restored_oid "$RESTORED_OID" \

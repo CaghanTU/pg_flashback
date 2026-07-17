@@ -19,8 +19,39 @@ pub struct RecoveryConfig {
     pub snapshot_provider: SnapshotProvider,
     pub expire_lock_path: PathBuf,
     pub max_work_bytes: u64,
+    /// Aggregate apparent-byte ceiling across all request directories under
+    /// `work_root` (excluding helper metadata directories such as `.locks`).
+    #[serde(default = "default_max_work_root_bytes")]
+    pub max_work_root_bytes: u64,
+    /// Minimum free filesystem bytes that must remain throughout recovery.
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
+    /// Successful artifacts older than this many seconds become GC-eligible.
+    /// Zero disables age-based expiry; count/byte caps still apply.
+    #[serde(default = "default_artifact_ttl_seconds")]
+    pub artifact_ttl_seconds: u64,
+    /// Maximum number of completed artifacts retained under `work_root`.
+    /// Zero means unlimited count.
+    #[serde(default)]
+    pub max_retained_artifacts: u64,
+    /// Maximum total completed-artifact dump bytes retained under `work_root`.
+    /// Zero means unlimited bytes.
+    #[serde(default)]
+    pub max_retained_artifact_bytes: u64,
     pub command_timeout_seconds: u64,
     pub recovery_timeout_seconds: u64,
+}
+
+fn default_max_work_root_bytes() -> u64 {
+    u64::MAX
+}
+
+fn default_min_free_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_artifact_ttl_seconds() -> u64 {
+    86_400
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +70,15 @@ pub struct RestoreRequest {
     pub expected_schema_version: u64,
     #[serde(default)]
     pub expected_schema_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_fingerprint: Option<String>,
+    /// Extension coverage pins echoed verbatim for accept round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_anchor_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +216,44 @@ pub struct ExecutionState {
     pub phase: String,
     pub updated_at_unix_seconds: u64,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactPin {
+    pub request_id: String,
+    pub pinned_at_unix_seconds: u64,
+    pub reason: String,
+    pub artifact_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GcAction {
+    Keep,
+    Remove,
+    Reconcile,
+    SkipBusy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GcDecision {
+    pub request_id: String,
+    pub action: GcAction,
+    pub reason: String,
+    pub bytes: u64,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GcReport {
+    pub status: &'static str,
+    pub dry_run: bool,
+    pub decisions: Vec<GcDecision>,
+    pub removed_requests: u64,
+    pub freed_bytes: u64,
+    pub retained_artifacts: u64,
+    pub retained_artifact_bytes: u64,
+    pub audit_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]

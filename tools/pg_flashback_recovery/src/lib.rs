@@ -1,5 +1,7 @@
+mod capacity;
 pub mod error;
 mod executor;
+mod gc;
 pub mod model;
 mod pgbackrest;
 mod probe;
@@ -10,6 +12,7 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 
+use crate::capacity::{check_free_space, check_work_root_quota};
 use crate::error::RecoveryError;
 use crate::model::{
     RecoveryConfig, RecoveryEngine, RestorePlan, RestoreRequest, RestoreResult, SnapshotProvider,
@@ -17,6 +20,7 @@ use crate::model::{
 };
 use crate::pgbackrest::{direct_backup_tree, parse_lsn, read_backup_catalog, select_backup};
 
+pub use crate::gc::{run_gc, unpin_artifact};
 pub use crate::probe::run_probe;
 
 const MAX_CONTRACT_BYTES: u64 = 1024 * 1024;
@@ -120,6 +124,8 @@ pub fn build_plan(
             });
         }
     }
+    check_work_root_quota(config)?;
+    check_free_space(config)?;
 
     let direct_tree = direct_backup_tree(&config.repository_path, &config.stanza, &selected.label);
     let tree_is_startable = direct_tree.join("PG_VERSION").is_file();
@@ -299,6 +305,9 @@ mod tests {
             expected_schema_version: 1,
             expected_schema_sha256: None,
             expected_fingerprint: None,
+            tracking_id: None,
+            generation_id: None,
+            backup_anchor_id: None,
         }
     }
 

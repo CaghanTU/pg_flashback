@@ -345,8 +345,12 @@ EOF
 
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     cat >> "$PRIMARY_DIR/postgresql.conf" <<EOF
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
 shared_preload_libraries = 'pg_flashback'
-pg_flashback.capture_mode = 'trigger'
+pg_flashback.capture_mode = 'wal'
+pg_flashback.enabled = on
 EOF
 fi
 
@@ -392,10 +396,6 @@ primary_sql "VACUUM (ANALYZE) target_table;" > /dev/null
 primary_sql "VACUUM (ANALYZE) noise_table;" > /dev/null
 primary_sql "CHECKPOINT;" > /dev/null
 
-if [[ "$EXTENSION_ENABLED" == "1" ]]; then
-    primary_sql "CREATE EXTENSION pg_flashback; SELECT flashback_track_backup('public.target_table', 'e2e_snapshot'); SELECT flashback_track_backup('\"odd schema\".\"we\"\"ird\"', 'e2e_snapshot');" > /dev/null
-fi
-
 DATABASE_BYTES=$(primary_sql "SELECT pg_database_size(current_database());")
 TARGET_TABLE_BYTES=$(primary_sql "SELECT pg_total_relation_size('public.target_table');")
 log "actual database=$(numfmt --to=iec-i --suffix=B "$DATABASE_BYTES") target_table=$(numfmt --to=iec-i --suffix=B "$TARGET_TABLE_BYTES")"
@@ -407,6 +407,22 @@ log "restarting primary with WAL archiving enabled"
 pgbr stanza-create
 pgbr check
 
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    primary_sql "CREATE EXTENSION IF NOT EXISTS pg_flashback;" > /dev/null
+    primary_sql "SELECT flashback_track_backup('public.target_table', 'e2e_snapshot');" > /dev/null
+    primary_sql "SELECT flashback_track_backup('\"odd schema\".\"we\"\"ird\"', 'e2e_snapshot');" > /dev/null
+    for _ in $(seq 1 100); do
+        unresolved=$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
+            WHERE recovery_profile='backup' AND state='building'
+              AND NOT (details ? 'tracking_marker_lsn');")
+        [[ "$unresolved" == "0" ]] && break
+        primary_sql "SELECT flashback_consume_wal(4096);" > /dev/null || true
+        sleep 0.1
+    done
+    [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations WHERE recovery_profile='backup' AND details ? 'tracking_marker_lsn';")" == "2" ]] \
+        || die "backup tracking markers were not resolved"
+fi
+
 log "taking plain-format full backup"
 t0=$(now_ns)
 pgbr backup --type=full
@@ -414,12 +430,39 @@ t1=$(now_ns)
 BACKUP_MS=$(elapsed_ms "$t0" "$t1")
 BACKUP_LABEL=$(pgbr info --output=json | jq -r '.[0].backup | sort_by(.timestamp.stop) | last.label')
 BACKUP_STOP_LSN=$(pgbr info --output=json | jq -r '.[0].backup | sort_by(.timestamp.stop) | last.lsn.stop')
+BACKUP_START_LSN=$(pgbr info --output=json | jq -r '.[0].backup | sort_by(.timestamp.stop) | last.lsn.start')
 [[ -n "$BACKUP_LABEL" && "$BACKUP_LABEL" != "null" ]] || die "could not determine backup label"
+[[ -n "$BACKUP_START_LSN" && "$BACKUP_START_LSN" != "null" ]] || die "could not determine backup start LSN"
 
 BACKUP_DATA_DIR="$REPO_DIR/backup/$STANZA/$BACKUP_LABEL/pg_data"
 [[ -d "$BACKUP_DATA_DIR" ]] || die "plain backup data directory not found: $BACKUP_DATA_DIR"
 [[ -f "$BACKUP_DATA_DIR/PG_VERSION" ]] || die "backup is not a directly startable pg_data tree"
 BACKUP_REPO_BYTES=$(dir_apparent_bytes "$REPO_DIR")
+MANIFEST_PATH="$REPO_DIR/backup/$STANZA/$BACKUP_LABEL/backup.manifest"
+[[ -f "$MANIFEST_PATH" ]] || die "backup manifest not found: $MANIFEST_PATH"
+MANIFEST_SHA=$(sha256sum "$MANIFEST_PATH" | awk '{print $1}')
+SYSID=$(primary_sql "SELECT system_identifier FROM pg_control_system();")
+TIMELINE=$(primary_sql "SELECT timeline_id FROM pg_control_checkpoint();")
+
+if [[ "$EXTENSION_ENABLED" == "1" ]]; then
+    activate_backup_table() {
+        local table_ref=$1
+        primary_sql "SELECT flashback_activate_backup_anchor(
+            '$table_ref',
+            '$REPO_DIR',
+            '$STANZA',
+            '$BACKUP_LABEL',
+            $SYSID,
+            $TIMELINE,
+            '$MANIFEST_PATH',
+            '$MANIFEST_SHA',
+            '$BACKUP_START_LSN'::pg_lsn,
+            '$BACKUP_STOP_LSN'::pg_lsn
+        );" > /dev/null
+    }
+    activate_backup_table 'public.target_table'
+    activate_backup_table '"odd schema"."we""ird"'
+fi
 
 log "creating post-backup state and DROP timeline"
 CHURN_ROWS=$(( NOISE_ROWS * CHURN_PERCENT / 100 ))
@@ -453,7 +496,8 @@ EXTENSION_TARGET_REQUEST=null
 EXTENSION_QUOTED_REQUEST=null
 EXTENSION_ALTER_REQUEST=null
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
-    primary_sql "SELECT flashback_set_backup_coverage('public.target_table', '$BACKUP_STOP_LSN'::pg_lsn, '$TARGET_LSN'::pg_lsn); SELECT flashback_set_backup_coverage('\"odd schema\".\"we\"\"ird\"', '$BACKUP_STOP_LSN'::pg_lsn, '$TARGET_LSN'::pg_lsn);" > /dev/null
+    primary_sql "SELECT flashback_advance_backup_frontier('public.target_table', '$TARGET_LSN'::pg_lsn);
+                 SELECT flashback_advance_backup_frontier('\"odd schema\".\"we\"\"ird\"', '$TARGET_LSN'::pg_lsn);" > /dev/null
 fi
 sleep 2
 primary_sql "DROP TABLE target_table;" > /dev/null
@@ -467,7 +511,8 @@ primary_sql "SELECT pg_switch_wal();" > /dev/null
 sleep 3
 pgbr check
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
-    primary_sql "SELECT flashback_set_backup_coverage('public.target_table', '$BACKUP_STOP_LSN'::pg_lsn, '$AFTER_DROP_LSN'::pg_lsn); SELECT flashback_set_backup_coverage('\"odd schema\".\"we\"\"ird\"', '$BACKUP_STOP_LSN'::pg_lsn, '$AFTER_DROP_LSN'::pg_lsn);" > /dev/null
+    primary_sql "SELECT flashback_advance_backup_frontier('public.target_table', '$AFTER_DROP_LSN'::pg_lsn);
+                 SELECT flashback_advance_backup_frontier('\"odd schema\".\"we\"\"ird\"', '$AFTER_DROP_LSN'::pg_lsn);" > /dev/null
     EXTENSION_TARGET_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
     EXTENSION_QUOTED_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('\"odd schema\".\"we\"\"ird\"', '$DROP_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")
     EXTENSION_ALTER_REQUEST=$(primary_sql "WITH prepared AS (SELECT flashback_prepare_backup_restore('public.target_table', '$ALTER_MARKER_LSN'::pg_lsn) AS request) SELECT flashback_claim_backup_restore(request->>'request_id')::text FROM prepared;")

@@ -76,6 +76,7 @@ pub fn run_probe(config: &RecoveryConfig) -> Result<ProbeReport, RecoveryError> 
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn validate_config(config: &RecoveryConfig) -> Result<(), RecoveryError> {
     for (name, path) in [
         ("pgbackrest_bin", config.pgbackrest_bin.as_path()),
@@ -119,6 +120,21 @@ pub fn validate_config(config: &RecoveryConfig) -> Result<(), RecoveryError> {
     if config.max_work_bytes == 0 {
         return Err(RecoveryError::InvalidConfig(
             "max_work_bytes must be greater than zero".to_owned(),
+        ));
+    }
+    if config.max_work_root_bytes == 0 {
+        return Err(RecoveryError::InvalidConfig(
+            "max_work_root_bytes must be greater than zero".to_owned(),
+        ));
+    }
+    if config.max_work_root_bytes < config.max_work_bytes {
+        return Err(RecoveryError::InvalidConfig(
+            "max_work_root_bytes must be at least max_work_bytes".to_owned(),
+        ));
+    }
+    if config.min_free_bytes == 0 {
+        return Err(RecoveryError::InvalidConfig(
+            "min_free_bytes must be greater than zero".to_owned(),
         ));
     }
     if config.recovery_port == 0 {

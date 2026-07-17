@@ -92,6 +92,11 @@ write_config() {
     local command_timeout="$6"
     local recovery_timeout="$7"
     local max_work_bytes="$8"
+    local max_work_root_bytes="${9:-1099511627776}"
+    local min_free_bytes="${10:-67108864}"
+    local artifact_ttl_seconds="${11:-86400}"
+    local max_retained_artifacts="${12:-64}"
+    local max_retained_artifact_bytes="${13:-1099511627776}"
     jq -n \
         --arg profile "$profile" \
         --arg pgbackrest "$PGBACKREST" \
@@ -109,6 +114,11 @@ write_config() {
         --argjson command_timeout "$command_timeout" \
         --argjson recovery_timeout "$recovery_timeout" \
         --argjson max_work_bytes "$max_work_bytes" \
+        --argjson max_work_root_bytes "$max_work_root_bytes" \
+        --argjson min_free_bytes "$min_free_bytes" \
+        --argjson artifact_ttl_seconds "$artifact_ttl_seconds" \
+        --argjson max_retained_artifacts "$max_retained_artifacts" \
+        --argjson max_retained_artifact_bytes "$max_retained_artifact_bytes" \
         '{
           profile: $profile,
           pgbackrest_bin: $pgbackrest,
@@ -125,6 +135,11 @@ write_config() {
           snapshot_provider: $provider,
           expire_lock_path: $expire_lock,
           max_work_bytes: $max_work_bytes,
+          max_work_root_bytes: $max_work_root_bytes,
+          min_free_bytes: $min_free_bytes,
+          artifact_ttl_seconds: $artifact_ttl_seconds,
+          max_retained_artifacts: $max_retained_artifacts,
+          max_retained_artifact_bytes: $max_retained_artifact_bytes,
           command_timeout_seconds: $command_timeout,
           recovery_timeout_seconds: $recovery_timeout
         }' > "$path"
@@ -462,6 +477,87 @@ QUOTA_REQUEST="$RUN_ROOT/request-quota.json"
 write_request "$QUOTA_REQUEST" "e2e-quota" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
 expect_error "work_quota_exceeded" "$QUOTA_CONFIG" "$QUOTA_REQUEST"
 pass "backup larger than the configured work quota is rejected before materialization"
+
+# Free-space reserve clearly above available capacity.
+FREE_CONFIG="$RUN_ROOT/helper-free-space.json"
+write_config "$FREE_CONFIG" "e2e_free_space" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 10 120 \
+    536870912 1099511627776 9223372036854775807 86400 64 1099511627776
+FREE_REQUEST="$RUN_ROOT/request-free-space.json"
+write_request "$FREE_REQUEST" "e2e-free-space" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "" ""
+expect_error "free_space_exhausted" "$FREE_CONFIG" "$FREE_REQUEST"
+pass "configured free-space reserve rejects recovery before materialization"
+
+# GC dry-run + live: expired unpinned artifact removed; fresh pin retained.
+GC_OLD_DIR="$WORK_ROOT/e2e-gc-old"
+mkdir -p "$GC_OLD_DIR"
+printf 'stale-artifact' > "$GC_OLD_DIR/target-table.dump"
+HELPER_VERSION_STRING="$($HELPER --version)"
+jq -n \
+    --arg request_id "e2e-gc-old" \
+    --arg artifact_path "$GC_OLD_DIR/target-table.dump" \
+    --arg helper_version "$HELPER_VERSION_STRING" \
+    '{
+      result_format_version: 3,
+      helper_version: $helper_version,
+      status: "completed",
+      request: {
+        request_id: $request_id,
+        database: "pocdb",
+        table: {schema: "public", name: "target_table", rel_oid: 1},
+        target: {kind: "lsn", value: "0/1", observed_at_unix_seconds: 1, inclusive: true},
+        expected_schema_version: 1,
+        expected_schema_sha256: null,
+        expected_fingerprint: null
+      },
+      profile: "e2e_snapshot",
+      engine: "classic_restore",
+      stanza: "large_db_poc",
+      repository_key: 1,
+      backup_label: "stale",
+      backup_stop_lsn: "0/1",
+      postgres_version: "17",
+      pgbackrest_version: "2",
+      recovered_row_count: 0,
+      recovered_owner: "postgres",
+      recovered_acl: [],
+      recovered_schema_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      artifact_schema: "flashback_import",
+      artifact_table: "r_aaaaaaaaaaaaaaaa",
+      artifact_schema_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      recovered_fingerprint: "0|0",
+      artifact_path: $artifact_path,
+      artifact_bytes: 14,
+      artifact_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      durations: {materialize_ms: 1, recovery_ms: 1, validate_ms: 1, extract_ms: 1, total_ms: 4},
+      cleanup_complete: true
+    }' > "$GC_OLD_DIR/result.json"
+jq -n \
+    --arg request_id "e2e-gc-old" \
+    '{request_id: $request_id, phase: "completed", updated_at_unix_seconds: 1, detail: null}' \
+    > "$GC_OLD_DIR/state.json"
+
+[[ -f "$WORK_ROOT/$SUCCESS_REQUEST_ID/artifact.pin" ]] \
+    || die "successful restore did not write an awaiting-import pin"
+GC_DRY_JSON="$RUN_ROOT/gc-dry-run.json"
+"$HELPER" gc --config "$SNAPSHOT_CONFIG" --dry-run > "$GC_DRY_JSON"
+[[ "$(jq -r '.status' "$GC_DRY_JSON")" == "ok" ]]
+[[ "$(jq -r '.dry_run' "$GC_DRY_JSON")" == "true" ]]
+jq -e --arg id e2e-gc-old \
+    '.decisions[] | select(.request_id == $id and .action == "remove")' \
+    "$GC_DRY_JSON" > /dev/null
+[[ -d "$GC_OLD_DIR" ]] || die "dry-run GC deleted an artifact"
+GC_LIVE_JSON="$RUN_ROOT/gc-live.json"
+# Short TTL so the synthetic old artifact is eligible while the pinned success stays.
+GC_CONFIG="$RUN_ROOT/helper-gc.json"
+write_config "$GC_CONFIG" "e2e_snapshot" "xfs_reflink" "$HELPER_PORT" "/usr/bin/cp" 120 300 \
+    536870912 1099511627776 67108864 60 64 1099511627776
+"$HELPER" gc --config "$GC_CONFIG" > "$GC_LIVE_JSON"
+[[ ! -d "$GC_OLD_DIR" ]] || die "live GC left expired unpinned artifact in place"
+[[ -f "$WORK_ROOT/$SUCCESS_REQUEST_ID/artifact.pin" ]] \
+    || die "live GC removed a pinned successful artifact"
+[[ -f "$(jq -r '.audit_path' "$GC_LIVE_JSON")" ]] \
+    || die "GC audit log was not written"
+pass "gc --dry-run and gc remove expired artifacts while preserving pins"
 
 CONFLICT_REQUEST="$RUN_ROOT/request-conflict.json"
 jq '.expected_fingerprint = "conflict"' "$SUCCESS_REQUEST" > "$CONFLICT_REQUEST"

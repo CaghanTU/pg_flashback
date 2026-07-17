@@ -27,6 +27,12 @@ static RESTORE_WORK_MEM_GUC: GucSetting<Option<CString>> = GucSetting::<Option<C
 /// maintenance_work_mem override for deferred index builds during flashback_restore.
 static INDEX_BUILD_WORK_MEM_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
+/// Maximum projected local-restore peak size (pg_size_bytes text). Empty/0 disables.
+static LOCAL_RESTORE_MAX_PEAK_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Extra safety reserve included in local-restore peak estimates.
+static LOCAL_RESTORE_SAFETY_RESERVE_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
@@ -152,6 +158,24 @@ pub fn register_worker_and_guc() {
         c"maintenance_work_mem for deferred index builds during flashback_restore",
         c"Passed to set_config('maintenance_work_mem') before building PK and secondary indexes on shadow table. Default: 512MB.",
         &INDEX_BUILD_WORK_MEM_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.local_restore_max_peak_bytes",
+        c"Reject local restores whose projected peak exceeds this size",
+        c"Accepted by pg_size_bytes(). Empty or 0 disables the gate. Set a conservative filesystem headroom budget so local restore fails closed before ACCESS EXCLUSIVE.",
+        &LOCAL_RESTORE_MAX_PEAK_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.local_restore_safety_reserve_bytes",
+        c"Safety reserve included in local restore peak estimates",
+        c"Accepted by pg_size_bytes() and added to twice the live relation size. Default when unset: 64MB.",
+        &LOCAL_RESTORE_SAFETY_RESERVE_BYTES_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );

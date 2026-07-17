@@ -39,6 +39,14 @@ pub enum RecoveryError {
     #[error("selected backup requires {required} bytes, above max_work_bytes={limit}")]
     WorkQuotaExceeded { required: u64, limit: u64 },
 
+    #[error("work_root aggregate usage {used} bytes exceeds max_work_root_bytes={limit}")]
+    WorkRootQuotaExceeded { used: u64, limit: u64 },
+
+    #[error(
+        "filesystem free space {available} bytes is below min_free_bytes={required}"
+    )]
+    FreeSpaceExhausted { available: u64, required: u64 },
+
     #[error("request {0} is already running")]
     RequestAlreadyRunning(String),
 
@@ -100,6 +108,8 @@ impl RecoveryError {
             Self::NoEligibleBackup(_) => "no_eligible_backup",
             Self::UnsupportedTarget(_) => "unsupported_target",
             Self::WorkQuotaExceeded { .. } => "work_quota_exceeded",
+            Self::WorkRootQuotaExceeded { .. } => "work_root_quota_exceeded",
+            Self::FreeSpaceExhausted { .. } => "free_space_exhausted",
             Self::RequestAlreadyRunning(_) => "request_already_running",
             Self::RecoveryBusy(_) => "recovery_busy",
             Self::RequestConflict(_) => "request_conflict",

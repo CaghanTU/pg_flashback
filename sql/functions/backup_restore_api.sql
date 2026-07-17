@@ -798,7 +798,6 @@ BEGIN
         ),
         'expected_schema_version', v_schema.schema_version,
         'expected_schema_sha256', v_schema.helper_schema_sha256,
-        'expected_fingerprint', NULL,
         'tracking_id', v_tracked.tracking_id,
         'generation_id', v_generation.generation_id,
         'backup_anchor_id', v_generation.backup_anchor_id

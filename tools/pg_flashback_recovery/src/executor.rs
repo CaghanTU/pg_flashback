@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signal_hook::consts::{SIGINT, SIGTERM};
 
+use crate::capacity::{
+    available_work_space, check_capacity, check_work_root_quota, is_request_directory_name,
+};
 use crate::error::RecoveryError;
+use crate::gc::write_artifact_pin;
 use crate::load_json;
 use crate::model::{
     ExecutionDurations, ExecutionState, RecoveredAclEntry, RecoveryConfig, RecoveryEngine,
@@ -30,7 +34,6 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PROCESS_STOP_TIMEOUT: u64 = 60;
 const LOG_TAIL_BYTES: u64 = 16 * 1024;
 const RESULT_FORMAT_VERSION: u32 = 3;
-const MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const ARTIFACT_SCHEMA: &str = "flashback_import";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -102,15 +105,8 @@ impl Runtime<'_> {
         self.work_dir.join("active-process.json")
     }
 
-    fn check_work_quota(&self) -> Result<(), RecoveryError> {
-        let work_bytes = tree_apparent_bytes(&self.work_dir)?;
-        if work_bytes > self.config.max_work_bytes {
-            return Err(RecoveryError::WorkQuotaExceeded {
-                required: work_bytes,
-                limit: self.config.max_work_bytes,
-            });
-        }
-        Ok(())
+    fn check_capacity(&self) -> Result<(), RecoveryError> {
+        check_capacity(self.config, &self.work_dir)
     }
 
     fn cleanup(&mut self) -> Result<(), RecoveryError> {
@@ -170,6 +166,7 @@ pub fn execute_restore(
     reject_symlink_path(&work_dir, "request work directory")?;
     let result_path = work_dir.join("result.json");
     if let Some(existing) = reusable_result(config, request, &result_path)? {
+        write_artifact_pin(&work_dir, &request.request_id, &existing.artifact_sha256)?;
         return Ok(existing);
     }
     let _profile_lock = acquire_profile_lock(config)?;
@@ -184,6 +181,11 @@ pub fn execute_restore(
             runtime.cleanup()?;
             result.cleanup_complete = true;
             write_json_atomic(&runtime.result_path, &result)?;
+            write_artifact_pin(
+                &runtime.work_dir,
+                &runtime.request.request_id,
+                &result.artifact_sha256,
+            )?;
             runtime.write_state("completed", None)?;
             Ok(result)
         }
@@ -208,6 +210,13 @@ fn acquire_request_lock(
     config: &RecoveryConfig,
     request: &RestoreRequest,
 ) -> Result<File, RecoveryError> {
+    acquire_request_lock_for_id(config, &request.request_id)
+}
+
+pub(crate) fn acquire_request_lock_for_id(
+    config: &RecoveryConfig,
+    request_id: &str,
+) -> Result<File, RecoveryError> {
     let lock_dir = config.work_root.join(".locks");
     prepare_secure_directory(&lock_dir)?;
     let lock = OpenOptions::new()
@@ -217,14 +226,14 @@ fn acquire_request_lock(
         .mode(0o600)
         .truncate(false)
         .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(lock_dir.join(format!("{}.lock", request.request_id)))
+        .open(lock_dir.join(format!("{request_id}.lock")))
         .map_err(|error| RecoveryError::Io {
             operation: "opening request lock",
             message: error.to_string(),
         })?;
     FileExt::try_lock_exclusive(&lock).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            RecoveryError::RequestAlreadyRunning(request.request_id.clone())
+            RecoveryError::RequestAlreadyRunning(request_id.to_owned())
         } else {
             RecoveryError::Io {
                 operation: "locking request",
@@ -235,8 +244,10 @@ fn acquire_request_lock(
     Ok(lock)
 }
 
-fn acquire_profile_lock(config: &RecoveryConfig) -> Result<File, RecoveryError> {
-    let lock_path = config.work_root.join(".locks").join("execution.lock");
+pub(crate) fn acquire_profile_lock(config: &RecoveryConfig) -> Result<File, RecoveryError> {
+    let lock_dir = config.work_root.join(".locks");
+    prepare_secure_directory(&lock_dir)?;
+    let lock_path = lock_dir.join("execution.lock");
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -337,23 +348,21 @@ fn prepare_runtime<'a>(
     let log_dir = work_dir.join("logs");
     prepare_secure_directory(&log_dir)?;
 
-    let available = fs2::available_space(&config.work_root).map_err(|error| RecoveryError::Io {
-        operation: "checking initial work filesystem capacity",
-        message: error.to_string(),
-    })?;
+    let available = available_work_space(config)?;
     let minimum_free = if plan.engine == RecoveryEngine::ClassicRestore {
         plan.estimated_backup_bytes
             .unwrap_or(0)
-            .saturating_add(MIN_FREE_BYTES)
+            .saturating_add(config.min_free_bytes)
     } else {
-        MIN_FREE_BYTES.min(config.max_work_bytes)
+        config.min_free_bytes.min(config.max_work_bytes)
     };
     if available < minimum_free {
-        return Err(RecoveryError::WorkQuotaExceeded {
+        return Err(RecoveryError::FreeSpaceExhausted {
+            available,
             required: minimum_free,
-            limit: available,
         });
     }
+    check_work_root_quota(config)?;
     let cancellation = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&cancellation)).map_err(|error| {
         RecoveryError::Io {
@@ -384,32 +393,10 @@ fn prepare_runtime<'a>(
     })
 }
 
-fn tree_apparent_bytes(path: &Path) -> Result<u64, RecoveryError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| RecoveryError::Io {
-        operation: "reading work quota metadata",
-        message: format!("{}: {error}", path.display()),
-    })?;
-    if !metadata.is_dir() {
-        return Ok(metadata.len());
-    }
-
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path).map_err(|error| RecoveryError::Io {
-        operation: "walking work quota directory",
-        message: format!("{}: {error}", path.display()),
-    })? {
-        let entry = entry.map_err(|error| RecoveryError::Io {
-            operation: "reading work quota entry",
-            message: error.to_string(),
-        })?;
-        total = total.saturating_add(tree_apparent_bytes(&entry.path())?);
-    }
-    Ok(total)
-}
-
 fn execute_inner(runtime: &mut Runtime<'_>) -> Result<RestoreResult, RecoveryError> {
     let total_started = Instant::now();
     runtime.check_cancelled()?;
+    runtime.check_capacity()?;
 
     let materialize_started = Instant::now();
     runtime.write_state(
@@ -418,7 +405,7 @@ fn execute_inner(runtime: &mut Runtime<'_>) -> Result<RestoreResult, RecoveryErr
     )?;
     let repository_lock = materialize(runtime)?;
     let materialize_ms = elapsed_ms(materialize_started);
-    runtime.check_work_quota()?;
+    runtime.check_capacity()?;
 
     validate_materialized_cluster(runtime)?;
     if runtime.plan.engine == RecoveryEngine::SnapshotDirect {
@@ -434,7 +421,7 @@ fn execute_inner(runtime: &mut Runtime<'_>) -> Result<RestoreResult, RecoveryErr
         message: error.to_string(),
     })?;
     let recovery_ms = elapsed_ms(recovery_started);
-    runtime.check_work_quota()?;
+    runtime.check_capacity()?;
 
     let validate_started = Instant::now();
     runtime.write_state("validating", None)?;
@@ -448,7 +435,7 @@ fn execute_inner(runtime: &mut Runtime<'_>) -> Result<RestoreResult, RecoveryErr
     let artifact_table = artifact_table_name(&runtime.request.request_id);
     let artifact_schema_sha256 = prepare_export_table(runtime, &artifact_table)?;
     extract_table(runtime)?;
-    runtime.check_work_quota()?;
+    runtime.check_capacity()?;
     let extract_ms = elapsed_ms(extract_started);
     let artifact_bytes = fs::metadata(&runtime.artifact_path)
         .map_err(|error| RecoveryError::Io {
@@ -610,6 +597,7 @@ fn materialize_snapshot(runtime: &Runtime<'_>) -> Result<(), RecoveryError> {
         "snapshot materialization",
         runtime.config.command_timeout_seconds,
         &runtime.cancellation,
+        Some(runtime),
     )
 }
 
@@ -643,6 +631,7 @@ fn materialize_classic(runtime: &Runtime<'_>) -> Result<(), RecoveryError> {
         "classic pgBackRest restore",
         runtime.config.command_timeout_seconds,
         &runtime.cancellation,
+        Some(runtime),
     )
 }
 
@@ -847,6 +836,7 @@ fn start_postgres(runtime: &mut Runtime<'_>) -> Result<(), RecoveryError> {
         "starting temporary PostgreSQL",
         runtime.config.command_timeout_seconds,
         &runtime.cancellation,
+        Some(runtime),
     );
     runtime.postgres_started = runtime.pgdata.join("postmaster.pid").exists();
     result?;
@@ -856,13 +846,13 @@ fn start_postgres(runtime: &mut Runtime<'_>) -> Result<(), RecoveryError> {
 
 fn wait_for_promotion(runtime: &Runtime<'_>) -> Result<(), RecoveryError> {
     let started = Instant::now();
-    let mut last_quota_check = Instant::now();
+    let mut last_capacity_check = Instant::now();
     let timeout = Duration::from_secs(runtime.config.recovery_timeout_seconds);
     loop {
         runtime.check_cancelled()?;
-        if last_quota_check.elapsed() >= Duration::from_secs(1) {
-            runtime.check_work_quota()?;
-            last_quota_check = Instant::now();
+        if last_capacity_check.elapsed() >= Duration::from_secs(1) {
+            runtime.check_capacity()?;
+            last_capacity_check = Instant::now();
         }
         if started.elapsed() > timeout {
             return Err(RecoveryError::CommandTimeout {
@@ -1078,6 +1068,7 @@ fn extract_table(runtime: &Runtime<'_>) -> Result<(), RecoveryError> {
         "extracting target table",
         runtime.config.command_timeout_seconds,
         &runtime.cancellation,
+        Some(runtime),
     )
 }
 
@@ -1107,6 +1098,7 @@ fn psql_output(runtime: &Runtime<'_>, sql: &str) -> Result<String, RecoveryError
         "querying temporary PostgreSQL",
         runtime.config.command_timeout_seconds,
         &runtime.cancellation,
+        Some(runtime),
     )?;
     if !output.status.success() {
         return Err(RecoveryError::CommandFailed {
@@ -1117,6 +1109,7 @@ fn psql_output(runtime: &Runtime<'_>, sql: &str) -> Result<String, RecoveryError
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_captured_command(
     command: &mut Command,
     stdout_path: &Path,
@@ -1125,6 +1118,7 @@ fn run_captured_command(
     operation: &'static str,
     timeout_seconds: u64,
     cancellation: &Arc<AtomicBool>,
+    capacity: Option<&Runtime<'_>>,
 ) -> Result<std::process::Output, RecoveryError> {
     let program = PathBuf::from(command.get_program());
     let stdout_file = secure_output_file(stdout_path)?;
@@ -1143,6 +1137,7 @@ fn run_captured_command(
         register_active_process(&mut child, active_process_path, operation)?;
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
+    let mut last_capacity_check = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait().map_err(|error| RecoveryError::Io {
@@ -1164,6 +1159,15 @@ fn run_captured_command(
         if cancellation.load(Ordering::SeqCst) {
             terminate_process_group(&mut child, process_group);
             return Err(RecoveryError::Cancelled);
+        }
+        if let Some(runtime) = capacity {
+            if last_capacity_check.elapsed() >= Duration::from_secs(1) {
+                if let Err(error) = runtime.check_capacity() {
+                    terminate_process_group(&mut child, process_group);
+                    return Err(error);
+                }
+                last_capacity_check = Instant::now();
+            }
         }
         if started.elapsed() > timeout {
             terminate_process_group(&mut child, process_group);
@@ -1189,6 +1193,7 @@ fn secure_output_file(path: &Path) -> Result<File, RecoveryError> {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_logged_command(
     command: &mut Command,
     log_path: &Path,
@@ -1196,6 +1201,7 @@ fn run_logged_command(
     operation: &'static str,
     timeout_seconds: u64,
     cancellation: &Arc<AtomicBool>,
+    capacity: Option<&Runtime<'_>>,
 ) -> Result<(), RecoveryError> {
     let program = PathBuf::from(command.get_program());
     let log = OpenOptions::new()
@@ -1226,6 +1232,7 @@ fn run_logged_command(
         register_active_process(&mut child, active_process_path, operation)?;
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
+    let mut last_capacity_check = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait().map_err(|error| RecoveryError::Io {
@@ -1244,6 +1251,15 @@ fn run_logged_command(
         if cancellation.load(Ordering::SeqCst) {
             terminate_process_group(&mut child, process_group);
             return Err(RecoveryError::Cancelled);
+        }
+        if let Some(runtime) = capacity {
+            if last_capacity_check.elapsed() >= Duration::from_secs(1) {
+                if let Err(error) = runtime.check_capacity() {
+                    terminate_process_group(&mut child, process_group);
+                    return Err(error);
+                }
+                last_capacity_check = Instant::now();
+            }
         }
         if started.elapsed() > timeout {
             terminate_process_group(&mut child, process_group);
@@ -1360,7 +1376,11 @@ fn stop_postgres(config: &RecoveryConfig, pgdata: &Path) -> Result<(), RecoveryE
     }
 }
 
-fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<(), RecoveryError> {
+#[allow(clippy::too_many_lines)]
+pub(crate) fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<(), RecoveryError> {
+    if !config.work_root.exists() {
+        return Ok(());
+    }
     for entry in fs::read_dir(&config.work_root).map_err(|error| RecoveryError::Io {
         operation: "scanning abandoned recovery requests",
         message: error.to_string(),
@@ -1379,7 +1399,7 @@ fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<(), RecoveryE
         let Some(request_id) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if request_id.starts_with('.') || !safe_request_directory_name(&request_id) {
+        if !is_request_directory_name(&request_id) {
             continue;
         }
 
@@ -1387,8 +1407,23 @@ fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<(), RecoveryE
         let active_process_path = work_dir.join("active-process.json");
         let pgdata = work_dir.join("pgdata");
         let socket_dir = socket_directory(config, &request_id)?;
-        let abandoned = active_process_path.is_file() || pgdata.exists() || socket_dir.exists();
-        if !abandoned {
+        let result_path = work_dir.join("result.json");
+        let state_path = work_dir.join("state.json");
+        let abandoned_runtime =
+            active_process_path.is_file() || pgdata.exists() || socket_dir.exists();
+
+        // Incomplete failed directories without a reusable result are cleaned so
+        // aggregate quota accounts only for live or completed work.
+        let orphan_incomplete = !abandoned_runtime
+            && !result_path.is_file()
+            && state_path.is_file()
+            && matches!(
+                load_json::<ExecutionState>(&state_path).ok().as_ref().map(|state| state.phase.as_str()),
+                Some("failed" | "cleanup_failed" | "accepted" | "materializing" | "recovering"
+                    | "validating" | "extracting" | "cleaning")
+            );
+
+        if !abandoned_runtime && !orphan_incomplete {
             continue;
         }
 
@@ -1405,13 +1440,55 @@ fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<(), RecoveryE
             ))
         })?;
         remove_file_if_exists(&work_dir.join("target-table.dump"))?;
+        // Drop partial logs/tmp so aggregate quota does not retain crash debris.
+        if orphan_incomplete || abandoned_runtime {
+            for name in ["logs", "pgdata"] {
+                remove_dir_if_exists(&work_dir.join(name)).map_err(|error| {
+                    RecoveryError::CleanupFailed(format!(
+                        "cannot remove abandoned {name} for {request_id}: {error}"
+                    ))
+                })?;
+            }
+            for entry in fs::read_dir(&work_dir).map_err(|error| RecoveryError::Io {
+                operation: "scanning abandoned request debris",
+                message: error.to_string(),
+            })? {
+                let entry = entry.map_err(|error| RecoveryError::Io {
+                    operation: "reading abandoned request debris",
+                    message: error.to_string(),
+                })?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+                    || name.starts_with('.')
+                {
+                    if entry.path().is_dir() {
+                        remove_dir_if_exists(&entry.path()).map_err(|error| {
+                            RecoveryError::CleanupFailed(format!(
+                                "cannot remove abandoned temp dir for {request_id}: {error}"
+                            ))
+                        })?;
+                    } else {
+                        remove_file_if_exists(&entry.path())?;
+                    }
+                }
+            }
+        }
         write_json_atomic(
             &work_dir.join("state.json"),
             &ExecutionState {
                 request_id,
                 phase: "reconciled_after_crash".to_owned(),
                 updated_at_unix_seconds: unix_seconds()?,
-                detail: None,
+                detail: Some(if orphan_incomplete {
+                    "cleared incomplete request without reusable artifact".to_owned()
+                } else {
+                    "cleared abandoned runtime material".to_owned()
+                }),
             },
         )?;
     }
@@ -1462,14 +1539,6 @@ fn terminate_recorded_process(path: &Path) -> Result<(), RecoveryError> {
 
 fn process_matches(process_id: u32, start_ticks: u64) -> bool {
     process_start_ticks(process_id).is_ok_and(|actual| actual == start_ticks)
-}
-
-fn safe_request_directory_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn reconcile_stale_request(
@@ -1534,7 +1603,7 @@ fn reject_repository_symlink_components(root: &Path, target: &Path) -> Result<()
     Ok(())
 }
 
-fn prepare_secure_directory(path: &Path) -> Result<(), RecoveryError> {
+pub(crate) fn prepare_secure_directory(path: &Path) -> Result<(), RecoveryError> {
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(RecoveryError::InvalidConfig(format!(
             "secure directory may not be a symlink: {}",
@@ -1634,7 +1703,7 @@ fn command_output(program: &Path, args: &[&str]) -> Result<String, RecoveryError
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), RecoveryError> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), RecoveryError> {
     let parent = path.parent().ok_or_else(|| RecoveryError::Io {
         operation: "resolving JSON parent directory",
         message: path.display().to_string(),
@@ -1720,7 +1789,7 @@ fn read_log_tail(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).trim().to_owned()
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<(), RecoveryError> {
+pub(crate) fn remove_file_if_exists(path: &Path) -> Result<(), RecoveryError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1731,7 +1800,7 @@ fn remove_file_if_exists(path: &Path) -> Result<(), RecoveryError> {
     }
 }
 
-fn remove_dir_if_exists(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

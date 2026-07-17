@@ -117,6 +117,11 @@ override any of these paths or options.
   "snapshot_provider": "xfs_reflink",
   "expire_lock_path": "/run/pg_flashback/app-repo2.lock",
   "max_work_bytes": 1099511627776,
+  "max_work_root_bytes": 2199023255552,
+  "min_free_bytes": 67108864,
+  "artifact_ttl_seconds": 86400,
+  "max_retained_artifacts": 32,
+  "max_retained_artifact_bytes": 1099511627776,
   "command_timeout_seconds": 3600,
   "recovery_timeout_seconds": 7200
 }
@@ -124,8 +129,10 @@ override any of these paths or options.
 
 `max_work_bytes` is a logical request-tree ceiling. Set it above the selected
 full backup's logical size even when reflinks make the additional physical
-allocation small. The helper also checks filesystem headroom and rechecks the
-work tree during WAL replay.
+allocation small. `max_work_root_bytes` bounds the aggregate of all request
+directories under `work_root`. The helper continuously enforces
+`min_free_bytes` during materialize/replay/export, pins completed artifacts
+until import (`unpin`), and expires them with `gc` / `gc --dry-run`.
 
 Probe before enabling the profile:
 

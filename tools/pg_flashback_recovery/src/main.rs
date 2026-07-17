@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use pg_flashback_recovery::error::RecoveryError;
 use pg_flashback_recovery::model::{ErrorResponse, RecoveryConfig, RestoreRequest};
 use pg_flashback_recovery::{
-    build_plan, load_json, load_recovery_config, restore_table, run_probe,
+    build_plan, load_json, load_recovery_config, restore_table, run_gc, run_probe, unpin_artifact,
 };
 use serde::Serialize;
 
@@ -38,6 +38,21 @@ enum Commands {
         config: PathBuf,
         #[arg(long)]
         request: PathBuf,
+    },
+    /// Garbage-collect abandoned work and expired or excess artifacts.
+    Gc {
+        #[arg(long)]
+        config: PathBuf,
+        /// Report decisions without deleting anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Release an awaiting-import artifact pin after successful import.
+    Unpin {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request_id: String,
     },
 }
 
@@ -72,6 +87,22 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             let request: RestoreRequest = load_json(&request)?;
             to_value(restore_table(&config, &request)?)
+        }
+        Commands::Gc { config, dry_run } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            to_value(run_gc(&config, dry_run)?)
+        }
+        Commands::Unpin {
+            config,
+            request_id,
+        } => {
+            let config: RecoveryConfig = load_recovery_config(&config)?;
+            unpin_artifact(&config, &request_id)?;
+            to_value(serde_json::json!({
+                "status": "ok",
+                "request_id": request_id,
+                "pin_released": true,
+            }))
         }
     }
 }

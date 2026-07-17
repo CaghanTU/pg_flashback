@@ -82,6 +82,8 @@ GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)        TO flashba
 GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz)      TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text, pg_lsn)         TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text[], pg_lsn)       TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_estimate_local_restore_peak_bytes(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_local_restore_preflight(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted_lsn(text, pg_lsn) TO flashback_admin;

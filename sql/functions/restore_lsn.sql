@@ -2,6 +2,75 @@
 -- Correctness-qualified COMMIT-LSN restore/query/recovery APIs.
 -- =================================================================
 
+-- Conservative local-restore peak model (shadow + successor base + reserve).
+-- Filesystem free-space probes remain OS/helper concerns; this gate rejects
+-- restores whose projected peak clearly exceeds the operator budget.
+CREATE OR REPLACE FUNCTION flashback_estimate_local_restore_peak_bytes(p_rel regclass)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_live bigint;
+    v_reserve bigint;
+BEGIN
+    IF p_rel IS NULL THEN
+        RAISE EXCEPTION 'flashback_estimate_local_restore_peak_bytes: relation is NULL';
+    END IF;
+    v_live := pg_total_relation_size(p_rel);
+    v_reserve := COALESCE(
+        pg_size_bytes(
+            COALESCE(
+                NULLIF(current_setting('pg_flashback.local_restore_safety_reserve_bytes', true), ''),
+                '64MB'
+            )
+        ),
+        67108864
+    );
+    IF v_reserve < 0 THEN
+        RAISE EXCEPTION 'pg_flashback.local_restore_safety_reserve_bytes must be non-negative';
+    END IF;
+    RETURN (v_live * 2) + v_reserve;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_local_restore_preflight(p_rel regclass)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_peak bigint;
+    v_max bigint;
+BEGIN
+    v_peak := flashback_estimate_local_restore_peak_bytes(p_rel);
+    v_max := COALESCE(
+        pg_size_bytes(
+            COALESCE(
+                NULLIF(current_setting('pg_flashback.local_restore_max_peak_bytes', true), ''),
+                '0'
+            )
+        ),
+        0
+    );
+    IF v_max < 0 THEN
+        RAISE EXCEPTION 'pg_flashback.local_restore_max_peak_bytes must be non-negative';
+    END IF;
+    IF v_max > 0 AND v_peak > v_max THEN
+        RAISE EXCEPTION
+            'pg_flashback: local restore peak estimate % bytes exceeds pg_flashback.local_restore_max_peak_bytes=%',
+            v_peak, v_max
+            USING ERRCODE = 'disk_full',
+                  HINT = 'Free space, raise the budget, or use the backup recovery profile.';
+    END IF;
+    RETURN v_peak;
+END;
+$$;
+
 -- Drain every already-committed WAL record for relations that are about to be
 -- physically swapped. Logical decoding cannot reconstruct a relation after
 -- its old pg_class row is dropped, so a restore must prove this queue empty
@@ -411,6 +480,11 @@ BEGIN
                                   hashint8(admission.tracking_id));
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
+
+    -- Capacity preflight before the final-strength relation lock.
+    PERFORM flashback_local_restore_preflight(
+        format('%I.%I', admission.schema_name, admission.table_name)::regclass
+    );
 
     -- Freeze the old physical relation before draining its logical backlog.
     -- ensure_active_wal_stream() already owns the database-stream key, so the
