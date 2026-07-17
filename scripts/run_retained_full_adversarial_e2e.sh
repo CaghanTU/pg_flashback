@@ -215,7 +215,7 @@ cat >> "$PRIMARY_DIR/postgresql.conf" <<EOF
 port = $PRIMARY_PORT
 unix_socket_directories = '$SOCKET_DIR'
 listen_addresses = ''
-wal_level = replica
+wal_level = logical
 archive_mode = on
 archive_command = '$PGBACKREST --config=$PGBACKREST_CONFIG --stanza=$STANZA archive-push %p'
 archive_timeout = 1
