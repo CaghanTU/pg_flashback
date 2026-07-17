@@ -1,0 +1,12 @@
+{
+  "run_id": "20260717T003935Z-544734",
+  "commit": "39fabad5dde08c2655cb0f880b07a15c1c2506c2",
+  "status": "PASS",
+  "rows": 100,
+  "measurements": {
+    "default_replica_identity": {"wal_bytes": 44400, "rough_txn_latency_ms": 4},
+    "replica_identity_full": {"wal_bytes": 54056, "rough_txn_latency_ms": 5, "wal_ratio_to_default": 1.217},
+    "tracked_local_delta": {"wal_bytes": 54032, "rough_txn_latency_ms": 4, "wal_ratio_to_default": 1.217, "captured_update_rows": 100}
+  },
+  "limitations": "Single-node development sample. WAL includes checkpoint/full-page-image effects and does not establish production throughput or retention capacity."
+}

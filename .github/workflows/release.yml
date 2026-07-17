@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
 
 permissions:
   contents: read
@@ -23,9 +24,13 @@ jobs:
         run: |
           package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           helper_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' tools/pg_flashback_recovery/Cargo.toml | head -1)"
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
           test "$helper_version" = "$package_version"
-          grep -Fq "## [${package_version}]" CHANGELOG.md
+          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            test "${GITHUB_REF_NAME%-rc.*}" = "v${package_version}"
+          else
+            test "${GITHUB_REF_NAME}" = "v${package_version}"
+            grep -Fq "## [${package_version}]" CHANGELOG.md
+          fi
 
   extension-package:
     name: Extension package (PG${{ matrix.pg }})
@@ -194,11 +199,19 @@ jobs:
       - name: Extract release notes
         run: |
           version="${GITHUB_REF_NAME#v}"
-          awk -v heading="## [${version}]" '
-            $0 == heading {found=1; next}
-            found && /^## \[/ {exit}
-            found {print}
-          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          if [[ "$version" =~ -rc\.[0-9]+$ ]]; then
+            awk '
+              /^## \[/ && $0 != "## [Unreleased]" {exit}
+              /^## \[Unreleased\]/ {found=1; next}
+              found {print}
+            ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          else
+            awk -v heading="## [${version}]" '
+              $0 == heading {found=1; next}
+              found && /^## \[/ {exit}
+              found {print}
+            ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          fi
           test -s dist/RELEASE_NOTES.md
 
       - name: Create draft GitHub Release
@@ -209,4 +222,4 @@ jobs:
             dist/*.tar.gz
             dist/SHA256SUMS
           draft: true
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
