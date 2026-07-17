@@ -15,6 +15,7 @@ qualification_sha256_or_null() {
 qualification_provenance_init() {
     local root=$1
     local pg_config=$2
+    QUALIFICATION_REPO_ROOT="$root"
     QUALIFICATION_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     QUALIFICATION_TESTED_COMMIT="$(git -C "$root" rev-parse HEAD)"
     QUALIFICATION_BRANCH="$(git -C "$root" branch --show-current)"
@@ -37,21 +38,36 @@ qualification_provenance_init() {
         qualification_sha256_or_null \
             "$root/tools/pg_flashback_recovery/target/release/pg-flashback-recovery"
     )"
+    if [[ "$QUALIFICATION_HELPER_SHA256" == "null" ]]; then
+        QUALIFICATION_HELPER_SHA256="$(
+            qualification_sha256_or_null \
+                "$root/tools/pg_flashback_recovery/target/debug/pg-flashback-recovery"
+        )"
+    fi
 }
 
 qualification_provenance_json() {
     local finished_at=$1
+    local source_tree
+    source_tree="$(git -C "${QUALIFICATION_REPO_ROOT:-.}" rev-parse "${QUALIFICATION_TESTED_COMMIT}^{tree}" 2>/dev/null || true)"
     cat <<EOF
   "provenance": {
+    "source_commit": "$QUALIFICATION_TESTED_COMMIT",
+    "source_tree": "$source_tree",
     "tested_commit": "$QUALIFICATION_TESTED_COMMIT",
+    "tree_clean_at_start": $QUALIFICATION_TREE_CLEAN,
     "tree_clean": $QUALIFICATION_TREE_CLEAN,
     "branch": "$QUALIFICATION_BRANCH",
     "exact_tag": "$QUALIFICATION_EXACT_TAG",
     "postgresql_version": "$QUALIFICATION_POSTGRES_VERSION",
     "extension_binary_sha256": $QUALIFICATION_EXTENSION_SHA256,
+    "helper_binary_sha256": $QUALIFICATION_HELPER_SHA256,
     "helper_release_binary_sha256": $QUALIFICATION_HELPER_SHA256,
+    "run_started_at": "$QUALIFICATION_STARTED_AT",
+    "run_completed_at": "$finished_at",
     "started_at": "$QUALIFICATION_STARTED_AT",
-    "finished_at": "$finished_at"
+    "finished_at": "$finished_at",
+    "note": "source_commit is the tested tree; a later evidence-summary commit must differ only in docs/evidence"
   }
 EOF
 }
