@@ -562,9 +562,7 @@ pub fn expire_backups(config: &RecoveryConfig) -> Result<ExpireResult, RecoveryE
         )));
     }
     let lease_id = lease.lease_id.ok_or_else(|| {
-        RecoveryError::VerificationFailed(
-            "controller expiration lease has no lease_id".to_owned(),
-        )
+        RecoveryError::VerificationFailed("controller expiration lease has no lease_id".to_owned())
     })?;
     let output = Command::new(&config.pgbackrest_bin)
         .arg(format!("--config={}", config.pgbackrest_config.display()))
@@ -1031,11 +1029,7 @@ fn contiguous_archive_frontier_at(
             observed,
         });
     }
-    let mut segment = segment_name(
-        expected_timeline,
-        start_segment,
-        segment_size,
-    );
+    let mut segment = segment_name(expected_timeline, start_segment, segment_size);
     let mut proof = Sha256::new();
     let mut frontier = start;
     for _ in 0..1_000_000 {
