@@ -290,13 +290,12 @@ set -e
                    WHERE tracking_id=$TRACKING_ID AND state='active';")" == "0" ]]
 pass "corrupted manifest rejected; coverage stays unanchored"
 
-# Negative: missing middle WAL rejected for retained activation.
+# Negative: missing required WAL rejected for retained activation.
 MISSING_REPO="$RUN_ROOT/repo-missing-wal"
 cp -a --reflink=always "$REPO_DIR" "$MISSING_REPO"
-mapfile -t WAL_SEGS < <(find "$MISSING_REPO/archive/$STANZA" -type f \
-    -regextype posix-extended -regex '.*/[0-9A-Fa-f]{24}-[0-9a-f]{40}' | sort)
-[[ "${#WAL_SEGS[@]}" -ge 2 ]] || die "need >=2 WAL segments"
-rm -f "${WAL_SEGS[-2]}"
+# Delete the archive tree so contiguous WAL from backup stop cannot be proven.
+rm -rf "$MISSING_REPO/archive/$STANZA"
+mkdir -p "$MISSING_REPO/archive/$STANZA"
 PGBR_MISSING="$RUN_ROOT/pgbackrest-missing.conf"
 sed "s|$REPO_DIR|$MISSING_REPO|" "$PGBACKREST_CONFIG" > "$PGBR_MISSING"
 HELPER_MISSING="$RUN_ROOT/helper-missing.json"
@@ -311,7 +310,7 @@ set -e
 [[ "$MISSING_RC" != "0" ]] || die "missing WAL must fail retained verify-anchor"
 [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
                    WHERE tracking_id=$TRACKING_ID AND state='active';")" == "0" ]]
-pass "missing middle WAL rejects retained activation"
+pass "missing archive WAL rejects retained activation"
 
 # Positive: eligible retained FULL activates without a new FULL.
 VERIFY_REQ="$RUN_ROOT/verify-retained.json"
