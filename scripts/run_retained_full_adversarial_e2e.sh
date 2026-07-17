@@ -271,7 +271,9 @@ CORRUPT_REPO="$RUN_ROOT/repo-corrupt"
 cp -a --reflink=always "$REPO_DIR" "$CORRUPT_REPO"
 MANIFEST=$(find "$CORRUPT_REPO/backup/$STANZA/$FULL0_LABEL" -name backup.manifest | head -n1)
 [[ -f "$MANIFEST" ]] || die "manifest missing"
-printf 'corrupted' >> "$MANIFEST"
+# Break an identity-binding header field; trailing garbage alone is not enough
+# because verify-anchor hashes the on-disk bytes as the bound digest.
+sed -i 's/backup-label="[^"]*"/backup-label="TAMPERED-LABEL"/' "$MANIFEST"
 PGBR_CORRUPT="$RUN_ROOT/pgbackrest-corrupt.conf"
 sed "s|$REPO_DIR|$CORRUPT_REPO|" "$PGBACKREST_CONFIG" > "$PGBR_CORRUPT"
 HELPER_CORRUPT="$RUN_ROOT/helper-corrupt.json"
