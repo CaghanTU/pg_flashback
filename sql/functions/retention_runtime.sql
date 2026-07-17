@@ -472,11 +472,20 @@ BEGIN
     -- Newly created intents below are intentionally not processed until the
     -- next invocation, proving the durable intent precedes destructive work.
     FOR rec IN
-        SELECT r.generation_id
+        SELECT r.generation_id, r.tracking_id
         FROM flashback.generation_payload_retirements r
         WHERE r.state = 'retiring'
         ORDER BY r.requested_at, r.retirement_id
     LOOP
+        -- A restore or untrack may own this lifecycle key. Do not allow that
+        -- one table to head-of-line block cleanup for other tables; the
+        -- database stream key above is already held, preserving the common
+        -- database -> lifecycle lock order.
+        IF NOT pg_try_advisory_xact_lock(
+            358944::integer, hashint8(rec.tracking_id)
+        ) THEN
+            CONTINUE;
+        END IF;
         v_actions := v_actions
             + flashback_resume_generation_retirement(rec.generation_id);
     END LOOP;
@@ -517,8 +526,11 @@ BEGIN
         -- eligibility check so those expected states cannot abort retention
         -- for every other lifecycle.  The explicit begin function remains
         -- strict for callers that request one generation directly.
-        PERFORM pg_advisory_xact_lock(358944::integer,
-                                      hashint8(rec.tracking_id));
+        IF NOT pg_try_advisory_xact_lock(
+            358944::integer, hashint8(rec.tracking_id)
+        ) THEN
+            CONTINUE;
+        END IF;
 
         SELECT EXISTS (
             SELECT 1

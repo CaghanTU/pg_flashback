@@ -1,0 +1,15 @@
+{
+  "run_id": "20260717T003736Z-543463",
+  "status": "PASS",
+  "hold_seconds": 30,
+  "tracked_tables": ["public.m3_locked", "public.m3_open"],
+  "locked_tracking_id": 1,
+  "capture_progressed_on_unblocked_table_during_hold": true,
+  "unblocked_delta_rows_before_hold": 0,
+  "unblocked_delta_rows_last_sample_during_hold": 2900,
+  "unblocked_delta_rows_at_hold_end": 3000,
+  "samples": [{"second":1,"visible_rows":0,"slot_lag_bytes":158296},{"second":2,"visible_rows":100,"slot_lag_bytes":455176},{"second":3,"visible_rows":200,"slot_lag_bytes":460720},{"second":4,"visible_rows":300,"slot_lag_bytes":464912},{"second":5,"visible_rows":400,"slot_lag_bytes":386344},{"second":6,"visible_rows":500,"slot_lag_bytes":398752},{"second":7,"visible_rows":600,"slot_lag_bytes":443920},{"second":8,"visible_rows":700,"slot_lag_bytes":311608},{"second":9,"visible_rows":800,"slot_lag_bytes":448344},{"second":10,"visible_rows":900,"slot_lag_bytes":461840},{"second":11,"visible_rows":1000,"slot_lag_bytes":444880},{"second":12,"visible_rows":1100,"slot_lag_bytes":461616},{"second":13,"visible_rows":1200,"slot_lag_bytes":447824},{"second":14,"visible_rows":1300,"slot_lag_bytes":459216},{"second":15,"visible_rows":1400,"slot_lag_bytes":430400},{"second":16,"visible_rows":1500,"slot_lag_bytes":470528},{"second":17,"visible_rows":1600,"slot_lag_bytes":398496},{"second":18,"visible_rows":1700,"slot_lag_bytes":467880},{"second":19,"visible_rows":1800,"slot_lag_bytes":459200},{"second":20,"visible_rows":1900,"slot_lag_bytes":471784},{"second":21,"visible_rows":2000,"slot_lag_bytes":449336},{"second":22,"visible_rows":2100,"slot_lag_bytes":461872},{"second":23,"visible_rows":2200,"slot_lag_bytes":449872},{"second":24,"visible_rows":2300,"slot_lag_bytes":459160},{"second":25,"visible_rows":2400,"slot_lag_bytes":471032},{"second":26,"visible_rows":2500,"slot_lag_bytes":453416},{"second":27,"visible_rows":2600,"slot_lag_bytes":462056},{"second":28,"visible_rows":2700,"slot_lag_bytes":453872},{"second":29,"visible_rows":2800,"slot_lag_bytes":451080},{"second":30,"visible_rows":2900,"slot_lag_bytes":479936}],
+  "p95_visibility_target_ms": 2000,
+  "p95_visibility_ms": null,
+  "visibility_measurement_status": "PARTIAL: one-second polling samples prove progress but do not provide per-commit p95 latency."
+}

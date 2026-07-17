@@ -1225,36 +1225,118 @@ BEGIN
           AND cg.state IN ('building', 'active', 'sealed')
     ) recoverable_relations;
 
-    -- The stream lock acquired by flashback_ensure_active_wal_stream() is the
-    -- outer lock. Pin every qualified lifecycle in stable-ID order before WAL
-    -- promotion so retention cannot freeze counts/delete a sealed generation
-    -- while an already-owned backlog row is still being attached to it.
-    FOR lock_rec IN
-        SELECT tt.tracking_id
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile IN ('local_delta', 'backup')
-        ORDER BY tt.tracking_id
-    LOOP
-        PERFORM pg_advisory_xact_lock(358944::integer,
-                                      hashint8(lock_rec.tracking_id));
-    END LOOP;
-
     -- Do not advance the slot (or create temp/catalog WAL) when the output
     -- plugin has no user-table message.  get_changes() advances across
     -- filtered flashback.* WAL too; recording that advancement would itself
     -- generate more WAL and create a permanent worker feedback loop.
-    SELECT EXISTS (
-        SELECT 1
-        FROM pg_logical_slot_peek_changes(
-                 flashback_effective_slot_name(), NULL, batch_size,
-                 'tracked_oids', v_tracked_oids
-             ) AS ch(lsn, xid, data)
-        WHERE ch.data LIKE '{%'
-    ) INTO v_has_output;
+    DROP TABLE IF EXISTS pg_temp._fb_wal_peek;
+    CREATE TEMP TABLE _fb_wal_peek (
+        change_lsn pg_lsn,
+        source_xid bigint,
+        data jsonb,
+        ord bigint
+    ) ON COMMIT DROP;
+
+    INSERT INTO _fb_wal_peek(change_lsn, source_xid, data, ord)
+    SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
+    FROM pg_logical_slot_peek_changes(
+             flashback_effective_slot_name(), NULL, batch_size,
+             'tracked_oids', v_tracked_oids
+         )
+         WITH ORDINALITY AS ch(lsn, xid, data, ord)
+    WHERE ch.data LIKE '{%'
+    ORDER BY ch.ord;
+
+    SELECT EXISTS (SELECT 1 FROM _fb_wal_peek) INTO v_has_output;
     IF NOT v_has_output THEN
         RETURN 0;
     END IF;
+
+    -- Pin only lifecycles touched by this peeked batch (plus building boundary
+    -- resolutions and pending protected DDL for commits in the batch). Waiting
+    -- on every active lifecycle made an unrelated restore/maintenance hold
+    -- head-of-line block capture for other tables.
+    --
+    -- If any required lifecycle pin is busy, skip without get_changes so the
+    -- slot does not advance past rows we are not allowed to promote yet.
+    DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
+    CREATE TEMP TABLE _fb_wal_lock_ids (
+        tracking_id bigint PRIMARY KEY
+    ) ON COMMIT DROP;
+
+    INSERT INTO _fb_wal_lock_ids(tracking_id)
+    SELECT DISTINCT needed.tracking_id
+    FROM (
+        SELECT tt.tracking_id
+        FROM _fb_wal_peek p
+        JOIN flashback.tracked_tables tt
+          ON tt.is_active
+         AND tt.recovery_profile IN ('local_delta', 'backup')
+         AND tt.rel_oid = (p.data->>'oid')::oid
+        WHERE (p.data->>'op') IN (
+            'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'DROP', 'ALTER'
+        )
+
+        UNION
+
+        SELECT cg.tracking_id
+        FROM _fb_wal_peek p
+        JOIN flashback.coverage_generations cg
+          ON cg.rel_oid_at_boundary = (p.data->>'oid')::oid
+         AND cg.state IN ('building', 'active', 'sealed')
+        JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = cg.tracking_id
+         AND tt.is_active
+         AND tt.recovery_profile = 'local_delta'
+        WHERE (p.data->>'op') IN (
+            'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'DROP', 'ALTER'
+        )
+
+        UNION
+
+        SELECT cg.tracking_id
+        FROM flashback.coverage_generations cg
+        WHERE cg.state = 'building'
+          AND (
+              cg.stream_id = v_stream_id
+              OR (
+                  cg.recovery_profile = 'backup'
+                  AND cg.stream_id IS NULL
+              )
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM _fb_wal_peek p
+              WHERE p.data ? 'commit'
+                AND (p.data->>'commit')::bigint = cg.boundary_xid
+          )
+
+        UNION
+
+        SELECT tt.tracking_id
+        FROM flashback.pending_wal_events pend
+        JOIN flashback.tracked_tables tt
+          ON tt.rel_oid = pend.rel_oid
+         AND tt.is_active
+        WHERE pend.stream_id = v_stream_id
+          AND EXISTS (
+              SELECT 1
+              FROM _fb_wal_peek p
+              WHERE p.data ? 'commit'
+                AND (p.data->>'commit')::bigint = pend.source_xid
+          )
+    ) needed
+    WHERE needed.tracking_id IS NOT NULL;
+
+    FOR lock_rec IN
+        SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
+    LOOP
+        IF NOT pg_try_advisory_xact_lock(
+            358944::integer, hashint8(lock_rec.tracking_id)
+        ) THEN
+            RETURN 0;
+        END IF;
+    END LOOP;
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
     DROP TABLE IF EXISTS pg_temp._fb_wal_commits;
@@ -1628,19 +1710,42 @@ BEGIN
          WHERE stream_id = v_stream_id
            AND state = 'active';
 
-        UPDATE flashback.coverage_generations
-           SET valid_through_lsn = LEAST(
-                   v_frontier_lsn,
-                   COALESCE(superseded_before_lsn, v_frontier_lsn)
-               ),
-               valid_through_time = CASE
-                   WHEN superseded_before_lsn IS NULL OR v_frontier_lsn < superseded_before_lsn
-                       THEN v_frontier_time
-                   ELSE valid_through_time
-               END
-         WHERE stream_id = v_stream_id
-           AND state IN ('active', 'sealed')
-           AND valid_through_lsn <= v_frontier_lsn;
+        -- Advance watermarks for lifecycles pinned for this batch. Independently
+        -- try-lock idle lifecycles so an unrelated hold does not freeze their
+        -- empty prefix, while a busy restore/untrack still owns its watermark.
+        FOR lock_rec IN
+            SELECT DISTINCT cg.tracking_id
+            FROM flashback.coverage_generations cg
+            WHERE cg.stream_id = v_stream_id
+              AND cg.state IN ('active', 'sealed')
+              AND cg.valid_through_lsn <= v_frontier_lsn
+            ORDER BY cg.tracking_id
+        LOOP
+            IF NOT EXISTS (
+                SELECT 1 FROM _fb_wal_lock_ids pinned
+                WHERE pinned.tracking_id = lock_rec.tracking_id
+            ) AND NOT pg_try_advisory_xact_lock(
+                358944::integer, hashint8(lock_rec.tracking_id)
+            ) THEN
+                CONTINUE;
+            END IF;
+
+            UPDATE flashback.coverage_generations
+               SET valid_through_lsn = LEAST(
+                       v_frontier_lsn,
+                       COALESCE(superseded_before_lsn, v_frontier_lsn)
+                   ),
+                   valid_through_time = CASE
+                       WHEN superseded_before_lsn IS NULL
+                            OR v_frontier_lsn < superseded_before_lsn
+                           THEN v_frontier_time
+                       ELSE valid_through_time
+                   END
+             WHERE stream_id = v_stream_id
+               AND tracking_id = lock_rec.tracking_id
+               AND state IN ('active', 'sealed')
+               AND valid_through_lsn <= v_frontier_lsn;
+        END LOOP;
     ELSE
         UPDATE flashback.capture_streams
            SET confirmed_flush_lsn = v_confirmed_flush_lsn,

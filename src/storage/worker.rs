@@ -8,6 +8,9 @@ use std::time::Duration;
 
 static WORKER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(75);
 static WORKER_BATCH_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(4096);
+static MAINTENANCE_EVERY_N_CYCLES_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
+static MAINTENANCE_LOCK_TIMEOUT_MS_GUC: GucSetting<i32> = GucSetting::<i32>::new(250);
+static MAINTENANCE_STATEMENT_TIMEOUT_MS_GUC: GucSetting<i32> = GucSetting::<i32>::new(2_000);
 static MAX_ROW_SIZE_GUC: GucSetting<i32> = GucSetting::<i32>::new(65536);
 static ENABLED_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -75,6 +78,39 @@ pub fn register_worker_and_guc() {
         50_000,
         GucContext::Sighup,
         GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.maintenance_every_n_cycles",
+        c"Run pg_flashback maintenance every N capture cycles",
+        c"Checkpoints, partition creation, and retention run only after this many successful enabled capture cycles.",
+        &MAINTENANCE_EVERY_N_CYCLES_GUC,
+        1,
+        10_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.maintenance_lock_timeout_ms",
+        c"Lock wait limit for pg_flashback maintenance",
+        c"Maximum time a checkpoint, partition, or retention maintenance transaction waits for a lock before yielding to capture.",
+        &MAINTENANCE_LOCK_TIMEOUT_MS_GUC,
+        10,
+        60_000,
+        GucContext::Sighup,
+        GucFlags::UNIT_MS,
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.maintenance_statement_timeout_ms",
+        c"Statement limit for pg_flashback maintenance",
+        c"Maximum runtime for each checkpoint, partition, or retention maintenance transaction before it yields to capture.",
+        &MAINTENANCE_STATEMENT_TIMEOUT_MS_GUC,
+        50,
+        300_000,
+        GucContext::Sighup,
+        GucFlags::UNIT_MS,
     );
 
     GucRegistry::define_bool_guc(
@@ -268,6 +304,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let mut slot_warned = false;
     let mut last_enabled: Option<bool> = None;
     let mut last_mode: Option<&'static str> = None;
+    let mut enabled_cycle_count: u64 = 0;
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -321,12 +358,18 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             flush_staging_to_delta_log();
             let flush_ms = t0.elapsed().as_millis();
 
-            // Skip checkpoint and retention during active restore to avoid
-            // snapshotting a partially-restored table or purging needed deltas.
-            // Worker is a separate process, so check advisory locks via SPI.
+            // Maintenance is deliberately scheduled after capture and on a
+            // coarser cadence. Each maintenance operation has independent
+            // lock/statement limits, so a blocked lifecycle cannot hold up the
+            // next WAL consume or staging flush.
+            enabled_cycle_count = enabled_cycle_count.wrapping_add(1);
             let mut ckpt_ms: u128 = 0;
             let mut retention_ms: u128 = 0;
-            if !is_any_restore_active() {
+            let maintenance_every = MAINTENANCE_EVERY_N_CYCLES_GUC.get().clamp(1, 10_000) as u64;
+            if enabled_cycle_count % maintenance_every == 0 && !is_any_restore_active() {
+                // Skip checkpoint and retention during active restore to avoid
+                // snapshotting a partially-restored table or purging needed deltas.
+                // Worker is a separate process, so check advisory locks via SPI.
                 let t1 = std::time::Instant::now();
                 run_periodic_checkpoints();
                 run_ensure_partitions();
@@ -354,10 +397,6 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
 
     if is_capture_enabled() {
         flush_staging_to_delta_log();
-        if !is_any_restore_active() {
-            run_periodic_checkpoints();
-            run_retention_purge();
-        }
     }
     log!("pg_flashback delta worker {worker_index} stopped (database: {db_name})");
 }
@@ -565,60 +604,66 @@ fn flush_staging_to_delta_log() {
 }
 
 fn run_periodic_checkpoints() {
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        Spi::run(
-            "DO $$
+    run_bounded_maintenance(
+        "CHECKPOINT_WORKER",
+        "DO $$
                          BEGIN
                              IF to_regprocedure('flashback_take_due_checkpoints()') IS NOT NULL THEN
                                  PERFORM flashback_take_due_checkpoints();
                              END IF;
                          END
                          $$",
-        )?;
-        Ok(())
-    });
-
-    if let Err(err) = result {
-        log!("pg_flashback CHECKPOINT_WORKER_ERROR error={err:?}");
-    }
+    );
 }
 
 fn run_retention_purge() {
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        Spi::run(
-            "DO $$
+    run_bounded_maintenance(
+        "RETENTION_PURGE",
+        "DO $$
                          BEGIN
                              IF to_regprocedure('flashback_apply_retention()') IS NOT NULL THEN
                                  PERFORM flashback_apply_retention();
                              END IF;
                          END
                          $$",
-        )?;
-        Ok(())
-    });
-
-    if let Err(err) = result {
-        log!("pg_flashback RETENTION_PURGE_ERROR error={err:?}");
-    }
+    );
 }
 
 /// Ensure delta_log has a partition covering today (and next month if near month-end).
 /// No-op if delta_log is not partitioned.
 fn run_ensure_partitions() {
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        Spi::run(
-            "DO $$
+    run_bounded_maintenance(
+        "PARTITION_ENSURE",
+        "DO $$
              BEGIN
                  IF to_regprocedure('flashback_ensure_delta_partition(date)') IS NOT NULL THEN
                      PERFORM flashback_ensure_delta_partition(CURRENT_DATE);
                  END IF;
              END
              $$",
-        )?;
+    );
+}
+
+/// Run a best-effort maintenance transaction that cannot monopolize the
+/// capture worker. Errors include lock_timeout and statement_timeout; both
+/// abort only this transaction and are retried on a later maintenance cycle.
+fn run_bounded_maintenance(operation: &str, query: &str) {
+    let lock_timeout_ms = MAINTENANCE_LOCK_TIMEOUT_MS_GUC.get().clamp(10, 60_000);
+    let statement_timeout_ms = MAINTENANCE_STATEMENT_TIMEOUT_MS_GUC
+        .get()
+        .clamp(50, 300_000);
+    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
+        Spi::run(&format!(
+            "SELECT set_config('lock_timeout', '{lock_timeout_ms}ms', true);
+             SELECT set_config('statement_timeout', '{statement_timeout_ms}ms', true);
+             {query}"
+        ))?;
         Ok(())
     });
 
     if let Err(err) = result {
-        log!("pg_flashback PARTITION_ENSURE_ERROR error={err:?}");
+        log!(
+            "pg_flashback {operation}_ERROR lock_timeout_ms={lock_timeout_ms} statement_timeout_ms={statement_timeout_ms} error={err:?}"
+        );
     }
 }
