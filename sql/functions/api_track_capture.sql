@@ -1296,18 +1296,15 @@ BEGIN
             'metadata_only', 'true'
         );
         IF v_discarded <> 0 THEN
-            PERFORM flashback_mark_capture_stream_broken(
-                v_stream_id,
-                'decoder_empty_prefix_mismatch',
-                jsonb_build_object(
-                    'slot_name', v_slot_name,
-                    'scan_start_lsn', v_scan_start_lsn,
-                    'scan_upto_lsn', v_upto_lsn,
-                    'unexpected_rows', v_discarded
-                )
-            );
-            RAISE WARNING 'pg_flashback: empty metadata peek/get mismatch consumed % unexpected rows; stream % was frozen with a durable gap',
-                v_discarded, v_stream_id;
+            -- A transaction can finish COMMIT between two READ COMMITTED
+            -- decoding statements while its commit record is already below
+            -- the fixed LSN bound. Abort the SQL transaction: PostgreSQL does
+            -- not publish get_changes slot advancement until transaction
+            -- commit, so the next worker cycle safely peeks and retries the
+            -- same prefix with the now-visible transaction.
+            RAISE EXCEPTION 'pg_flashback: empty metadata peek/get race (% rows); retrying without slot advancement',
+                v_discarded
+                USING ERRCODE = 'serialization_failure';
         END IF;
         RETURN 0;
     END IF;
@@ -1470,18 +1467,8 @@ BEGIN
                 data->>'commit', data->>'marker'
            FROM _fb_wal_peek)
     ) THEN
-        PERFORM flashback_mark_capture_stream_broken(
-            v_stream_id,
-            'decoder_metadata_full_mismatch',
-            jsonb_build_object(
-                'slot_name', v_slot_name,
-                'scan_start_lsn', v_scan_start_lsn,
-                'scan_upto_lsn', v_upto_lsn
-            )
-        );
-        RAISE WARNING 'pg_flashback: metadata/full prefix mismatch; stream % was frozen with a durable gap',
-            v_stream_id;
-        RETURN 0;
+        RAISE EXCEPTION 'pg_flashback: metadata/full prefix changed during preflight; retrying without slot advancement'
+            USING ERRCODE = 'serialization_failure';
     END IF;
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_commits;

@@ -17,7 +17,7 @@ static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CS
 /// Comma-separated list of databases. Each gets its own background worker.
 /// When set, overrides the single `target_database` GUC.
 static TARGET_DATABASES_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
-/// Maximum background workers to register (Postmaster context, requires restart).
+/// Maximum database worker pairs to register (capture + maintenance per DB).
 static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
 /// Capture mode: 'wal' (WAL-based via logical decoding), 'trigger' (legacy trigger-based),
 /// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
@@ -163,8 +163,8 @@ pub fn register_worker_and_guc() {
 
     GucRegistry::define_int_guc(
         c"pg_flashback.max_workers",
-        c"Maximum number of pg_flashback background workers",
-        c"Each worker handles one database. Extra workers beyond the database count exit gracefully. Requires restart.",
+        c"Maximum number of pg_flashback database worker pairs",
+        c"Each configured database gets one capture worker and one maintenance worker. Requires two background-worker slots per database and a restart.",
         &MAX_WORKERS_GUC,
         1,
         8,
@@ -235,12 +235,21 @@ pub fn register_worker_and_guc() {
         GucFlags::default(),
     );
 
-    // Register up to max_workers background workers.
-    // Each worker receives its index (0-based) as the argument.
-    // At runtime, each worker reads the database list and connects to
-    // its assigned database, or exits if no database is assigned.
+    // Register one correctness-critical capture worker and one independently
+    // bounded maintenance worker for each configured database. Registering
+    // only actual targets avoids consuming max_worker_processes slots for the
+    // unused capacity of max_workers.
     let max_w = MAX_WORKERS_GUC.get().clamp(1, 8) as usize;
-    for i in 0..max_w {
+    let configured = resolve_database_list();
+    let worker_pairs = configured.len().min(max_w);
+    if configured.len() > max_w {
+        warning!(
+            "pg_flashback configured {} databases but max_workers permits only {} worker pairs",
+            configured.len(),
+            max_w
+        );
+    }
+    for i in 0..worker_pairs {
         let name = if i == 0 {
             "pg_flashback delta worker".to_string()
         } else {
@@ -249,6 +258,20 @@ pub fn register_worker_and_guc() {
 
         BackgroundWorkerBuilder::new(&name)
             .set_function("pg_flashback_delta_worker_main")
+            .set_library("pg_flashback")
+            .set_argument((i as i32).into_datum())
+            .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
+            .enable_spi_access()
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .load();
+
+        let maintenance_name = if i == 0 {
+            "pg_flashback maintenance worker".to_string()
+        } else {
+            format!("pg_flashback maintenance worker {}", i)
+        };
+        BackgroundWorkerBuilder::new(&maintenance_name)
+            .set_function("pg_flashback_maintenance_worker_main")
             .set_library("pg_flashback")
             .set_argument((i as i32).into_datum())
             .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
@@ -323,7 +346,6 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let mut slot_warned = false;
     let mut last_enabled: Option<bool> = None;
     let mut last_mode: Option<&'static str> = None;
-    let mut enabled_cycle_count: u64 = 0;
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -377,33 +399,11 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             flush_staging_to_delta_log();
             let flush_ms = t0.elapsed().as_millis();
 
-            // Maintenance is deliberately scheduled after capture and on a
-            // coarser cadence. Each maintenance operation has independent
-            // lock/statement limits, so a blocked lifecycle cannot hold up the
-            // next WAL consume or staging flush.
-            enabled_cycle_count = enabled_cycle_count.wrapping_add(1);
-            let mut ckpt_ms: u128 = 0;
-            let mut retention_ms: u128 = 0;
-            let maintenance_every = MAINTENANCE_EVERY_N_CYCLES_GUC.get().clamp(1, 10_000) as u64;
-            if enabled_cycle_count % maintenance_every == 0 && !is_any_restore_active() {
-                // Skip checkpoint and retention during active restore to avoid
-                // snapshotting a partially-restored table or purging needed deltas.
-                // Worker is a separate process, so check advisory locks via SPI.
-                let t1 = std::time::Instant::now();
-                run_periodic_checkpoints();
-                run_ensure_partitions();
-                ckpt_ms = t1.elapsed().as_millis();
-
-                let t2 = std::time::Instant::now();
-                run_retention_purge();
-                retention_ms = t2.elapsed().as_millis();
-            }
-
             let cycle_ms = cycle_start.elapsed().as_millis();
             let interval_ms_val = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u128;
             if cycle_ms > interval_ms_val {
                 warning!(
-                    "pg_flashback WORKER_SLOW_CYCLE cycle_ms={cycle_ms} flush_ms={flush_ms} ckpt_ms={ckpt_ms} retention_ms={retention_ms} interval_ms={interval_ms_val}"
+                    "pg_flashback CAPTURE_SLOW_CYCLE cycle_ms={cycle_ms} flush_ms={flush_ms} interval_ms={interval_ms_val}"
                 );
             }
         }
@@ -418,6 +418,38 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
         flush_staging_to_delta_log();
     }
     log!("pg_flashback delta worker {worker_index} stopped (database: {db_name})");
+}
+
+pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    let worker_index = unsafe { i32::from_datum(arg, false) }.unwrap_or(0) as usize;
+    let db_list = resolve_database_list();
+    if worker_index >= db_list.len() {
+        return;
+    }
+    let db_name = &db_list[worker_index];
+    BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
+    log!("pg_flashback maintenance worker {worker_index} started (database: {db_name})");
+
+    loop {
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
+        if is_capture_enabled() && !is_any_restore_active() {
+            run_periodic_checkpoints();
+            run_ensure_partitions();
+            run_retention_purge();
+        }
+        let capture_interval = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
+        let cadence = MAINTENANCE_EVERY_N_CYCLES_GUC.get().clamp(1, 10_000) as u64;
+        let wait_ms = capture_interval.saturating_mul(cadence).min(600_000);
+        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(wait_ms))) {
+            break;
+        }
+    }
+    log!("pg_flashback maintenance worker {worker_index} stopped (database: {db_name})");
 }
 
 /// Check if any backend is performing a flashback restore by looking for

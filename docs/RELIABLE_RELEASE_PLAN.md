@@ -50,13 +50,16 @@ The current `large-db-poc` baseline already contains:
 - a recovery helper with snapshot-direct and classic pgBackRest engines;
 - recovery-helper E2E coverage including identical recovered fingerprints.
 
-The remaining critical path is:
+Current implementation status on `work/v0.1.0-overnight`:
 
-1. backup-profile coverage-generation integration;
-2. bounded local/helper capacity and artifact garbage collection;
-3. capture/maintenance worker isolation;
-4. release versioning, packaging and clean-host installation;
-5. soak, concurrency and failure qualification.
+1. backup-profile generation wiring, authenticated proof installation,
+   coordinated expire and periodic missing-anchor detection are implemented;
+2. bounded local/helper capacity and artifact garbage collection are
+   implemented, with exact-RC qualification still required;
+3. capture and bounded maintenance run in separate per-database workers; the
+   exact-commit qualification harness enforces the stated p95/max SLOs;
+4. release versioning, packaging and clean-host installation remain open;
+5. exact-RC 24-hour soak and the final negative/race matrix remain open.
 
 ## 3. Milestone 0 — Freeze the release contract
 
@@ -280,6 +283,12 @@ All permanent and temporary storage has a measurable bound, and no supported
 operation is allowed to fill the filesystem optimistically.
 
 ## 6. Milestone 3 — Isolate capture from maintenance
+
+Implementation status: **COMPLETE; exact clean-commit evidence must accompany
+the release candidate.** Each configured database has one capture process and
+one independently scheduled maintenance process. The qualification harness
+rejects a run unless both processes exist and measures each commit from its
+own acknowledgement to first durable visibility.
 
 Estimated duration: **3–4 working days**
 

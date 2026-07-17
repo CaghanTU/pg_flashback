@@ -446,6 +446,10 @@ for _ in $(seq 1 20); do
     sleep 0.5
 done
 assert_eq "worker bu veritabanına bağlı" "$DB" "$WORKER_DB"
+assert_eq "maintenance ayrı worker process'inde" "1" \
+    "$(qp "SELECT count(*) FROM pg_stat_activity
+           WHERE backend_type = 'pg_flashback maintenance worker'
+             AND datname = '$DB'")"
 
 echo "━━━ 1b. Lifecycle lock çakışması slot ilerlemesini rollback ediyor ━━━"
 q "CREATE TABLE consume_lock_probe(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null

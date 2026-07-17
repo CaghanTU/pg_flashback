@@ -2,10 +2,9 @@
 # Development qualification for M3 capture/maintenance isolation.
 #
 # Starts an isolated PostgreSQL cluster, tracks two local_delta tables, then
-# holds one lifecycle lock while the other table receives WAL. Capture and
-# maintenance deliberately still share one background-worker loop: its cadence,
-# timeouts, and maintenance attempts are configured below. This is therefore an
-# isolation measurement, not evidence that they run in separate workers.
+# holds one lifecycle lock while the other table receives WAL. The harness
+# requires distinct capture and maintenance background processes before it
+# accepts any latency sample.
 #
 # Prerequisite: install the current extension for this PostgreSQL build first:
 #   cargo pgrx install --pg-config /usr/local/pgsql-17/bin/pg_config
@@ -80,6 +79,14 @@ q() {
 }
 
 q "CREATE EXTENSION pg_flashback;"
+capture_workers=$(q "SELECT count(*) FROM pg_stat_activity
+                      WHERE backend_type = 'pg_flashback delta worker';")
+maintenance_workers=$(q "SELECT count(*) FROM pg_stat_activity
+                          WHERE backend_type = 'pg_flashback maintenance worker';")
+[[ "$capture_workers" == "1" && "$maintenance_workers" == "1" ]] || {
+    echo "FAIL: expected one independent capture and maintenance worker" >&2
+    exit 1
+}
 q "CREATE TABLE public.m3_locked(id integer PRIMARY KEY, payload text NOT NULL);
    CREATE TABLE public.m3_open(id integer PRIMARY KEY, payload text NOT NULL);"
 # flashback_track deliberately requires its own transaction before any other
@@ -130,66 +137,46 @@ rows_before=$(q "SELECT count(*) FROM flashback.delta_log
                   WHERE rel_oid = 'public.m3_open'::regclass;")
 start_lag=$(q "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint
                FROM pg_replication_slots WHERE slot_name = '$SLOT';")
-declare -a ACK_NS VISIBLE_NS
-emitted=0
-for i in $(seq 1 "$COMMIT_SAMPLES"); do
-    # One row and one psql invocation make this a distinct committed
-    # transaction. Record monotonic time after psql returns its commit ack.
-    q "INSERT INTO public.m3_open VALUES ($i, repeat('x', 32));" >/dev/null
-    ACK_NS[$i]=$(monotonic_ns)
-    emitted=$i
-done
-
-# delta_log's new_data identifies each insert. Poll at 20 ms and use its
-# contiguous inserted-id watermark to stamp the first observation for every
-# committed transaction. This measures commit acknowledgement to first
-# observable capture, with poll-resolution uncertainty only.
-visible_through=0
-polls=0
-# Keep every observation inside the actual advisory-lock hold. The lock holder
-# may finish before a slow machine emits all samples, in which case this run
-# truthfully reports only the commits observed during the hold.
-while (( visible_through < emitted )); do
-    holder=$(q "SELECT count(*)
-                 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-                 WHERE l.locktype = 'advisory' AND l.classid = 358944
-                   AND l.objid = hashint8($TRACKING_ID)
-                   AND l.granted AND a.application_name = 'pgfb_m3_lifecycle_hold';")
-    [[ "$holder" == "1" ]] || break
-    visible=$(q "SELECT COALESCE(max((new_data->>'id')::integer), 0)
-                 FROM flashback.delta_log
-                 WHERE rel_oid = 'public.m3_open'::regclass
-                   AND event_type = 'INSERT'
-                   AND (new_data->>'id')::integer BETWEEN 1 AND $emitted;")
-    if (( visible > visible_through )); then
-        now_ns=$(monotonic_ns)
-        (( visible > emitted )) && visible=$emitted
-        for i in $(seq $((visible_through + 1)) "$visible"); do
-            VISIBLE_NS[$i]=$now_ns
-        done
-        visible_through=$visible
-    fi
-    polls=$((polls + 1))
-    sleep "$POLL_SECONDS"
-done
-rows_last_during_hold=$(q "SELECT count(*) FROM flashback.delta_log
-                           WHERE rel_oid = 'public.m3_open'::regclass;")
-capture_progressed=false
-(( visible_through > 0 )) && capture_progressed=true
-
 latencies_file="$WORK_ROOT/visibility-latencies-ms.txt"
 samples_file="$WORK_ROOT/visibility-samples.jsonl"
 : >"$latencies_file"
 : >"$samples_file"
-for i in $(seq 1 "$emitted"); do
-    if [[ -n "${VISIBLE_NS[$i]:-}" ]]; then
-        latency_ms=$(( (VISIBLE_NS[$i] - ACK_NS[$i]) / 1000000 ))
-        printf '%s\n' "$latency_ms" >>"$latencies_file"
-        printf '{"id":%s,"commit_ack_monotonic_ns":%s,"first_visible_monotonic_ns":%s,"visibility_latency_ms":%s}\n' \
-            "$i" "${ACK_NS[$i]}" "${VISIBLE_NS[$i]}" "$latency_ms" >>"$samples_file"
-    fi
+emitted=0
+polls=0
+for i in $(seq 1 "$COMMIT_SAMPLES"); do
+    # One row and one psql invocation make this a distinct committed
+    # transaction. Poll this exact event immediately after its commit ack;
+    # batching all writes before polling incorrectly charged workload
+    # generation time to early commits.
+    q "INSERT INTO public.m3_open VALUES ($i, repeat('x', 32));" >/dev/null
+    ack_ns=$(monotonic_ns)
+    emitted=$i
+    visible=false
+    deadline=$(( $(date +%s) + 5 ))
+    while (( $(date +%s) <= deadline )); do
+        if [[ "$(q "SELECT EXISTS(
+              SELECT 1 FROM flashback.delta_log
+              WHERE rel_oid = 'public.m3_open'::regclass
+                AND event_type = 'INSERT'
+                AND (new_data->>'id')::integer = $i); ")" == "t" ]]; then
+            visible=true
+            visible_ns=$(monotonic_ns)
+            latency_ms=$(( (visible_ns - ack_ns) / 1000000 ))
+            printf '%s\n' "$latency_ms" >>"$latencies_file"
+            printf '{"id":%s,"commit_ack_monotonic_ns":%s,"first_visible_monotonic_ns":%s,"visibility_latency_ms":%s}\n' \
+                "$i" "$ack_ns" "$visible_ns" "$latency_ms" >>"$samples_file"
+            break
+        fi
+        polls=$((polls + 1))
+        sleep "$POLL_SECONDS"
+    done
+    [[ "$visible" == true ]] || break
 done
+rows_last_during_hold=$(q "SELECT count(*) FROM flashback.delta_log
+                           WHERE rel_oid = 'public.m3_open'::regclass;")
+capture_progressed=false
 observed_samples=$(wc -l <"$latencies_file" | tr -d ' ')
+(( observed_samples > 0 )) && capture_progressed=true
 visibility_samples_json=$(paste -sd, "$samples_file")
 if (( observed_samples > 0 )); then
     sort -n "$latencies_file" -o "$latencies_file"
@@ -253,7 +240,7 @@ final_lag="${final_lag:-$(q "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(
 # or FAIL. Never claim PASS with null p95.
 status="FAIL"
 if [[ "$capture_progressed" == true ]] && (( observed_samples >= COMMIT_SAMPLES )) &&
-   [[ "$p95" != null ]] && (( p95 < 2000 )) && (( max_ms < 5000 )) &&
+   [[ "$p95" != null ]] && (( p95 < 1000 )) && (( max_ms < 5000 )) &&
    [[ "$drain_ok" == true ]]; then
     status="PASS"
 elif [[ "$capture_progressed" == true ]] && (( observed_samples > 0 )) && [[ "$p95" != null ]]; then
@@ -267,8 +254,10 @@ $(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
   "status": "$status",
   "hold_seconds": $HOLD_SECONDS,
   "config": {"worker_interval_ms": 50, "maintenance_every_n_cycles": 1, "maintenance_lock_timeout_ms": 100, "maintenance_statement_timeout_ms": 1000, "commit_samples": $COMMIT_SAMPLES, "poll_seconds": $POLL_SECONDS},
-  "measurement_note": "Capture and maintenance share one background-worker loop; this measures progress despite a held unrelated lifecycle lock.",
-  "shared_background_worker_loop": true,
+  "measurement_note": "Independent capture and maintenance background processes; commit acknowledgement to first durable delta visibility while an unrelated lifecycle lock is held.",
+  "shared_background_worker_loop": false,
+  "capture_worker_count": $capture_workers,
+  "maintenance_worker_count": $maintenance_workers,
   "worker_interval_ms": 50,
   "tracked_tables": ["public.m3_locked", "public.m3_open"],
   "locked_tracking_id": $TRACKING_ID,
@@ -289,7 +278,7 @@ $(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
   "drain_ok": $drain_ok,
   "visibility_poll_seconds": $POLL_SECONDS,
   "visibility_poll_count": $polls,
-  "p95_visibility_target_ms": 2000,
+  "p95_visibility_target_ms": 1000,
   "max_visibility_target_ms": 5000,
   "p50_visibility_ms": $p50,
   "p95_visibility_ms": $p95,

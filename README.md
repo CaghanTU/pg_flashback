@@ -11,7 +11,7 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 > **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
 > qualified, including generation-aware local retention, but the project as a
 > whole is still pre-release. Automated capacity/write-stall admission,
-> capture/maintenance worker isolation, backup-profile coverage finalization
+> remaining backup-profile negative/race qualification, exact-RC soak,
 > and versioned upgrade packaging remain release gates. Read the binding
 > [storage policy](docs/STORAGE_POLICY.md),
 > [coverage design](docs/COVERAGE_MODEL.md) and
@@ -64,7 +64,8 @@ heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
 | Logical decoder | Filters by tracked relation OID, decodes DML, and records transaction COMMIT LSN separately from row-change LSN. Client-supplied logical-message bodies are never trusted. |
 | AFTER Triggers (statement + row) | Legacy/experimental compatibility capture into LOGGED `staging_events`; it does not create qualified local coverage. |
 | `ProcessUtility_hook` | Intercepts DDL and writes authoritative TRUNCATE/DROP/ALTER metadata to a protected LOGGED pending table in the user's transaction. |
-| Background Worker (`flashback_worker`) | Consumes the logical slot, promotes complete commits, resolves pending generation boundaries and advances the inclusive watermark. Capture/maintenance worker isolation remains a release gate. |
+| Capture worker | Consumes the logical slot, promotes complete commits, resolves pending generation boundaries and advances the inclusive watermark. |
+| Maintenance worker | Independently runs bounded checkpoints, partition maintenance and retention so a slow lifecycle cannot block WAL draining. |
 | `delta_log` | Generation/stream-bound JSONB event store, partitioned by `committed_at`; qualified events carry row-change and transaction COMMIT LSNs. |
 | Coverage generations | Exact locked base + one immutable WAL stream epoch + an inclusive complete-commit watermark. Slot discontinuity freezes the old frontier and opens a durable gap; `flashback_reanchor()` creates a new exact base. |
 | `schema_versions` | Tracks column definitions, constraints, indexes, triggers, and RLS policies per schema change. |
@@ -341,7 +342,7 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 | `worker_batch_size` | `4096` | SIGHUP | Maximum rows per worker flush cycle. |
 | `target_database` | `postgres` | Restart | Database the background worker connects to (single‑DB mode). Overridden by `target_databases`. |
 | `target_databases` | *(unset)* | Restart | Comma-separated list of databases for multi‑DB mode. Each database gets its own worker. Example: `'app,analytics,audit'`. |
-| `max_workers` | `4` | Restart | Maximum number of background workers registered at startup. Extra workers beyond the database count exit gracefully. |
+| `max_workers` | `4` | Restart | Maximum configured database worker pairs. Each target database consumes two `max_worker_processes` slots: one capture and one maintenance worker. |
 
 All GUCs except those marked *Restart* take effect via `SIGHUP`. For qualified
 tables, `enabled` and effective capture-mode transitions deliberately invalidate
@@ -726,9 +727,14 @@ SELECT flashback_restore('public.events', now() - interval '5 minutes');
 shared_preload_libraries = 'pg_flashback'
 pg_flashback.target_databases = 'app_db,analytics_db,audit_db'
 pg_flashback.max_workers = 3
+# Reserve six extension slots (capture + maintenance per database), plus
+# PostgreSQL's other background workers.
+max_worker_processes = 12
 ```
 
-Each database gets its own background worker process. Extra workers beyond the database count exit gracefully.
+Each database gets a dedicated capture worker and a dedicated maintenance
+worker. `max_workers` limits database pairs, not total processes; PostgreSQL
+must have two free `max_worker_processes` slots per configured database.
 
 ### Application Integration
 
