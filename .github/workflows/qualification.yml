@@ -1,0 +1,171 @@
+name: Qualification (overnight)
+
+on:
+  push:
+    branches: [work/v0.1.0-overnight]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PGRX_VERSION: "0.16.1"
+
+jobs:
+  shellcheck:
+    name: ShellCheck (hosted runner)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: bash -n and ShellCheck
+        run: |
+          bash -n scripts/*.sh
+          shellcheck -S warning scripts/*.sh
+
+  build-candidate:
+    name: Build exact candidate archive
+    runs-on: ubuntu-22.04
+    outputs:
+      source_commit: ${{ steps.manifest.outputs.source_commit }}
+      package_sha256: ${{ steps.manifest.outputs.package_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require clean tree
+        run: test -z "$(git status --porcelain=v1)"
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang jq
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tools/pg_flashback_recovery/target
+          key: ${{ runner.os }}-candidate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-candidate-
+
+      - name: Install cargo-pgrx and PostgreSQL 17
+        run: |
+          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          cargo pgrx init --pg17 download
+
+      - name: Build candidate archives
+        run: |
+          chmod +x scripts/build_candidate_archive.sh scripts/run_clean_host_candidate_smoke.sh
+          PG_MAJOR=17 ./scripts/build_candidate_archive.sh
+
+      - name: Publish manifest outputs
+        id: manifest
+        run: |
+          manifest="$(ls -1d target/candidate/*/MANIFEST.json | head -n1)"
+          echo "source_commit=$(jq -r '.provenance.source_commit' "$manifest")" >> "$GITHUB_OUTPUT"
+          echo "package_sha256=$(jq -r '.artifacts.package_sha256' "$manifest")" >> "$GITHUB_OUTPUT"
+          echo "CANDIDATE_DIR=$(dirname "$manifest")" >> "$GITHUB_ENV"
+          jq . "$manifest"
+
+      - name: Upload candidate archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-flashback-candidate-${{ steps.manifest.outputs.source_commit }}
+          path: |
+            target/candidate/*/
+          if-no-files-found: error
+
+  clean-host:
+    name: Clean-host install from candidate archive
+    needs: build-candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang curl \
+            meson ninja-build libxml2-dev libpq-dev zlib1g-dev liblz4-dev \
+            libzstd-dev libbz2-dev libyaml-dev libssh2-1-dev jq
+
+      - name: Install Rust 1.85 (pgrx PG only; no project source checkout)
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Install cargo-pgrx and PostgreSQL 17 runtime
+        run: |
+          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          cargo pgrx init --pg17 download
+
+      - name: Build exact pgBackRest 2.53.1
+        run: |
+          curl -fsSL \
+            https://github.com/pgbackrest/pgbackrest/archive/refs/tags/release/2.53.1.tar.gz \
+            | tar -xz -C /tmp
+          meson setup -Dbuildtype=release /tmp/pgbackrest-build \
+            /tmp/pgbackrest-release-2.53.1
+          ninja -C /tmp/pgbackrest-build src/pgbackrest
+
+      - name: Download candidate artifact only
+        uses: actions/download-artifact@v4
+        with:
+          name: pg-flashback-candidate-${{ needs.build-candidate.outputs.source_commit }}
+          path: /tmp/candidate-dl
+
+      - name: Locate candidate directory
+        id: cand
+        run: |
+          manifest="$(find /tmp/candidate-dl -name MANIFEST.json -print -quit)"
+          test -n "$manifest"
+          echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
+          jq . "$manifest"
+
+      - name: Run clean-host smoke from archives only
+        env:
+          CANDIDATE_DIR: ${{ steps.cand.outputs.dir }}
+          PGBACKREST: /tmp/pgbackrest-build/src/pgbackrest
+          KEEP: "1"
+          CLEAN_HOST_WORK: /tmp/pgfb-clean-host-work
+          CLEAN_HOST_RESULT: /tmp/pgfb-clean-host-work/result.json
+        run: |
+          export PG_BIN
+          PG_BIN="$(dirname "$(cargo pgrx info pg-config 17)")"
+          # Smoke script is packaged inside the extension archive.
+          ext_archive="$(jq -r '.artifacts.extension_archive.name' "$CANDIDATE_DIR/MANIFEST.json")"
+          mkdir -p /tmp/smoke-extract
+          tar -C /tmp/smoke-extract -xzf "$CANDIDATE_DIR/$ext_archive"
+          smoke="$(find /tmp/smoke-extract -type f -name run_clean_host_candidate_smoke.sh -print -quit)"
+          test -n "$smoke"
+          chmod +x "$smoke"
+          "$smoke"
+
+      - name: Upload clean-host result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-host-smoke-${{ needs.build-candidate.outputs.source_commit }}
+          path: |
+            /tmp/pgfb-clean-host-work/result.json
+            /tmp/pgfb-clean-host-work/log/**
+          if-no-files-found: warn

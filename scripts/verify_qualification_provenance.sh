@@ -83,13 +83,25 @@ done
 # Honesty: never claim clean-host / 24h soak passed without explicit true/passed.
 CLEAN_HOST="$(jq -r '.clean_host_smoke // .provenance.clean_host_smoke // "not_run"' "$EVIDENCE")"
 SOAK="$(jq -r '.exact_rc_24h_soak // .provenance.exact_rc_24h_soak // "not_run"' "$EVIDENCE")"
-# Accept plain statuses or "not_run (...reason...)" / "blocked (...)" forms.
-case "$CLEAN_HOST" in
-    passed|true|not_run|skipped*|blocked*|NOT_RUN*|not_run\ *|blocked\ *|skipped\ *) ;;
+# Accept plain statuses or annotated "not_run (...)" / "blocked (...)" forms.
+normalize_gate_status() {
+    local raw=$1
+    case "$raw" in
+        passed|true) printf '%s' passed ;;
+        not_run|NOT_RUN|not_run\ *|NOT_RUN\ *) printf '%s' not_run ;;
+        skipped|skipped\ *) printf '%s' skipped ;;
+        blocked|blocked\ *) printf '%s' blocked ;;
+        *) printf '%s' "$raw" ;;
+    esac
+}
+CLEAN_HOST_NORM="$(normalize_gate_status "$CLEAN_HOST")"
+SOAK_NORM="$(normalize_gate_status "$SOAK")"
+case "$CLEAN_HOST_NORM" in
+    passed|not_run|skipped|blocked) ;;
     *) die "clean_host_smoke has unrecognized status: $CLEAN_HOST" ;;
 esac
-case "$SOAK" in
-    passed|true|not_run|skipped*|blocked*|NOT_RUN*|not_run\ *|blocked\ *|skipped\ *) ;;
+case "$SOAK_NORM" in
+    passed|not_run|skipped|blocked) ;;
     *) die "exact_rc_24h_soak has unrecognized status: $SOAK" ;;
 esac
 ok "clean_host=$CLEAN_HOST soak=$SOAK"
