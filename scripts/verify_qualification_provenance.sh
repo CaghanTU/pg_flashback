@@ -83,12 +83,13 @@ done
 # Honesty: never claim clean-host / 24h soak passed without explicit true/passed.
 CLEAN_HOST="$(jq -r '.clean_host_smoke // .provenance.clean_host_smoke // "not_run"' "$EVIDENCE")"
 SOAK="$(jq -r '.exact_rc_24h_soak // .provenance.exact_rc_24h_soak // "not_run"' "$EVIDENCE")"
+# Accept plain statuses or "not_run (...reason...)" / "blocked (...)" forms.
 case "$CLEAN_HOST" in
-    passed|true|not_run|skipped*|blocked*|NOT_RUN*) ;;
+    passed|true|not_run|skipped*|blocked*|NOT_RUN*|not_run\ *|blocked\ *|skipped\ *) ;;
     *) die "clean_host_smoke has unrecognized status: $CLEAN_HOST" ;;
 esac
 case "$SOAK" in
-    passed|true|not_run|skipped*|blocked*|NOT_RUN*) ;;
+    passed|true|not_run|skipped*|blocked*|NOT_RUN*|not_run\ *|blocked\ *|skipped\ *) ;;
     *) die "exact_rc_24h_soak has unrecognized status: $SOAK" ;;
 esac
 ok "clean_host=$CLEAN_HOST soak=$SOAK"
