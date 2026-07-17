@@ -411,7 +411,7 @@ BEGIN
                 CASE WHEN rec.retiring_count > 0
                      THEN 'generation payload retirement in progress' END,
                 CASE WHEN rec.retention_blocked
-                     THEN 'sealed predecessor exclusive range is past retention; run reconcile-anchors to retire' END
+                     THEN 'sealed generation retention is blocked pending complete drain/new anchor; run reconcile-anchors to retire backup predecessors when eligible' END
             );
         ELSIF rec.generation_id IS NULL THEN
             IF rec.recovery_profile = 'backup' THEN
