@@ -725,18 +725,20 @@ jq -n \
       blockers: $blockers
     }' > "$RESULT_JSON"
 
-# Design recommendation (PoC-only; no production wiring).
+# Persist latest run evidence without reverting the production-wired contract.
 cat > "$DESIGN_NOTE" <<EOF
-# Retained FULL + continuous WAL PoC
+# Retained FULL + continuous WAL
 
-Status: evidence harness for research only. **Not production-wired for v0.1.0.**
+Status: **production-wired for v0.1** (one retained FULL + continuous WAL).
+Differential/incremental backup chains and non-pgBackRest providers remain
+unsupported.
 
 ## Question
 
 Can an existing retained FULL that completed **before** the tracking marker, plus
 contiguous archived WAL through the requested target, physically recover the
-exact table — including across a production shadow-swap — without changing the
-supported activation contract?
+exact table — including across a production shadow-swap — and can tracking
+activate that path without requiring a newly created FULL after the marker?
 
 ## Correct recovery invariant
 
@@ -748,21 +750,40 @@ supported activation contract?
 - physical anchor/dependencies and required WAL remain pinned
 - a backup overlapping the target is not eligible merely because its start LSN is earlier
 
-## Production contract (unchanged)
+## Production contract
 
-Activation still requires:
+\`verify-anchor\` discovers repository-derived anchors only:
 
-\`marker COMMIT LSN < FULL start LSN < FULL stop LSN\`
+1. Prefer a fresh FULL with \`backup_start_lsn > tracking_marker_lsn\` when one
+   already exists.
+2. Otherwise activate a retained FULL with \`backup_stop_lsn <= marker\` and
+   contiguous archived WAL through the marker (\`activation_mode =
+   retained_full_plus_wal\`).
+3. If neither exists, fail closed — do not auto-start a cluster-sized FULL.
+   Operators may take an explicit fresh FULL and retry.
 
-Scenario B/C success does **not** make older-FULL activation production-ready.
+Retained activation keeps the physical generation boundary at the FULL stop
+(FK-bound to \`backup_anchors\`) and sets initial \`valid_through\` from the
+verified WAL frontier. Tracked \`coverage_start_lsn\` is the marker. Fresh
+activation still uses the FULL stop as both boundary and initial
+\`valid_through\`.
+
+## Harnesses
+
+| Harness | Role |
+|---------|------|
+| \`scripts/run_retained_full_wal_poc.sh\` | Physical A/B/C fingerprints + production retained activation |
+| \`scripts/run_retained_full_adversarial_e2e.sh\` | Activation negatives, pin/expire, forge refusal, restore |
+| \`tests/sql/integration/retained_full_activation.sql\` | SQL consume/eligibility contract |
+| \`scripts/run_recovery_helper_e2e.sh\` | Wrong sysid/timeline and related helper fail-closed paths |
 
 ## Latest run
 
-See \`$RESULT_JSON\` (run_id=$RUN_ID).
+See \`$RESULT_JSON\` (run_id=$RUN_ID, git_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)).
 
 | Scenario | Intent | Status |
 |----------|--------|--------|
-| A | FULL after marker (current contract) | $SCENARIO_A_STATUS |
+| A | Post-activation restore (retained active) | $SCENARIO_A_STATUS |
 | B | Retained FULL before marker + WAL | $SCENARIO_B_STATUS |
 | C | WAL through production shadow-swap | $SCENARIO_C_STATUS |
 
@@ -777,22 +798,16 @@ See \`$RESULT_JSON\` (run_id=$RUN_ID).
 WAL archive footprint observed for scenario B repository view: ${WAL_RANGE_BYTES:-n/a} bytes.
 Fresher-anchor recommendation when replay dominates total RTO: $RECOMMEND_FRESHER.
 
-## Production wiring still required (if B/C remain proven)
+## Limits
 
-1. Explicit eligibility policy for pre-marker FULL selection (opt-in, audited).
-2. Durable pin of FULL + required WAL range independent of post-marker FULL labels.
-3. Activation/proof path that distinguishes physical recoverability from the
-   current marker-before-FULL operational contract.
-4. Health/action reporting for long replay / fresher-anchor recommendation.
-5. Expire coordination that never drops a pinned pre-marker FULL or its WAL prefix.
-6. Qualification matrix and RC soak — do not ship on PoC evidence alone.
-
-## Decision gate
-
-- If A/B/C pass on a real pgBackRest repository: keep this document as the design
-  recommendation; leave production FULL-after-marker behavior unchanged.
-- If B or C cannot be proven: leave production unchanged and record the blocker
-  in the result JSON \`blockers\` array.
+- One FULL + continuous WAL only (no diff/incr chains).
+- pgBackRest is the only qualified provider.
+- Direct external \`pgbackrest expire\` bypassing the helper remains unsupported;
+  health/audit must detect a disappeared pinned anchor.
+- Safe advancement to a newer independently verified FULL is operator-driven
+  (new verified generation); old pins release only after the successor is active
+  and the predecessor is no longer referenced by active/sealed coverage.
+- Long replay may recommend a fresher anchor via health without auto-taking a FULL.
 EOF
 
 [[ "$SCENARIO_A_STATUS" == "passed" && "$SCENARIO_B_STATUS" == "passed" ]] \

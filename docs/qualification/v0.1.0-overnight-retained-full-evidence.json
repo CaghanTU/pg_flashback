@@ -1,0 +1,27 @@
+{
+  "branch": "work/v0.1.0-overnight",
+  "starting_head_required": "45f2473093c5c31f12a099377229f8bb0cef4b86",
+  "prior_audit_fix": "e78b33ef7537bc0f2f2e3950800f36b0a1af4aa3",
+  "helper_debug_sha256": "32ad1d950157278112944ac80ede8593f808ca8d35c3a477879da6a31f3d7e58",
+  "adversarial_result": "20260717T164603Z-364161.json",
+  "poc_result": "20260717T164623Z-364710.json",
+  "dev_soak_60s": "dev-soak-20260717T165109Z-383079.json",
+  "pgrx_matrix": {"pg15": "skipped_no_pg_config", "pg16": "75_passed", "pg17": "75_passed", "pg18": "75_passed"},
+  "e2e": {
+    "run_retained_full_adversarial_e2e": "passed",
+    "run_retained_full_wal_poc": "passed_14",
+    "run_recovery_helper_e2e": "passed_35",
+    "run_backup_coverage_e2e": "passed",
+    "run_local_capacity_e2e": "passed_isolated_pg17",
+    "run_wal_e2e": "passed",
+    "run_fault_injection_smoke": "passed",
+    "measure_wal_overhead": "passed",
+    "run_capture_maintenance_isolation_slo": "passed",
+    "run_dev_soak_60s": "passed"
+  },
+  "known_transitive_advisories": ["RUSTSEC-2024-0436 paste (pgrx)", "RUSTSEC-2021-0127 serde_cbor (pgrx)"],
+  "shellcheck": "not_installed",
+  "clean_host_smoke": "not_run",
+  "exact_rc_24h_soak": "not_run",
+  "unsupported": ["differential_incremental_chains", "non_pgbackrest_providers", "pg15_on_this_host"]
+}
