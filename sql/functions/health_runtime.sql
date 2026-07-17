@@ -157,6 +157,10 @@ BEGIN
             cg.valid_through_lsn,
             cg.valid_through_time,
             cg.state_reason AS generation_state_reason,
+            cg.details AS generation_details,
+            ba.backup_label,
+            ba.backup_stop_lsn,
+            ba.details AS anchor_details,
             pending.generation_id AS pending_generation_id,
             pending.state_reason AS pending_state_reason,
             COALESCE(gaps.open_gap_count, 0) AS open_gap_count,
@@ -172,6 +176,9 @@ BEGIN
             WHERE g.tracking_id = tt.tracking_id AND g.state = 'active'
             LIMIT 1
         ) cg ON true
+        LEFT JOIN flashback.backup_anchors ba
+          ON ba.backup_anchor_id = cg.backup_anchor_id
+         AND ba.tracking_id = cg.tracking_id
         LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         LEFT JOIN LATERAL (
             SELECT g.generation_id, g.state_reason
@@ -326,9 +333,9 @@ BEGIN
            )
         THEN
             v_health := 'backup_reanchor_required';
-            v_action := 'take_new_full_backup_after_marker';
+            v_action := 'activate_eligible_retained_or_fresh_full';
             v_reason := format(
-                'tracking_id %s is unanchored after production swap; a new qualifying FULL backup is required',
+                'tracking_id %s is unanchored after production swap; activate an eligible retained FULL with continuous WAL or take and verify a fresh FULL after the marker',
                 rec.tracking_id
             );
         ELSIF slot.safe_wal_size IS NOT NULL
@@ -401,8 +408,8 @@ BEGIN
         ELSIF rec.generation_id IS NULL THEN
             IF rec.recovery_profile = 'backup' THEN
                 v_health := 'backup_reanchor_required';
-                v_action := 'take_new_full_backup_after_marker';
-                v_reason := 'no eligible coverage generation; verified FULL anchor required';
+                v_action := 'activate_eligible_retained_or_fresh_full';
+                v_reason := 'no eligible coverage generation; activate a retained FULL with continuous WAL or verify a fresh FULL after the marker';
             ELSE
                 v_health := 'reanchor_recommended';
                 v_action := 'flashback_reanchor';
@@ -411,9 +418,36 @@ BEGIN
         ELSIF rec.stream_state = 'active'
            OR (rec.recovery_profile = 'backup' AND rec.generation_state = 'active')
         THEN
-            v_health := 'healthy';
-            v_action := 'none';
-            v_reason := NULL;
+            IF rec.recovery_profile = 'backup'
+               AND COALESCE(rec.generation_details->>'activation_mode', '')
+                   = 'retained_full_plus_wal'
+               AND rec.backup_stop_lsn IS NOT NULL
+               AND rec.valid_through_lsn IS NOT NULL
+               AND (rec.valid_through_lsn - rec.backup_stop_lsn) > pg_size_bytes('1GB')
+            THEN
+                v_health := 'healthy';
+                v_action := 'consider_fresher_full_anchor';
+                v_reason := format(
+                    'active retained FULL %s; replay distance from backup_stop %s through %s may imply poor RTO',
+                    rec.backup_label, rec.backup_stop_lsn, rec.valid_through_lsn
+                );
+            ELSIF rec.recovery_profile = 'backup' AND rec.backup_label IS NOT NULL THEN
+                v_health := 'healthy';
+                v_action := 'none';
+                v_reason := format(
+                    'active FULL %s mode=%s valid_through=%s',
+                    rec.backup_label,
+                    COALESCE(
+                        rec.generation_details->>'activation_mode',
+                        'fresh_full_after_marker'
+                    ),
+                    rec.valid_through_lsn
+                );
+            ELSE
+                v_health := 'healthy';
+                v_action := 'none';
+                v_reason := NULL;
+            END IF;
         ELSE
             v_health := 'maintenance_required';
             v_action := 'inspect_coverage_state';

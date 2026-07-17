@@ -152,7 +152,8 @@ GRANT EXECUTE ON FUNCTION flashback_install_verified_wal_frontier_proof(
     text, bigint, bigint, text, text, text, bigint, pg_lsn, text, timestamptz, jsonb, text
 ) TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_backup_proof_attestation_payload(
-    text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn
+    text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn,
+    text, pg_lsn
 ) TO flashback_recovery_agent;
 GRANT EXECUTE ON FUNCTION flashback_wal_frontier_attestation_payload(
     text, bigint, bigint, text, text, text, bigint, pg_lsn, text

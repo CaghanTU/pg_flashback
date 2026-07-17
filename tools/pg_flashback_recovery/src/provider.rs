@@ -277,32 +277,47 @@ impl PhysicalRecoveryProvider for PgBackRestProvider {
 
     fn pin_dependencies(
         &self,
-        _config: &RecoveryConfig,
+        config: &RecoveryConfig,
         dependencies: &DependencySet,
     ) -> Result<DependencyPin, RecoveryError> {
-        // Durable pin state lives in extension generation metadata; the helper
-        // returns a stable identity for audit/GC coordination.
+        use crate::executor::{prepare_secure_directory, write_json_atomic};
+
         let pin_id = dependencies
             .members
             .iter()
             .filter_map(|member| member.label.clone())
             .collect::<Vec<_>>()
             .join("+");
-        Ok(DependencyPin {
-            pin_id: if pin_id.is_empty() {
-                "wal-only".to_owned()
-            } else {
-                pin_id
-            },
+        let pin_id = if pin_id.is_empty() {
+            "wal-only".to_owned()
+        } else {
+            pin_id
+        };
+        let pin = DependencyPin {
+            pin_id: pin_id.clone(),
             dependencies: dependencies.clone(),
-        })
+        };
+        let pin_dir = config.work_root.join("dependency-pins");
+        prepare_secure_directory(&pin_dir)?;
+        write_json_atomic(&pin_dir.join(format!("{pin_id}.json")), &pin)?;
+        Ok(pin)
     }
 
     fn release_dependencies(
         &self,
-        _config: &RecoveryConfig,
-        _pin: &DependencyPin,
+        config: &RecoveryConfig,
+        pin: &DependencyPin,
     ) -> Result<(), RecoveryError> {
+        let path = config
+            .work_root
+            .join("dependency-pins")
+            .join(format!("{}.json", pin.pin_id));
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|error| RecoveryError::Io {
+                operation: "releasing dependency pin",
+                message: error.to_string(),
+            })?;
+        }
         Ok(())
     }
 
@@ -440,8 +455,12 @@ mod tests {
     }
 
     #[test]
-    fn release_dependencies_is_a_no_op_today() {
-        let config = sample_config();
+    fn pin_and_release_dependencies_are_durable() {
+        let root = std::env::temp_dir().join(format!("pgfb-pin-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create work root");
+        let mut config = sample_config();
+        config.work_root = root.clone();
         let provider = qualified_provider();
         let pin = provider
             .pin_dependencies(
@@ -462,9 +481,19 @@ mod tests {
                 },
             )
             .expect("pin");
+        assert!(config
+            .work_root
+            .join("dependency-pins")
+            .join("label.json")
+            .is_file());
         provider
             .release_dependencies(&config, &pin)
             .expect("release");
+        assert!(!config
+            .work_root
+            .join("dependency-pins")
+            .join("label.json")
+            .is_file());
         let deps = provider
             .enumerate_dependencies(
                 &config,
@@ -475,11 +504,16 @@ mod tests {
             )
             .expect("enumerate");
         assert!(!deps.members.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn dependency_kinds_are_extensible_without_selecting_them() {
-        let config = sample_config();
+        let root = std::env::temp_dir().join(format!("pgfb-pin-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create work root");
+        let mut config = sample_config();
+        config.work_root = root.clone();
         let pin = qualified_provider()
             .pin_dependencies(
                 &config,
@@ -504,5 +538,6 @@ mod tests {
             pin.dependencies.members[0].kind,
             DependencyKind::FullBackup
         ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

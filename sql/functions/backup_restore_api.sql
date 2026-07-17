@@ -974,16 +974,17 @@ CREATE OR REPLACE FUNCTION flashback_backup_proof_attestation_payload(
     p_manifest_reference text,
     p_manifest_sha256 text,
     p_backup_start_lsn pg_lsn,
-    p_backup_stop_lsn pg_lsn
+    p_backup_stop_lsn pg_lsn,
+    p_activation_mode text DEFAULT 'fresh_full_after_marker',
+    p_wal_verified_through_lsn pg_lsn DEFAULT NULL
 )
 RETURNS text
 LANGUAGE sql
 IMMUTABLE
-STRICT
 SET search_path = pg_catalog
 AS $$
     SELECT jsonb_build_object(
-        'kind', 'backup-anchor-v1',
+        'kind', 'backup-anchor-v2',
         'verification_request_id', p_verification_request_id,
         'tracking_id', p_tracking_id,
         'helper_profile', p_helper_profile,
@@ -995,7 +996,9 @@ AS $$
         'manifest_reference', p_manifest_reference,
         'manifest_sha256', p_manifest_sha256,
         'backup_start_lsn', p_backup_start_lsn::text,
-        'backup_stop_lsn', p_backup_stop_lsn::text
+        'backup_stop_lsn', p_backup_stop_lsn::text,
+        'activation_mode', COALESCE(NULLIF(btrim(p_activation_mode), ''), 'fresh_full_after_marker'),
+        'wal_verified_through_lsn', p_wal_verified_through_lsn::text
     )::text;
 $$;
 
@@ -1069,7 +1072,10 @@ BEGIN
             p_repository_key, p_stanza, p_backup_label,
             p_database_system_identifier, p_timeline_id,
             p_manifest_reference, p_manifest_sha256,
-            p_backup_start_lsn, p_backup_stop_lsn
+            p_backup_start_lsn, p_backup_stop_lsn,
+            COALESCE(NULLIF(btrim(COALESCE(p_details, '{}'::jsonb) ->> 'activation_mode'), ''),
+                     'fresh_full_after_marker'),
+            NULLIF(btrim(COALESCE(p_details, '{}'::jsonb) ->> 'wal_verified_through_lsn'), '')::pg_lsn
         );
         IF p_attestation_hmac IS NULL
            OR NOT flashback_verify_proof_hmac(v_payload, p_attestation_hmac)
@@ -1117,6 +1123,9 @@ DECLARE
     v_sysid numeric;
     v_timeline bigint;
     v_marker_lsn pg_lsn;
+    v_activation_mode text;
+    v_wal_through pg_lsn;
+    v_valid_through pg_lsn;
 BEGIN
     IF p_proof_id IS NULL THEN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: proof_id is required';
@@ -1181,9 +1190,36 @@ BEGIN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: tracking marker COMMIT LSN is not resolved yet'
             USING HINT = 'Wait for the worker to consume the BOUNDARY commit, then retry.';
     END IF;
-    IF v_proof.backup_start_lsn <= v_marker_lsn THEN
-        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: FULL backup start % must be strictly after marker COMMIT %',
-            v_proof.backup_start_lsn, v_marker_lsn;
+
+    v_activation_mode := COALESCE(
+        NULLIF(btrim(COALESCE(v_proof.details, '{}'::jsonb) ->> 'activation_mode'), ''),
+        'fresh_full_after_marker'
+    );
+    IF v_activation_mode = 'retained_full_plus_wal' THEN
+        -- Retained FULL completed at/before the marker; continuous WAL must
+        -- already be attested through the marker in the helper proof.
+        IF v_proof.backup_stop_lsn > v_marker_lsn THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: retained FULL stop % is after marker %; use fresh_full_after_marker or a completed pre-marker FULL',
+                v_proof.backup_stop_lsn, v_marker_lsn;
+        END IF;
+        v_wal_through := NULLIF(
+            btrim(COALESCE(v_proof.details, '{}'::jsonb) ->> 'wal_verified_through_lsn'),
+            ''
+        )::pg_lsn;
+        IF v_wal_through IS NULL OR v_wal_through < v_marker_lsn THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: retained FULL requires wal_verified_through_lsn >= marker %',
+                v_marker_lsn;
+        END IF;
+        v_valid_through := v_wal_through;
+    ELSIF v_activation_mode = 'fresh_full_after_marker' THEN
+        IF v_proof.backup_start_lsn <= v_marker_lsn THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: FULL backup start % must be strictly after marker COMMIT %',
+                v_proof.backup_start_lsn, v_marker_lsn;
+        END IF;
+        v_valid_through := v_proof.backup_stop_lsn;
+    ELSE
+        RAISE EXCEPTION 'flashback_consume_verified_backup_proof: unsupported activation_mode %',
+            v_activation_mode;
     END IF;
 
     SELECT ba.backup_anchor_id, cg.generation_id
@@ -1227,7 +1263,17 @@ BEGIN
             v_proof.backup_label;
     END IF;
 
-    IF v_pending.boundary_lsn IS NOT NULL
+    -- Intended coverage lower bound: fresh FULL activates at backup stop;
+    -- retained FULL+WAL advertises coverage from the tracking marker (with
+    -- backup_stop <= marker already proven above).
+    IF v_activation_mode = 'retained_full_plus_wal' THEN
+        IF v_pending.boundary_lsn IS NOT NULL
+           AND v_pending.boundary_lsn IS DISTINCT FROM v_marker_lsn
+        THEN
+            RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
+                v_pending.boundary_lsn;
+        END IF;
+    ELSIF v_pending.boundary_lsn IS NOT NULL
        AND v_pending.boundary_lsn IS DISTINCT FROM v_proof.backup_stop_lsn
     THEN
         RAISE EXCEPTION 'flashback_consume_verified_backup_proof: building generation already has immutable boundary %',
@@ -1249,25 +1295,42 @@ BEGIN
         v_proof.verified_at, session_user,
         jsonb_build_object(
             'activation_kind', COALESCE(v_pending.boundary_kind, 'initial_track'),
+            'activation_mode', v_activation_mode,
             'source_generation_id', v_pending.generation_id,
             'verification_request_id', v_proof.verification_request_id,
-            'proof_id', v_proof.proof_id
+            'proof_id', v_proof.proof_id,
+            'wal_verified_through_lsn', v_valid_through,
+            'required_dependencies', COALESCE(v_proof.details -> 'required_dependencies', '[]'::jsonb)
         )
     ) RETURNING backup_anchor_id INTO v_anchor_id;
 
     UPDATE flashback.coverage_generations
        SET backup_anchor_id = v_anchor_id,
-           boundary_lsn = v_proof.backup_stop_lsn,
+           boundary_lsn = CASE
+               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
+               ELSE v_proof.backup_stop_lsn
+           END,
            boundary_time = v_proof.verified_at,
-           valid_through_lsn = v_proof.backup_stop_lsn,
+           valid_through_lsn = v_valid_through,
            valid_through_time = v_proof.verified_at,
            state = 'active',
            activated_at = clock_timestamp(),
-           state_reason = 'verified_full_backup',
+           state_reason = CASE
+               WHEN v_activation_mode = 'retained_full_plus_wal'
+                   THEN 'verified_retained_full_plus_wal'
+               ELSE 'verified_full_backup'
+           END,
            details = COALESCE(details, '{}'::jsonb)
                || jsonb_build_object(
                    'tracking_marker_lsn', v_marker_lsn,
-                   'verification_request_id', v_proof.verification_request_id
+                   'verification_request_id', v_proof.verification_request_id,
+                   'activation_mode', v_activation_mode,
+                   'backup_stop_lsn', v_proof.backup_stop_lsn,
+                   'wal_verified_through_lsn', v_valid_through,
+                   'required_dependencies', COALESCE(
+                       v_proof.details -> 'required_dependencies', '[]'::jsonb
+                   ),
+                   'dependency_pin_id', v_proof.details ->> 'dependency_pin_id'
                )
      WHERE generation_id = v_pending.generation_id
        AND state = 'building'
@@ -1279,18 +1342,27 @@ BEGIN
     END IF;
 
     UPDATE flashback.tracked_tables
-       SET coverage_start_lsn = v_proof.backup_stop_lsn,
-           coverage_end_lsn = v_proof.backup_stop_lsn
+       SET coverage_start_lsn = CASE
+               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
+               ELSE v_proof.backup_stop_lsn
+           END,
+           coverage_end_lsn = v_valid_through
      WHERE tracking_id = v_tracked.tracking_id;
 
     UPDATE flashback.coverage_gaps
-       SET gap_end_lsn = v_proof.backup_stop_lsn,
+       SET gap_end_lsn = CASE
+               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
+               ELSE v_proof.backup_stop_lsn
+           END,
            gap_end_time = v_proof.verified_at,
            reanchored_by_generation_id = v_generation_id,
            reanchored_at = clock_timestamp()
      WHERE tracking_id = v_tracked.tracking_id
        AND reanchored_by_generation_id IS NULL
-       AND gap_start_lsn < v_proof.backup_stop_lsn;
+       AND gap_start_lsn < CASE
+               WHEN v_activation_mode = 'retained_full_plus_wal' THEN v_marker_lsn
+               ELSE v_proof.backup_stop_lsn
+           END;
 
     UPDATE flashback.verified_backup_proofs
        SET consumed_at = clock_timestamp(),

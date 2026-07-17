@@ -335,6 +335,10 @@ mod tests {
         "../tests/sql/integration/local_capacity_admission.sql"
     );
     sql_test!(
+        it_retained_full_activation,
+        "../tests/sql/integration/retained_full_activation.sql"
+    );
+    sql_test!(
         it_slot_health_actions,
         "../tests/sql/integration/slot_health_actions.sql"
     );
