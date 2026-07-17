@@ -118,9 +118,10 @@ configuration.
    test when snapshot-direct is requested.
 3. Read `pgbackrest info --output=json` and select the newest completed full
    backup whose stop LSN is not later than the target.
-4. Acquire the request lock and bind the request ID immutably to both request
-   JSON and helper profile.
-5. Acquire the single-execution work-root lock and reconcile any abandoned
+4. Acquire the single-execution work-root lock, then the request lock, and bind
+   the request ID immutably to both request JSON and helper profile. All paths
+   use this profile-then-request order.
+5. Reconcile any abandoned
    process group, PostgreSQL cluster or socket from a previous crash.
 6. Acquire the shared external repository lock, re-read the backup catalog and
    confirm the selected label still exists.

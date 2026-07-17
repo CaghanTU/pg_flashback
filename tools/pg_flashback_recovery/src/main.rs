@@ -92,10 +92,7 @@ fn run(cli: Cli) -> Result<serde_json::Value, RecoveryError> {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             to_value(run_gc(&config, dry_run)?)
         }
-        Commands::Unpin {
-            config,
-            request_id,
-        } => {
+        Commands::Unpin { config, request_id } => {
             let config: RecoveryConfig = load_recovery_config(&config)?;
             unpin_artifact(&config, &request_id)?;
             to_value(serde_json::json!({

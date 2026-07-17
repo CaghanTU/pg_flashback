@@ -30,7 +30,6 @@ struct ArtifactCandidate {
     artifact_bytes: u64,
     tree_bytes: u64,
     pinned: bool,
-    pin_age_seconds: u64,
 }
 
 /// Run helper artifact GC, optionally as a dry-run that only records decisions.
@@ -80,7 +79,7 @@ pub fn run_gc(config: &RecoveryConfig, dry_run: bool) -> Result<GcReport, Recove
             }
 
             let work_dir = entry.path();
-            let request_lock = match try_acquire_request_lock(config, &request_id) {
+            let _request_lock = match try_acquire_request_lock(config, &request_id) {
                 Ok(lock) => lock,
                 Err(RecoveryError::RequestAlreadyRunning(_)) => {
                     let decision = GcDecision {
@@ -99,7 +98,6 @@ pub fn run_gc(config: &RecoveryConfig, dry_run: bool) -> Result<GcReport, Recove
 
             // Revalidate durable pin/result state only after the per-request lock.
             let inspection = inspect_request(config, &request_id, &work_dir, now)?;
-            drop(request_lock);
 
             match inspection {
                 RequestInspection::Keep { reason, bytes } => {
@@ -123,6 +121,9 @@ pub fn run_gc(config: &RecoveryConfig, dry_run: bool) -> Result<GcReport, Recove
                     };
                     append_audit(&audit_path, &decision)?;
                     if !dry_run {
+                        // Keep the request lock through deletion so a restore cannot
+                        // recreate this directory after the inspection above.
+                        run_remove_now_before_delete_hook();
                         remove_request_directory(config, &request_id, &work_dir)?;
                     }
                     decisions.push(decision);
@@ -140,24 +141,28 @@ pub fn run_gc(config: &RecoveryConfig, dry_run: bool) -> Result<GcReport, Recove
 
     let mut retained = Vec::new();
     for candidate in candidates {
+        if candidate.pinned {
+            let decision = GcDecision {
+                request_id: candidate.request_id.clone(),
+                action: GcAction::Keep,
+                reason: "artifact is pinned awaiting import".to_owned(),
+                bytes: candidate.tree_bytes,
+                dry_run,
+            };
+            append_audit(&audit_path, &decision)?;
+            decisions.push(decision);
+            retained.push(candidate);
+            continue;
+        }
+
         let ttl_expired = config.artifact_ttl_seconds > 0
             && now.saturating_sub(candidate.completed_at) >= config.artifact_ttl_seconds;
-        let pin_expired = candidate.pinned
-            && config.artifact_ttl_seconds > 0
-            && candidate.pin_age_seconds >= config.artifact_ttl_seconds;
 
-        if ttl_expired || pin_expired {
-            let reason = if pin_expired {
-                format!(
-                    "artifact pin exceeded TTL of {} seconds",
-                    config.artifact_ttl_seconds
-                )
-            } else {
-                format!(
-                    "completed artifact exceeded TTL of {} seconds",
-                    config.artifact_ttl_seconds
-                )
-            };
+        if ttl_expired {
+            let reason = format!(
+                "completed artifact exceeded TTL of {} seconds",
+                config.artifact_ttl_seconds
+            );
             let decision = GcDecision {
                 request_id: candidate.request_id.clone(),
                 action: GcAction::Remove,
@@ -184,20 +189,6 @@ pub fn run_gc(config: &RecoveryConfig, dry_run: bool) -> Result<GcReport, Recove
                 remove_request_directory(config, &candidate.request_id, &candidate.work_dir)?;
             }
             decisions.push(decision);
-            continue;
-        }
-
-        if candidate.pinned {
-            let decision = GcDecision {
-                request_id: candidate.request_id.clone(),
-                action: GcAction::Keep,
-                reason: "artifact is pinned awaiting import".to_owned(),
-                bytes: candidate.tree_bytes,
-                dry_run,
-            };
-            append_audit(&audit_path, &decision)?;
-            decisions.push(decision);
-            retained.push(candidate);
             continue;
         }
 
@@ -302,22 +293,9 @@ fn inspect_request(
             && artifact_path.is_file()
             && result.artifact_path == artifact_path
         {
-            let pin_path = work_dir.join(PIN_FILE_NAME);
-            let (pinned, pin_age) = if pin_path.is_file() {
-                let pin: ArtifactPin = load_json(&pin_path)?;
-                if pin.request_id != request_id {
-                    return Ok(RequestInspection::RemoveNow {
-                        reason: "artifact pin request_id does not match directory".to_owned(),
-                        bytes: tree_bytes,
-                    });
-                }
-                (
-                    true,
-                    now.saturating_sub(pin.pinned_at_unix_seconds),
-                )
-            } else {
-                (false, 0)
-            };
+            // A durable pin is authoritative, even if it is malformed or old.
+            // Only explicit unpin or a terminal transition may make it collectible.
+            let pinned = work_dir.join(PIN_FILE_NAME).is_file();
             let completed_at = state_completed_at(&state_path)?.unwrap_or(now);
             return Ok(RequestInspection::Completed(ArtifactCandidate {
                 request_id: request_id.to_owned(),
@@ -326,7 +304,6 @@ fn inspect_request(
                 artifact_bytes: result.artifact_bytes,
                 tree_bytes,
                 pinned,
-                pin_age_seconds: pin_age,
             }));
         }
         return Ok(RequestInspection::RemoveNow {
@@ -347,7 +324,10 @@ fn inspect_request(
             });
         }
         return Ok(RequestInspection::Keep {
-            reason: format!("request phase {} has no completed artifact yet", state.phase),
+            reason: format!(
+                "request phase {} has no completed artifact yet",
+                state.phase
+            ),
             bytes: tree_bytes,
         });
     }
@@ -380,6 +360,10 @@ fn still_protected_completed(
     work_dir: &Path,
     now: u64,
 ) -> Result<bool, RecoveryError> {
+    // Pins have no TTL: their presence protects the artifact until unpin.
+    if work_dir.join(PIN_FILE_NAME).is_file() {
+        return Ok(true);
+    }
     match inspect_request(
         config,
         work_dir
@@ -392,10 +376,7 @@ fn still_protected_completed(
         RequestInspection::Completed(candidate) => {
             let ttl_expired = config.artifact_ttl_seconds > 0
                 && now.saturating_sub(candidate.completed_at) >= config.artifact_ttl_seconds;
-            let pin_expired = candidate.pinned
-                && config.artifact_ttl_seconds > 0
-                && candidate.pin_age_seconds >= config.artifact_ttl_seconds;
-            Ok(!(ttl_expired || pin_expired) && candidate.pinned)
+            Ok(!ttl_expired)
         }
         RequestInspection::Keep { .. } => Ok(true),
         RequestInspection::RemoveNow { .. } => Ok(false),
@@ -422,10 +403,9 @@ fn enforce_retention_caps(
             .iter()
             .map(|candidate| candidate.artifact_bytes)
             .fold(0_u64, u64::saturating_add);
-        let over_count =
-            config.max_retained_artifacts > 0 && count > config.max_retained_artifacts;
-        let over_bytes = config.max_retained_artifact_bytes > 0
-            && bytes > config.max_retained_artifact_bytes;
+        let over_count = config.max_retained_artifacts > 0 && count > config.max_retained_artifacts;
+        let over_bytes =
+            config.max_retained_artifact_bytes > 0 && bytes > config.max_retained_artifact_bytes;
         if !over_count && !over_bytes {
             break;
         }
@@ -456,12 +436,20 @@ fn enforce_retention_caps(
         append_audit(audit_path, &decision)?;
         if !dry_run {
             let _lock = acquire_request_lock_for_id(config, &candidate.request_id)?;
-            let pin_path = candidate.work_dir.join(PIN_FILE_NAME);
-            if pin_path.is_file() {
+            let still_eligible = matches!(
+                inspect_request(
+                    config,
+                    &candidate.request_id,
+                    &candidate.work_dir,
+                    unix_seconds()?
+                )?,
+                RequestInspection::Completed(ArtifactCandidate { pinned: false, .. })
+            );
+            if !still_eligible {
                 let keep = GcDecision {
                     request_id: candidate.request_id,
                     action: GcAction::Keep,
-                    reason: "pin appeared after selection; refusing deletion".to_owned(),
+                    reason: "revalidated as protected after lock acquisition".to_owned(),
                     bytes: candidate.tree_bytes,
                     dry_run,
                 };
@@ -510,13 +498,40 @@ fn remove_request_directory(
         .join(".contracts")
         .join(format!("{request_id}.json"));
     remove_file_if_exists(&contract)?;
-    let lock = config
-        .work_root
-        .join(".locks")
-        .join(format!("{request_id}.lock"));
-    remove_file_if_exists(&lock)?;
+    // Keep the lock file so flock continues to coordinate through one inode.
     Ok(())
 }
+
+#[cfg(test)]
+type RemoveNowBeforeDeleteHook = dyn Fn() + Send + Sync;
+
+#[cfg(test)]
+static REMOVE_NOW_BEFORE_DELETE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::Arc<RemoveNowBeforeDeleteHook>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_remove_now_before_delete_hook(hook: Option<std::sync::Arc<RemoveNowBeforeDeleteHook>>) {
+    *REMOVE_NOW_BEFORE_DELETE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("remove-before-delete hook lock poisoned") = hook;
+}
+
+#[cfg(test)]
+fn run_remove_now_before_delete_hook() {
+    let hook = REMOVE_NOW_BEFORE_DELETE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("remove-before-delete hook lock poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_remove_now_before_delete_hook() {}
 
 fn state_completed_at(path: &Path) -> Result<Option<u64>, RecoveryError> {
     if !path.is_file() {
@@ -602,14 +617,24 @@ fn unix_seconds() -> Result<u64, RecoveryError> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::thread;
 
-    use super::{run_gc, write_artifact_pin, PIN_FILE_NAME};
-    use crate::executor::{prepare_secure_directory, write_json_atomic};
-    use crate::model::{
-        ArtifactPin, ExecutionDurations, ExecutionState, GcAction, RecoveryConfig,
-        RecoveryEngine, RestoreRequest, RestoreResult, SnapshotProvider, TableRef, TargetKind,
-        RecoveryTarget,
+    use super::{
+        run_gc, set_remove_now_before_delete_hook, unpin_artifact, write_artifact_pin,
+        PIN_FILE_NAME,
     };
+    use crate::error::RecoveryError;
+    use crate::executor::{
+        acquire_profile_lock, acquire_request_lock_for_id, prepare_secure_directory,
+        write_json_atomic,
+    };
+    use crate::model::{
+        ArtifactPin, ExecutionDurations, ExecutionState, GcAction, RecoveryConfig, RecoveryEngine,
+        RecoveryTarget, RestoreRequest, RestoreResult, SnapshotProvider, TableRef, TargetKind,
+    };
+
+    static REMOVE_NOW_HOOK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn test_config(work_root: PathBuf) -> RecoveryConfig {
         RecoveryConfig {
@@ -695,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_removes_expired_unpinned_and_keeps_fresh_pins() {
+    fn gc_keeps_ancient_pins_until_explicit_unpin() {
         let root = std::env::temp_dir().join(format!(
             "pgfb-gc-{}-{}",
             std::process::id(),
@@ -707,11 +732,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         prepare_secure_directory(&root).unwrap();
         let config = test_config(root.clone());
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
 
         let old_id = "old-artifact";
         let old_dir = root.join(old_id);
@@ -747,12 +767,22 @@ mod tests {
             &ExecutionState {
                 request_id: pinned_id.to_owned(),
                 phase: "completed".to_owned(),
-                updated_at_unix_seconds: now,
+                updated_at_unix_seconds: 1,
                 detail: None,
             },
         )
         .unwrap();
         write_artifact_pin(&pinned_dir, pinned_id, &"c".repeat(64)).unwrap();
+        write_json_atomic(
+            &pinned_dir.join(PIN_FILE_NAME),
+            &ArtifactPin {
+                request_id: pinned_id.to_owned(),
+                pinned_at_unix_seconds: 1,
+                reason: "awaiting_import".to_owned(),
+                artifact_sha256: "c".repeat(64),
+            },
+        )
+        .unwrap();
 
         let dry = run_gc(&config, true).unwrap();
         assert!(dry.decisions.iter().any(|decision| {
@@ -769,6 +799,73 @@ mod tests {
         let pin: ArtifactPin = crate::load_json(&pinned_dir.join(PIN_FILE_NAME)).unwrap();
         assert_eq!(pin.reason, "awaiting_import");
         assert!(live.audit_path.is_file());
+
+        unpin_artifact(&config, pinned_id).unwrap();
+        let after_unpin = run_gc(&config, false).unwrap();
+        assert!(after_unpin.decisions.iter().any(|decision| {
+            decision.request_id == pinned_id && decision.action == GcAction::Remove
+        }));
+        assert!(!pinned_dir.exists());
+        assert!(
+            root.join(".locks")
+                .join(format!("{pinned_id}.lock"))
+                .is_file(),
+            "request lock files persist so flock keeps a stable inode"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn remove_now_holds_request_lock_through_delete() {
+        let _hook_test_lock = REMOVE_NOW_HOOK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "pgfb-gc-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        prepare_secure_directory(&root).unwrap();
+        let config = test_config(root.clone());
+        let request_id = "remove-now-race";
+        let work_dir = root.join(request_id);
+        prepare_secure_directory(&work_dir).unwrap();
+        fs::write(work_dir.join("orphan"), b"orphan").unwrap();
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        set_remove_now_before_delete_hook(Some(Arc::new(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        })));
+
+        let gc_config = config.clone();
+        let gc = thread::spawn(move || run_gc(&gc_config, false));
+        ready_rx.recv().unwrap();
+
+        // Restores use profile -> request. The profile lock blocks them first;
+        // the direct request check also proves GC keeps its lock through delete.
+        assert!(matches!(
+            acquire_profile_lock(&config),
+            Err(RecoveryError::RecoveryBusy(profile)) if profile == "test"
+        ));
+        assert!(matches!(
+            acquire_request_lock_for_id(&config, request_id),
+            Err(RecoveryError::RequestAlreadyRunning(id)) if id == request_id
+        ));
+        assert!(work_dir.exists());
+
+        release_tx.send(()).unwrap();
+        gc.join().unwrap().unwrap();
+        set_remove_now_before_delete_hook(None);
+        assert!(!work_dir.exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -42,9 +42,7 @@ pub enum RecoveryError {
     #[error("work_root aggregate usage {used} bytes exceeds max_work_root_bytes={limit}")]
     WorkRootQuotaExceeded { used: u64, limit: u64 },
 
-    #[error(
-        "filesystem free space {available} bytes is below min_free_bytes={required}"
-    )]
+    #[error("filesystem free space {available} bytes is below min_free_bytes={required}")]
     FreeSpaceExhausted { available: u64, required: u64 },
 
     #[error("request {0} is already running")]

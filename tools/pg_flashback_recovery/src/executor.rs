@@ -159,6 +159,8 @@ pub fn execute_restore(
 ) -> Result<RestoreResult, RecoveryError> {
     prepare_secure_directory(&config.work_root)?;
     prepare_secure_directory(&config.socket_root)?;
+    // Every multi-lock path takes profile before request, including cache hits.
+    let _profile_lock = acquire_profile_lock(config)?;
     let _request_lock = acquire_request_lock(config, request)?;
     preserve_request_contract(config, request)?;
 
@@ -169,7 +171,6 @@ pub fn execute_restore(
         write_artifact_pin(&work_dir, &request.request_id, &existing.artifact_sha256)?;
         return Ok(existing);
     }
-    let _profile_lock = acquire_profile_lock(config)?;
     reconcile_abandoned_requests(config)?;
     let mut runtime = prepare_runtime(config, request, plan, work_dir, result_path)?;
     runtime.write_state("accepted", None)?;
@@ -1418,9 +1419,20 @@ pub(crate) fn reconcile_abandoned_requests(config: &RecoveryConfig) -> Result<()
             && !result_path.is_file()
             && state_path.is_file()
             && matches!(
-                load_json::<ExecutionState>(&state_path).ok().as_ref().map(|state| state.phase.as_str()),
-                Some("failed" | "cleanup_failed" | "accepted" | "materializing" | "recovering"
-                    | "validating" | "extracting" | "cleaning")
+                load_json::<ExecutionState>(&state_path)
+                    .ok()
+                    .as_ref()
+                    .map(|state| state.phase.as_str()),
+                Some(
+                    "failed"
+                        | "cleanup_failed"
+                        | "accepted"
+                        | "materializing"
+                        | "recovering"
+                        | "validating"
+                        | "extracting"
+                        | "cleaning"
+                )
             );
 
         if !abandoned_runtime && !orphan_incomplete {
