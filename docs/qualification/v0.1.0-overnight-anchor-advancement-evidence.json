@@ -1,13 +1,14 @@
 {
   "branch": "work/v0.1.0-overnight",
   "provenance": {
-    "source_commit": "2b6b45b87eb42a0d160e65e82e16d4df7e3b2690",
-    "source_tree": "f60332559c639fd9215eb59ec2e049781cfa95aa",
+    "source_commit": "92ccab390badd8567afffc6431ff95de7f27e21f",
+    "source_tree": "6e664d409a854846aba6e9e0a487b38ffde9a389",
+    "tested_product_commit": "2b6b45b87eb42a0d160e65e82e16d4df7e3b2690",
     "helper_binary_sha256": "e53c9d9f886dcf571ea5fea1fea4760b2ddf24978611c4767fbda0352d3d630e",
     "extension_binary_sha256": "c1269f78c1565673a8303d319667614a5db13f847d265ed3610ef2d2bfb12e60",
-    "run_completed_at": "2026-07-17T17:39:13Z",
+    "run_completed_at": "2026-07-17T17:39:29Z",
     "tree_clean_at_start": true,
-    "note": "source_commit is the tested executable/SQL/test tree; evidence_summary_commit may differ only in docs/evidence"
+    "note": "Product/SQL/tests were exercised at tested_product_commit; source_commit adds only the provenance verifier script. evidence_summary_commit may differ only in docs/evidence."
   },
   "pgrx_matrix": {
     "pg15": "76_passed",
