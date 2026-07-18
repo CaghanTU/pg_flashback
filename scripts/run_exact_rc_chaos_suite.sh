@@ -427,9 +427,19 @@ BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
 # slot and matches scripts/run_fault_injection_smoke.sh.
 "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
 wait_primary_ready || die "primary did not accept connections after worker kill restart"
+# Wait for worker + healthy before writing, then require delta_log growth.
+for _ in $(seq 1 200); do
+    HEALTH=$(primary_sql "SELECT health FROM flashback_health()
+                          WHERE table_name='public.chaos_probe';")
+    WORKER_ALIVE=$(primary_sql "SELECT count(*) FROM pg_stat_activity
+        WHERE backend_type='pg_flashback delta worker'
+          AND datname=current_database();")
+    [[ "$HEALTH" == "healthy" && "$WORKER_ALIVE" -ge 1 ]] && break
+    sleep 0.1
+done
+[[ "${HEALTH:-}" == "healthy" ]] || die "probe not healthy after restart (got ${HEALTH:-none})"
 primary_sql "INSERT INTO public.chaos_probe(payload) VALUES ('worker-kill');" >/dev/null
 AFTER_ROWS="$BEFORE_ROWS"
-HEALTH=""
 for _ in $(seq 1 200); do
     AFTER_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                               WHERE rel_oid='public.chaos_probe'::regclass;")
@@ -439,7 +449,7 @@ for _ in $(seq 1 200); do
     primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
 done
-[[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" ]] || die "capture did not resume after worker kill"
+[[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" ]] || die "capture did not resume after worker kill (before=$BEFORE_ROWS after=$AFTER_ROWS health=$HEALTH)"
 [[ "$HEALTH" == "healthy" ]] || die "health not healthy after worker kill (got ${HEALTH:-none})"
 assert_baseline "worker_kill"
 pass worker_kill
