@@ -189,14 +189,16 @@ wait_commit_covered() {
 }
 restore_lsn_retry() {
     local rel=$1 lsn=$2
-    local _i
+    local _i err
+    err=""
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-        if q "SELECT flashback_restore_lsn('$rel', '$lsn'::pg_lsn);" >/dev/null 2>/dev/null; then
+        if err=$(q "SELECT flashback_restore_lsn('$rel', '$lsn'::pg_lsn);" 2>&1); then
             return 0
         fi
         sleep 0.1
     done
+    log "restore_lsn last error for $rel@$lsn: $err"
     return 1
 }
 force_archive() { q "SELECT pg_switch_wal();" >/dev/null; sleep 2; }
@@ -361,6 +363,11 @@ COLS_DROP=$(q "SELECT string_agg(attname, ',' ORDER BY attnum)
                FROM pg_attribute WHERE attrelid='public.drop_probe'::regclass AND attnum>0 AND NOT attisdropped;")
 q "DROP TABLE public.drop_probe;" >/dev/null
 [[ "$(q "SELECT to_regclass('public.drop_probe') IS NULL;")" == "t" ]] || die "DROP did not remove relation"
+q "SELECT pg_switch_wal();" >/dev/null
+# Drain the DROP event so restore's relation-WAL barrier can pass for the
+# historical OID before reconstruct.
+wait_commit_covered "public.drop_probe" "DROP" "true" >/dev/null \
+    || die "DROP event not covered before restore"
 restore_lsn_retry "public.drop_probe" "$DROP_TARGET_LSN" || die "drop restore_lsn failed"
 [[ "$(q "SELECT to_regclass('public.drop_probe') IS NOT NULL;")" == "t" ]] || die "drop restore missing table"
 [[ "$(fingerprint_of "public.drop_probe")" == "$FP_DROP" ]] || die "drop restore fingerprint"

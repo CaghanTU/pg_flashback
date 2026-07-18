@@ -353,29 +353,46 @@ PY
 
 do_drop_restore_drill() {
     local tag=$1
+    local lsn fp _i vt
     q "DROP TABLE IF EXISTS public.drop_probe;" >/dev/null
     q "CREATE TABLE public.drop_probe(id bigint PRIMARY KEY, marker text NOT NULL, payload text NOT NULL);"
-    q "INSERT INTO public.drop_probe VALUES (1,'$tag', repeat('d', 500));" >/dev/null
     q "SELECT flashback_track('public.drop_probe');" >/dev/null
     wait_healthy "public.drop_probe" || die "$tag drop_probe not healthy"
-    local lsn fp
-    lsn=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-             WHERE rel_oid='public.drop_probe'::regclass
-             ORDER BY commit_lsn DESC LIMIT 1;")
-    for _ in $(seq 1 100); do
-        local vt
-        vt=$(q "SELECT valid_through_lsn::text FROM flashback.coverage_generations cg
-                JOIN flashback.tracked_tables tt USING (tracking_id)
-                WHERE tt.table_name='drop_probe' AND cg.state='active'
-                ORDER BY cg.generation_no DESC LIMIT 1;")
-        [[ -n "$vt" && "$(q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;")" == "t" ]] && break
-        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-        sleep 0.1
+    q "INSERT INTO public.drop_probe VALUES (1,'$tag', repeat('d', 500));" >/dev/null
+    q "SELECT pg_switch_wal();" >/dev/null
+    lsn=""
+    for _i in $(seq 1 200); do
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        lsn=$(q "SELECT commit_lsn::text FROM flashback.delta_log
+                 WHERE table_name='public.drop_probe' AND event_type='INSERT'
+                 ORDER BY commit_lsn DESC LIMIT 1;")
+        vt=$(q "SELECT valid_through_lsn::text FROM flashback.coverage_generations
+                WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
+        if [[ -n "$lsn" && -n "$vt" && "$(q "SELECT CASE WHEN '$vt'::pg_lsn >= '$lsn'::pg_lsn THEN 't' ELSE 'f' END;")" == "t" ]]; then
+            break
+        fi
+        sleep 0.05
     done
+    [[ -n "$lsn" ]] || die "$tag drop frontier not covered"
     fp=$(fingerprint_of "public.drop_probe")
     q "DROP TABLE public.drop_probe;" >/dev/null
     [[ "$(q "SELECT to_regclass('public.drop_probe') IS NULL;")" == "t" ]] || die "$tag drop failed"
-    q "SELECT flashback_restore_lsn('public.drop_probe', '$lsn');" >/dev/null
+    q "SELECT pg_switch_wal();" >/dev/null
+    for _i in $(seq 1 200); do
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE table_name='public.drop_probe' AND event_type='DROP';")" -ge 1 ]] && break
+        sleep 0.05
+    done
+    for _i in $(seq 1 200); do
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        if q "SELECT flashback_restore_lsn('public.drop_probe', '$lsn'::pg_lsn);" >/dev/null 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        if (( _i == 200 )); then
+            die "$tag drop restore_lsn failed"
+        fi
+    done
     [[ "$(fingerprint_of "public.drop_probe")" == "$fp" ]] || die "$tag drop restore fingerprint"
     wait_healthy "public.drop_probe" || die "$tag post-drop coverage"
     LAST_OP="drop_restore_$tag"

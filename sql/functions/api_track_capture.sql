@@ -167,7 +167,25 @@ AS $$
             FROM pg_policy pol
             WHERE pol.polrelid = c.oid
         ), '[]'::jsonb),
-        'rls_enabled', c.relrowsecurity
+        'rls_enabled', c.relrowsecurity,
+        -- Ownership metadata is required for flashback_restore_lsn after a
+        -- real DROP TABLE, when the live relation is gone and cannot donate
+        -- owner/ACL during finalize_shadow_swap.
+        'owner', (SELECT rolname FROM pg_roles WHERE oid = c.relowner),
+        'acl', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'grantee', CASE
+                        WHEN ae.grantee = 0 THEN 'PUBLIC'
+                        ELSE (SELECT rolname FROM pg_roles WHERE oid = ae.grantee)
+                    END,
+                    'privilege', ae.privilege_type,
+                    'is_grantable', ae.is_grantable
+                )
+                ORDER BY ae.grantee, ae.privilege_type
+            )
+            FROM aclexplode(c.relacl) AS ae(grantor, grantee, privilege_type, is_grantable)
+        ), '[]'::jsonb)
     )
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace

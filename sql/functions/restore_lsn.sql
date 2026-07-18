@@ -165,6 +165,17 @@ BEGIN
         FROM flashback.snapshots snap
         WHERE snap.snapshot_id = admission.boundary_snapshot_id
           AND snap.tracking_id = admission.tracking_id;
+    ELSE
+        -- schema_versions stores structural pieces only; ownership metadata for
+        -- dropped-table reconstruct lives on the boundary snapshot schema_def.
+        SELECT v_schema_def || jsonb_strip_nulls(jsonb_build_object(
+                   'owner', snap.schema_def->>'owner',
+                   'acl', snap.schema_def->'acl'
+               ))
+          INTO v_schema_def
+        FROM flashback.snapshots snap
+        WHERE snap.snapshot_id = admission.boundary_snapshot_id
+          AND snap.tracking_id = admission.tracking_id;
     END IF;
     IF v_schema_def IS NULL OR jsonb_array_length(COALESCE(v_schema_def->'columns', '[]'::jsonb)) = 0 THEN
         RAISE EXCEPTION 'pg_flashback: generation % has no usable boundary schema',
@@ -408,6 +419,8 @@ DECLARE
     v_shadow_name text;
     v_new_rel_oid oid;
     v_old_rel_oid oid;
+    v_live_oid oid;
+    v_capacity_rel oid;
     v_current_generation_id bigint;
     v_new_stream_id bigint;
     v_new_snapshot_id bigint;
@@ -441,29 +454,54 @@ BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
-    -- Capacity preflight before the final-strength relation lock.
-    PERFORM flashback_local_restore_preflight(
-        format('%I.%I', admission.schema_name, admission.table_name)::regclass
-    );
+    v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
+    IF v_live_oid IS NOT NULL THEN
+        v_capacity_rel := v_live_oid;
+    ELSE
+        -- DROP TABLE reconstruct: live heap is gone. Budget restore peak from
+        -- the admitted boundary snapshot payload (heap+TOAST proxy).
+        v_capacity_rel := to_regclass(admission.snapshot_table);
+        IF v_capacity_rel IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: cannot admit restore capacity for dropped table % without boundary snapshot %',
+                p_target_table, admission.snapshot_table;
+        END IF;
+    END IF;
+
+    -- Capacity preflight before the final-strength relation lock (or before
+    -- reconstruct when the live relation is already absent).
+    PERFORM flashback_local_restore_preflight(v_capacity_rel);
     PERFORM flashback_apply_local_boundary_lock_timeout();
 
-    -- Freeze the old physical relation, then prove its bounded logical prefix
-    -- empty without trying to advance the slot in this transaction.
-    BEGIN
-        EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
-                       admission.schema_name, admission.table_name);
-    EXCEPTION WHEN lock_not_available THEN
-        RAISE EXCEPTION 'pg_flashback: local restore lock wait exceeded local_boundary_write_stall_ms'
-            USING ERRCODE = 'lock_not_available',
-                  HINT = 'Retry when the table is idle, raise the write-stall budget, or use the backup profile.';
-    END;
+    IF v_live_oid IS NOT NULL THEN
+        -- Freeze the old physical relation, then prove its bounded logical prefix
+        -- empty without trying to advance the slot in this transaction.
+        BEGIN
+            EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+                           admission.schema_name, admission.table_name);
+        EXCEPTION WHEN lock_not_available THEN
+            RAISE EXCEPTION 'pg_flashback: local restore lock wait exceeded local_boundary_write_stall_ms'
+                USING ERRCODE = 'lock_not_available',
+                      HINT = 'Retry when the table is idle, raise the write-stall budget, or use the backup profile.';
+        END;
+    END IF;
+
+    -- Drain against the tracked lifecycle OID (survives DROP TABLE).
     PERFORM flashback_assert_relation_wal_drained(ARRAY[admission.rel_oid]);
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
-    -- Revalidate capacity under the locked relation before materialization.
-    PERFORM flashback_local_restore_preflight(
-        format('%I.%I', admission.schema_name, admission.table_name)::regclass
-    );
+
+    v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
+    IF v_live_oid IS NOT NULL THEN
+        v_capacity_rel := v_live_oid;
+    ELSE
+        v_capacity_rel := to_regclass(admission.snapshot_table);
+        IF v_capacity_rel IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: cannot revalidate restore capacity for dropped table % without boundary snapshot %',
+                p_target_table, admission.snapshot_table;
+        END IF;
+    END IF;
+    -- Revalidate capacity before materialization.
+    PERFORM flashback_local_restore_preflight(v_capacity_rel);
 
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg

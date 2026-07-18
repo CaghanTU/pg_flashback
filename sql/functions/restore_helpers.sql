@@ -1333,8 +1333,17 @@ BEGIN
         END;
     END LOOP;
 
-    -- Restore owner and ACL
-    IF v_owner IS NOT NULL THEN
+    -- Restore owner and ACL. When the live relation was already DROP'd before
+    -- restore, catalog rows are gone — use ownership captured in schema_def.
+    IF v_owner IS NULL AND COALESCE(ddl_info->>'owner', '') <> '' THEN
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I OWNER TO %I',
+                p_orig_schema, p_orig_table, ddl_info->>'owner');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'flashback: could not restore owner % for %.% from schema_def: %',
+                ddl_info->>'owner', p_orig_schema, p_orig_table, SQLERRM;
+        END;
+    ELSIF v_owner IS NOT NULL THEN
         EXECUTE format('ALTER TABLE %I.%I OWNER TO %s',
             p_orig_schema, p_orig_table, v_owner);
     END IF;
@@ -1353,6 +1362,38 @@ BEGIN
                         v_acl_rec.privilege_type, p_orig_schema, p_orig_table,
                         quote_ident((SELECT rolname FROM pg_roles WHERE oid = v_acl_rec.grantee)));
                 END IF;
+            END LOOP;
+        END;
+    ELSIF jsonb_typeof(ddl_info->'acl') = 'array'
+          AND jsonb_array_length(ddl_info->'acl') > 0
+    THEN
+        DECLARE
+            v_acl_json record;
+        BEGIN
+            FOR v_acl_json IN
+                SELECT a->>'grantee' AS grantee,
+                       a->>'privilege' AS privilege,
+                       COALESCE((a->>'is_grantable')::boolean, false) AS is_grantable
+                FROM jsonb_array_elements(ddl_info->'acl') a
+            LOOP
+                BEGIN
+                    IF v_acl_json.grantee = 'PUBLIC' THEN
+                        EXECUTE format('GRANT %s ON %I.%I TO PUBLIC%s',
+                            v_acl_json.privilege, p_orig_schema, p_orig_table,
+                            CASE WHEN v_acl_json.is_grantable
+                                 THEN ' WITH GRANT OPTION' ELSE '' END);
+                    ELSE
+                        EXECUTE format('GRANT %s ON %I.%I TO %I%s',
+                            v_acl_json.privilege, p_orig_schema, p_orig_table,
+                            v_acl_json.grantee,
+                            CASE WHEN v_acl_json.is_grantable
+                                 THEN ' WITH GRANT OPTION' ELSE '' END);
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    RAISE WARNING 'flashback: GRANT % on %.% to % from schema_def failed: %',
+                        v_acl_json.privilege, p_orig_schema, p_orig_table,
+                        v_acl_json.grantee, SQLERRM;
+                END;
             END LOOP;
         END;
     END IF;
