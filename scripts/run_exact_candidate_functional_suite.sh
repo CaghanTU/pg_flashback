@@ -299,8 +299,12 @@ q "ALTER TABLE public.steady_dml OWNER TO func_owner;
 q "SELECT flashback_track('public.steady_dml');" >/dev/null
 wait_healthy "public.steady_dml" || die "steady_dml not healthy"
 q "INSERT INTO public.steady_dml VALUES (1,'ins','a'),(2,'ins','b');" >/dev/null
+for _ in $(seq 1 200); do
+    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='public.steady_dml'::regclass AND event_type='INSERT';")" -ge 2 ]] && break
+    sleep 0.1
+done
 q "UPDATE public.steady_dml SET marker='upd', payload='b2' WHERE id=2;" >/dev/null
-q "DELETE FROM public.steady_dml WHERE id=1;" >/dev/null
 COMMIT_LSN=""
 for _ in $(seq 1 200); do
     q "SELECT flashback_consume_wal(4096);" >/dev/null || true
@@ -310,19 +314,37 @@ for _ in $(seq 1 200); do
                       AND event_type = 'UPDATE'
                     ORDER BY commit_lsn DESC LIMIT 1;")
     [[ -n "$COMMIT_LSN" ]] && break
-    COMMIT_LSN=$(q "SELECT commit_lsn::text
-                    FROM flashback.delta_log
-                    WHERE rel_oid='public.steady_dml'::regclass
-                    ORDER BY commit_lsn DESC LIMIT 1;")
-    [[ -n "$COMMIT_LSN" ]] && break
     sleep 0.1
 done
-[[ -n "$COMMIT_LSN" ]] || die "no delta_log commit LSN"
+[[ -n "$COMMIT_LSN" ]] || die "no UPDATE commit LSN in delta_log"
 wait_watermark "public.steady_dml" "$COMMIT_LSN" || die "watermark missed $COMMIT_LSN"
+q "DELETE FROM public.steady_dml WHERE id=1;" >/dev/null
+for _ in $(seq 1 200); do
+    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+    DEL_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
+                 WHERE rel_oid='public.steady_dml'::regclass AND event_type='DELETE'
+                 ORDER BY commit_lsn DESC LIMIT 1;")
+    [[ -n "$DEL_LSN" ]] && break
+    sleep 0.1
+done
+wait_watermark "public.steady_dml" "$DEL_LSN" || die "delete watermark missed"
 FP_STEADY=$(fingerprint_of "public.steady_dml")
+# Mutate past the restore target, drain, then restore the DELETE-era fingerprint.
 q "UPDATE public.steady_dml SET payload='mutated' WHERE id=2;" >/dev/null
-restore_lsn_retry "public.steady_dml" "$COMMIT_LSN" || die "DML restore_lsn failed after drain"
-[[ "$(fingerprint_of "public.steady_dml")" == "$FP_STEADY" ]] || die "DML restore fingerprint mismatch"
+for _ in $(seq 1 200); do
+    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+    MUT=$(q "SELECT commit_lsn::text FROM flashback.delta_log
+             WHERE rel_oid='public.steady_dml'::regclass AND event_type='UPDATE'
+             ORDER BY commit_lsn DESC LIMIT 1;")
+    [[ -n "$MUT" && "$(q "SELECT '$MUT'::pg_lsn > '$DEL_LSN'::pg_lsn;")" == "t" ]] && break
+    sleep 0.1
+done
+wait_watermark "public.steady_dml" "$MUT" || true
+restore_lsn_retry "public.steady_dml" "$DEL_LSN" || die "DML restore_lsn failed after drain"
+[[ "$(fingerprint_of "public.steady_dml")" == "$FP_STEADY" ]] \
+    || die "DML restore fingerprint mismatch (got $(fingerprint_of "public.steady_dml") want $FP_STEADY)"
+[[ "$(q "SELECT count(*) FROM public.steady_dml;")" == "1" ]] || die "DML restore row count"
+[[ "$(q "SELECT payload FROM public.steady_dml WHERE id=2;")" == "b2" ]] || die "DML restore payload"
 wait_healthy "public.steady_dml" || die "post-restore health"
 pass local_dml
 
