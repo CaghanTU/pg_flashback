@@ -257,20 +257,26 @@ write_request() {
 }
 
 assert_baseline() {
-    local label="$1" health_target health_probe
+    local label="$1" require_probe="${2:-1}" health_target health_probe
     for _ in $(seq 1 80); do
         health_target=$(primary_sql "SELECT health FROM flashback_health()
                                      WHERE table_name='public.target_table';")
-        health_probe=$(primary_sql "SELECT health FROM flashback_health()
-                                    WHERE table_name='public.chaos_probe';")
-        [[ "$health_target" == "healthy" && "$health_probe" == "healthy" ]] && break
+        if [[ "$require_probe" == "1" ]]; then
+            health_probe=$(primary_sql "SELECT health FROM flashback_health()
+                                        WHERE table_name='public.chaos_probe';")
+            [[ "$health_target" == "healthy" && "$health_probe" == "healthy" ]] && break
+        else
+            [[ "$health_target" == "healthy" ]] && break
+        fi
         primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
         sleep 0.1
     done
     [[ "$health_target" == "healthy" ]] \
         || die "baseline target_table unhealthy after $label (got $health_target)"
-    [[ "$health_probe" == "healthy" ]] \
-        || die "baseline chaos_probe unhealthy after $label (got $health_probe)"
+    if [[ "$require_probe" == "1" ]]; then
+        [[ "$health_probe" == "healthy" ]] \
+            || die "baseline chaos_probe unhealthy after $label (got $health_probe)"
+    fi
     [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
                        WHERE tracking_id=$TRACKING_ID AND state='active';")" == "1" ]] \
         || die "baseline active generation missing after $label"
@@ -397,7 +403,7 @@ jq -n --arg request_id "chaos-retained-ok" --argjson tracking_id "$TRACKING_ID" 
     > "$RUN_ROOT/verify-retained.result.json"
 [[ "$(jq -r '.status' "$RUN_ROOT/verify-retained.result.json")" == "verified" ]] \
     || die "retained activation failed"
-assert_baseline "activation"
+assert_baseline "activation" 0
 
 # Separate local_delta probe table for worker/slot injectors (backup profile
 # coverage alone is not the local capture path exercised by fault smoke).
@@ -413,7 +419,7 @@ done
 [[ "$(primary_sql "SELECT health FROM flashback_health()
                    WHERE table_name='public.chaos_probe';")" == "healthy" ]] \
     || die "chaos_probe did not become healthy"
-assert_baseline "initial healthy"
+assert_baseline "initial healthy" 1
 
 # ---------------------------------------------------------------------------
 # 1) Worker kill: SIGKILL delta worker (or postmaster restart) and recover
