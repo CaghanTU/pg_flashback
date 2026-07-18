@@ -658,6 +658,12 @@ PROD_AFTER_MISS=$(primary_sql "SELECT ba.backup_label
 primary_sql "UPDATE flashback.coverage_generations
              SET state='aborted', aborted_at=clock_timestamp()
              WHERE tracking_id=$TRACKING_ID AND state='building';" >/dev/null || true
+# Clone-side verify/reconcile can freeze controller coverage when proofs disagree;
+# restore retained activation from the live repository before continuing.
+"$HELPER" verify-anchor --config "$HELPER_CONFIG" --request "$VERIFY_REQ" \
+    >"$RUN_ROOT/verify-retained-after-repo.result.json"
+[[ "$(jq -r '.status' "$RUN_ROOT/verify-retained-after-repo.result.json")" == "verified" ]] \
+    || die "live verify-anchor did not restore coverage after repo chaos"
 assert_baseline "repo_dependency_loss"
 pass repo_dependency_loss
 cleanup_injected_faults
