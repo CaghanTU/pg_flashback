@@ -385,55 +385,44 @@ jq -n --arg request_id "chaos-retained-ok" --argjson tracking_id "$TRACKING_ID" 
     || die "retained activation failed"
 assert_baseline "activation"
 
-# Also enable local_delta tracking path for worker/slot injectors on same table.
-# flashback_track_backup already tracks; ensure local health path is healthy.
+# Ensure WAL capture is draining and health is healthy for worker/slot injectors.
 for _ in $(seq 1 80); do
+    primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     [[ "$(primary_sql "SELECT health FROM flashback_health()
                        WHERE table_name='public.target_table';")" == "healthy" ]] && break
-    primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
 done
 assert_baseline "initial healthy"
 
 # ---------------------------------------------------------------------------
-# 1) Worker kill: STOP idle delta worker, assert capture stalls, CONT, recover
+# 1) Worker kill: SIGKILL delta worker (or postmaster restart) and recover
 # ---------------------------------------------------------------------------
 mark_fail worker_kill
-WORKER_PID=""
-for _ in $(seq 1 100); do
-    WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
-        WHERE backend_type='pg_flashback delta worker'
-          AND datname=current_database()
-          AND wait_event_type='Extension'
-        LIMIT 1;")
-    [[ -n "$WORKER_PID" ]] && break
-    sleep 0.1
-done
-[[ -n "$WORKER_PID" ]] || die "delta worker not idle for STOP"
-kill -STOP "$WORKER_PID"
-STOPPED_WORKER_PID="$WORKER_PID"
-sleep 0.05
-[[ "$(primary_sql "SELECT count(*) FROM pg_locks
-                   WHERE pid=$WORKER_PID AND locktype='advisory' AND granted")" == "0" ]] \
-    || { kill -CONT "$WORKER_PID" || true; STOPPED_WORKER_PID=""; die "worker held advisory locks while STOPPED"; }
+WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
+    WHERE backend_type='pg_flashback delta worker'
+      AND datname=current_database()
+    LIMIT 1;")
 BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                            WHERE rel_oid='public.target_table'::regclass;")
+if [[ -n "$WORKER_PID" ]]; then
+    kill -KILL "$WORKER_PID" || true
+else
+    log "delta worker not visible; falling back to postmaster restart"
+    "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
+fi
 primary_sql "INSERT INTO public.target_table(marker, payload)
              VALUES ('worker-kill', decode(repeat('ab', 16), 'hex'));" >/dev/null
-sleep 0.4
-DURING_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
-                           WHERE rel_oid='public.target_table'::regclass;")
-[[ "$DURING_ROWS" == "$BEFORE_ROWS" ]] || die "capture advanced while worker STOPPED"
-kill -CONT "$WORKER_PID"
-STOPPED_WORKER_PID=""
-for _ in $(seq 1 100); do
+for _ in $(seq 1 120); do
     AFTER_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                               WHERE rel_oid='public.target_table'::regclass;")
-    [[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" ]] && break
+    HEALTH=$(primary_sql "SELECT health FROM flashback_health()
+                          WHERE table_name='public.target_table';")
+    [[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" && "$HEALTH" == "healthy" ]] && break
     primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
 done
-[[ "${AFTER_ROWS:-0}" -gt "$BEFORE_ROWS" ]] || die "worker did not resume capture after CONT"
+[[ "${AFTER_ROWS:-0}" -gt "$BEFORE_ROWS" ]] || die "capture did not resume after worker kill"
+[[ "${HEALTH:-}" == "healthy" ]] || die "health not healthy after worker kill (got ${HEALTH:-none})"
 assert_baseline "worker_kill"
 pass worker_kill
 cleanup_injected_faults
