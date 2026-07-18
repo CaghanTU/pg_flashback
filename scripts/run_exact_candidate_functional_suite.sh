@@ -154,12 +154,14 @@ wait_healthy() {
 }
 wait_watermark() {
     local rel=$1 lsn=$2
-    local _i vt
+    local _i vt tname
+    tname="${rel##*.}"
+    tname="${tname//\"/}"
     for _i in $(seq 1 200); do
         vt=$(q "SELECT valid_through_lsn::text
                 FROM flashback.coverage_generations cg
                 JOIN flashback.tracked_tables tt USING (tracking_id)
-                WHERE tt.schema_name || '.' || tt.table_name = '$rel'
+                WHERE tt.table_name = '$tname'
                   AND cg.state='active'
                 ORDER BY cg.generation_no DESC LIMIT 1;")
         if [[ -n "$vt" && "$(q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;")" == "t" ]]; then
