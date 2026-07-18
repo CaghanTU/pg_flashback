@@ -532,9 +532,10 @@ q "DROP TABLE public.target_table;" >/dev/null
     || die "helper recovered fingerprint mismatch"
 [[ "$(jq -r '.recovered_owner' "$RUN_ROOT/restore-drop.result.json")" == "func_owner" ]] \
     || die "helper recovered owner mismatch"
-[[ "$(jq -r '[.recovered_acl[]?|select(.grantee=="func_reader" and .privilege=="SELECT")]|length'
-            "$RUN_ROOT/restore-drop.result.json")" -ge 1 ]] \
-    || die "helper recovered ACL missing func_reader SELECT"
+ACL_OK=$(jq -r \
+    '[.recovered_acl[]? | select(.grantee=="func_reader" and .privilege=="SELECT")] | length' \
+    "$RUN_ROOT/restore-drop.result.json")
+[[ "${ACL_OK:-0}" -ge 1 ]] || die "helper recovered ACL missing func_reader SELECT"
 ART=$(jq -r '.artifact_path // empty' "$RUN_ROOT/restore-drop.result.json")
 [[ -n "$ART" && -f "$ART" ]] || die "helper artifact missing"
 [[ ! -e "$WORK_ROOT/func-drop/pgdata" ]] || die "helper left pgdata after drop restore"
