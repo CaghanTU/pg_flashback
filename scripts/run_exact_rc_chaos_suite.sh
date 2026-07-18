@@ -257,10 +257,20 @@ write_request() {
 }
 
 assert_baseline() {
-    local label="$1"
-    [[ "$(primary_sql "SELECT health FROM flashback_health()
-                       WHERE table_name='public.target_table';")" == "healthy" ]] \
-        || die "baseline unhealthy after $label"
+    local label="$1" health_target health_probe
+    for _ in $(seq 1 80); do
+        health_target=$(primary_sql "SELECT health FROM flashback_health()
+                                     WHERE table_name='public.target_table';")
+        health_probe=$(primary_sql "SELECT health FROM flashback_health()
+                                    WHERE table_name='public.chaos_probe';")
+        [[ "$health_target" == "healthy" && "$health_probe" == "healthy" ]] && break
+        primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        sleep 0.1
+    done
+    [[ "$health_target" == "healthy" ]] \
+        || die "baseline target_table unhealthy after $label (got $health_target)"
+    [[ "$health_probe" == "healthy" ]] \
+        || die "baseline chaos_probe unhealthy after $label (got $health_probe)"
     [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
                        WHERE tracking_id=$TRACKING_ID AND state='active';")" == "1" ]] \
         || die "baseline active generation missing after $label"
@@ -569,10 +579,20 @@ for _ in $(seq 1 80); do
 done
 [[ "$(primary_sql "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$SLOT'")" == "1" ]] \
     || die "slot not recreated"
+# Shared DB slot also covers backup-tracked tables; reanchor target_table too.
+set +e
+primary_sql "SELECT flashback_reanchor('target_table');" >/dev/null 2>&1
+set -e
 # Abort any leftover building gens from the gap path on backup tracking.
 primary_sql "UPDATE flashback.coverage_generations
              SET state='aborted', aborted_at=clock_timestamp()
              WHERE tracking_id=$TRACKING_ID AND state='building';" >/dev/null || true
+# Restore retained backup active coverage if reanchor aborted it.
+if [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
+                      WHERE tracking_id=$TRACKING_ID AND state='active';")" != "1" ]]; then
+    "$HELPER" verify-anchor --config "$HELPER_CONFIG" --request "$VERIFY_REQ" \
+        >"$RUN_ROOT/verify-retained-after-slot.result.json"
+fi
 assert_baseline "slot_loss"
 pass slot_loss
 cleanup_injected_faults
