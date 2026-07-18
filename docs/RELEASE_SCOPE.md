@@ -99,10 +99,10 @@ non-pgBackRest providers remain unsupported.
 - structural schema, row fingerprint, owner and table ACL restoration
 - the reference controller's checksum-verified, single-transaction import and
   extension shadow swap
-- an initial durable tracking marker followed only by a new full backup whose
-  start LSN is strictly after the resolved marker commit; that backup's
-  verified stop boundary is the first physical-backup anchor, and tracking has
-  zero active generations before it
+- an initial durable tracking marker followed by `verify-anchor` activation of
+  either a fresh FULL (start LSN strictly after the marker) or a retained FULL
+  with contiguous archived WAL (`retained_full_plus_wal`); tracking has zero
+  active generations before that proof is consumed
 - an immutable backup anchor that binds repository/stanza/label, FULL type,
   system identifier, timeline, manifest reference/digest and the marker plus
   start/stop LSNs to one tracking lifecycle

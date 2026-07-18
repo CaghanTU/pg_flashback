@@ -206,11 +206,19 @@ LSNs or manifest digests are not recoverability evidence.
 
 The release-qualified initial-tracking protocol must first commit a durable
 LOGGED tracking marker and resolve its real commit coordinate. Tracking remains
-unanchored with zero active generations until pgBackRest completes a **new
-full backup whose start LSN is strictly after that resolved marker
-commit**. A backup that already existed or was in progress when tracking began
-does not qualify even if it stops afterward. Once verified under the repository
-shared lock, the helper/controller installs an immutable proof
+unanchored with zero active generations until `verify-anchor` installs a
+one-time verified FULL proof. Two activation modes are supported:
+
+1. **Fresh FULL after marker** — a completed FULL whose start LSN is strictly
+   after the resolved marker commit (legacy / preferred when scheduling a new
+   FULL is easy).
+2. **Retained FULL + continuous WAL** — an already-retained FULL whose stop LSN
+   is at or before the marker, with contiguous archived WAL from that stop
+   through the marker, verified under the repository shared lock
+   (`activation_mode=retained_full_plus_wal`).
+
+A backup that was still in progress when tracking began does not qualify.
+Once verified, the helper/controller installs an immutable proof
 (`verification_request_id`, repository/profile, stanza, label, sysid, timeline,
 manifest reference + SHA-256, start/stop LSN) and consumes it exactly once for
 that tracking lifecycle.

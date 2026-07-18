@@ -77,7 +77,16 @@ install -m 0644 "$package_control" "$package_sql" "$EXT_DIR/share/extension/"
 printf '%s\n' "$PG_MAJOR" > "$EXT_DIR/PG_MAJOR"
 cp README.md LICENSE CHANGELOG.md "$EXT_DIR/" 2>/dev/null || true
 cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md "$EXT_DIR/docs/" 2>/dev/null || true
-install -m 0755 "$ROOT/scripts/run_clean_host_candidate_smoke.sh" "$EXT_DIR/scripts/"
+mkdir -p "$EXT_DIR/scripts/lib"
+install -m 0755 \
+    "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
+    "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
+    "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
+    "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
+    "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
+    "$ROOT/scripts/run_exact_rc_harness_selftest.sh" \
+    "$EXT_DIR/scripts/"
+install -m 0644 "$ROOT/scripts/lib/exact_candidate_identity.sh" "$EXT_DIR/scripts/lib/"
 tar -C "$STAGE" -czf "$OUT_ROOT/${EXT_NAME}.tar.gz" "$EXT_NAME"
 
 # 3) Recovery helper release binary.
@@ -95,7 +104,16 @@ install -m 0755 \
 cp "$ROOT/tools/pg_flashback_recovery/examples/"*.json "$HELPER_DIR/examples/" 2>/dev/null || true
 cp "$ROOT/tools/pg_flashback_recovery/README.md" "$HELPER_DIR/README.md"
 cp LICENSE CHANGELOG.md "$HELPER_DIR/" 2>/dev/null || true
-install -m 0755 "$ROOT/scripts/run_clean_host_candidate_smoke.sh" "$HELPER_DIR/scripts/"
+mkdir -p "$HELPER_DIR/scripts/lib"
+install -m 0755 \
+    "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
+    "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
+    "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
+    "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
+    "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
+    "$ROOT/scripts/run_exact_rc_harness_selftest.sh" \
+    "$HELPER_DIR/scripts/"
+install -m 0644 "$ROOT/scripts/lib/exact_candidate_identity.sh" "$HELPER_DIR/scripts/lib/"
 tar -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
 
 SRC_SHA="$(sha256sum "$OUT_ROOT/${SRC_NAME}.tar.gz" | awk '{print $1}')"

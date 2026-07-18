@@ -325,9 +325,10 @@ the [operator runbook](docs/BACKUP_RESTORE_RUNBOOK.md) and
 The helper/result contract is implemented, but coverage-generation integration
 is still pending; this is not yet an end-to-end release-qualified procedure.
 Release-qualified initial backup tracking must first commit and resolve a
-durable tracking marker, then remain unanchored until a new full backup whose
-start LSN is strictly after that marker activates at its verified stop
-anchor. It cannot adopt a pre-existing or already-running backup.
+durable tracking marker, then remain unanchored until `verify-anchor` activates
+either a fresh FULL that starts after the marker or a retained FULL with
+contiguous WAL (`retained_full_plus_wal`). An in-progress backup at track time
+still does not qualify.
 After a backup-profile production swap, pg_flashback must create no local row
 snapshot. The adopted protocol records a pending swap transaction/unanchored
 gap, seals the predecessor after resolving the swap commit and deliberately has

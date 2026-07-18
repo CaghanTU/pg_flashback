@@ -135,7 +135,9 @@ The required protocol is:
 2. The marker transaction commits before it can be resolved.
 3. The worker resolves its real COMMIT LSN.
 4. A backup that predates or overlaps that marker is rejected.
-5. A new full backup must start strictly after the marker COMMIT LSN.
+5. Activation is via `verify-anchor`: either a fresh FULL that starts after the
+   marker COMMIT LSN, or a retained FULL with contiguous WAL
+   (`retained_full_plus_wal`).
 6. The completed backup is revalidated under the repository lock.
 7. Only its verified stop boundary may activate the first generation.
 
@@ -537,20 +539,34 @@ backup coverage lifecycle E2E
 fault-injection suite
 clean-package smoke install
 archive checksum verification
-24-hour exact-RC bounded soak
+exact-candidate functional suite
+exact-candidate short chaos suite
+24-hour exact-candidate bounded stability soak
 ```
 
-### Exact-RC 24-hour soak
+Supported claim after Gate B + Gate C pass on this host class:
 
-After the RC artifacts are built and installed, run one uninterrupted 24-hour
-bounded soak against the exact RC commit and those exact packaged artifacts.
-Record the commit, tag, artifact checksums, configuration, workload seed,
-resource samples and fault schedule. Any code, dependency, packaging or
-qualification-script change invalidates this evidence and requires the
-24-hour soak to be rerun.
+> 24-hour exact-candidate bounded stability soak plus separate exact-candidate
+> chaos suite on Linux/aarch64 under Lima on an Apple Silicon host.
 
-The exact-RC soak must finish with no silent coverage loss, unbounded disk
-growth, leaked process/socket/materialized cluster or unexplained SLO breach.
+Do not claim native macOS extension support, x86_64 24h qualification,
+continuous 24h chaos, 100+ GiB qualification, or all providers.
+
+### Exact-RC 24-hour bounded stability soak
+
+After the RC artifacts are built and installed from `CANDIDATE_DIR`, run one
+uninterrupted 24-hour **bounded stability** soak against the exact RC commit
+and those exact packaged binaries (Gate C). Destructive repository/slot faults
+are exercised in a separate exact-candidate chaos suite (Gate B), not by
+corrupting the long-lived 24h cluster. Record the commit, artifact checksums,
+installed binary hashes, configuration, workload seed and resource samples.
+Any code, dependency, packaging or qualification-script change invalidates this
+evidence and requires Gates A–C to be rerun.
+
+The stability soak must finish with ≥86400 active monotonic seconds, no silent
+coverage loss, no unbounded disk growth, no leaked process/socket/materialized
+cluster and no unexplained SLO breach. Workload-budget exhaustion must stop
+heavy writes without ending the clock.
 
 ### Publication sequence
 

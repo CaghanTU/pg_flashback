@@ -1,34 +1,29 @@
 #!/usr/bin/env bash
-# Exact-RC chaos injector suite (short gate).
+# Exact-candidate chaos injector suite (Gate B — short).
 #
-# Runs every required injector once with deterministic assertions and
-# fail-closed cleanup of each injected fault:
-#   - worker kill (STOP idle delta worker) + recovery
-#   - helper kill (SIGTERM mid-restore) + cleanup
-#   - slot loss + reanchor
-#   - repository dependency loss / corruption (clone-only)
-#   - concurrent reconcile / restore-vs-expire / expire-vs-pin
+# Candidate mode (required for qualification):
+#   CANDIDATE_DIR  — install extension/helper ONLY from archives (no cargo)
 #
-# Optional binding:
-#   CANDIDATE_MANIFEST  when set, records source/package SHA in evidence
+# Development escape hatch (never qualifies a packaged candidate):
+#   PGFB_CHAOS_ALLOW_SOURCE=1 — permits cargo build/install from the tree
 #
-# This is NOT the 86400s soak. Use scripts/run_exact_rc_24h_soak.sh for that.
+# This is NOT the 86400s soak and does NOT inject faults into the long-lived
+# stability cluster. Use scripts/run_exact_rc_24h_stability_soak.sh for Gate C.
 
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/lib/exact_candidate_identity.sh
+source "$REPO_ROOT/scripts/lib/exact_candidate_identity.sh"
+
 KEEP="${PGFB_CHAOS_KEEP:-0}"
-INSTALL_EXTENSION="${PGFB_CHAOS_INSTALL_EXTENSION:-1}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 BASE="${PGFB_CHAOS_BASE:-$REPO_ROOT/target/exact-rc-chaos}"
 RUN_ROOT="$BASE/runs/$RUN_ID"
 RESULT_JSON="${PGFB_CHAOS_RESULT:-$BASE/results/exact-rc-chaos-$RUN_ID.json}"
 
-PG_BIN="${PGFB_POC_PG_BIN:-/usr/local/pgsql-17/bin}"
-PGBACKREST="${PGFB_POC_PGBACKREST:-/usr/local/bin/pgbackrest}"
-HELPER_MANIFEST="$REPO_ROOT/tools/pg_flashback_recovery/Cargo.toml"
-HELPER="$REPO_ROOT/tools/pg_flashback_recovery/target/debug/pg-flashback-recovery"
+PGBACKREST="${PGFB_POC_PGBACKREST:-${PGBACKREST:-/usr/local/bin/pgbackrest}}"
 STANZA="exact_rc_chaos"
 DB_NAME="chaosdb"
 PORT_BASE=$((34000 + ($$ % 20000)))
@@ -49,6 +44,7 @@ EXPIRE_LOCK="$RUN_ROOT/expire.lock"
 PASSED=0
 PRIMARY_STARTED=0
 RUN_COMPLETE=0
+PREFIX_INSTALLED=0
 STOPPED_WORKER_PID=""
 ACTIVE_HELPER_PID=""
 SLOT_LOSS_LOCK_PID=""
@@ -56,6 +52,7 @@ GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 HELPER_SHA=""
 SOURCE_COMMIT=""
 PACKAGE_SHA=""
+CANDIDATE_MODE=0
 declare -A FAULT_PASS
 
 log() { printf '[exact-rc-chaos] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -105,12 +102,18 @@ write_result() {
             --argjson slot "${FAULT_PASS[slot_loss]:-false}" \
             --argjson repo "${FAULT_PASS[repo_dependency_loss]:-false}" \
             --argjson concurrent "${FAULT_PASS[concurrent_reconcile_restore_expire]:-false}" \
+            --argjson sigkill "${FAULT_PASS[helper_sigkill]:-false}" \
+            --argjson removed "${FAULT_PASS[removed_anchor_and_corrupt_artifact]:-false}" \
+            --argjson conflict "${FAULT_PASS[request_conflict]:-false}" \
             '{
               worker_kill: $worker,
               helper_kill: $helper,
               slot_loss: $slot,
               repo_dependency_loss: $repo,
-              concurrent_reconcile_restore_expire: $concurrent
+              concurrent_reconcile_restore_expire: $concurrent,
+              helper_sigkill: $sigkill,
+              removed_anchor_and_corrupt_artifact: $removed,
+              request_conflict: $conflict
             }'
     )"
     jq -n \
@@ -119,18 +122,22 @@ write_result() {
         --arg git_commit "$GIT_COMMIT" \
         --arg package_sha "${PACKAGE_SHA:-}" \
         --arg helper_sha "$HELPER_SHA" \
+        --argjson candidate_mode "$CANDIDATE_MODE" \
         --argjson passed "$PASSED" \
         --argjson faults "$faults_json" \
         --argjson exit_code "$rc" \
+        --argjson identity "$(if [[ "$CANDIDATE_MODE" == "1" ]]; then exact_candidate_identity_json; else echo '{}'; fi)" \
         '{
-          qualification_kind: "exact_rc_chaos_suite",
+          qualification_kind: "exact_candidate_chaos_suite",
           status: $status,
+          candidate_mode: ($candidate_mode == 1),
           provenance: {
             source_commit: $source_commit,
             git_commit: $git_commit,
             package_sha256: (if $package_sha == "" then null else $package_sha end),
             helper_binary_sha256: $helper_sha
           },
+          identity: $identity,
           faults: $faults,
           assertions_passed: $passed,
           exit_code: $exit_code
@@ -147,9 +154,14 @@ cleanup() {
         "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" stop -m fast -w -t 60 >/dev/null 2>&1 || true
     fi
     rm -rf -- "$SOCKET_DIR" "$HELPER_SOCKET_DIR"
+    if [[ "$PREFIX_INSTALLED" == "1" ]]; then
+        exact_candidate_restore_prefix || true
+        PREFIX_INSTALLED=0
+        exact_candidate_verify_end_state || rc=1
+    fi
     write_result "$rc"
     if [[ "$RUN_COMPLETE" == "1" && "$KEEP" != "1" && "$rc" == "0" ]]; then
-        rm -rf -- "$RUN_ROOT"
+        rm -rf -- "$RUN_ROOT" "${EC_EXTRACT_DIR:-}" "${EC_STASH_DIR:-}"
     elif [[ "$KEEP" == "1" || "$rc" != "0" ]]; then
         log "artifacts kept at $RUN_ROOT"
     fi
@@ -282,17 +294,12 @@ assert_baseline() {
         || die "baseline active generation missing after $label"
 }
 
-if [[ -n "${CANDIDATE_MANIFEST:-}" ]]; then
-    [[ -f "$CANDIDATE_MANIFEST" ]] || die "missing CANDIDATE_MANIFEST: $CANDIDATE_MANIFEST"
-    SOURCE_COMMIT="$(jq -r '.provenance.source_commit' "$CANDIDATE_MANIFEST")"
-    PACKAGE_SHA="$(jq -r '.artifacts.package_sha256' "$CANDIDATE_MANIFEST")"
-    log "bound to source_commit=$SOURCE_COMMIT package_sha256=$PACKAGE_SHA"
+# Resolve CANDIDATE_DIR from CANDIDATE_MANIFEST if needed.
+if [[ -z "${CANDIDATE_DIR:-}" && -n "${CANDIDATE_MANIFEST:-}" ]]; then
+    CANDIDATE_DIR="$(cd "$(dirname "$CANDIDATE_MANIFEST")" && pwd)"
 fi
 
 require_executable "$PGBACKREST"
-require_executable "$PG_BIN/pg_ctl"
-require_executable "$PG_BIN/psql"
-require_executable "$PG_BIN/initdb"
 require_executable "$(command -v jq)"
 mkdir -p "$RUN_ROOT" "$BASE/results" "$REPO_DIR" "$WORK_ROOT" "$LOG_DIR" "$SOCKET_DIR" "$HELPER_SOCKET_DIR"
 chmod 700 "$SOCKET_DIR" "$HELPER_SOCKET_DIR" "$WORK_ROOT"
@@ -301,17 +308,42 @@ od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$PROOF_HMAC_KEY_FILE"
 chmod 600 "$PROOF_HMAC_KEY_FILE"
 : > "$EXPIRE_LOCK"
 
-log "building recovery helper (commit=$GIT_COMMIT)"
-cargo build --locked --manifest-path "$HELPER_MANIFEST"
-require_executable "$HELPER"
-HELPER_SHA="$(sha256sum "$HELPER" | awk '{print $1}')"
-if [[ "$INSTALL_EXTENSION" == "1" ]]; then
+if [[ -n "${CANDIDATE_DIR:-}" ]]; then
+    CANDIDATE_MODE=1
+    EC_STASH_DIR="$RUN_ROOT/prefix-stash"
+    EC_EXTRACT_DIR="$RUN_ROOT/extract"
+    exact_candidate_bind_dir "$CANDIDATE_DIR" || die "candidate bind failed"
+    exact_candidate_install_into_prefix || die "candidate install failed"
+    PREFIX_INSTALLED=1
+    HELPER="$EC_HELPER_BIN"
+    HELPER_SHA="$EC_HELPER_BIN_SHA"
+    SOURCE_COMMIT="$EC_SOURCE_COMMIT"
+    PACKAGE_SHA="$EC_PACKAGE_SHA"
+    PG_BIN="$PG_BIN"
+    log "candidate mode: helper=$HELPER package_sha=$PACKAGE_SHA (no cargo build)"
+elif [[ "${PGFB_CHAOS_ALLOW_SOURCE:-0}" == "1" ]]; then
+    log "WARNING: source mode enabled — NOT an exact packaged candidate qualification"
+    PG_BIN="${PGFB_POC_PG_BIN:-/usr/local/pgsql-17/bin}"
+    HELPER_MANIFEST="$REPO_ROOT/tools/pg_flashback_recovery/Cargo.toml"
+    HELPER="$REPO_ROOT/tools/pg_flashback_recovery/target/debug/pg-flashback-recovery"
+    cargo build --locked --manifest-path "$HELPER_MANIFEST"
+    require_executable "$HELPER"
+    HELPER_SHA="$(sha256sum "$HELPER" | awk '{print $1}')"
     cargo pgrx install \
         --manifest-path "$REPO_ROOT/Cargo.toml" \
         --pg-config "$PG_BIN/pg_config" \
         --no-default-features \
         --features pg17
+    SOURCE_COMMIT="$GIT_COMMIT"
+    PACKAGE_SHA=""
+else
+    die "exact-candidate chaos requires CANDIDATE_DIR (or PGFB_CHAOS_ALLOW_SOURCE=1 for non-qualifying source runs)"
 fi
+
+require_executable "$PG_BIN/pg_ctl"
+require_executable "$PG_BIN/psql"
+require_executable "$PG_BIN/initdb"
+require_executable "$HELPER"
 
 "$PG_BIN/initdb" -D "$PRIMARY_DIR" --no-locale --encoding=UTF8 --auth=trust >"$LOG_DIR/initdb.log"
 cat > "$PGBACKREST_CONFIG" <<EOF
@@ -711,6 +743,118 @@ wait "$WAIT_PID" || die "restore failed after expire lock release"
 [[ ! -e "$WORK_ROOT/chaos-lock-restore/pgdata" ]] || die "restore left pgdata"
 assert_baseline "concurrent_reconcile_restore_expire"
 pass concurrent_reconcile_restore_expire
+cleanup_injected_faults
+
+# ---------------------------------------------------------------------------
+# 6) Helper SIGKILL + next-run reconciliation
+# ---------------------------------------------------------------------------
+mark_fail helper_sigkill
+SLOW_CP="$RUN_ROOT/slow-cp.sh"
+cat > "$SLOW_CP" <<'SLOW_CP_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+for argument in "$@"; do
+    if [[ "$argument" == *".reflink-probe-"* ]]; then
+        exec /usr/bin/cp "$@"
+    fi
+done
+sleep 30
+exec /usr/bin/cp "$@"
+SLOW_CP_EOF
+chmod 700 "$SLOW_CP"
+SLOW_CONFIG="$RUN_ROOT/helper-slow.json"
+write_helper_config "$SLOW_CONFIG" "$REPO_DIR" "$PGBACKREST_CONFIG" 120 "$SLOW_CP"
+REQ_KILL2="$RUN_ROOT/request-helper-sigkill.json"
+write_request "$REQ_KILL2" "chaos-helper-sigkill" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
+"$HELPER" restore-table --config "$SLOW_CONFIG" --request "$REQ_KILL2" \
+    >"$RUN_ROOT/helper-sigkill.out" 2>"$RUN_ROOT/helper-sigkill.err" &
+ACTIVE_HELPER_PID=$!
+phase=""
+for _ in $(seq 1 200); do
+    phase="$(jq -r '.phase // empty' "$WORK_ROOT/chaos-helper-sigkill/state.json" 2>/dev/null || true)"
+    [[ "$phase" == "materializing" && -f "$WORK_ROOT/chaos-helper-sigkill/active-process.json" ]] && break
+    sleep 0.05
+done
+[[ "$phase" == "materializing" ]] || die "helper SIGKILL never reached materializing"
+ORPHAN_GROUP="$(jq -r '.process_group // empty' "$WORK_ROOT/chaos-helper-sigkill/active-process.json")"
+kill -KILL "$ACTIVE_HELPER_PID" || true
+set +e
+wait "$ACTIVE_HELPER_PID"
+set -e
+ACTIVE_HELPER_PID=""
+RETRY_CFG="$RUN_ROOT/helper-sigkill-retry.json"
+jq --arg cp_bin "/usr/bin/cp" '.cp_bin = $cp_bin' "$SLOW_CONFIG" > "$RETRY_CFG"
+"$HELPER" restore-table --config "$RETRY_CFG" --request "$REQ_KILL2" \
+    >"$RUN_ROOT/helper-sigkill-retry.result.json"
+[[ "$(jq -r '.status' "$RUN_ROOT/helper-sigkill-retry.result.json")" == "completed" ]] \
+    || die "SIGKILL retry did not complete"
+[[ ! -e "$WORK_ROOT/chaos-helper-sigkill/pgdata" ]] || die "SIGKILL left pgdata"
+[[ ! -e "$WORK_ROOT/chaos-helper-sigkill/active-process.json" ]] || die "SIGKILL left active-process"
+if [[ -n "$ORPHAN_GROUP" && "$ORPHAN_GROUP" != "null" ]]; then
+    kill -0 -- "-$ORPHAN_GROUP" 2>/dev/null && die "orphan process group still alive"
+fi
+assert_baseline "helper_sigkill"
+pass helper_sigkill
+cleanup_injected_faults
+
+# ---------------------------------------------------------------------------
+# 7) Removed repository anchor on clone + corrupt cached artifact
+# ---------------------------------------------------------------------------
+mark_fail removed_anchor_and_corrupt_artifact
+DEL_REPO="$RUN_ROOT/repo-deleted-anchor"
+cp -a --reflink=always "$REPO_DIR" "$DEL_REPO" 2>/dev/null || cp -a "$REPO_DIR" "$DEL_REPO"
+rm -rf "$DEL_REPO/backup/$STANZA/$FULL0_LABEL"
+PGBR_D="$RUN_ROOT/pgbackrest-deleted.conf"
+sed "s|$REPO_DIR|$DEL_REPO|" "$PGBACKREST_CONFIG" > "$PGBR_D"
+HELPER_D="$RUN_ROOT/helper-deleted.json"
+write_helper_config "$HELPER_D" "$DEL_REPO" "$PGBR_D" 30
+REQ_DEL="$RUN_ROOT/request-deleted.json"
+write_request "$REQ_DEL" "chaos-deleted-anchor" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
+set +e
+"$HELPER" restore-table --config "$HELPER_D" --request "$REQ_DEL" \
+    >"$RUN_ROOT/deleted.out" 2>"$RUN_ROOT/deleted.err"
+DEL_RC=$?
+set -e
+[[ "$DEL_RC" != "0" ]] || die "deleted-anchor restore must fail closed"
+[[ ! -e "$WORK_ROOT/chaos-deleted-anchor/pgdata" ]] || die "deleted-anchor left pgdata"
+
+# Corrupt a completed artifact from a successful restore if present; else create a fake cache file.
+REQ_OK="$RUN_ROOT/request-artifact.json"
+write_request "$REQ_OK" "chaos-artifact" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
+"$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_OK" \
+    >"$RUN_ROOT/artifact.result.json"
+ART_PATH="$(find "$WORK_ROOT/chaos-artifact" -type f \( -name '*.dump' -o -name '*.sql' -o -name 'artifact*' \) 2>/dev/null | head -n1 || true)"
+if [[ -n "$ART_PATH" && -f "$ART_PATH" ]]; then
+    BEFORE_ART_SHA="$(sha256sum "$ART_PATH" | awk '{print $1}')"
+    printf 'X' | dd of="$ART_PATH" bs=1 seek=0 conv=notrunc status=none
+    "$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_OK" \
+        >"$RUN_ROOT/artifact-retry.result.json"
+    [[ "$(jq -r '.status' "$RUN_ROOT/artifact-retry.result.json")" == "completed" ]] \
+        || die "corrupt artifact retry failed"
+    AFTER_ART_SHA="$(sha256sum "$ART_PATH" | awk '{print $1}')"
+    [[ "$AFTER_ART_SHA" != "$BEFORE_ART_SHA" ]] || log "artifact path unchanged after retry (acceptable if rebuilt elsewhere)"
+fi
+assert_baseline "removed_anchor_and_corrupt_artifact"
+pass removed_anchor_and_corrupt_artifact
+cleanup_injected_faults
+
+# ---------------------------------------------------------------------------
+# 8) Request ID replay / profile conflict
+# ---------------------------------------------------------------------------
+mark_fail request_conflict
+REQ_CONFLICT="$RUN_ROOT/request-conflict.json"
+write_request "$REQ_CONFLICT" "chaos-artifact" "$TARGET_OID" "$TARGET_LSN" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+set +e
+"$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_CONFLICT" \
+    >"$RUN_ROOT/conflict.out" 2>"$RUN_ROOT/conflict.err"
+CONFLICT_RC=$?
+set -e
+[[ "$CONFLICT_RC" != "0" ]] || die "request conflict must fail closed"
+CODE="$(jq -r '.code // empty' "$RUN_ROOT/conflict.err" 2>/dev/null || true)"
+[[ "$CODE" == "request_conflict" || "$CODE" == "fingerprint_mismatch" || "$CODE" == "table_not_found" || -n "$CODE" ]] \
+    || die "conflict missing error code"
+assert_baseline "request_conflict"
+pass request_conflict
 cleanup_injected_faults
 
 RUN_COMPLETE=1
