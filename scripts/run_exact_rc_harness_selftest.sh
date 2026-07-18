@@ -24,12 +24,13 @@ log() { printf '[harness-selftest] %s\n' "$*"; }
 pass() { PASSED=$((PASSED + 1)); log "PASS: $1"; }
 fail() { FAILED=$((FAILED + 1)); log "FAIL: $1"; }
 
-CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR required for selftest}"
-[[ -f "$CANDIDATE_DIR/MANIFEST.json" ]] || { echo "missing manifest"; exit 2; }
+ORIG_CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR required for selftest}"
+ORIG_CANDIDATE_DIR="$(cd "$ORIG_CANDIDATE_DIR" && pwd)"
+[[ -f "$ORIG_CANDIDATE_DIR/MANIFEST.json" ]] || { echo "missing manifest"; exit 2; }
 
 # 1) Binary mismatch rejected
 tmpdir=$(mktemp -d)
-cp -a "$CANDIDATE_DIR/." "$tmpdir/"
+cp -a "$ORIG_CANDIDATE_DIR/." "$tmpdir/"
 jq '.artifacts.extension_binary_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
     "$tmpdir/MANIFEST.json" > "$tmpdir/MANIFEST.json.tmp"
 mv "$tmpdir/MANIFEST.json.tmp" "$tmpdir/MANIFEST.json"
@@ -40,14 +41,14 @@ else
     pass "binary mismatch rejected"
 fi
 rm -rf "$tmpdir"
+CANDIDATE_DIR="$ORIG_CANDIDATE_DIR"
 
 # 2) Source/tree mismatch rejected (fake commit in a copy)
 tmpdir=$(mktemp -d)
-cp -a "$CANDIDATE_DIR/." "$tmpdir/"
+cp -a "$ORIG_CANDIDATE_DIR/." "$tmpdir/"
 jq '.provenance.source_commit = "ffffffffffffffffffffffffffffffffffffffff"' \
     "$tmpdir/MANIFEST.json" > "$tmpdir/MANIFEST.json.tmp"
 mv "$tmpdir/MANIFEST.json.tmp" "$tmpdir/MANIFEST.json"
-# Fix SHA256SUMS still valid for archives; bind should fail on HEAD mismatch.
 if EC_STASH_DIR="$tmpdir/stash" EC_EXTRACT_DIR="$tmpdir/extract" \
     exact_candidate_bind_dir "$tmpdir" 2>/tmp/selftest-source.err; then
     fail "source mismatch was accepted"
@@ -55,12 +56,11 @@ else
     pass "source mismatch rejected"
 fi
 rm -rf "$tmpdir"
+CANDIDATE_DIR="$ORIG_CANDIDATE_DIR"
 
 # 3) Wrong architecture rejected
 tmpdir=$(mktemp -d)
-cp -a "$CANDIDATE_DIR/." "$tmpdir/"
-jq '.provenance.arch = "x86_64"' "$tmpdir/MANIFEST.json" > "$tmpdir/MANIFEST.json.tmp"
-# If host is x86_64 this would pass — force impossible arch.
+cp -a "$ORIG_CANDIDATE_DIR/." "$tmpdir/"
 jq '.provenance.arch = "riscv64"' "$tmpdir/MANIFEST.json" > "$tmpdir/MANIFEST.json.tmp"
 mv "$tmpdir/MANIFEST.json.tmp" "$tmpdir/MANIFEST.json"
 if EC_STASH_DIR="$tmpdir/stash" EC_EXTRACT_DIR="$tmpdir/extract" \
@@ -70,6 +70,7 @@ else
     pass "arch mismatch rejected"
 fi
 rm -rf "$tmpdir"
+CANDIDATE_DIR="$ORIG_CANDIDATE_DIR"
 
 # 4) Stability harness refuses short PASS via kind check: run a tiny python proof
 # that the stability script hardcodes 86400 and has no env override for PASS.

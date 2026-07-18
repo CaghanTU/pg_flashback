@@ -289,10 +289,22 @@ wait_healthy "public.steady_dml" || die "steady_dml not healthy"
 q "INSERT INTO public.steady_dml VALUES (1,'ins','a'),(2,'ins','b');" >/dev/null
 q "UPDATE public.steady_dml SET marker='upd', payload='b2' WHERE id=2;" >/dev/null
 q "DELETE FROM public.steady_dml WHERE id=1;" >/dev/null
-COMMIT_LSN=$(q "SELECT flashback.delta_log.commit_lsn::text
-                FROM flashback.delta_log
-                WHERE rel_oid='public.steady_dml'::regclass
-                ORDER BY commit_lsn DESC LIMIT 1;")
+COMMIT_LSN=""
+for _ in $(seq 1 200); do
+    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+    COMMIT_LSN=$(q "SELECT commit_lsn::text
+                    FROM flashback.delta_log
+                    WHERE rel_oid='public.steady_dml'::regclass
+                      AND event_type = 'UPDATE'
+                    ORDER BY commit_lsn DESC LIMIT 1;")
+    [[ -n "$COMMIT_LSN" ]] && break
+    COMMIT_LSN=$(q "SELECT commit_lsn::text
+                    FROM flashback.delta_log
+                    WHERE rel_oid='public.steady_dml'::regclass
+                    ORDER BY commit_lsn DESC LIMIT 1;")
+    [[ -n "$COMMIT_LSN" ]] && break
+    sleep 0.1
+done
 [[ -n "$COMMIT_LSN" ]] || die "no delta_log commit LSN"
 wait_watermark "public.steady_dml" "$COMMIT_LSN" || die "watermark missed $COMMIT_LSN"
 FP_STEADY=$(fingerprint_of "public.steady_dml")
