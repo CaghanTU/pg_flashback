@@ -73,7 +73,18 @@ Set `PG_FLASHBACK_REQUIRE_CLEAN_TREE=1` for a release-gate invocation. This
 rejects a dirty checkout before cluster creation. Exact-RC tests must run from
 a clean checkout/tag and archive `target/qualification/` externally.
 
-These are development-qualification harnesses only. The exact-RC 24-hour soak
-and its release evidence remain a separate release gate.
+These are development-qualification harnesses only. Exact-candidate release
+gates are separate and must use packaged archives from `CANDIDATE_DIR`:
+
+1. `scripts/run_exact_candidate_functional_suite.sh` (Gate A)
+2. `scripts/run_exact_rc_chaos_suite.sh` (Gate B; short destructive suite)
+3. `scripts/run_exact_rc_24h_stability_soak.sh` (Gate C; ≥86400 active seconds)
+
+`scripts/run_exact_rc_harness_selftest.sh` is accelerated harness regression
+only (`qualification_kind=exact_rc_harness_selftest`) and must never emit a
+24h release PASS. Supported claim language after Gates B and C on this host
+class is the bounded stability soak plus a separate exact-candidate chaos
+suite on Linux/aarch64 under Lima on an Apple Silicon host.
+
 If extension installation fails, record that prerequisite failure rather than
 treating an older installed extension as qualification evidence.

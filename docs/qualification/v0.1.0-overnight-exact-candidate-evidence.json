@@ -1,64 +1,55 @@
 {
   "branch": "work/v0.1.0-overnight-sanitized",
-  "old_branch": "work/v0.1.0-overnight",
   "qualification_kind": "exact_candidate_release_gates",
-  "old_product_commit": "77ba5a4536b3ee9987386266a4c2b228277c1330",
-  "old_tip": "e0eebeef4b1d3c14b3a78fc36fe2956ad77af297",
-  "old_tree": "d32642f1d0ebe81d8f59574f9844cd226c745836",
-  "sanitized_replay_tip": "85cfe24c0c0d2ff1d4ed07aca74bcda0182296fc",
-  "sanitized_replay_tree": "d32642f1d0ebe81d8f59574f9844cd226c745836",
-  "tree_equality_vs_e0eebee_before_evidence_regen": "PASS",
-  "product_commit": "8001a55c598bbbc5f5fefb575ecf7a95e5756f36",
   "shellcheck": "passed",
   "shellcheck_runner": "local_aarch64",
-  "clean_host_smoke": "passed",
-  "clean_host_runner": "local_aarch64_package",
-  "exact_rc_chaos_suite": "passed",
-  "exact_rc_24h_soak": "not_run (short gates incomplete on x86_64; no x86_64 soak host/package from GHA)",
-  "full_ci_matrix": "blocked (GitHub Actions billing/spending limit)",
-  "local_e2e": {
-    "run_exact_rc_chaos_suite": "passed",
-    "run_clean_host_candidate_smoke": "passed",
-    "run_retained_full_adversarial_e2e": "passed_11",
-    "run_anchor_advancement_e2e": "passed_17",
-    "run_fault_injection_smoke": "passed",
-    "run_recovery_helper_e2e": "passed_35"
+  "fmt_clippy": "passed",
+  "helper_unit_tests": "passed_22",
+  "pgrx_regression": {
+    "pg15": "skipped (not installed locally)",
+    "pg16": "passed_76",
+    "pg17": "passed_76",
+    "pg18": "passed_76"
   },
-  "rc_ready": "NO",
+  "local_e2e": {
+    "run_wal_e2e": "passed",
+    "run_backup_coverage_e2e": "passed",
+    "run_recovery_helper_e2e": "passed",
+    "run_retained_full_adversarial_e2e": "passed",
+    "run_anchor_advancement_e2e": "passed",
+    "run_fault_injection_smoke": "passed"
+  },
+  "clean_host_smoke": "passed",
+  "exact_candidate_functional_suite": "passed",
+  "exact_candidate_chaos_suite": "passed",
+  "exact_rc_harness_selftest": "passed",
+  "exact_rc_24h_soak": "not_run",
+  "full_ci_matrix": "blocked (GitHub Actions billing/spending limit)",
+  "rc_ready": "YES_LOCAL_AARCH64_SHORT_GATES",
+  "readiness": "READY_TO_START after freeze rebuild binds HEAD to CANDIDATE_DIR",
+  "supported_claim_after_gate_b_and_c": "24-hour exact-candidate bounded stability soak plus separate exact-candidate chaos suite on Linux/aarch64 under Lima on an Apple Silicon host.",
   "github": {
     "pr3": "https://github.com/CaghanTU/pg_flashback/pull/3",
     "pr3_draft": true,
-    "gha_blocker": "hosted runners refuse jobs: account payments failed or spending limit",
-    "example_blocked_ci_run": "https://github.com/CaghanTU/pg_flashback/actions/runs/29625848647"
+    "pr3_branch": "work/v0.1.0-overnight",
+    "gha_blocker": "hosted runners refuse jobs: account payments failed or spending limit"
   },
-  "local_artifact_paths": {
-    "manifest": "target/candidate/8001a55c598bbbc5f5fefb575ecf7a95e5756f36/MANIFEST.json",
-    "clean_host_result": "target/clean-host-sanitized/result.json",
-    "chaos_results": "target/exact-rc-chaos-local/results/",
-    "retained_e2e": "target/e2e-sanitized/retained/results/",
-    "advancement_e2e": "target/e2e-sanitized/advance/results/"
+  "capacity_preflight": {
+    "min_free_reserve_bytes": 2147483648,
+    "max_work_bytes_default": 805306368,
+    "note": "Workload budget stops heavy writes; duration clock continues to 86400 active monotonic seconds. Bind live free bytes from the READY preflight, not this committed snapshot."
   },
-  "exact_rc_24h_soak_command": "CANDIDATE_MANIFEST=target/candidate/<x86_64-commit>/MANIFEST.json PG_FLASHBACK_REQUIRE_CLEAN_TREE=1 ./scripts/run_exact_rc_24h_soak.sh",
+  "exact_rc_24h_soak_command": "CANDIDATE_DIR=$PWD/target/candidate/$(git rev-parse HEAD) PG_FLASHBACK_REQUIRE_CLEAN_TREE=1 PG_FLASHBACK_CHAOS_SUITE=off nohup ./scripts/run_exact_rc_24h_stability_soak.sh > target/qualification/exact-rc-24h-stability.nohup.out 2>&1 & echo $!",
   "remaining_blockers": [
-    "GitHub Actions billing/spending limit blocks ShellCheck/CI/clean-host/chaos on hosted x86_64 runners",
-    "no x86_64 exact-candidate package SHA from clean hosted build; local package is aarch64 only",
-    "exact 86400s soak not started",
-    "old overnight branch still contains Cursor Co-authored-by trailers (kept; not deleted)"
+    "exact 86400s stability soak not started",
+    "GitHub Actions billing/spending limit blocks hosted x86_64 CI/package matrix",
+    "old overnight branch work/v0.1.0-overnight still contains Cursor Co-authored-by trailers (kept; not deleted)"
   ],
   "provenance": {
-    "source_commit": "8001a55c598bbbc5f5fefb575ecf7a95e5756f36",
-    "source_tree": "7a21d6fef96c82ad2c800595da27ff16d26cd50f",
-    "package_sha256": "3c58f97a167fd14779faf64e9382b6b821e9a4690a3d01df34315e439ef9eb6f",
-    "extension_archive_sha256": "3c58f97a167fd14779faf64e9382b6b821e9a4690a3d01df34315e439ef9eb6f",
-    "helper_archive_sha256": "1cd10dc7fdf35afe364569fa771ca649592317b9c982f8a232bdbfbb367aa834",
-    "extension_binary_sha256": "16c455a0c33f5c7f8de07efe63a430fa679d5bbe8d95831806d050dbb838aca3",
-    "helper_binary_sha256": "a17cfb25b1bacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6",
-    "source_archive_sha256": "173efbb88009e81b65d29d78222dc75a93925904fff0ed6f1aa2f12e8dbb675b",
+    "bind": "target/candidate/<source_commit>/MANIFEST.json",
+    "note": "Do not reuse package SHA 3c58f97a... or prior overnight packages. Exact-candidate gates install only from CANDIDATE_DIR archives. Live source_commit/tree/package/extension/helper digests are whatever MANIFEST.json records for HEAD at freeze.",
     "arch": "aarch64",
     "pg_major": "17",
-    "built_at": "2026-07-18T01:47:45Z",
-    "note": "Do not reuse old overnight x86_64 package SHA 38c195f9...; that qualified a different commit/branch with AI attribution trailers.",
-    "clean_host_smoke": "passed",
-    "exact_rc_24h_soak": "not_run (short gates incomplete on x86_64; no x86_64 soak host/package from GHA)"
+    "exact_rc_24h_soak": "not_run"
   }
 }

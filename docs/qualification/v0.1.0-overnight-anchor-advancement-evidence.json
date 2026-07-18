@@ -30,7 +30,7 @@
   "shellcheck": "not_installed (dnf has no ShellCheck/shellcheck package on this host)",
   "clean_host_smoke": "not_run (no docker/podman/disposable clean environment available)",
   "exact_rc_24h_soak": "not_run",
-  "soak_repro_command": "Bind exact source_commit/package_sha256, then run the dedicated exact-RC 24h chaos soak for a full 86400s elapsed; do not call a shorter run 24h.",
+  "soak_repro_command": "Bind CANDIDATE_DIR (not only MANIFEST), run exact-candidate functional + chaos suites, then the dedicated 24h bounded stability soak for >=86400 active monotonic seconds; do not call a shorter run 24h or claim continuous 24h chaos.",
   "unsupported": [
     "differential_incremental_chains",
     "non_pgbackrest_providers",
