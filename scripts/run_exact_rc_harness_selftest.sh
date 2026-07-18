@@ -81,11 +81,12 @@ else
     fail "stability soak duration gate is weakenable"
 fi
 
-# 5) Wrapper does not call run_dev_soak
-if ! rg -n 'run_dev_soak' "$REPO_ROOT/scripts/run_exact_rc_24h_soak.sh" >/dev/null; then
-    pass "orchestrator no longer wraps run_dev_soak"
+# 5) Wrapper does not invoke the development soak harness
+if ! rg -n '^[^#]*run_dev_soak\.sh' "$REPO_ROOT/scripts/run_exact_rc_24h_soak.sh" >/dev/null \
+   && rg -n 'run_exact_rc_24h_stability_soak' "$REPO_ROOT/scripts/run_exact_rc_24h_soak.sh" >/dev/null; then
+    pass "orchestrator delegates to dedicated stability soak"
 else
-    fail "orchestrator still references run_dev_soak"
+    fail "orchestrator still invokes development soak or lacks stability soak"
 fi
 
 # 6) Selftest result kind cannot be the release soak kind

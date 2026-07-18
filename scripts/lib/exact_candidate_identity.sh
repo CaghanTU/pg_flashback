@@ -137,8 +137,8 @@ exact_candidate_bind_dir() {
 
 exact_candidate_stash_prefix_file() {
     local src=$1 rel=$2
+    mkdir -p "$(dirname "$EC_STASH_DIR/$rel")"
     if [[ -e "$src" || -L "$src" ]]; then
-        mkdir -p "$(dirname "$EC_STASH_DIR/$rel")"
         cp -a -- "$src" "$EC_STASH_DIR/$rel"
         exact_candidate_sha256 "$src" > "$EC_STASH_DIR/${rel}.sha256"
         printf 'present\n' > "$EC_STASH_DIR/${rel}.state"

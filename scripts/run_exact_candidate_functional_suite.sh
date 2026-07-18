@@ -162,10 +162,22 @@ wait_watermark() {
                 WHERE tt.schema_name || '.' || tt.table_name = '$rel'
                   AND cg.state='active'
                 ORDER BY cg.generation_no DESC LIMIT 1;")
-        if [[ -n "$vt" ]] && q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;"; then
-            [[ "$(q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;")" == "t" ]] && return 0
+        if [[ -n "$vt" && "$(q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;")" == "t" ]]; then
+            return 0
         fi
         q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        sleep 0.1
+    done
+    return 1
+}
+restore_lsn_retry() {
+    local rel=$1 lsn=$2
+    local _i
+    for _i in $(seq 1 200); do
+        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        if q "SELECT flashback_restore_lsn('$rel', '$lsn');" >/dev/null 2>/dev/null; then
+            return 0
+        fi
         sleep 0.1
     done
     return 1
@@ -309,7 +321,7 @@ done
 wait_watermark "public.steady_dml" "$COMMIT_LSN" || die "watermark missed $COMMIT_LSN"
 FP_STEADY=$(fingerprint_of "public.steady_dml")
 q "UPDATE public.steady_dml SET payload='mutated' WHERE id=2;" >/dev/null
-q "SELECT flashback_restore_lsn('public.steady_dml', '$COMMIT_LSN');" >/dev/null
+restore_lsn_retry "public.steady_dml" "$COMMIT_LSN" || die "DML restore_lsn failed after drain"
 [[ "$(fingerprint_of "public.steady_dml")" == "$FP_STEADY" ]] || die "DML restore fingerprint mismatch"
 wait_healthy "public.steady_dml" || die "post-restore health"
 pass local_dml
@@ -343,7 +355,7 @@ DROP_TARGET_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
 wait_watermark "public.drop_probe" "$DROP_TARGET_LSN" || die "drop frontier not covered"
 q "DROP TABLE public.drop_probe;" >/dev/null
 [[ "$(q "SELECT to_regclass('public.drop_probe') IS NULL;")" == "t" ]] || die "DROP did not remove relation"
-q "SELECT flashback_restore_lsn('public.drop_probe', '$DROP_TARGET_LSN');" >/dev/null
+restore_lsn_retry "public.drop_probe" "$DROP_TARGET_LSN" || die "drop restore_lsn failed"
 [[ "$(q "SELECT to_regclass('public.drop_probe') IS NOT NULL;")" == "t" ]] || die "drop restore missing table"
 [[ "$(fingerprint_of "public.drop_probe")" == "$FP_DROP" ]] || die "drop restore fingerprint"
 [[ "$(q "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.drop_probe'::regclass;")" == "$OWNER_DROP" ]] \
@@ -372,7 +384,7 @@ TRUNC_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
 wait_watermark "public.trunc_probe" "$TRUNC_LSN" || die "trunc watermark"
 FP_TRUNC=$(fingerprint_of "public.trunc_probe")
 q "TRUNCATE public.trunc_probe;" >/dev/null
-q "SELECT flashback_restore_lsn('public.trunc_probe', '$TRUNC_LSN');" >/dev/null
+restore_lsn_retry "public.trunc_probe" "$TRUNC_LSN" || die "truncate restore_lsn failed"
 [[ "$(fingerprint_of "public.trunc_probe")" == "$FP_TRUNC" ]] || die "truncate restore fingerprint"
 pass local_truncate_restore
 
@@ -392,7 +404,7 @@ COLS_BEFORE=$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribu
                  WHERE attrelid='public.alter_probe'::regclass AND attnum>0 AND NOT attisdropped;")
 q "ALTER TABLE public.alter_probe DROP COLUMN status;" >/dev/null
 q "UPDATE public.alter_probe SET name='x' WHERE id=1;" >/dev/null
-q "SELECT flashback_restore_lsn('public.alter_probe', '$ALTER_LSN');" >/dev/null
+restore_lsn_retry "public.alter_probe" "$ALTER_LSN" || die "alter restore_lsn failed"
 COLS_AFTER=$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
                 WHERE attrelid='public.alter_probe'::regclass AND attnum>0 AND NOT attisdropped;")
 [[ "$COLS_AFTER" == "$COLS_BEFORE" ]] || die "alter restore schema ($COLS_AFTER != $COLS_BEFORE)"
@@ -413,7 +425,7 @@ TOAST_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
 wait_watermark 'public."Weird Name"' "$TOAST_LSN" || die "toast watermark"
 FP_TOAST=$(fingerprint_of 'public."Weird Name"')
 q "UPDATE public.\"Weird Name\" SET blob=repeat('U', 100) WHERE id=1;" >/dev/null
-q "SELECT flashback_restore_lsn('public.\"Weird Name\"', '$TOAST_LSN');" >/dev/null
+restore_lsn_retry 'public."Weird Name"' "$TOAST_LSN" || die "toast restore_lsn failed"
 [[ "$(fingerprint_of 'public."Weird Name"')" == "$FP_TOAST" ]] || die "toast restore fingerprint"
 [[ "$(q "SELECT length(blob) FROM public.\"Weird Name\" WHERE id=1;")" == "20000" ]] || die "toast length"
 pass local_quoted_toast

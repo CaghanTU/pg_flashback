@@ -10,7 +10,7 @@
 #   CANDIDATE_DIR  directory containing MANIFEST.json + archives
 #
 # CHAOS_ONLY=1 runs Gate B only (NOT a 24h soak).
-# This wrapper never wraps run_dev_soak.sh.
+# Orchestrator delegates only to packaged functional/chaos/stability suites.
 #
 # Claim language (when Gate B + Gate C both pass on aarch64/Lima):
 #   "24-hour exact-candidate bounded stability soak plus separate exact-candidate
