@@ -279,27 +279,34 @@ done
                    WHERE recovery_profile='local_delta' ORDER BY generation_no DESC LIMIT 1;")" == "active" ]] \
     || die "local track did not activate"
 primary_sql "UPDATE public.local_t SET note='changed' WHERE id=1;"
-# Capture the change commit LSN after forcing a commit boundary into WAL.
-TARGET_LOCAL_LSN=$(primary_sql "SELECT pg_current_wal_insert_lsn()::text;")
 primary_sql "SELECT pg_switch_wal();" >/dev/null
+TARGET_LOCAL_LSN=""
 for _ in $(seq 1 200); do
     primary_sql "SELECT flashback_consume_wal(8192);" >/dev/null || true
+    TARGET_LOCAL_LSN=$(primary_sql "
+        SELECT commit_lsn::text
+        FROM flashback.delta_log
+        WHERE table_name = 'public.local_t'
+          AND event_type = 'UPDATE'
+          AND new_data->>'note' = 'changed'
+        ORDER BY commit_lsn DESC
+        LIMIT 1;")
     VT=$(primary_sql "SELECT valid_through_lsn::text FROM flashback.coverage_generations
                       WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
-    if [[ -n "$VT" ]] && primary_sql "SELECT CASE WHEN '$VT'::pg_lsn >= '$TARGET_LOCAL_LSN'::pg_lsn
-                                                  THEN 't' ELSE 'f' END;" | grep -qx t; then
+    if [[ -n "$TARGET_LOCAL_LSN" && -n "$VT" ]] && \
+       primary_sql "SELECT CASE WHEN '$VT'::pg_lsn >= '$TARGET_LOCAL_LSN'::pg_lsn
+                               THEN 't' ELSE 'f' END;" | grep -qx t; then
         break
     fi
     sleep 0.05
 done
+[[ -n "$TARGET_LOCAL_LSN" ]] || die "changed row was not captured into delta_log"
 VT=$(primary_sql "SELECT valid_through_lsn::text FROM flashback.coverage_generations
                   WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
-[[ -n "$VT" ]] || die "local valid_through unresolved"
 primary_sql "SELECT CASE WHEN '$VT'::pg_lsn >= '$TARGET_LOCAL_LSN'::pg_lsn
                          THEN true ELSE false END;" | grep -qx t \
-    || die "local watermark $VT has not reached change LSN $TARGET_LOCAL_LSN"
-# Restore to the proven watermark (inclusive), which covers the change.
-primary_sql "SELECT flashback_restore_lsn('public.local_t', '$VT'::pg_lsn);" >/dev/null
+    || die "local watermark $VT has not reached change commit LSN $TARGET_LOCAL_LSN"
+primary_sql "SELECT flashback_restore_lsn('public.local_t', '$TARGET_LOCAL_LSN'::pg_lsn);" >/dev/null
 [[ "$(primary_sql "SELECT note FROM public.local_t WHERE id=1;")" == "changed" ]] \
     || die "local restore did not retain changed row"
 pass "local track/change/restore"
