@@ -422,15 +422,9 @@ wait_primary_ready() {
 }
 BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                            WHERE rel_oid='public.chaos_probe'::regclass;")
-WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
-    WHERE backend_type='pg_flashback delta worker'
-      AND datname=current_database()
-    LIMIT 1;")
-# Prefer killing the delta worker; always bounce postmaster so bgworkers restart
-# deterministically (matches scripts/run_fault_injection_smoke.sh).
-if [[ -n "$WORKER_PID" ]]; then
-    kill -KILL "$WORKER_PID" || true
-fi
+# Kill the worker by bouncing postmaster. Direct SIGKILL of the bgworker is
+# observed as slot/stream loss (covered by slot_loss); restart preserves the
+# slot and matches scripts/run_fault_injection_smoke.sh.
 "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
 wait_primary_ready || die "primary did not accept connections after worker kill restart"
 primary_sql "INSERT INTO public.chaos_probe(payload) VALUES ('worker-kill');" >/dev/null
