@@ -139,8 +139,8 @@ jobs:
         id: cand
         run: |
           expected="${{ needs.build-candidate.outputs.source_commit }}"
-          manifest="$(find /tmp/candidate-dl -path "*/${expected}/MANIFEST.json" -print -quit \
-            || find /tmp/candidate-dl -name MANIFEST.json -print -quit)"
+          find /tmp/candidate-dl -type f | sort
+          manifest="$(find /tmp/candidate-dl -name MANIFEST.json -print | head -n1)"
           test -n "$manifest"
           test "$(jq -r '.provenance.source_commit' "$manifest")" = "$expected"
           echo "dir=$(dirname "$manifest")" >> "$GITHUB_OUTPUT"
