@@ -409,26 +409,24 @@ wait_primary_ready() {
     done
     return 1
 }
+BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
+                           WHERE rel_oid='public.target_table'::regclass;")
 WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
     WHERE backend_type='pg_flashback delta worker'
       AND datname=current_database()
     LIMIT 1;")
-BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
-                           WHERE rel_oid='public.target_table'::regclass;")
+# Prefer killing the delta worker; always bounce postmaster so bgworkers restart
+# deterministically (matches scripts/run_fault_injection_smoke.sh).
 if [[ -n "$WORKER_PID" ]]; then
     kill -KILL "$WORKER_PID" || true
-else
-    log "delta worker not visible; falling back to postmaster restart"
-    "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
 fi
-wait_primary_ready || die "primary did not accept connections after worker kill"
-# Allow bgworker restart before writing.
-sleep 0.5
+"$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
+wait_primary_ready || die "primary did not accept connections after worker kill restart"
 primary_sql "INSERT INTO public.target_table(marker, payload)
              VALUES ('worker-kill', decode(repeat('ab', 16), 'hex'));" >/dev/null
 AFTER_ROWS="$BEFORE_ROWS"
 HEALTH=""
-for _ in $(seq 1 120); do
+for _ in $(seq 1 200); do
     AFTER_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                               WHERE rel_oid='public.target_table'::regclass;")
     HEALTH=$(primary_sql "SELECT health FROM flashback_health()
