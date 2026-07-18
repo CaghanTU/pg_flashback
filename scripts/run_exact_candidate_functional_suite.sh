@@ -28,6 +28,9 @@ PASSED=0
 PRIMARY_STARTED=0
 RUN_COMPLETE=0
 PREFIX_INSTALLED=0
+SOCKET_DIR=""
+HELPER_SOCKET_DIR=""
+PRIMARY_DIR=""
 declare -A CASE_PASS
 
 log() { printf '[exact-candidate-functional] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -147,28 +150,40 @@ wait_healthy() {
     for _i in $(seq 1 200); do
         h=$(q "SELECT health FROM flashback_health() WHERE table_name='$rel';")
         [[ "$h" == "healthy" ]] && return 0
-        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
         sleep 0.1
     done
     return 1
 }
-wait_watermark() {
-    local rel=$1 lsn=$2
-    local _i vt tname
-    tname="${rel##*.}"
-    tname="${tname//\"/}"
+wait_local_delta_active() {
+    local _i state
     for _i in $(seq 1 200); do
-        vt=$(q "SELECT valid_through_lsn::text
-                FROM flashback.coverage_generations cg
-                JOIN flashback.tracked_tables tt USING (tracking_id)
-                WHERE tt.table_name = '$tname'
-                  AND cg.state='active'
-                ORDER BY cg.generation_no DESC LIMIT 1;")
-        if [[ -n "$vt" && "$(q "SELECT '$vt'::pg_lsn >= '$lsn'::pg_lsn;")" == "t" ]]; then
+        state=$(q "SELECT state FROM flashback.coverage_generations
+                   WHERE recovery_profile='local_delta' ORDER BY generation_no DESC LIMIT 1;")
+        [[ "$state" == "active" ]] && return 0
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        sleep 0.05
+    done
+    return 1
+}
+wait_commit_covered() {
+    # Args: table_name like public.foo, event_type, optional SQL predicate on new_data
+    local tname=$1 etype=$2 pred=${3:-true}
+    local _i lsn vt
+    for _i in $(seq 1 200); do
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        lsn=$(q "SELECT commit_lsn::text FROM flashback.delta_log
+                 WHERE table_name = '$tname'
+                   AND event_type = '$etype'
+                   AND ($pred)
+                 ORDER BY commit_lsn DESC LIMIT 1;")
+        vt=$(q "SELECT valid_through_lsn::text FROM flashback.coverage_generations
+                WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
+        if [[ -n "$lsn" && -n "$vt" && "$(q "SELECT CASE WHEN '$vt'::pg_lsn >= '$lsn'::pg_lsn THEN 't' ELSE 'f' END;")" == "t" ]]; then
+            printf '%s' "$lsn"
             return 0
         fi
-        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-        sleep 0.1
+        sleep 0.05
     done
     return 1
 }
@@ -176,8 +191,8 @@ restore_lsn_retry() {
     local rel=$1 lsn=$2
     local _i
     for _i in $(seq 1 200); do
-        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-        if q "SELECT flashback_restore_lsn('$rel', '$lsn');" >/dev/null 2>/dev/null; then
+        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
+        if q "SELECT flashback_restore_lsn('$rel', '$lsn'::pg_lsn);" >/dev/null 2>/dev/null; then
             return 0
         fi
         sleep 0.1
@@ -299,49 +314,23 @@ q "CREATE TABLE public.steady_dml(
 q "ALTER TABLE public.steady_dml OWNER TO func_owner;
    GRANT SELECT ON public.steady_dml TO func_reader;"
 q "SELECT flashback_track('public.steady_dml');" >/dev/null
+wait_local_delta_active || die "local_delta not active"
 wait_healthy "public.steady_dml" || die "steady_dml not healthy"
 q "INSERT INTO public.steady_dml VALUES (1,'ins','a'),(2,'ins','b');" >/dev/null
-for _ in $(seq 1 200); do
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='public.steady_dml'::regclass AND event_type='INSERT';")" -ge 2 ]] && break
-    sleep 0.1
-done
+q "SELECT pg_switch_wal();" >/dev/null
+wait_commit_covered "public.steady_dml" "INSERT" "true" >/dev/null || die "INSERT not covered"
 q "UPDATE public.steady_dml SET marker='upd', payload='b2' WHERE id=2;" >/dev/null
-COMMIT_LSN=""
-for _ in $(seq 1 200); do
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    COMMIT_LSN=$(q "SELECT commit_lsn::text
-                    FROM flashback.delta_log
-                    WHERE rel_oid='public.steady_dml'::regclass
-                      AND event_type = 'UPDATE'
-                    ORDER BY commit_lsn DESC LIMIT 1;")
-    [[ -n "$COMMIT_LSN" ]] && break
-    sleep 0.1
-done
-[[ -n "$COMMIT_LSN" ]] || die "no UPDATE commit LSN in delta_log"
-wait_watermark "public.steady_dml" "$COMMIT_LSN" || die "watermark missed $COMMIT_LSN"
+q "SELECT pg_switch_wal();" >/dev/null
+wait_commit_covered "public.steady_dml" "UPDATE" "new_data->>'payload' = 'b2'" >/dev/null \
+    || die "UPDATE not covered"
 q "DELETE FROM public.steady_dml WHERE id=1;" >/dev/null
-for _ in $(seq 1 200); do
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    DEL_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-                 WHERE rel_oid='public.steady_dml'::regclass AND event_type='DELETE'
-                 ORDER BY commit_lsn DESC LIMIT 1;")
-    [[ -n "$DEL_LSN" ]] && break
-    sleep 0.1
-done
-wait_watermark "public.steady_dml" "$DEL_LSN" || die "delete watermark missed"
+q "SELECT pg_switch_wal();" >/dev/null
+DEL_LSN=$(wait_commit_covered "public.steady_dml" "DELETE" "true") \
+    || die "DELETE not covered"
 FP_STEADY=$(fingerprint_of "public.steady_dml")
-# Mutate past the restore target, drain, then restore the DELETE-era fingerprint.
 q "UPDATE public.steady_dml SET payload='mutated' WHERE id=2;" >/dev/null
-for _ in $(seq 1 200); do
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    MUT=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-             WHERE rel_oid='public.steady_dml'::regclass AND event_type='UPDATE'
-             ORDER BY commit_lsn DESC LIMIT 1;")
-    [[ -n "$MUT" && "$(q "SELECT '$MUT'::pg_lsn > '$DEL_LSN'::pg_lsn;")" == "t" ]] && break
-    sleep 0.1
-done
-wait_watermark "public.steady_dml" "$MUT" || true
+q "SELECT pg_switch_wal();" >/dev/null
+wait_commit_covered "public.steady_dml" "UPDATE" "new_data->>'payload' = 'mutated'" >/dev/null || true
 restore_lsn_retry "public.steady_dml" "$DEL_LSN" || die "DML restore_lsn failed after drain"
 [[ "$(fingerprint_of "public.steady_dml")" == "$FP_STEADY" ]] \
     || die "DML restore fingerprint mismatch (got $(fingerprint_of "public.steady_dml") want $FP_STEADY)"
@@ -358,25 +347,18 @@ q "CREATE TABLE public.drop_probe(
      id bigint PRIMARY KEY, marker text NOT NULL, payload text NOT NULL);"
 q "ALTER TABLE public.drop_probe OWNER TO func_owner;
    GRANT SELECT ON public.drop_probe TO func_reader;"
-q "INSERT INTO public.drop_probe VALUES (1,'keep', repeat('d', 200));" >/dev/null
 q "SELECT flashback_track('public.drop_probe');" >/dev/null
+wait_local_delta_active || die "local_delta not active for drop_probe"
 wait_healthy "public.drop_probe" || die "drop_probe not healthy"
+q "INSERT INTO public.drop_probe VALUES (1,'keep', repeat('d', 200));" >/dev/null
+q "SELECT pg_switch_wal();" >/dev/null
+DROP_TARGET_LSN=$(wait_commit_covered "public.drop_probe" "INSERT" "true") \
+    || die "drop frontier not covered"
 FP_DROP=$(fingerprint_of "public.drop_probe")
 OWNER_DROP=$(q "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.drop_probe'::regclass;")
 ACL_DROP=$(q "SELECT COALESCE(array_to_string(relacl, ','), '') FROM pg_class WHERE oid='public.drop_probe'::regclass;")
 COLS_DROP=$(q "SELECT string_agg(attname, ',' ORDER BY attnum)
                FROM pg_attribute WHERE attrelid='public.drop_probe'::regclass AND attnum>0 AND NOT attisdropped;")
-# Ensure frontier covers current content before DROP.
-q "SELECT pg_current_wal_lsn();" >/dev/null
-for _ in $(seq 1 100); do
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='public.drop_probe'::regclass;")" -ge 1 ]] && break
-    sleep 0.1
-done
-DROP_TARGET_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-                     WHERE rel_oid='public.drop_probe'::regclass
-                     ORDER BY commit_lsn DESC LIMIT 1;")
-wait_watermark "public.drop_probe" "$DROP_TARGET_LSN" || die "drop frontier not covered"
 q "DROP TABLE public.drop_probe;" >/dev/null
 [[ "$(q "SELECT to_regclass('public.drop_probe') IS NULL;")" == "t" ]] || die "DROP did not remove relation"
 restore_lsn_retry "public.drop_probe" "$DROP_TARGET_LSN" || die "drop restore_lsn failed"
@@ -400,12 +382,11 @@ pass local_drop_restore
 CASE_PASS[local_truncate_restore]=false
 q "CREATE TABLE public.trunc_probe(id bigint PRIMARY KEY, v text NOT NULL);"
 q "SELECT flashback_track('public.trunc_probe');" >/dev/null
+wait_local_delta_active || die "local_delta not active for trunc"
 wait_healthy "public.trunc_probe" || die "trunc_probe not healthy"
 q "INSERT INTO public.trunc_probe VALUES (1,'a'),(2,'b');" >/dev/null
-TRUNC_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-               WHERE rel_oid='public.trunc_probe'::regclass
-               ORDER BY commit_lsn DESC LIMIT 1;")
-wait_watermark "public.trunc_probe" "$TRUNC_LSN" || die "trunc watermark"
+q "SELECT pg_switch_wal();" >/dev/null
+TRUNC_LSN=$(wait_commit_covered "public.trunc_probe" "INSERT" "true") || die "trunc watermark"
 FP_TRUNC=$(fingerprint_of "public.trunc_probe")
 q "TRUNCATE public.trunc_probe;" >/dev/null
 restore_lsn_retry "public.trunc_probe" "$TRUNC_LSN" || die "truncate restore_lsn failed"
@@ -418,12 +399,11 @@ pass local_truncate_restore
 CASE_PASS[local_alter_restore]=false
 q "CREATE TABLE public.alter_probe(id bigint PRIMARY KEY, name text NOT NULL, status text NOT NULL);"
 q "SELECT flashback_track('public.alter_probe');" >/dev/null
+wait_local_delta_active || die "local_delta not active for alter"
 wait_healthy "public.alter_probe" || die "alter_probe not healthy"
 q "INSERT INTO public.alter_probe VALUES (1,'n','ok');" >/dev/null
-ALTER_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-               WHERE rel_oid='public.alter_probe'::regclass
-               ORDER BY commit_lsn DESC LIMIT 1;")
-wait_watermark "public.alter_probe" "$ALTER_LSN" || die "alter watermark"
+q "SELECT pg_switch_wal();" >/dev/null
+ALTER_LSN=$(wait_commit_covered "public.alter_probe" "INSERT" "true") || die "alter watermark"
 COLS_BEFORE=$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute
                  WHERE attrelid='public.alter_probe'::regclass AND attnum>0 AND NOT attisdropped;")
 q "ALTER TABLE public.alter_probe DROP COLUMN status;" >/dev/null
@@ -441,12 +421,11 @@ pass local_alter_restore
 CASE_PASS[local_quoted_toast]=false
 q 'CREATE TABLE public."Weird Name"(id bigint PRIMARY KEY, blob text NOT NULL);'
 q 'SELECT flashback_track('\''public."Weird Name"'\'');' >/dev/null
+wait_local_delta_active || die "local_delta not active for quoted"
 wait_healthy 'public."Weird Name"' || die "quoted table not healthy"
 q "INSERT INTO public.\"Weird Name\" VALUES (1, repeat('T', 20000));" >/dev/null
-TOAST_LSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-               WHERE rel_oid='public.\"Weird Name\"'::regclass
-               ORDER BY commit_lsn DESC LIMIT 1;")
-wait_watermark 'public."Weird Name"' "$TOAST_LSN" || die "toast watermark"
+q "SELECT pg_switch_wal();" >/dev/null
+TOAST_LSN=$(wait_commit_covered 'public."Weird Name"' "INSERT" "true") || die "toast watermark"
 FP_TOAST=$(fingerprint_of 'public."Weird Name"')
 q "UPDATE public.\"Weird Name\" SET blob=repeat('U', 100) WHERE id=1;" >/dev/null
 restore_lsn_retry 'public."Weird Name"' "$TOAST_LSN" || die "toast restore_lsn failed"
