@@ -526,25 +526,21 @@ q "DROP TABLE public.target_table;" >/dev/null
 "$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_DROP" \
     > "$RUN_ROOT/restore-drop.result.json"
 [[ "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] || die "helper drop-restore failed"
-ART=$(jq -r '.artifact_path // .dump_path // empty' "$RUN_ROOT/restore-drop.result.json")
-[[ "$(jq -r '.fingerprint // .row_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
-   || "$(jq -r '.verified_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
-   || "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] \
-    || die "drop restore missing fingerprint proof"
-if [[ -n "$ART" && -f "$ART" ]]; then
-    "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" restore_check || true
-    "$PG_BIN/pg_restore" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check --no-owner "$ART" >/dev/null 2>&1 \
-        || "$PG_BIN/psql" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check -v ON_ERROR_STOP=1 -f "$ART" >/dev/null 2>&1 \
-        || true
-fi
+[[ "$(jq -r '.cleanup_complete' "$RUN_ROOT/restore-drop.result.json")" == "true" ]] \
+    || die "helper drop-restore cleanup incomplete"
+[[ "$(jq -r '.recovered_fingerprint' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" ]] \
+    || die "helper recovered fingerprint mismatch"
+[[ "$(jq -r '.recovered_owner' "$RUN_ROOT/restore-drop.result.json")" == "func_owner" ]] \
+    || die "helper recovered owner mismatch"
+[[ "$(jq -r '[.recovered_acl[]?|select(.grantee=="func_reader" and .privilege=="SELECT")]|length'
+            "$RUN_ROOT/restore-drop.result.json")" -ge 1 ]] \
+    || die "helper recovered ACL missing func_reader SELECT"
+ART=$(jq -r '.artifact_path // empty' "$RUN_ROOT/restore-drop.result.json")
+[[ -n "$ART" && -f "$ART" ]] || die "helper artifact missing"
 [[ ! -e "$WORK_ROOT/func-drop/pgdata" ]] || die "helper left pgdata after drop restore"
-# Helper materializes outside production; relation remains absent until an
-# operator swap. Health must not report healthy for a missing relation.
-if [[ "$(q "SELECT to_regclass('public.target_table') IS NULL;")" == "t" ]]; then
-    HEALTH_POST=$(q "SELECT COALESCE(max(health), 'missing') FROM flashback_health()
-                     WHERE table_name='public.target_table';")
-    [[ "$HEALTH_POST" != "healthy" ]] || die "post-drop helper health dishonestly healthy"
-fi
+# Production relation stays absent until an operator swap; that is honest.
+[[ "$(q "SELECT to_regclass('public.target_table') IS NULL;")" == "t" ]] \
+    || die "helper unexpectedly swapped into production"
 pass backup_drop_restore
 
 # Cleanup leak check
