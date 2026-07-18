@@ -82,7 +82,10 @@ gates are separate and must use packaged archives from `CANDIDATE_DIR`:
 
 `scripts/run_exact_rc_harness_selftest.sh` is accelerated harness regression
 only (`qualification_kind=exact_rc_harness_selftest`) and must never emit a
-24h release PASS. Supported claim language after Gates B and C on this host
+24h release PASS. `scripts/run_development_stability_15m.sh` separately runs
+every scheduled stability drill in a 15-minute development-only window. It
+emits `development_accelerated_stability`; it cannot satisfy or claim the
+exact 24-hour release gate. Supported claim language after Gates B and C on this host
 class is the bounded stability soak plus a separate exact-candidate chaos
 suite on Linux/aarch64 under Lima on an Apple Silicon host.
 

@@ -95,13 +95,13 @@ KIND="exact_rc_harness_selftest"
     && pass "selftest kind distinct from release soak" \
     || fail "selftest kind collides with release soak"
 
-# 7) Budget exhaustion concept: heavy-write disable without ending clock
-# (static check that HEAVY_WRITES_ENABLED path exists and loop continues)
+# 7) Budget exhaustion concept: early heavy-write stop, then hard ceiling
 if rg -n 'HEAVY_WRITES_ENABLED=0' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
-   && rg -n 'clock continues' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
-    pass "workload budget stops heavy writes without ending clock"
+   && rg -n 'HEAVY_WRITE_STOP_BYTES' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && rg -n 'exceeded hard MAX_WORK_BYTES' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
+    pass "workload budget soft-stops with headroom and enforces a hard ceiling"
 else
-    fail "workload budget/clock separation missing"
+    fail "workload budget headroom/hard ceiling missing"
 fi
 
 # 8) Prefix stash/restore helpers exist
@@ -110,6 +110,30 @@ if declare -F exact_candidate_restore_prefix >/dev/null \
     pass "prefix stash/restore helpers present"
 else
     fail "prefix stash/restore helpers missing"
+fi
+
+# 9) Accelerated wrapper is development-only and exact mode remains fixed.
+if rg -n 'PG_FLASHBACK_STABILITY_MODE=accelerated' "$REPO_ROOT/scripts/run_development_stability_15m.sh" >/dev/null \
+   && rg -n 'development_accelerated_stability' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && rg -n 'QUAL_DURATION_SECONDS=86400' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
+    pass "accelerated drill mode is distinct from fixed 24-hour qualification"
+else
+    fail "accelerated mode can collide with exact qualification"
+fi
+
+# 10) Local restore must wait for source and mutation LSNs before restore.
+if [[ "$(rg -c 'wait_for_delta_lsn_after \"public.restore_probe\"' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh")" -ge 2 ]] \
+   && [[ "$(rg -c 'wait_for_coverage_lsn \"public.restore_probe\"' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh")" -ge 2 ]]; then
+    pass "local restore waits for captured and covered source/mutation LSNs"
+else
+    fail "local restore LSN wait discipline missing"
+fi
+
+# 11) Early/late DROP drills use distinct tracking identities.
+if rg -n 'local table_name="drop_probe_\$\{tag\}"' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
+    pass "DROP drills use distinct relations instead of retracking one lifecycle"
+else
+    fail "DROP drills can collide on one tracking lifecycle"
 fi
 
 STATUS=failed

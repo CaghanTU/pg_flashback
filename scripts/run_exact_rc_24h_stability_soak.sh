@@ -2,9 +2,9 @@
 # Dedicated 24-hour exact-candidate bounded stability soak (Gate C).
 #
 # HARD RULES:
-# - qualification_kind is always exact_rc_24h_stability_soak
-# - PASS requires >= 86400 active monotonic seconds
-# - no env var may emit PASS for a shorter duration
+# - exact mode qualification_kind is exact_rc_24h_stability_soak
+# - exact mode PASS requires >= 86400 active monotonic seconds
+# - accelerated mode is explicitly development-only and cannot emit the exact kind
 # - installs ONLY from CANDIDATE_DIR (never cargo-builds)
 # - workload budget exhaustion stops heavy writes but does NOT end the clock
 # - suspension/heartbeat gaps fail closed
@@ -17,6 +17,7 @@
 # Optional resource bounds (bytes):
 #   PG_FLASHBACK_SOAK_MIN_FREE_BYTES   default 2147483648 (2 GiB)
 #   PG_FLASHBACK_SOAK_MAX_WORK_BYTES   default 805306368 (~768 MiB)
+#   PG_FLASHBACK_SOAK_WORK_STOP_HEADROOM_BYTES default 67108864 (64 MiB)
 #   PG_FLASHBACK_SOAK_HEARTBEAT_MAX_GAP_SECONDS  default 180
 
 set -Eeuo pipefail
@@ -29,18 +30,52 @@ CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
 PGBACKREST="${PGBACKREST:-/usr/local/bin/pgbackrest}"
 KEEP="${PGFB_STABILITY_KEEP:-1}"
 
-# Duration is NOT overridable below 86400 for this qualification_kind.
-QUAL_DURATION_SECONDS=86400
+STABILITY_MODE="${PG_FLASHBACK_STABILITY_MODE:-exact}"
+case "$STABILITY_MODE" in
+    exact)
+        # Duration is NOT overridable below 86400 for this qualification kind.
+        QUALIFICATION_KIND=exact_rc_24h_stability_soak
+        QUAL_DURATION_SECONDS=86400
+        RESULT_PREFIX=exact-rc-24h-stability
+        RESULT_CLAIM="24-hour exact-candidate bounded stability soak plus separate exact-candidate chaos suite on Linux/aarch64 under Lima on an Apple Silicon host."
+        ;;
+    accelerated)
+        # Development regression only. This mode must never satisfy Gate C.
+        QUALIFICATION_KIND=development_accelerated_stability
+        QUAL_DURATION_SECONDS="${PG_FLASHBACK_STABILITY_ACCELERATED_SECONDS:-900}"
+        if (( QUAL_DURATION_SECONDS < 300 || QUAL_DURATION_SECONDS > 3600 )); then
+            echo "FAIL: accelerated duration must be between 300 and 3600 seconds" >&2
+            exit 2
+        fi
+        RESULT_PREFIX=development-accelerated-stability
+        RESULT_CLAIM="Development-only accelerated stability/drill regression; not 24-hour release qualification."
+        ;;
+    *)
+        echo "FAIL: unsupported PG_FLASHBACK_STABILITY_MODE=$STABILITY_MODE" >&2
+        exit 2
+        ;;
+esac
 MIN_FREE_BYTES="${PG_FLASHBACK_SOAK_MIN_FREE_BYTES:-2147483648}"
 MAX_WORK_BYTES="${PG_FLASHBACK_SOAK_MAX_WORK_BYTES:-805306368}"
+WORK_STOP_HEADROOM_BYTES="${PG_FLASHBACK_SOAK_WORK_STOP_HEADROOM_BYTES:-67108864}"
+if (( WORK_STOP_HEADROOM_BYTES <= 0 || WORK_STOP_HEADROOM_BYTES >= MAX_WORK_BYTES )); then
+    echo "FAIL: work-stop headroom must be positive and below max work bytes" >&2
+    exit 2
+fi
+HEAVY_WRITE_STOP_BYTES=$((MAX_WORK_BYTES - WORK_STOP_HEADROOM_BYTES))
 HEARTBEAT_MAX_GAP="${PG_FLASHBACK_SOAK_HEARTBEAT_MAX_GAP_SECONDS:-180}"
 SAMPLE_INTERVAL="${PG_FLASHBACK_SOAK_SAMPLE_INTERVAL_SECONDS:-45}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-BASE="${PGFB_STABILITY_BASE:-$REPO_ROOT/target/exact-rc-24h-stability}"
+if [[ "$STABILITY_MODE" == "exact" ]]; then
+    DEFAULT_BASE="$REPO_ROOT/target/exact-rc-24h-stability"
+else
+    DEFAULT_BASE="$REPO_ROOT/target/development-accelerated-stability"
+fi
+BASE="${PGFB_STABILITY_BASE:-$DEFAULT_BASE}"
 RUN_ROOT="$BASE/runs/$RUN_ID"
 RESULT_DIR="${PGFB_STABILITY_RESULT_DIR:-$BASE/results}"
-RESULT_JSON="$RESULT_DIR/exact-rc-24h-stability-$RUN_ID.json"
+RESULT_JSON="$RESULT_DIR/$RESULT_PREFIX-$RUN_ID.json"
 HEARTBEAT_FILE="$RUN_ROOT/heartbeat.txt"
 SAMPLES_JSONL="$RUN_ROOT/samples.jsonl"
 PROGRESS_LOG="$RUN_ROOT/progress.log"
@@ -65,6 +100,7 @@ LAST_HB_MONO_NS=0
 START_UTC=""
 PEAK_WORK_BYTES=0
 START_FS_FREE=0
+WORK_BUDGET_LOGGED=0
 
 log() { printf '[exact-rc-24h-stability] %s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$PROGRESS_LOG"; }
 die() { log "FAIL: $*"; STATUS=failed; exit 1; }
@@ -73,7 +109,7 @@ require_executable() { [[ -x "$1" ]] || die "required executable not found: $1";
 write_heartbeat() {
     local elapsed=$1
     cat > "$HEARTBEAT_FILE" <<EOF
-qualification_kind=exact_rc_24h_stability_soak
+qualification_kind=$QUALIFICATION_KIND
 run_id=$RUN_ID
 elapsed_active_seconds=$elapsed
 target_seconds=$QUAL_DURATION_SECONDS
@@ -123,7 +159,14 @@ enforce_resource_bounds() {
     fi
     if (( LAST_WORK > MAX_WORK_BYTES )); then
         HEAVY_WRITES_ENABLED=0
-        log "work bytes $LAST_WORK hit MAX_WORK_BYTES=$MAX_WORK_BYTES; stopping heavy writes (clock continues)"
+        die "work bytes $LAST_WORK exceeded hard MAX_WORK_BYTES=$MAX_WORK_BYTES"
+    fi
+    if (( HEAVY_WRITES_ENABLED == 1 && LAST_WORK >= HEAVY_WRITE_STOP_BYTES )); then
+        HEAVY_WRITES_ENABLED=0
+        if (( WORK_BUDGET_LOGGED == 0 )); then
+            log "work bytes $LAST_WORK reached soft stop $HEAVY_WRITE_STOP_BYTES; stopping heavy writes with ${WORK_STOP_HEADROOM_BYTES}-byte headroom (clock continues)"
+            WORK_BUDGET_LOGGED=1
+        fi
     fi
     # Soft stop heavy writes when projected remaining free would breach reserve.
     if (( LAST_FREE - 67108864 < MIN_FREE_BYTES )); then
@@ -151,7 +194,8 @@ write_result() {
     mkdir -p "$RESULT_DIR"
     jq -n \
         --arg status "$STATUS" \
-        --arg kind "exact_rc_24h_stability_soak" \
+        --arg kind "$QUALIFICATION_KIND" \
+        --arg claim "$RESULT_CLAIM" \
         --arg started_utc "$START_UTC" \
         --arg finished_utc "$end_utc" \
         --argjson elapsed "$elapsed_s" \
@@ -186,7 +230,7 @@ write_result() {
           drills: $drills,
           identity: $identity,
           exit_code: $exit_code,
-          claim: "24-hour exact-candidate bounded stability soak plus separate exact-candidate chaos suite on Linux/aarch64 under Lima on an Apple Silicon host."
+          claim: $claim
         }' > "$RESULT_JSON"
     log "result written: $RESULT_JSON status=$STATUS elapsed=${elapsed_s}s"
 }
@@ -291,6 +335,48 @@ wait_healthy() {
     return 1
 }
 
+wait_for_delta_lsn_after() {
+    local rel=$1 after_event_id=$2 attempts=${3:-200}
+    local _i lsn
+    for _i in $(seq 1 "$attempts"); do
+        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        lsn=$(q "SELECT commit_lsn::text
+                 FROM flashback.delta_log
+                 WHERE rel_oid='$rel'::regclass
+                   AND event_id > $after_event_id
+                   AND commit_lsn IS NOT NULL
+                 ORDER BY event_id DESC
+                 LIMIT 1;")
+        if [[ -n "$lsn" ]]; then
+            printf '%s\n' "$lsn"
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_for_coverage_lsn() {
+    local rel=$1 target_lsn=$2 attempts=${3:-200}
+    local _i covered
+    [[ -n "$target_lsn" ]] || return 1
+    for _i in $(seq 1 "$attempts"); do
+        q "SELECT flashback_consume_wal(4096);" >/dev/null || true
+        covered=$(q "SELECT EXISTS (
+                       SELECT 1
+                       FROM flashback.coverage_generations cg
+                       JOIN flashback.tracked_tables tt USING (tracking_id)
+                       WHERE tt.rel_oid='$rel'::regclass
+                         AND cg.state='active'
+                         AND cg.valid_through_lsn IS NOT NULL
+                         AND cg.valid_through_lsn >= '$target_lsn'::pg_lsn
+                     );")
+        [[ "$covered" == "t" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 q "CREATE EXTENSION pg_flashback;"
 # Noise DB also loads extension for filtered WAL.
 qn "CREATE EXTENSION pg_flashback;"
@@ -315,7 +401,7 @@ START_MONO_NS="$(exact_candidate_monotonic_now_ns)"
 LAST_HB_MONO_NS="$START_MONO_NS"
 LAST_OP="startup"
 NEXT_DRILL="early_drop"
-log "stability soak started; duration=${QUAL_DURATION_SECONDS}s max_work=$MAX_WORK_BYTES min_free=$MIN_FREE_BYTES"
+log "stability soak started; kind=$QUALIFICATION_KIND duration=${QUAL_DURATION_SECONDS}s max_work=$MAX_WORK_BYTES soft_stop=$HEAVY_WRITE_STOP_BYTES min_free=$MIN_FREE_BYTES"
 write_heartbeat 0
 enforce_resource_bounds
 
@@ -353,39 +439,47 @@ PY
 
 do_drop_restore_drill() {
     local tag=$1
+    local table_name="drop_probe_${tag}"
+    local rel="public.${table_name}"
     local lsn fp _i vt
-    q "DROP TABLE IF EXISTS public.drop_probe;" >/dev/null
-    q "CREATE TABLE public.drop_probe(id bigint PRIMARY KEY, marker text NOT NULL, payload text NOT NULL);"
-    q "SELECT flashback_track('public.drop_probe');" >/dev/null
-    wait_healthy "public.drop_probe" || die "$tag drop_probe not healthy"
-    q "INSERT INTO public.drop_probe VALUES (1,'$tag', repeat('d', 500));" >/dev/null
+    q "DROP TABLE IF EXISTS $rel;" >/dev/null
+    q "CREATE TABLE $rel(id bigint PRIMARY KEY, marker text NOT NULL, payload text NOT NULL);"
+    q "SELECT flashback_track('$rel');" >/dev/null
+    wait_healthy "$rel" || die "$tag $table_name not healthy"
+    q "INSERT INTO $rel VALUES (1,'$tag', repeat('d', 500));" >/dev/null
     q "SELECT pg_switch_wal();" >/dev/null
     lsn=""
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
         lsn=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-                 WHERE table_name='public.drop_probe' AND event_type='INSERT'
+                 WHERE table_name='$rel' AND event_type='INSERT'
                  ORDER BY commit_lsn DESC LIMIT 1;")
-        vt=$(q "SELECT valid_through_lsn::text FROM flashback.coverage_generations
-                WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
+        vt=$(q "SELECT cg.valid_through_lsn::text
+                FROM flashback.coverage_generations cg
+                JOIN flashback.tracked_tables tt USING (tracking_id)
+                WHERE tt.rel_oid='$rel'::regclass
+                  AND cg.recovery_profile='local_delta'
+                  AND cg.state='active'
+                ORDER BY cg.generation_no DESC
+                LIMIT 1;")
         if [[ -n "$lsn" && -n "$vt" && "$(q "SELECT CASE WHEN '$vt'::pg_lsn >= '$lsn'::pg_lsn THEN 't' ELSE 'f' END;")" == "t" ]]; then
             break
         fi
         sleep 0.05
     done
     [[ -n "$lsn" ]] || die "$tag drop frontier not covered"
-    fp=$(fingerprint_of "public.drop_probe")
-    q "DROP TABLE public.drop_probe;" >/dev/null
-    [[ "$(q "SELECT to_regclass('public.drop_probe') IS NULL;")" == "t" ]] || die "$tag drop failed"
+    fp=$(fingerprint_of "$rel")
+    q "DROP TABLE $rel;" >/dev/null
+    [[ "$(q "SELECT to_regclass('$rel') IS NULL;")" == "t" ]] || die "$tag drop failed"
     q "SELECT pg_switch_wal();" >/dev/null
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-        [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE table_name='public.drop_probe' AND event_type='DROP';")" -ge 1 ]] && break
+        [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE table_name='$rel' AND event_type='DROP';")" -ge 1 ]] && break
         sleep 0.05
     done
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-        if q "SELECT flashback_restore_lsn('public.drop_probe', '$lsn'::pg_lsn);" >/dev/null 2>/dev/null; then
+        if q "SELECT flashback_restore_lsn('$rel', '$lsn'::pg_lsn);" >/dev/null 2>/dev/null; then
             break
         fi
         sleep 0.1
@@ -393,8 +487,8 @@ do_drop_restore_drill() {
             die "$tag drop restore_lsn failed"
         fi
     done
-    [[ "$(fingerprint_of "public.drop_probe")" == "$fp" ]] || die "$tag drop restore fingerprint"
-    wait_healthy "public.drop_probe" || die "$tag post-drop coverage"
+    [[ "$(fingerprint_of "$rel")" == "$fp" ]] || die "$tag drop restore fingerprint"
+    wait_healthy "$rel" || die "$tag post-drop coverage"
     LAST_OP="drop_restore_$tag"
 }
 
@@ -466,23 +560,23 @@ SQL
     fi
     if (( DRILL_LOCAL_RESTORE == 0 && elapsed >= RESTORE_AT )); then
         NEXT_DRILL=local_restore
+        RBEFORE=$(q "SELECT COALESCE(max(event_id), 0) FROM flashback.delta_log
+                     WHERE rel_oid='public.restore_probe'::regclass;")
         q "INSERT INTO public.restore_probe VALUES (1, 'r', 'p')
            ON CONFLICT (id) DO UPDATE SET marker='r$elapsed', payload='p';" >/dev/null
-        RLSN=$(q "SELECT commit_lsn::text FROM flashback.delta_log
-                  WHERE rel_oid='public.restore_probe'::regclass
-                  ORDER BY commit_lsn DESC LIMIT 1;")
-        for _ in $(seq 1 80); do
-            q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-            RVT=$(q "SELECT valid_through_lsn::text FROM flashback.coverage_generations cg
-                    JOIN flashback.tracked_tables tt USING (tracking_id)
-                    WHERE tt.table_name='restore_probe' AND cg.state='active'
-                    ORDER BY cg.generation_no DESC LIMIT 1;")
-            [[ -n "$RVT" && "$(q "SELECT '$RVT'::pg_lsn >= '$RLSN'::pg_lsn;")" == "t" ]] && break
-            sleep 0.1
-        done
+        RLSN=$(wait_for_delta_lsn_after "public.restore_probe" "$RBEFORE" 200) \
+            || die "local restore source commit LSN was not captured"
+        wait_for_coverage_lsn "public.restore_probe" "$RLSN" 200 \
+            || die "local restore source LSN $RLSN was not covered"
         RFP=$(fingerprint_of "public.restore_probe")
+        RMUT_BEFORE=$(q "SELECT COALESCE(max(event_id), 0) FROM flashback.delta_log
+                         WHERE rel_oid='public.restore_probe'::regclass;")
         q "UPDATE public.restore_probe SET payload='mut';" >/dev/null
-        q "SELECT flashback_restore_lsn('public.restore_probe', '$RLSN');" >/dev/null
+        RMUT_LSN=$(wait_for_delta_lsn_after "public.restore_probe" "$RMUT_BEFORE" 200) \
+            || die "local restore mutation commit LSN was not captured"
+        wait_for_coverage_lsn "public.restore_probe" "$RMUT_LSN" 200 \
+            || die "local restore mutation LSN $RMUT_LSN was not covered"
+        q "SELECT flashback_restore_lsn('public.restore_probe', '$RLSN'::pg_lsn);" >/dev/null
         [[ "$(fingerprint_of "public.restore_probe")" == "$RFP" ]] || die "local restore fingerprint"
         DRILL_LOCAL_RESTORE=1
         LAST_OP=local_restore
@@ -515,6 +609,7 @@ done
 
 # Final drain and assertions.
 log "duration window complete; draining and final assertions"
+enforce_resource_bounds
 FINAL_TARGET=$(q "SELECT pg_current_wal_lsn()::text;")
 for _ in $(seq 1 600); do
     q "SELECT flashback_consume_wal(8192);" >/dev/null || true
@@ -523,6 +618,7 @@ for _ in $(seq 1 600); do
     [[ -n "$flush" && "$(q "SELECT '$flush'::pg_lsn >= '$FINAL_TARGET'::pg_lsn;")" == "t" ]] && break
     sleep 1
 done
+enforce_resource_bounds
 [[ "$(q "SELECT health FROM flashback_health() WHERE table_name='public.steady_dml';")" == "healthy" ]] \
     || die "final health not healthy"
 [[ "$DRILL_EARLY_DROP" == "1" && "$DRILL_LATE_DROP" == "1" && "$DRILL_RESTART" == "1" \

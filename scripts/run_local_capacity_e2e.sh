@@ -33,21 +33,19 @@ echo "━━━ local capacity E2E ━━━"
 qp "DROP DATABASE IF EXISTS $DB WITH (FORCE)" >/dev/null
 qp "CREATE DATABASE $DB" >/dev/null
 q "CREATE EXTENSION pg_flashback" >/dev/null
-q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes='8GB'" >/dev/null || true
-q "SELECT set_config('pg_flashback.local_max_snapshot_bytes','8GB', false)" >/dev/null
-q "SELECT set_config('pg_flashback.local_max_restore_peak_bytes','16GB', false)" >/dev/null
-q "SELECT set_config('pg_flashback.local_min_filesystem_bytes','64MB', false)" >/dev/null
-q "SELECT set_config('pg_flashback.local_safety_reserve_bytes','16MB', false)" >/dev/null
-q "SELECT set_config('pg_flashback.capture_mode','wal', false)" >/dev/null
 
 q "CREATE TABLE capacity_lock(id int PRIMARY KEY, payload text);
    INSERT INTO capacity_lock VALUES (1,'seed')" >/dev/null
 
 echo "── budget rejection before track copy ──"
-q "SELECT set_config('pg_flashback.local_max_snapshot_bytes','64', false)" >/dev/null
 TRACK_RC=0
-q "SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track')" \
-    >/tmp/pg_flashback_capacity_track_reject.out 2>&1 || TRACK_RC=$?
+"$PSQL" -d "$DB" -v ON_ERROR_STOP=1 -c "
+SELECT set_config('pg_flashback.local_max_snapshot_bytes','64', false);
+SELECT set_config('pg_flashback.local_max_restore_peak_bytes','16GB', false);
+SELECT set_config('pg_flashback.local_min_filesystem_bytes','64MB', false);
+SELECT set_config('pg_flashback.local_safety_reserve_bytes','16MB', false);
+SELECT flashback_admit_local_capacity('capacity_lock'::regclass, 'track');
+" >/tmp/pg_flashback_capacity_track_reject.out 2>&1 || TRACK_RC=$?
 [[ "$TRACK_RC" != "0" ]] || { echo "FAIL: undersized track budget was admitted"; exit 1; }
 grep -q "capacity admission failed" /tmp/pg_flashback_capacity_track_reject.out
 echo "  ok: track rejected before copy"
