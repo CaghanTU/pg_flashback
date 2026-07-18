@@ -640,30 +640,30 @@ PGBR_M="$RUN_ROOT/pgbackrest-missing.conf"
 sed "s|$REPO_DIR|$REMOVE_REPO|" "$PGBACKREST_CONFIG" > "$PGBR_M"
 HELPER_M="$RUN_ROOT/helper-missing.json"
 write_helper_config "$HELPER_M" "$REMOVE_REPO" "$PGBR_M" 30
-jq -n --arg request_id "chaos-missing-wal" --argjson tracking_id "$TRACKING_ID" \
-    '{request_id:$request_id, tracking_id:$tracking_id}' > "$RUN_ROOT/frontier-missing.json"
+# Use restore-table against the missing-archive clone. Do NOT call
+# verify-frontier/audit against a bad clone while sharing the live controller —
+# those paths freeze production coverage as repository_anchor_missing.
+REQ_MISS="$RUN_ROOT/request-missing-wal.json"
+write_request "$REQ_MISS" "chaos-missing-wal" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
 set +e
-"$HELPER" verify-frontier --config "$HELPER_M" --request "$RUN_ROOT/frontier-missing.json" \
+"$HELPER" restore-table --config "$HELPER_M" --request "$REQ_MISS" \
     >"$RUN_ROOT/missing-wal.out" 2>"$RUN_ROOT/missing-wal.err"
 MISSING_RC=$?
 set -e
-[[ "$MISSING_RC" != "0" ]] || die "missing archive must fail verify-frontier"
+[[ "$MISSING_RC" != "0" ]] || die "missing archive must fail restore-table"
 PROD_AFTER_MISS=$(primary_sql "SELECT ba.backup_label
                           FROM flashback.coverage_generations cg
                           JOIN flashback.backup_anchors ba USING (backup_anchor_id, tracking_id)
                           WHERE cg.tracking_id=$TRACKING_ID AND cg.state='active';")
 [[ "$PROD_AFTER_MISS" == "$PROD_BEFORE" ]] || die "missing-archive clone mutated preferred anchor"
+[[ "$(primary_sql "SELECT health FROM flashback_health()
+                   WHERE table_name='public.target_table';")" != "repository_anchor_missing" ]] \
+    || die "missing-archive clone froze live coverage"
 # Live repo still intact.
 [[ -d "$REPO_DIR/backup/$STANZA/$FULL0_LABEL" ]] || die "live FULL0 missing after clone faults"
 primary_sql "UPDATE flashback.coverage_generations
              SET state='aborted', aborted_at=clock_timestamp()
              WHERE tracking_id=$TRACKING_ID AND state='building';" >/dev/null || true
-# Clone-side verify/reconcile can freeze controller coverage when proofs disagree;
-# restore retained activation from the live repository before continuing.
-"$HELPER" verify-anchor --config "$HELPER_CONFIG" --request "$VERIFY_REQ" \
-    >"$RUN_ROOT/verify-retained-after-repo.result.json"
-[[ "$(jq -r '.status' "$RUN_ROOT/verify-retained-after-repo.result.json")" == "verified" ]] \
-    || die "live verify-anchor did not restore coverage after repo chaos"
 assert_baseline "repo_dependency_loss"
 pass repo_dependency_loss
 cleanup_injected_faults
