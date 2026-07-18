@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, work/v0.1.0-overnight]
+    branches: [main, develop, work/v0.1.0-overnight, work/v0.1.0-overnight-sanitized]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -210,12 +210,35 @@ jobs:
           PGFB_POC_PG_BIN="$(dirname "$(cargo pgrx info pg-config 17)")"
           scripts/run_recovery_helper_e2e.sh
 
+      - name: Run retained-full adversarial + anchor advancement + fault E2Es
+        env:
+          PGFB_POC_PGBACKREST: /tmp/pgbackrest-build/src/pgbackrest
+          PGFB_RETAINED_ADV_BASE: /mnt/pg-flashback-e2e/work/retained-adv
+          PGFB_ADVANCE_BASE: /mnt/pg-flashback-e2e/work/anchor-advance
+          PGFB_FAULT_WORK_ROOT: /mnt/pg-flashback-e2e/work/fault-smoke
+          PGFB_FAULT_RESULT_DIR: /mnt/pg-flashback-e2e/work/results
+          # Extension already installed by recovery helper E2E above.
+          PGFB_RETAINED_ADV_INSTALL_EXTENSION: "0"
+          PGFB_ADVANCE_INSTALL_EXTENSION: "0"
+        run: |
+          export PGFB_POC_PG_BIN
+          PGFB_POC_PG_BIN="$(dirname "$(cargo pgrx info pg-config 17)")"
+          chmod +x scripts/run_retained_full_adversarial_e2e.sh \
+            scripts/run_anchor_advancement_e2e.sh \
+            scripts/run_fault_injection_smoke.sh
+          scripts/run_retained_full_adversarial_e2e.sh
+          scripts/run_anchor_advancement_e2e.sh
+          scripts/run_fault_injection_smoke.sh
+
       - name: Upload qualification summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: recovery-e2e-summary
-          path: /mnt/pg-flashback-e2e/work/results/*.json
+          path: |
+            /mnt/pg-flashback-e2e/work/results/*.json
+            /mnt/pg-flashback-e2e/work/retained-adv/results/*.json
+            /mnt/pg-flashback-e2e/work/anchor-advance/results/*.json
           if-no-files-found: warn
 
       - name: Unmount qualification filesystem

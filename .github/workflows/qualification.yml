@@ -2,7 +2,7 @@ name: Qualification (overnight)
 
 on:
   push:
-    branches: [work/v0.1.0-overnight]
+    branches: [work/v0.1.0-overnight, work/v0.1.0-overnight-sanitized]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -173,4 +173,68 @@ jobs:
           path: |
             /tmp/pgfb-clean-host-work/result.json
             /tmp/pgfb-clean-host-work/log/**
+          if-no-files-found: warn
+
+  exact-rc-chaos:
+    name: Exact-RC chaos suite (once)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libclang-dev clang curl \
+            meson ninja-build libxml2-dev libpq-dev zlib1g-dev liblz4-dev \
+            libzstd-dev libbz2-dev libyaml-dev libssh2-1-dev jq
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tools/pg_flashback_recovery/target
+          key: ${{ runner.os }}-chaos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-chaos-
+
+      - name: Install cargo-pgrx and PostgreSQL 17
+        run: |
+          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          cargo pgrx init --pg17 download
+
+      - name: Build exact pgBackRest 2.53.1
+        run: |
+          curl -fsSL \
+            https://github.com/pgbackrest/pgbackrest/archive/refs/tags/release/2.53.1.tar.gz \
+            | tar -xz -C /tmp
+          meson setup -Dbuildtype=release /tmp/pgbackrest-build \
+            /tmp/pgbackrest-release-2.53.1
+          ninja -C /tmp/pgbackrest-build src/pgbackrest
+
+      - name: Run exact-RC chaos suite once
+        env:
+          PGFB_POC_PGBACKREST: /tmp/pgbackrest-build/src/pgbackrest
+          PGFB_CHAOS_KEEP: "1"
+          PGFB_CHAOS_BASE: /tmp/pgfb-exact-rc-chaos
+        run: |
+          export PGFB_POC_PG_BIN
+          PGFB_POC_PG_BIN="$(dirname "$(cargo pgrx info pg-config 17)")"
+          chmod +x scripts/run_exact_rc_chaos_suite.sh
+          ./scripts/run_exact_rc_chaos_suite.sh
+
+      - name: Upload chaos result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-rc-chaos-${{ github.sha }}
+          path: |
+            /tmp/pgfb-exact-rc-chaos/results/**
+            /tmp/pgfb-exact-rc-chaos/runs/**/log/**
           if-no-files-found: warn
