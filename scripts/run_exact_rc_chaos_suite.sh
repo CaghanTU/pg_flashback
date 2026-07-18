@@ -398,6 +398,17 @@ assert_baseline "initial healthy"
 # 1) Worker kill: SIGKILL delta worker (or postmaster restart) and recover
 # ---------------------------------------------------------------------------
 mark_fail worker_kill
+wait_primary_ready() {
+    local _i
+    for _i in $(seq 1 120); do
+        if "$PG_BIN/psql" -X -qAt -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d "$DB_NAME" \
+            -c "SELECT 1" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
 WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
     WHERE backend_type='pg_flashback delta worker'
       AND datname=current_database()
@@ -410,8 +421,13 @@ else
     log "delta worker not visible; falling back to postmaster restart"
     "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
 fi
+wait_primary_ready || die "primary did not accept connections after worker kill"
+# Allow bgworker restart before writing.
+sleep 0.5
 primary_sql "INSERT INTO public.target_table(marker, payload)
              VALUES ('worker-kill', decode(repeat('ab', 16), 'hex'));" >/dev/null
+AFTER_ROWS="$BEFORE_ROWS"
+HEALTH=""
 for _ in $(seq 1 120); do
     AFTER_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
                               WHERE rel_oid='public.target_table'::regclass;")
@@ -421,8 +437,8 @@ for _ in $(seq 1 120); do
     primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
 done
-[[ "${AFTER_ROWS:-0}" -gt "$BEFORE_ROWS" ]] || die "capture did not resume after worker kill"
-[[ "${HEALTH:-}" == "healthy" ]] || die "health not healthy after worker kill (got ${HEALTH:-none})"
+[[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" ]] || die "capture did not resume after worker kill"
+[[ "$HEALTH" == "healthy" ]] || die "health not healthy after worker kill (got ${HEALTH:-none})"
 assert_baseline "worker_kill"
 pass worker_kill
 cleanup_injected_faults
