@@ -385,13 +385,20 @@ jq -n --arg request_id "chaos-retained-ok" --argjson tracking_id "$TRACKING_ID" 
     || die "retained activation failed"
 assert_baseline "activation"
 
-# Ensure WAL capture is draining and health is healthy for worker/slot injectors.
-for _ in $(seq 1 80); do
-    primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
+# Separate local_delta probe table for worker/slot injectors (backup profile
+# coverage alone is not the local capture path exercised by fault smoke).
+primary_sql "CREATE TABLE public.chaos_probe(
+    id bigserial PRIMARY KEY, payload text NOT NULL);"
+primary_sql "SELECT flashback_track('public.chaos_probe');" >/dev/null
+for _ in $(seq 1 100); do
     [[ "$(primary_sql "SELECT health FROM flashback_health()
-                       WHERE table_name='public.target_table';")" == "healthy" ]] && break
+                       WHERE table_name='public.chaos_probe';")" == "healthy" ]] && break
+    primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
 done
+[[ "$(primary_sql "SELECT health FROM flashback_health()
+                   WHERE table_name='public.chaos_probe';")" == "healthy" ]] \
+    || die "chaos_probe did not become healthy"
 assert_baseline "initial healthy"
 
 # ---------------------------------------------------------------------------
@@ -410,7 +417,7 @@ wait_primary_ready() {
     return 1
 }
 BEFORE_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
-                           WHERE rel_oid='public.target_table'::regclass;")
+                           WHERE rel_oid='public.chaos_probe'::regclass;")
 WORKER_PID=$(primary_sql "SELECT pid FROM pg_stat_activity
     WHERE backend_type='pg_flashback delta worker'
       AND datname=current_database()
@@ -422,15 +429,14 @@ if [[ -n "$WORKER_PID" ]]; then
 fi
 "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
 wait_primary_ready || die "primary did not accept connections after worker kill restart"
-primary_sql "INSERT INTO public.target_table(marker, payload)
-             VALUES ('worker-kill', decode(repeat('ab', 16), 'hex'));" >/dev/null
+primary_sql "INSERT INTO public.chaos_probe(payload) VALUES ('worker-kill');" >/dev/null
 AFTER_ROWS="$BEFORE_ROWS"
 HEALTH=""
 for _ in $(seq 1 200); do
     AFTER_ROWS=$(primary_sql "SELECT count(*) FROM flashback.delta_log
-                              WHERE rel_oid='public.target_table'::regclass;")
+                              WHERE rel_oid='public.chaos_probe'::regclass;")
     HEALTH=$(primary_sql "SELECT health FROM flashback_health()
-                          WHERE table_name='public.target_table';")
+                          WHERE table_name='public.chaos_probe';")
     [[ "$AFTER_ROWS" -gt "$BEFORE_ROWS" && "$HEALTH" == "healthy" ]] && break
     primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     sleep 0.1
@@ -496,17 +502,10 @@ SLOT=$(primary_sql "SELECT flashback_effective_slot_name();")
 OLD_STREAM_ID=$(primary_sql "SELECT cg.stream_id
     FROM flashback.coverage_generations cg
     JOIN flashback.tracked_tables tt USING (tracking_id)
-    WHERE tt.table_name='target_table' AND cg.state='active'
+    WHERE tt.table_name='chaos_probe' AND cg.state='active'
       AND cg.recovery_profile='local_delta'
     LIMIT 1;")
-# Prefer local_delta stream if present; otherwise use any active stream for table.
-if [[ -z "$OLD_STREAM_ID" || "$OLD_STREAM_ID" == "" ]]; then
-    OLD_STREAM_ID=$(primary_sql "SELECT cg.stream_id
-        FROM flashback.coverage_generations cg
-        WHERE cg.tracking_id=$TRACKING_ID AND cg.state='active'
-        LIMIT 1;")
-fi
-[[ -n "$OLD_STREAM_ID" ]] || die "no active stream for slot loss"
+[[ -n "$OLD_STREAM_ID" ]] || die "no active local_delta stream for slot loss"
 "$PG_BIN/psql" -X -qAt -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d "$DB_NAME" \
     >"$RUN_ROOT/slot-loss-lock.out" 2>&1 <<SQL &
 SET application_name = 'pgfb_chaos_slot_loss';
@@ -540,37 +539,33 @@ SLOT_LOSS_LOCK_PID=""
 [[ "$SLOT_DROPPED" == "1" ]] || die "slot drop failed"
 for _ in $(seq 1 100); do
     HEALTH=$(primary_sql "SELECT health FROM flashback_health()
-                          WHERE table_name='public.target_table';")
+                          WHERE table_name='public.chaos_probe';")
     [[ "$HEALTH" == "slot_lost" ]] && break
     sleep 0.1
 done
 [[ "${HEALTH:-}" == "slot_lost" ]] || die "expected slot_lost health, got ${HEALTH:-none}"
 primary_sql "SELECT pg_create_logical_replication_slot('$SLOT', 'pg_flashback');" >/dev/null
-# Reanchor local_delta path when available.
-set +e
-REANCHOR=$(primary_sql "SELECT flashback_reanchor('target_table');" 2>/dev/null)
-set -e
-if [[ -n "${REANCHOR:-}" ]]; then
-    for _ in $(seq 1 100); do
-        [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
-                           WHERE generation_id=$REANCHOR AND state='active';")" == "1" ]] && break
-        sleep 0.1
-    done
-fi
-# Ensure backup retained coverage remains usable / restore baseline health via consume.
+REANCHOR=$(primary_sql "SELECT flashback_reanchor('chaos_probe');")
+[[ -n "$REANCHOR" ]] || die "flashback_reanchor returned no generation"
+for _ in $(seq 1 100); do
+    [[ "$(primary_sql "SELECT count(*) FROM flashback.coverage_generations
+                       WHERE generation_id=$REANCHOR AND state='active';")" == "1" ]] && break
+    sleep 0.1
+done
 for _ in $(seq 1 80); do
     primary_sql "SELECT flashback_consume_wal(4096);" >/dev/null || true
     H=$(primary_sql "SELECT health FROM flashback_health()
-                     WHERE table_name='public.target_table';")
+                     WHERE table_name='public.chaos_probe';")
     [[ "$H" == "healthy" || "$H" == "catching_up" ]] && break
     sleep 0.1
 done
 [[ "$(primary_sql "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$SLOT'")" == "1" ]] \
     || die "slot not recreated"
-# Abort any leftover building gens from the gap path.
+# Abort any leftover building gens from the gap path on backup tracking.
 primary_sql "UPDATE flashback.coverage_generations
              SET state='aborted', aborted_at=clock_timestamp()
              WHERE tracking_id=$TRACKING_ID AND state='building';" >/dev/null || true
+assert_baseline "slot_loss"
 pass slot_loss
 cleanup_injected_faults
 
