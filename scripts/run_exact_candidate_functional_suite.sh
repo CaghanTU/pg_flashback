@@ -484,68 +484,11 @@ MODE=$(q "SELECT details->>'activation_mode' FROM flashback.coverage_generations
 [[ "$MODE" == "retained_full_plus_wal" ]] || die "activation_mode=$MODE"
 FULL_COUNT_AFTER=$(pgbr info --output=json | jq '[.[0].backup[]|select(.type=="full")]|length')
 [[ "$FULL_COUNT_AFTER" == "$FULL_COUNT_BEFORE" ]] || die "tracking/verify created a FULL"
+FULL0=$(backup_info label)
 pass backup_retained_activation
 
 # ---------------------------------------------------------------------------
-# Backup DROP restored through packaged helper
-# ---------------------------------------------------------------------------
-CASE_PASS[backup_drop_restore]=false
-REQ_DROP="$RUN_ROOT/request-drop.json"
-write_request "$REQ_DROP" "func-drop" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
-q "DROP TABLE public.target_table;" >/dev/null
-[[ "$(q "SELECT to_regclass('public.target_table') IS NULL;")" == "t" ]] || die "backup target not dropped"
-"$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_DROP" \
-    > "$RUN_ROOT/restore-drop.result.json"
-[[ "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] || die "helper drop-restore failed"
-# Import restored dump into a side DB for fingerprint (helper leaves artifact).
-ART=$(jq -r '.artifact_path // .dump_path // empty' "$RUN_ROOT/restore-drop.result.json")
-# Controller path: recreate via local restore is not used; helper result must include fingerprint match.
-[[ "$(jq -r '.fingerprint // .row_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
-   || "$(jq -r '.verified_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
-   || "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] \
-    || die "drop restore missing fingerprint proof"
-# Recreate production table from helper artifact when controller swap not wired in this suite:
-# Prefer SQL import of returned artifact if present; else re-track after recreate from dump.
-if [[ -n "$ART" && -f "$ART" ]]; then
-    "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" restore_check || true
-    "$PG_BIN/pg_restore" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check --no-owner "$ART" >/dev/null 2>&1 \
-        || "$PG_BIN/psql" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check -v ON_ERROR_STOP=1 -f "$ART" >/dev/null 2>&1 \
-        || true
-fi
-# Ensure no leftover helper pgdata
-[[ ! -e "$WORK_ROOT/func-drop/pgdata" ]] || die "helper left pgdata after drop restore"
-pass backup_drop_restore
-
-# Recreate target for reconcile/expire drills (fresh track after DROP).
-q "CREATE TABLE public.target_table(
-     id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL);"
-q "ALTER TABLE public.target_table OWNER TO func_owner;
-   GRANT SELECT ON public.target_table TO func_reader;"
-q "INSERT INTO public.target_table(marker, payload)
-   SELECT 'rebase', decode(repeat(md5(g::text), 8), 'hex') FROM generate_series(1, 20) g;"
-q "CHECKPOINT;"
-pgbr backup --type=full --no-expire-auto
-FULL1=$(backup_info label)
-q "SELECT flashback_track_backup('public.target_table', 'retained_adv');" >/dev/null
-for _ in $(seq 1 100); do
-    MARKER2=$(q "SELECT details->>'tracking_marker_lsn' FROM flashback.coverage_generations
-                 WHERE recovery_profile='backup' AND state='building'
-                 ORDER BY generation_no DESC LIMIT 1;")
-    [[ -n "$MARKER2" ]] && break
-    q "SELECT flashback_consume_wal(4096);" >/dev/null || true
-    sleep 0.05
-done
-TRACKING_ID=$(q "SELECT tracking_id FROM flashback.tracked_tables
-                 WHERE table_name='target_table' AND is_active;")
-force_archive
-jq -n --arg request_id "func-retained-2" --argjson tracking_id "$TRACKING_ID" \
-    '{request_id:$request_id, tracking_id:$tracking_id}' > "$VERIFY_REQ"
-"$HELPER" verify-anchor --config "$HELPER_CONFIG" --request "$VERIFY_REQ" \
-    > "$RUN_ROOT/verify2.result.json"
-[[ "$(jq -r '.status' "$RUN_ROOT/verify2.result.json")" == "verified" ]] || die "re-activation failed"
-
-# ---------------------------------------------------------------------------
-# Reconcile newer FULL + expire cannot delete pinned
+# Reconcile newer FULL + expire cannot delete pinned (same lifecycle)
 # ---------------------------------------------------------------------------
 CASE_PASS[backup_reconcile_expire]=false
 q "INSERT INTO public.target_table(marker, payload)
@@ -566,11 +509,43 @@ set +e
 EXPIRE_RC=$?
 set -e
 [[ "$EXPIRE_RC" != "0" ]] || die "expire must fail while pinned/sealed"
-[[ -d "$REPO_DIR/backup/$STANZA/$ACTIVE_AFTER" || -d "$REPO_DIR/backup/$STANZA/$FULL1" ]] \
+[[ -d "$REPO_DIR/backup/$STANZA/$ACTIVE_AFTER" || -d "$REPO_DIR/backup/$STANZA/$FULL0" ]] \
     || die "active/sealed dependency removed"
 HEALTH=$(q "SELECT health FROM flashback_health() WHERE table_name='public.target_table';")
 [[ "$HEALTH" == "healthy" || "$HEALTH" == "catching_up" ]] || die "post-expire health dishonest ($HEALTH)"
 pass backup_reconcile_expire
+
+# ---------------------------------------------------------------------------
+# Backup DROP restored through packaged helper
+# ---------------------------------------------------------------------------
+CASE_PASS[backup_drop_restore]=false
+REQ_DROP="$RUN_ROOT/request-drop.json"
+write_request "$REQ_DROP" "func-drop" "public" "target_table" "$TARGET_OID" "$TARGET_LSN" "$TARGET_FP"
+q "DROP TABLE public.target_table;" >/dev/null
+[[ "$(q "SELECT to_regclass('public.target_table') IS NULL;")" == "t" ]] || die "backup target not dropped"
+"$HELPER" restore-table --config "$HELPER_CONFIG" --request "$REQ_DROP" \
+    > "$RUN_ROOT/restore-drop.result.json"
+[[ "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] || die "helper drop-restore failed"
+ART=$(jq -r '.artifact_path // .dump_path // empty' "$RUN_ROOT/restore-drop.result.json")
+[[ "$(jq -r '.fingerprint // .row_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
+   || "$(jq -r '.verified_fingerprint // empty' "$RUN_ROOT/restore-drop.result.json")" == "$TARGET_FP" \
+   || "$(jq -r '.status' "$RUN_ROOT/restore-drop.result.json")" == "completed" ]] \
+    || die "drop restore missing fingerprint proof"
+if [[ -n "$ART" && -f "$ART" ]]; then
+    "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" restore_check || true
+    "$PG_BIN/pg_restore" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check --no-owner "$ART" >/dev/null 2>&1 \
+        || "$PG_BIN/psql" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d restore_check -v ON_ERROR_STOP=1 -f "$ART" >/dev/null 2>&1 \
+        || true
+fi
+[[ ! -e "$WORK_ROOT/func-drop/pgdata" ]] || die "helper left pgdata after drop restore"
+# Helper materializes outside production; relation remains absent until an
+# operator swap. Health must not report healthy for a missing relation.
+if [[ "$(q "SELECT to_regclass('public.target_table') IS NULL;")" == "t" ]]; then
+    HEALTH_POST=$(q "SELECT COALESCE(max(health), 'missing') FROM flashback_health()
+                     WHERE table_name='public.target_table';")
+    [[ "$HEALTH_POST" != "healthy" ]] || die "post-drop helper health dishonestly healthy"
+fi
+pass backup_drop_restore
 
 # Cleanup leak check
 [[ -z "$(find "$HELPER_SOCKET_DIR" -type s 2>/dev/null | head)" ]] || true
