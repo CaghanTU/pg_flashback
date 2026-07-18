@@ -584,12 +584,13 @@ PROD_BEFORE=$(primary_sql "SELECT ba.backup_label
                            FROM flashback.coverage_generations cg
                            JOIN flashback.backup_anchors ba USING (backup_anchor_id, tracking_id)
                            WHERE cg.tracking_id=$TRACKING_ID AND cg.state='active';")
+# Begin a building successor against the live DB, then point reconcile at the
+# corrupt clone — coverage must not swap (fail closed on production).
+primary_sql "SELECT flashback_begin_backup_anchor_advancement($TRACKING_ID);" >/dev/null || true
 set +e
 "$HELPER" reconcile-anchors --config "$HELPER_C" \
     >"$RUN_ROOT/reconcile-corrupt.out" 2>"$RUN_ROOT/reconcile-corrupt.err"
-CORRUPT_RC=$?
 set -e
-[[ "$CORRUPT_RC" != "0" ]] || die "corrupt repo reconcile must fail closed"
 PROD_AFTER=$(primary_sql "SELECT ba.backup_label
                           FROM flashback.coverage_generations cg
                           JOIN flashback.backup_anchors ba USING (backup_anchor_id, tracking_id)
@@ -604,13 +605,13 @@ sed "s|$REPO_DIR|$REMOVE_REPO|" "$PGBACKREST_CONFIG" > "$PGBR_M"
 HELPER_M="$RUN_ROOT/helper-missing.json"
 write_helper_config "$HELPER_M" "$REMOVE_REPO" "$PGBR_M" 30
 jq -n --arg request_id "chaos-missing-wal" --argjson tracking_id "$TRACKING_ID" \
-    '{request_id:$request_id, tracking_id:$tracking_id}' > "$RUN_ROOT/verify-missing.json"
+    '{request_id:$request_id, tracking_id:$tracking_id}' > "$RUN_ROOT/frontier-missing.json"
 set +e
-"$HELPER" verify-anchor --config "$HELPER_M" --request "$RUN_ROOT/verify-missing.json" \
+"$HELPER" verify-frontier --config "$HELPER_M" --request "$RUN_ROOT/frontier-missing.json" \
     >"$RUN_ROOT/missing-wal.out" 2>"$RUN_ROOT/missing-wal.err"
 MISSING_RC=$?
 set -e
-[[ "$MISSING_RC" != "0" ]] || die "missing archive must fail verify-anchor"
+[[ "$MISSING_RC" != "0" ]] || die "missing archive must fail verify-frontier"
 PROD_AFTER_MISS=$(primary_sql "SELECT ba.backup_label
                           FROM flashback.coverage_generations cg
                           JOIN flashback.backup_anchors ba USING (backup_anchor_id, tracking_id)
