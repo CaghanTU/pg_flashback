@@ -1328,14 +1328,39 @@ BEGIN
         IF v_discarded <> 0 THEN
             -- A transaction can finish COMMIT between two READ COMMITTED
             -- decoding statements while its commit record is already below
-            -- the fixed LSN bound. Abort the SQL transaction: PostgreSQL does
-            -- not publish get_changes slot advancement until transaction
-            -- commit, so the next worker cycle safely peeks and retries the
-            -- same prefix with the now-visible transaction.
-            RAISE EXCEPTION 'pg_flashback: empty metadata peek/get race (% rows); retrying without slot advancement',
+            -- the fixed LSN bound. Logical-slot advancement performed by
+            -- get_changes is not transactional, so this exception deliberately
+            -- leaves the stream to fail closed on the next lifecycle audit. It
+            -- must never be described as a safe retry: the decoded rows were
+            -- not admitted to the trusted history.
+            RAISE EXCEPTION 'pg_flashback: empty metadata peek/get race consumed % unexpected rows; capture coverage must be re-anchored',
                 v_discarded
-                USING ERRCODE = 'serialization_failure';
+                USING ERRCODE = 'data_corrupted',
+                      HINT = 'Inspect flashback_health(); re-anchor affected tables before accepting later restore targets.';
         END IF;
+
+        -- PostgreSQL may confirm through the end of the containing WAL record,
+        -- a few bytes beyond the requested upto_lsn. Record the catalog's
+        -- actual post-consume position in the same successful call; otherwise
+        -- the next lifecycle audit mistakes our own bounded empty-prefix
+        -- advancement for an external slot move and creates a false gap.
+        SELECT confirmed_flush_lsn, restart_lsn
+          INTO v_confirmed_flush_lsn, v_restart_lsn
+        FROM pg_replication_slots
+        WHERE slot_name = v_slot_name
+          AND database = current_database();
+
+        UPDATE flashback.capture_streams
+           SET confirmed_flush_lsn = v_confirmed_flush_lsn,
+               restart_lsn = v_restart_lsn,
+               details = COALESCE(details, '{}'::jsonb)
+                   || jsonb_build_object(
+                        'safe_slot_advance_start_lsn', v_scan_start_lsn,
+                        'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
+                        'safe_slot_advance_recorded_at', clock_timestamp()
+                      )
+         WHERE stream_id = v_stream_id
+           AND state = 'active';
         RETURN 0;
     END IF;
 

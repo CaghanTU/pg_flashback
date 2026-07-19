@@ -394,6 +394,16 @@ assert_eq "yalnız filtered WAL sonrası confirmed_flush sabit hedefe ulaştı" 
            FROM pg_replication_slots WHERE slot_name='$SLOT_NAME'")"
 assert_eq "empty-prefix consume delta_log satırı üretmedi" "$FILTERED_DELTA_BEFORE" \
     "$(q "SELECT count(*) FROM flashback.delta_log")"
+assert_eq "empty-prefix gerçek slot konumunu stream metadata'sına kaydetti" "t" \
+    "$(q "SELECT cs.confirmed_flush_lsn = rs.confirmed_flush_lsn
+           FROM flashback.capture_streams cs
+           JOIN pg_replication_slots rs ON rs.slot_name = cs.slot_name
+           WHERE cs.state='active'")"
+q "SELECT flashback_ensure_active_wal_stream()" > /dev/null
+assert_eq "bounded empty-prefix kendi slot ilerlemesini external saymadı" "0" \
+    "$(q "SELECT count(*) FROM flashback.capture_streams
+           WHERE state='broken'
+             AND invalidation_reason='replication_slot_advanced_externally'")"
 assert_eq "building backup generation filtered WAL ilerlemesini engellemedi" "building" \
     "$(q "SELECT cg.state FROM flashback.coverage_generations cg
            JOIN flashback.tracked_tables tt USING (tracking_id)
