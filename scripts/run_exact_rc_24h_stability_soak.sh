@@ -101,6 +101,7 @@ START_UTC=""
 PEAK_WORK_BYTES=0
 START_FS_FREE=0
 WORK_BUDGET_LOGGED=0
+SOCKET_DIR=""
 
 log() { printf '[exact-rc-24h-stability] %s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$PROGRESS_LOG"; }
 die() { log "FAIL: $*"; STATUS=failed; exit 1; }
@@ -249,7 +250,9 @@ cleanup() {
     if [[ "$PRIMARY_STARTED" == "1" ]]; then
         "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" stop -m fast -w -t 60 >/dev/null 2>&1 || true
     fi
-    rm -rf -- "$SOCKET_DIR" 2>/dev/null
+    if [[ -n "$SOCKET_DIR" ]]; then
+        rm -rf -- "$SOCKET_DIR" 2>/dev/null
+    fi
     if [[ "$PREFIX_INSTALLED" == "1" ]]; then
         exact_candidate_restore_prefix || true
         PREFIX_INSTALLED=0
