@@ -89,7 +89,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.worker_interval_ms",
         c"pg_flashback delta worker flush interval",
-        c"How often the background worker flushes staging events to flashback.delta_log (milliseconds).",
+        c"Base capture interval in milliseconds. WAL mode backs off to at most one second while idle and resets immediately after captured activity; trigger mode keeps this fixed interval.",
         &WORKER_INTERVAL_MS,
         50,
         10_000,
@@ -431,6 +431,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let mut slot_warned = false;
     let mut last_enabled: Option<bool> = None;
     let mut last_mode: Option<&'static str> = None;
+    let mut wal_idle_cycles: u32 = 0;
 
     loop {
         if BackgroundWorker::sighup_received() {
@@ -475,10 +476,15 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
                     }
                 }
                 if slot_ready {
-                    consume_wal_changes();
+                    match consume_wal_changes() {
+                        Some(inserted) if inserted > 0 => wal_idle_cycles = 0,
+                        Some(_) => wal_idle_cycles = wal_idle_cycles.saturating_add(1),
+                        None => wal_idle_cycles = 0,
+                    }
                 }
             } else {
                 slot_ready = false; // reset if mode changes away from WAL
+                wal_idle_cycles = 0;
             }
             // Always flush staging_events (DDL events go through staging even in WAL mode)
             flush_staging_to_delta_log();
@@ -493,7 +499,21 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
             }
         }
 
-        let interval_ms = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
+        let base_interval_ms = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
+        // Logical decoding emits PostgreSQL LOG records even for an empty
+        // prefix. Polling it every 50–75 ms while idle creates unbounded log
+        // amplification without improving correctness. WAL slots retain
+        // unconsumed changes across crashes, so bounded idle backoff affects
+        // only visibility latency. Any captured event or consume error resets
+        // the delay; trigger mode keeps its fixed crash-window cadence.
+        let interval_ms = if enabled && mode == "wal" {
+            let multiplier = 1_u64 << wal_idle_cycles.min(5);
+            base_interval_ms
+                .saturating_mul(multiplier)
+                .min(base_interval_ms.max(1_000))
+        } else {
+            base_interval_ms
+        };
         if !BackgroundWorker::wait_latch(Some(Duration::from_millis(interval_ms))) {
             break;
         }
@@ -641,7 +661,7 @@ fn ensure_replication_slot() -> bool {
 /// The heavy lifting lives in the SQL function flashback_consume_wal(), which
 /// stamps events with the real commit time and change LSN. Skips silently when
 /// the extension is not (yet) installed in this database.
-fn consume_wal_changes() {
+fn consume_wal_changes() -> Option<i32> {
     let batch_size = effective_worker_batch_size() as i32;
     let locked: Result<bool, SpiError> = BackgroundWorker::transaction(|| {
         let fn_exists = Spi::get_one::<bool>(
@@ -670,13 +690,17 @@ fn consume_wal_changes() {
         if let Err(err) = locked {
             log!("pg_flashback WAL_CONSUME_LOCK_ERROR error={err:?}");
         }
-        return;
+        return None;
     };
 
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        Spi::run_with_args("SELECT flashback_consume_wal($1)", &[batch_size.into()])?;
-        Ok(())
-    });
+    let result: Result<i32, SpiError> =
+        BackgroundWorker::transaction(|| {
+            Ok(Spi::get_one_with_args::<i32>(
+                "SELECT flashback_consume_wal($1)",
+                &[batch_size.into()],
+            )?
+            .unwrap_or(0))
+        });
 
     let unlock_result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         Spi::run(
@@ -688,12 +712,18 @@ fn consume_wal_changes() {
         )
     });
 
-    if let Err(err) = result {
-        log!("pg_flashback WAL_CONSUME_ERROR error={err:?}");
-    }
+    let inserted = match result {
+        Ok(inserted) => Some(inserted),
+        Err(err) => {
+            log!("pg_flashback WAL_CONSUME_ERROR error={err:?}");
+            None
+        }
+    };
     if let Err(err) = unlock_result {
         log!("pg_flashback WAL_CONSUME_UNLOCK_ERROR error={err:?}");
+        return None;
     }
+    inserted
 }
 
 fn flush_staging_to_delta_log() {

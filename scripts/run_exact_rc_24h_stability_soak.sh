@@ -129,17 +129,34 @@ EOF
 
 du_bytes() {
     local path=$1
+    local bytes
     [[ -e "$path" ]] || { echo 0; return; }
-    du -sb "$path" 2>/dev/null | awk '{print $1}'
+    # Active PostgreSQL directories create/unlink files while du walks them.
+    # A transient ENOENT must not silently terminate a multi-hour run under
+    # `set -o pipefail`; retry it, then let the caller report an explicit
+    # fail-closed measurement error.
+    for _ in 1 2 3; do
+        if bytes="$(du -sb "$path" 2>/dev/null | awk '{print $1}')"; then
+            printf '%s\n' "$bytes"
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
 }
 
 sample_resources() {
-    LAST_FREE="$(exact_candidate_free_bytes "$RUN_ROOT")"
+    LAST_FREE="$(exact_candidate_free_bytes "$RUN_ROOT")" \
+        || die "cannot measure filesystem free bytes"
     local pgdata_b wal_b flash_b work_b
-    pgdata_b="$(du_bytes "$PRIMARY_DIR")"
-    wal_b="$(du_bytes "$PRIMARY_DIR/pg_wal")"
-    flash_b="$(du_bytes "$PRIMARY_DIR/pg_flashback" 2>/dev/null || echo 0)"
-    work_b="$(du_bytes "$RUN_ROOT")"
+    pgdata_b="$(du_bytes "$PRIMARY_DIR")" \
+        || die "cannot measure active PostgreSQL data directory"
+    wal_b="$(du_bytes "$PRIMARY_DIR/pg_wal")" \
+        || die "cannot measure active pg_wal directory"
+    flash_b="$(du_bytes "$PRIMARY_DIR/pg_flashback")" \
+        || die "cannot measure pg_flashback directory"
+    work_b="$(du_bytes "$RUN_ROOT")" \
+        || die "cannot measure qualification work directory"
     LAST_WORK="$work_b"
     if (( work_b > PEAK_WORK_BYTES )); then PEAK_WORK_BYTES=$work_b; fi
     LAST_HEALTH="$(q "SELECT health FROM flashback_health() WHERE table_name='public.steady_dml';" 2>/dev/null || echo unavailable)"
@@ -243,9 +260,16 @@ on_interrupt() {
     exit 130
 }
 
+on_error() {
+    local rc=$?
+    STATUS=failed
+    log "FAIL: command exited rc=$rc line=${BASH_LINENO[0]} command=$BASH_COMMAND"
+    return "$rc"
+}
+
 cleanup() {
     local rc=$?
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM ERR
     set +e
     if [[ "$PRIMARY_STARTED" == "1" ]]; then
         "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" stop -m fast -w -t 60 >/dev/null 2>&1 || true
@@ -266,6 +290,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap on_interrupt INT TERM
+trap on_error ERR
 
 mkdir -p "$RUN_ROOT" "$RESULT_DIR" "$RUN_ROOT/log"
 : > "$SAMPLES_JSONL"

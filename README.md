@@ -349,7 +349,7 @@ All GUCs live under `pg_flashback.*`. They can be set globally (`postgresql.conf
 | `restore_work_mem` | `256MB` | Suset | `work_mem` override for snapshot bulk load during `flashback_restore`. Higher values speed up large table restores. |
 | `index_build_work_mem` | `512MB` | Suset | `maintenance_work_mem` override for deferred index builds on the shadow table during restore. |
 | `max_row_size` | `64kB` | SIGHUP | Legacy trigger-capture limit. The qualified decoder path does not silently skip events through this GUC. |
-| `worker_interval_ms` | `75` | SIGHUP | Background worker flush interval in milliseconds. |
+| `worker_interval_ms` | `75` | SIGHUP | Base capture interval. WAL mode adaptively backs off to at most one second while idle and resets after captured activity; trigger mode keeps the configured staging-visibility cadence. |
 | `worker_batch_size` | `4096` | SIGHUP | Maximum rows per worker flush cycle. |
 | `target_database` | `postgres` | Restart | Database the background worker connects to (single‑DB mode). Overridden by `target_databases`. |
 | `target_databases` | *(unset)* | Restart | Comma-separated list of databases for multi‑DB mode. Each database gets its own worker. Example: `'app,analytics,audit'`. |
