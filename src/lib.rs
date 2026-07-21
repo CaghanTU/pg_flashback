@@ -263,6 +263,10 @@ mod tests {
         "../tests/sql/integration/sequence_restore.sql"
     );
     sql_test!(
+        it_identity_schema_roundtrip,
+        "../tests/sql/integration/identity_schema_roundtrip.sql"
+    );
+    sql_test!(
         it_rls_policy_restore,
         "../tests/sql/integration/rls_policy_restore.sql"
     );

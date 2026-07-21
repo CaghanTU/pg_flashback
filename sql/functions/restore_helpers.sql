@@ -525,6 +525,31 @@ BEGIN
                 ELSE ''
             END,
             CASE
+                -- Identity is catalog state, not a normal nextval default.
+                -- Recreate its mode/options directly; restore_lsn resets the
+                -- new sequence to the recovered edge after the shadow swap.
+                WHEN col->>'identity' IN ('a', 'd') THEN format(
+                    ' GENERATED %s AS IDENTITY%s',
+                    CASE col->>'identity'
+                        WHEN 'a' THEN 'ALWAYS'
+                        ELSE 'BY DEFAULT'
+                    END,
+                    CASE
+                        WHEN col->'identity_options' IS NOT NULL
+                             AND col->'identity_options' <> 'null'::jsonb
+                        THEN format(
+                            ' (START WITH %s INCREMENT BY %s MINVALUE %s MAXVALUE %s CACHE %s %s)',
+                            col#>>'{identity_options,start}',
+                            col#>>'{identity_options,increment}',
+                            col#>>'{identity_options,min}',
+                            col#>>'{identity_options,max}',
+                            col#>>'{identity_options,cache}',
+                            CASE WHEN COALESCE((col#>>'{identity_options,cycle}')::boolean, false)
+                                 THEN 'CYCLE' ELSE 'NO CYCLE' END
+                        )
+                        ELSE ''
+                    END
+                )
                 -- GENERATED ALWAYS AS (expr) STORED
                 WHEN col->>'generated' = 's'
                      AND col->>'default_expr' IS NOT NULL

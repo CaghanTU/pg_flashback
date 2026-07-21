@@ -125,6 +125,7 @@ DECLARE
     v_vals text;
     v_set_clause text;
     v_pk_pred text;
+    v_identity_override text := '';
     v_applied bigint := 0;
 BEGIN
     IF p_destination_schema NOT IN ('flashback', 'pg_temp') THEN
@@ -205,10 +206,19 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: materialized schema has no insertable columns';
     END IF;
 
+    SELECT CASE WHEN EXISTS (
+               SELECT 1 FROM pg_attribute
+               WHERE attrelid = v_dest_oid
+                 AND attnum > 0
+                 AND NOT attisdropped
+                 AND attidentity <> ''
+           ) THEN ' OVERRIDING SYSTEM VALUE' ELSE '' END
+      INTO v_identity_override;
+
     EXECUTE format(
-        'INSERT INTO %I.%I (%s) SELECT %s FROM %s',
+        'INSERT INTO %I.%I (%s)%s SELECT %s FROM %s',
         p_destination_schema, p_destination_table,
-        v_col_list, v_col_list, admission.snapshot_table
+        v_col_list, v_identity_override, v_col_list, admission.snapshot_table
     );
 
     PERFORM flashback_apply_deferred_pk(
@@ -236,8 +246,9 @@ BEGIN
             SELECT col_list, val_list INTO v_cols, v_vals
             FROM flashback_build_insert_parts(v_dest_oid, rec.new_data);
             IF v_cols IS NOT NULL AND v_cols <> '' THEN
-                EXECUTE format('INSERT INTO %I.%I (%s) VALUES (%s)',
-                               p_destination_schema, p_destination_table, v_cols, v_vals);
+                EXECUTE format('INSERT INTO %I.%I (%s)%s VALUES (%s)',
+                               p_destination_schema, p_destination_table,
+                               v_cols, v_identity_override, v_vals);
             END IF;
         ELSIF rec.event_type = 'DELETE' THEN
             v_pred := flashback_build_predicate(v_dest_oid, rec.old_data);
@@ -272,9 +283,9 @@ BEGIN
                 SELECT col_list, val_list INTO v_cols, v_vals
                 FROM flashback_build_insert_parts(v_dest_oid, rec.new_data);
                 IF v_cols IS NOT NULL AND v_cols <> '' THEN
-                    EXECUTE format('INSERT INTO %I.%I (%s) VALUES (%s)',
+                    EXECUTE format('INSERT INTO %I.%I (%s)%s VALUES (%s)',
                                    p_destination_schema, p_destination_table,
-                                   v_cols, v_vals);
+                                   v_cols, v_identity_override, v_vals);
                 END IF;
             END IF;
         END IF;
@@ -435,6 +446,9 @@ DECLARE
     v_seq_schema text;
     v_seq_bare text;
     v_max_val bigint;
+    v_identity_edge bigint;
+    v_identity_start bigint;
+    v_identity_increment bigint;
 BEGIN
     PERFORM flashback_set_restore_in_progress(true);
 
@@ -581,6 +595,54 @@ BEGIN
         EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT %s',
                        materialized.source_schema_name, materialized.source_table_name,
                        def_rec.col_name, def_rec.default_expr);
+    END LOOP;
+
+    -- Identity sequences are created with the shadow table and move with it,
+    -- but explicit historical values do not advance their state. Position each
+    -- sequence at the recovered edge so the first application INSERT cannot
+    -- collide (or run backwards into an existing value for descending IDs).
+    FOR def_rec IN
+        SELECT elem->>'name' AS col_name,
+               elem->'identity_options' AS identity_options
+        FROM jsonb_array_elements(
+            COALESCE(materialized.target_schema_def->'columns', '[]'::jsonb)
+        ) elem
+        WHERE elem->>'identity' IN ('a', 'd')
+    LOOP
+        v_seq_name := pg_get_serial_sequence(
+            format('%I.%I', materialized.source_schema_name, materialized.source_table_name),
+            def_rec.col_name
+        );
+        IF v_seq_name IS NULL OR to_regclass(v_seq_name) IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: restored identity sequence missing for %.%.%',
+                materialized.source_schema_name,
+                materialized.source_table_name,
+                def_rec.col_name;
+        END IF;
+        v_identity_increment := COALESCE(
+            (def_rec.identity_options->>'increment')::bigint, 1
+        );
+        v_identity_start := COALESCE(
+            (def_rec.identity_options->>'start')::bigint, 1
+        );
+        IF v_identity_increment < 0 THEN
+            EXECUTE format('SELECT min(%I) FROM %I.%I',
+                           def_rec.col_name,
+                           materialized.source_schema_name,
+                           materialized.source_table_name)
+              INTO v_identity_edge;
+        ELSE
+            EXECUTE format('SELECT max(%I) FROM %I.%I',
+                           def_rec.col_name,
+                           materialized.source_schema_name,
+                           materialized.source_table_name)
+              INTO v_identity_edge;
+        END IF;
+        IF v_identity_edge IS NULL THEN
+            PERFORM setval(to_regclass(v_seq_name), v_identity_start, false);
+        ELSE
+            PERFORM setval(to_regclass(v_seq_name), v_identity_edge, true);
+        END IF;
     END LOOP;
 
     v_boundary_xid := (txid_current() % 4294967296)::bigint;

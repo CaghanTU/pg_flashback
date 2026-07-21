@@ -363,6 +363,14 @@ perform_local_drop_restore() {
     [[ "$(schema_signature "$rel")" == "$expected_schema" ]] || die "$scenario schema signature mismatch"
     [[ "$(owner_of "$rel")" == "$expected_owner" ]] || die "$scenario owner mismatch"
     [[ "$(acl_of "$rel")" == "$expected_acl" ]] || die "$scenario ACL mismatch"
+    if [[ "$scenario" == medium_indexed ]]; then
+        next_identity="$(q "BEGIN;
+          INSERT INTO public.drop_medium(external_key,category,payload)
+          VALUES ('post-restore-identity',1,'probe') RETURNING id;
+          ROLLBACK;")"
+        (( next_identity > rows )) \
+            || die "$scenario identity sequence did not advance beyond recovered max (next=$next_identity rows=$rows)"
+    fi
     wait_healthy "$rel" || die "$scenario successor coverage did not become healthy"
     DROP_PASSED=$((DROP_PASSED + 1))
     record_case local_delta "$scenario" "$iteration" "$rows" "$logical" "$physical" "$restore_ms"

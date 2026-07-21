@@ -58,7 +58,29 @@ AS $$
                     'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
                     'not_null', a.attnotnull,
                     'default_expr', pg_get_expr(d.adbin, d.adrelid),
-                    'generated', a.attgenerated
+                    'generated', a.attgenerated,
+                    'identity', a.attidentity,
+                    'identity_options', CASE
+                        WHEN a.attidentity <> '' THEN (
+                            SELECT jsonb_build_object(
+                                'start', s.seqstart,
+                                'increment', s.seqincrement,
+                                'min', s.seqmin,
+                                'max', s.seqmax,
+                                'cache', s.seqcache,
+                                'cycle', s.seqcycle
+                            )
+                            FROM pg_depend dep
+                            JOIN pg_sequence s ON s.seqrelid = dep.objid
+                            WHERE dep.classid = 'pg_class'::regclass
+                              AND dep.refclassid = 'pg_class'::regclass
+                              AND dep.refobjid = a.attrelid
+                              AND dep.refobjsubid = a.attnum
+                              AND dep.deptype = 'i'
+                            LIMIT 1
+                        )
+                        ELSE NULL
+                    END
                 )
                 ORDER BY a.attnum
             )
