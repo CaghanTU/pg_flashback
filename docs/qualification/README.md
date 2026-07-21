@@ -79,6 +79,18 @@ gates are separate and must use packaged archives from `CANDIDATE_DIR`:
 1. `scripts/run_exact_candidate_functional_suite.sh` (Gate A)
 2. `scripts/run_exact_rc_chaos_suite.sh` (Gate B; short destructive suite)
 3. `scripts/run_exact_rc_24h_stability_soak.sh` (Gate C; ≥86400 active seconds)
+4. `scripts/run_exact_candidate_drop_qualification.sh` (Gate D; dedicated
+   repeated DROP-to-restore product-claim suite)
+
+Gate D is deliberately not inferred from DML volume in Gate C. By default it
+performs 100 consecutive DROP/restore cycles on the same local tracking
+lifecycle, then drops and restores an indexed medium relation, a quoted TOAST
+relation, and a pgBackRest-backed relation through the packaged helper and
+reference-controller production swap. Its machine-readable result reports the
+actual DROP count, cumulative rows/logical bytes/physical bytes present at the
+destructive boundaries, concurrent commits during the medium restore, and
+restore latency distributions. A release must not describe DROP recovery as
+stress-qualified unless this exact-candidate gate passes.
 
 `scripts/run_exact_rc_harness_selftest.sh` is accelerated harness regression
 only (`qualification_kind=exact_rc_harness_selftest`) and must never emit a

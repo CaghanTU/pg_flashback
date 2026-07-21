@@ -136,6 +136,17 @@ else
     fail "DROP drills can collide on one tracking lifecycle"
 fi
 
+# 12) DROP product claims come from a dedicated destructive gate, not Gate C's
+# DML counters or its two tiny scheduled probes.
+if rg -n 'PGFB_DROP_REPEAT_COUNT:-100' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
+   && rg -n 'perform_local_drop_restore repeated_same_lifecycle' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
+   && rg -n 'record_case backup retained_full_plus_wal' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
+   && rg -n 'cumulative_rows_at_drop' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null; then
+    pass "dedicated DROP gate measures repeated local and backup-backed destruction"
+else
+    fail "dedicated DROP claim gate is missing or under-specified"
+fi
+
 STATUS=failed
 [[ "$FAILED" == "0" ]] && STATUS=passed
 jq -n \

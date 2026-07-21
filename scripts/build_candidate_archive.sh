@@ -81,6 +81,7 @@ mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
     "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
+    "$ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
     "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
     "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
     "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
@@ -108,6 +109,7 @@ mkdir -p "$HELPER_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
     "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
+    "$ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
     "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
     "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
     "$ROOT/scripts/run_exact_rc_24h_soak.sh" \

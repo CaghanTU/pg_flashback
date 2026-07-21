@@ -176,6 +176,12 @@ scripts/run_recovery_helper_e2e.sh
       including snapshot-direct and classic recovered-data fingerprint
       equality, a real post-DROP extension request and final production swap.
       Record the exact check count in the qualification artifact.
+- [ ] The dedicated exact-candidate DROP qualification passes. Evidence records
+      the actual attempted/passed DROP count (not DML operations), cumulative
+      rows and bytes present at each destructive boundary, repeated same-
+      lifecycle restores, indexed medium and quoted/TOAST reconstruction,
+      concurrent capture progress, and a pgBackRest-backed DROP through the
+      packaged helper and reference-controller production swap.
 - [ ] Every backup-profile swap commits a LOGGED pending/unanchored state and
       opens a durable gap; it does not create a local row snapshot, and both
       the result and `flashback_health()` report the required next full backup.
