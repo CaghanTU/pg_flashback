@@ -224,6 +224,7 @@ max_replication_slots = 10
 shared_preload_libraries = 'pg_flashback'
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
+pg_flashback.target_databases = '$DB_NAME'
 EOF
 
 "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" -l "$LOG_DIR/primary.log" start -w -t 60 >/dev/null
@@ -231,6 +232,13 @@ PRIMARY_STARTED=1
 "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" "$DB_NAME"
 pgbr stanza-create
 primary_sql "CREATE EXTENSION pg_flashback;"
+for _ in $(seq 1 200); do
+    state=$(primary_sql "SELECT admission_state FROM flashback_worker_readiness();")
+    [[ "$state" == "ready" || "$state" == "maintenance_missing" ]] && break
+    sleep 0.05
+done
+[[ "${state:-}" == "ready" || "${state:-}" == "maintenance_missing" ]] \
+    || { echo "FAIL: capture worker not ready for $DB_NAME" >&2; exit 1; }
 primary_sql "CREATE TABLE public.target_table(
     id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL);"
 primary_sql "INSERT INTO public.target_table(marker, payload)

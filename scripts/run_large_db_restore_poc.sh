@@ -358,6 +358,7 @@ max_wal_senders = 10
 shared_preload_libraries = 'pg_flashback'
 pg_flashback.capture_mode = 'wal'
 pg_flashback.enabled = on
+pg_flashback.target_databases = '$DB_NAME'
 pg_flashback.proof_hmac_key_file = '$PROOF_HMAC_KEY_FILE'
 EOF
 fi
@@ -417,6 +418,13 @@ pgbr check
 
 if [[ "$EXTENSION_ENABLED" == "1" ]]; then
     primary_sql "CREATE EXTENSION IF NOT EXISTS pg_flashback;" > /dev/null
+    for _ in $(seq 1 200); do
+        state=$(primary_sql "SELECT admission_state FROM flashback_worker_readiness();")
+        [[ "$state" == "ready" || "$state" == "maintenance_missing" ]] && break
+        sleep 0.05
+    done
+    [[ "${state:-}" == "ready" || "${state:-}" == "maintenance_missing" ]] \
+        || die "capture worker not ready for $DB_NAME after extension create"
     if [[ -n "$VERIFIER_BIN" ]]; then
         require_executable "$VERIFIER_BIN"
         primary_sql "CREATE ROLE pgfb_backup_verifier LOGIN;
