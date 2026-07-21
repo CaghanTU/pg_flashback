@@ -336,31 +336,33 @@ policy requires a bounded wait for the final `ACCESS EXCLUSIVE` lock. A
 same-name table with a different OID is never overwritten; finalization fails
 and leaves the unrelated table unchanged.
 
-### Post-restore coverage (required, not wired)
+### Post-restore coverage (wired successor; re-anchor still required)
 
 The backup profile never creates a local row snapshot after the swap. Doing so
 would silently turn it into `local_delta` and defeat the profile's storage
 contract.
 
-For the first release, backup finalization must instead atomically write a
-durable pending swap-XID marker, mark the tracking lifecycle `unanchored`, and
-open a persistent `post_restore_unanchored` gap. Its pre-commit LSN is not the
-swap's COMMIT LSN; a post-commit resolver may fill the real commit coordinate,
-seal the predecessor at that exclusive coordinate, and leave the successor
-`building`, but the gap remains open. Zero active generations is intentional in
-this state. The swap may be complete, but new targets are rejected while that
-gap is open; admission must not fall back to the predecessor. The current
-finalizer does not yet write this state, so its successful return is functional
-evidence only.
+`flashback_finalize_backup_restore()` now performs the transactional shadow
+swap and, in the same transaction, inserts a `building` backup-profile
+successor generation (`boundary_kind=post_restore`) with a durable swap-XID /
+boundary marker and emits the matching logical BOUNDARY message. Zero active
+generations after a successful finalize is intentional: the predecessor is
+left for sealing once the worker resolves the swap commit, and new targets
+remain rejected until a fresh FULL is verified.
+
+What finalize does **not** do:
+
+- it does not create a local_delta snapshot;
+- it does not activate coverage by itself;
+- it does not invent a FULL backup.
 
 Re-anchor is allowed only after pgBackRest completes a **new full backup whose
-start LSN is strictly after the resolved production-swap
-commit**. A backup already running during the swap does not qualify merely
-because its stop boundary is later. The controller verifies that full backup
-and its archived-WAL coverage, then activates the new backup generation at the
-verified stop boundary. Activation closes the open gap's upper endpoint; it
-never makes targets inside the gap valid. Reusing the old backup range or
-merely observing later archived WAL is not a first-release re-anchor.
+start LSN is strictly after the resolved production-swap commit**. A backup
+already running during the swap does not qualify merely because its stop
+boundary is later. Run helper `reconcile-anchors` / `verify-anchor` to activate
+that FULL at its stop boundary. Activation closes the open gap's upper
+endpoint; it never makes targets inside the gap valid. Reusing the old backup
+range or merely observing later archived WAL is not a first-release re-anchor.
 
 ## 7. Manual/resume protocol
 

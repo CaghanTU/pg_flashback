@@ -369,12 +369,13 @@ either a fresh FULL that starts after the marker or a retained FULL with
 contiguous WAL (`retained_full_plus_wal`). An in-progress backup at track time
 still does not qualify.
 After a backup-profile production swap, pg_flashback must create no local row
-snapshot. The adopted protocol records a pending swap transaction/unanchored
-gap, seals the predecessor after resolving the swap commit and deliberately has
-zero active generations. New targets remain rejected until a new completed
-full backup whose start LSN is strictly after that resolved commit is
-verified and activated at its stop boundary. The current finalizer does not
-wire that protocol yet.
+snapshot. `flashback_finalize_backup_restore()` swaps the validated artifact and
+records a `building` post-restore successor with a durable swap-XID / BOUNDARY
+marker. Zero active generations after finalize is intentional; new targets stay
+rejected until a new completed full backup whose start LSN is strictly after
+the resolved swap commit is verified and activated at its stop boundary via
+helper reconcile/verify. Finalize does not create that FULL and does not
+activate coverage by itself.
 
 ## 6. Configuration (GUCs)
 

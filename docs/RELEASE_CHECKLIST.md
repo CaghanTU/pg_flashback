@@ -11,11 +11,16 @@ required item is checked against the exact commit being released.
       `CHANGELOG.md` and the tag agree on the semantic version.
 - [ ] `docs/RELEASE_SCOPE.md` describes the actually tested PostgreSQL,
       pgBackRest, repository and table topologies.
-- [ ] Architecture claims are scoped independently: the exact 24-hour gate
-      names its Linux/architecture/host class, while x86_64 release artifacts
-      are not called qualified until hosted CI and clean-host packaging pass.
+- [ ] Architecture claims are scoped independently: the exact 24-hour Gate C is
+      a local_delta observer-only stability soak and names its
+      Linux/architecture/host class, while x86_64 release artifacts are not
+      called qualified until hosted CI and clean-host packaging pass.
 - [ ] The exact 24-hour result records 29/29 DROP/restores: 23 hourly, two
-      early/late and four after state-changing drills.
+      early/late and four after state-changing drills, each discovered via
+      `flashback_disaster_points` and verified by fingerprint/contract.
+- [ ] Gate C does not call `flashback_consume_wal()`; capture advances only via
+      admitted background workers. Manual consume remains a fail-closed harness
+      defect.
 - [ ] `docs/STORAGE_POLICY.md`, `docs/COVERAGE_MODEL.md`, README and runtime
       behavior agree; no scaffold-only feature is described as enforced.
 - [ ] T-01/A remains closed in the release scope: qualified local capture is

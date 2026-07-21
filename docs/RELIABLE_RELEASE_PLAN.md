@@ -560,24 +560,29 @@ Supported claim after Gate B + Gate C pass on this host class:
 Do not claim native macOS extension support, x86_64 24h qualification,
 continuous 24h chaos, 100+ GiB qualification, or all providers.
 
-### Exact-RC 24-hour bounded stability soak
+### Exact-RC 24-hour bounded local_delta stability soak
 
 After the RC artifacts are built and installed from `CANDIDATE_DIR`, run one
-uninterrupted 24-hour **bounded stability** soak against the exact RC commit
-and those exact packaged binaries (Gate C). Destructive repository/slot faults
-are exercised in a separate exact-candidate chaos suite (Gate B), not by
-corrupting the long-lived 24h cluster. Record the commit, artifact checksums,
-installed binary hashes, configuration, workload seed and resource samples.
+uninterrupted 24-hour **bounded local_delta stability** soak against the exact
+RC commit and those exact packaged binaries (Gate C). Gate C is observer-only:
+the test session never calls `flashback_consume_wal()`. Capture advances only
+through admitted background workers. Destructive repository/slot faults are
+exercised in a separate exact-candidate chaos suite (Gate B), not by corrupting
+the long-lived 24h cluster. Backup-backed recoverability remains a separate
+short-gate matrix. Record the commit, artifact checksums, installed binary
+hashes, configuration, workload seed and resource samples.
 The long-lived cluster must also complete 29/29 DROP/restores distributed over
-the day: 23 hourly, early/late, and one after each state-changing drill. Gate D
+the day: 23 hourly, early/late, and one after each state-changing drill, using
+`flashback_disaster_points` discovery plus fingerprint/contract checks. Gate D
 separately supplies the larger and more varied DROP stress evidence.
 Any code, dependency, packaging or qualification-script change invalidates this
 evidence and requires Gates A–C to be rerun.
 
-The stability soak must finish with ≥86400 active monotonic seconds, no silent
-coverage loss, no unbounded disk growth, no leaked process/socket/materialized
-cluster and no unexplained SLO breach. Workload-budget exhaustion must stop
-heavy writes without ending the clock.
+The stability soak must finish with ≥86400 active monotonic seconds, matching
+expected vs observed committed DML counts, no silent coverage loss, no unbounded
+disk growth, no leaked process/socket/materialized cluster and no unexplained
+SLO breach. Workload-budget exhaustion must stop heavy writes without ending
+the clock.
 
 ### Publication sequence
 

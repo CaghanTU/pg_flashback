@@ -12,10 +12,12 @@ optimistically.
 ## Common supported contract
 
 - PostgreSQL 15–18 on Linux. Regression and package builds are verified for all
-  four majors on Linux/aarch64. The exact 24-hour candidate gate targets PG17
-  Linux/aarch64 under Lima on an Apple Silicon host. Tagged prebuilt x86_64
-  archives remain a separately scoped artifact claim and require hosted CI and
-  clean-host success; no native macOS claim is made
+  four majors on Linux/aarch64. The exact 24-hour candidate gate (Gate C) is a
+  **local_delta** observer-only stability soak targeting PG17 Linux/aarch64
+  under Lima on an Apple Silicon host. Backup-backed qualification is a
+  separate suite matrix (functional/chaos/helper/retained/advancement). Tagged
+  prebuilt x86_64 archives remain a separately scoped artifact claim and require
+  hosted CI and clean-host success; no native macOS claim is made
 - one capture worker and one maintenance worker per admitted database; databases
   listed in `target_databases` but beyond `max_workers` are not admitted and
   `flashback_track` / `flashback_track_backup` fail closed without creating a
@@ -95,7 +97,9 @@ non-pgBackRest providers remain unsupported.
 - local POSIX pgBackRest repository
 - completed full backups
 - PostgreSQL 15–18 when `pg_bin_dir` matches the backup major version
-- pgBackRest 2.53.1 (the version exercised by the release E2E suite)
+- pgBackRest 2.53.1 (the version exercised by the release E2E suite on this
+  host). Newer 2.58.x compatibility is a separate qualification gap until an
+  isolated binary path is exercised; do not claim 2.58 without that evidence
 - LSN recovery targets
 - ordinary and quoted table identifiers passed as separate JSON fields
 - extension-created requests after DROP/TRUNCATE/ALTER using durable pre-DDL
