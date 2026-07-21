@@ -91,9 +91,11 @@ fi
 
 # 6) Selftest result kind cannot be the release soak kind
 KIND="exact_rc_harness_selftest"
-[[ "$KIND" != "exact_rc_24h_stability_soak" && "$KIND" != "exact_rc_24h_soak" ]] \
-    && pass "selftest kind distinct from release soak" \
-    || fail "selftest kind collides with release soak"
+if [[ "$KIND" != "exact_rc_24h_stability_soak" && "$KIND" != "exact_rc_24h_soak" ]]; then
+    pass "selftest kind distinct from release soak"
+else
+    fail "selftest kind collides with release soak"
+fi
 
 # 7) Budget exhaustion concept: early heavy-write stop, then hard ceiling
 if rg -n 'HEAVY_WRITES_ENABLED=0' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
