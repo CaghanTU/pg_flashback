@@ -35,7 +35,7 @@
     "accelerated_15m_stability": "passed",
     "clean_host_candidate_smoke": "passed"
   },
-  "accelerated_stability_evidence": "target/development-accelerated-stability/results/development-accelerated-stability-20260721T164242Z-*.json",
+  "accelerated_stability_evidence": "target/development-accelerated-stability/results/development-accelerated-stability-20260721T164242Z-1252600.json",
   "artifacts": {
     "source_archive": {
       "name": "pg_flashback-candidate-fd95e2d14b85-src.tar.gz",
