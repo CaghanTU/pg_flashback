@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317,SC2329
 # Dedicated 24-hour exact-candidate bounded stability soak (Gate C).
 #
 # HARD RULES:

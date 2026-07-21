@@ -432,25 +432,6 @@ fn flashback_max_worker_pairs() -> i32 {
     max_worker_pairs() as i32
 }
 
-#[cfg(test)]
-mod admission_tests {
-    use super::parse_target_databases;
-
-    #[test]
-    fn parses_trims_and_dedupes_first_wins() {
-        assert_eq!(
-            parse_target_databases(" db1, db2 ,db1, ,db3,,db2 "),
-            vec!["db1".to_string(), "db2".to_string(), "db3".to_string()]
-        );
-    }
-
-    #[test]
-    fn empty_and_whitespace_only_yield_empty() {
-        assert!(parse_target_databases("").is_empty());
-        assert!(parse_target_databases(" , , ").is_empty());
-    }
-}
-
 pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
@@ -932,5 +913,24 @@ fn run_bounded_maintenance(operation: &str, query: &str) {
         log!(
             "pg_flashback {operation}_ERROR lock_timeout_ms={lock_timeout_ms} statement_timeout_ms={statement_timeout_ms} error={err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::parse_target_databases;
+
+    #[test]
+    fn parses_trims_and_dedupes_first_wins() {
+        assert_eq!(
+            parse_target_databases(" db1, db2 ,db1, ,db3,,db2 "),
+            vec!["db1".to_string(), "db2".to_string(), "db3".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_yield_empty() {
+        assert!(parse_target_databases("").is_empty());
+        assert!(parse_target_databases(" , , ").is_empty());
     }
 }
