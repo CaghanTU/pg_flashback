@@ -568,6 +568,9 @@ and those exact packaged binaries (Gate C). Destructive repository/slot faults
 are exercised in a separate exact-candidate chaos suite (Gate B), not by
 corrupting the long-lived 24h cluster. Record the commit, artifact checksums,
 installed binary hashes, configuration, workload seed and resource samples.
+The long-lived cluster must also complete 29/29 DROP/restores distributed over
+the day: 23 hourly, early/late, and one after each state-changing drill. Gate D
+separately supplies the larger and more varied DROP stress evidence.
 Any code, dependency, packaging or qualification-script change invalidates this
 evidence and requires Gates A–C to be rerun.
 

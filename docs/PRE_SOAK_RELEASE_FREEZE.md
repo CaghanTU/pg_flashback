@@ -23,10 +23,12 @@ The final candidate must pass all of the following **before** Gate C starts:
 6. qualification harness self-test, provenance/identity checks, clean worktree,
    attribution scan and adequate bounded-work disk headroom.
 
-Gate D, rather than Gate C's two scheduled probes or its DML volume, owns the
-DROP recovery stress claim. Its default contract is 100 repeated local
-DROP/restores plus indexed-medium, quoted/TOAST and pgBackRest-backed DROP
-cases, with actual DROP count, rows/bytes, concurrency and latency recorded.
+Gate C distributes 29 DROP/restores over the active day: 23 hourly probes, two
+early/late probes and four probes immediately after restart, worker pause,
+maintenance lock and local restore. Gate D separately owns DROP breadth/scale:
+100 repeated local DROP/restores plus indexed-medium, quoted/TOAST and
+pgBackRest-backed cases, with actual DROP count, rows/bytes, concurrency and
+latency recorded.
 
 ## The one remaining long test
 
@@ -36,8 +38,9 @@ remaining technical runtime gate is:
 - **Gate C:** at least 86,400 active monotonic seconds of bounded stability on
   the exact same candidate package and installed binary hashes.
 
-Gate C is a duration/stability gate. Destructive faults belong to Gate B and
-DROP stress belongs to Gate D; neither is silently redefined after Gate C.
+Gate C is a duration/stability gate with time-distributed DROP recovery.
+Destructive repository/slot faults belong to Gate B and larger/broader DROP
+stress belongs to Gate D; neither is silently redefined after Gate C.
 
 No additional test may be made a v0.1.0 blocker after Gate C starts unless one
 of these invalidation conditions occurs:
@@ -78,4 +81,3 @@ The dedicated DROP gate found and fixed identity/sequence reconstruction and
 structured JSON/JSONB/array replay. The pre-soak audit also fixed a retained-
 FULL PoC post-success exit failure, corrected stale retained-anchor evidence,
 and required legal/security/operator documents in exact candidate archives.
-

@@ -38,6 +38,8 @@ case "$STABILITY_MODE" in
         QUAL_DURATION_SECONDS=86400
         RESULT_PREFIX=exact-rc-24h-stability
         RESULT_CLAIM="24-hour exact-candidate bounded stability soak plus separate exact-candidate chaos suite on Linux/aarch64 under Lima on an Apple Silicon host."
+        PERIODIC_DROP_TARGET=23
+        PERIODIC_DROP_INTERVAL_SECONDS=3600
         ;;
     accelerated)
         # Development regression only. This mode must never satisfy Gate C.
@@ -49,12 +51,16 @@ case "$STABILITY_MODE" in
         fi
         RESULT_PREFIX=development-accelerated-stability
         RESULT_CLAIM="Development-only accelerated stability/drill regression; not 24-hour release qualification."
+        PERIODIC_DROP_TARGET=7
+        PERIODIC_DROP_INTERVAL_SECONDS=$((QUAL_DURATION_SECONDS / (PERIODIC_DROP_TARGET + 1)))
         ;;
     *)
         echo "FAIL: unsupported PG_FLASHBACK_STABILITY_MODE=$STABILITY_MODE" >&2
         exit 2
         ;;
 esac
+POST_DRILL_DROP_TARGET=4
+DROP_DRILL_TARGET=$((2 + PERIODIC_DROP_TARGET + POST_DRILL_DROP_TARGET))
 MIN_FREE_BYTES="${PG_FLASHBACK_SOAK_MIN_FREE_BYTES:-2147483648}"
 MAX_WORK_BYTES="${PG_FLASHBACK_SOAK_MAX_WORK_BYTES:-805306368}"
 WORK_STOP_HEADROOM_BYTES="${PG_FLASHBACK_SOAK_WORK_STOP_HEADROOM_BYTES:-67108864}"
@@ -78,6 +84,7 @@ RESULT_DIR="${PGFB_STABILITY_RESULT_DIR:-$BASE/results}"
 RESULT_JSON="$RESULT_DIR/$RESULT_PREFIX-$RUN_ID.json"
 HEARTBEAT_FILE="$RUN_ROOT/heartbeat.txt"
 SAMPLES_JSONL="$RUN_ROOT/samples.jsonl"
+DROP_EVENTS_JSONL="$RUN_ROOT/drop-events.jsonl"
 PROGRESS_LOG="$RUN_ROOT/progress.log"
 
 PRIMARY_STARTED=0
@@ -95,6 +102,10 @@ DRILL_RESTART=0
 DRILL_WORKER_PAUSE=0
 DRILL_MAINT_LOCK=0
 DRILL_LOCAL_RESTORE=0
+DROP_DRILLS_ATTEMPTED=0
+DROP_DRILLS_PASSED=0
+PERIODIC_DROP_COUNT=0
+POST_DRILL_DROP_COUNT=0
 START_MONO_NS=0
 LAST_HB_MONO_NS=0
 START_UTC=""
@@ -123,6 +134,9 @@ slot_lag_bytes=${LAST_LAG:-0}
 free_bytes=${LAST_FREE:-0}
 work_bytes=${LAST_WORK:-0}
 next_drill=${NEXT_DRILL:-none}
+drop_restores=$DROP_DRILLS_PASSED/$DROP_DRILL_TARGET
+periodic_drop_restores=$PERIODIC_DROP_COUNT/$PERIODIC_DROP_TARGET
+next_periodic_drop_at_seconds=${NEXT_PERIODIC_DROP_AT:-none}
 utc_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 }
@@ -224,8 +238,16 @@ write_result() {
         --argjson max_work "$MAX_WORK_BYTES" \
         --argjson min_free "$MIN_FREE_BYTES" \
         --argjson start_free "$START_FS_FREE" \
+        --argjson drop_target "$DROP_DRILL_TARGET" \
+        --argjson drop_attempted "$DROP_DRILLS_ATTEMPTED" \
+        --argjson drop_passed "$DROP_DRILLS_PASSED" \
+        --argjson periodic_target "$PERIODIC_DROP_TARGET" \
+        --argjson periodic_passed "$PERIODIC_DROP_COUNT" \
+        --argjson post_target "$POST_DRILL_DROP_TARGET" \
+        --argjson post_passed "$POST_DRILL_DROP_COUNT" \
         --argjson exit_code "$rc" \
         --argjson identity "$(exact_candidate_identity_json 2>/dev/null || echo '{}')" \
+        --slurpfile drop_events "$DROP_EVENTS_JSONL" \
         --argjson drills "$(jq -n \
             --argjson early "$DRILL_EARLY_DROP" --argjson late "$DRILL_LATE_DROP" \
             --argjson restart "$DRILL_RESTART" --argjson pause "$DRILL_WORKER_PAUSE" \
@@ -246,6 +268,16 @@ write_result() {
           min_free_bytes: $min_free,
           start_free_bytes: $start_free,
           drills: $drills,
+          drop_restores: {
+            target: $drop_target,
+            attempted: $drop_attempted,
+            passed: $drop_passed,
+            periodic_target: $periodic_target,
+            periodic_passed: $periodic_passed,
+            post_drill_target: $post_target,
+            post_drill_passed: $post_passed,
+            events: $drop_events
+          },
           identity: $identity,
           exit_code: $exit_code,
           claim: $claim
@@ -294,6 +326,7 @@ trap on_error ERR
 
 mkdir -p "$RUN_ROOT" "$RESULT_DIR" "$RUN_ROOT/log"
 : > "$SAMPLES_JSONL"
+: > "$DROP_EVENTS_JSONL"
 : > "$PROGRESS_LOG"
 
 require_executable "$PGBACKREST"
@@ -429,7 +462,7 @@ START_MONO_NS="$(exact_candidate_monotonic_now_ns)"
 LAST_HB_MONO_NS="$START_MONO_NS"
 LAST_OP="startup"
 NEXT_DRILL="early_drop"
-log "stability soak started; kind=$QUALIFICATION_KIND duration=${QUAL_DURATION_SECONDS}s max_work=$MAX_WORK_BYTES soft_stop=$HEAVY_WRITE_STOP_BYTES min_free=$MIN_FREE_BYTES"
+log "stability soak started; kind=$QUALIFICATION_KIND duration=${QUAL_DURATION_SECONDS}s max_work=$MAX_WORK_BYTES soft_stop=$HEAVY_WRITE_STOP_BYTES min_free=$MIN_FREE_BYTES drop_target=$DROP_DRILL_TARGET periodic_drop_target=$PERIODIC_DROP_TARGET"
 write_heartbeat 0
 enforce_resource_bounds
 
@@ -440,6 +473,7 @@ PAUSE_AT=$((QUAL_DURATION_SECONDS * 2 / 10))           # ~20%
 MAINT_AT=$((QUAL_DURATION_SECONDS * 3 / 10))           # ~30%
 RESTORE_AT=$((QUAL_DURATION_SECONDS * 4 / 10))         # ~40%
 LATE_DROP_AT=$((QUAL_DURATION_SECONDS * 85 / 100))     # ~85%
+NEXT_PERIODIC_DROP_AT=$PERIODIC_DROP_INTERVAL_SECONDS
 
 do_cycle() {
     # ~64 KiB payload/cycle — paced across 24h, not a 2GiB burst.
@@ -469,7 +503,7 @@ do_drop_restore_drill() {
     local tag=$1
     local table_name="drop_probe_${tag}"
     local rel="public.${table_name}"
-    local lsn fp _i vt
+    local lsn fp _i vt drop_end_mono drop_elapsed
     q "DROP TABLE IF EXISTS $rel;" >/dev/null
     q "CREATE TABLE $rel(id bigint PRIMARY KEY, marker text NOT NULL, payload text NOT NULL);"
     q "SELECT flashback_track('$rel');" >/dev/null
@@ -497,6 +531,7 @@ do_drop_restore_drill() {
     done
     [[ -n "$lsn" ]] || die "$tag drop frontier not covered"
     fp=$(fingerprint_of "$rel")
+    DROP_DRILLS_ATTEMPTED=$((DROP_DRILLS_ATTEMPTED + 1))
     q "DROP TABLE $rel;" >/dev/null
     [[ "$(q "SELECT to_regclass('$rel') IS NULL;")" == "t" ]] || die "$tag drop failed"
     q "SELECT pg_switch_wal();" >/dev/null
@@ -517,6 +552,17 @@ do_drop_restore_drill() {
     done
     [[ "$(fingerprint_of "$rel")" == "$fp" ]] || die "$tag drop restore fingerprint"
     wait_healthy "$rel" || die "$tag post-drop coverage"
+    DROP_DRILLS_PASSED=$((DROP_DRILLS_PASSED + 1))
+    drop_end_mono="$(exact_candidate_monotonic_now_ns)"
+    drop_elapsed=$(( (drop_end_mono - START_MONO_NS) / 1000000000 ))
+    jq -nc \
+        --arg tag "$tag" --arg relation "$rel" --arg target_lsn "$lsn" \
+        --arg fingerprint "$fp" --argjson elapsed "$drop_elapsed" \
+        '{tag:$tag, relation:$relation, elapsed_active_seconds:$elapsed,
+          target_lsn:$target_lsn, relation_absent_after_drop:true,
+          fingerprint_verified:true, fingerprint:$fingerprint}' \
+        >> "$DROP_EVENTS_JSONL"
+    log "DROP restore passed tag=$tag elapsed=${drop_elapsed}s count=$DROP_DRILLS_PASSED/$DROP_DRILL_TARGET"
     LAST_OP="drop_restore_$tag"
 }
 
@@ -546,6 +592,8 @@ while true; do
         "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" restart -w -t 60 -l "$LOG_DIR/primary.log" >/dev/null
         for _ in $(seq 1 60); do q "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
         wait_healthy "public.steady_dml" || die "health after restart"
+        do_drop_restore_drill post_restart
+        POST_DRILL_DROP_COUNT=$((POST_DRILL_DROP_COUNT + 1))
         DRILL_RESTART=1
         LAST_OP=postgres_restart
         NEXT_DRILL=worker_pause
@@ -565,6 +613,8 @@ SQL
         sleep 22
         wait "$PAUSE_PID" || true
         wait_healthy "public.steady_dml" || die "health after pause"
+        do_drop_restore_drill post_worker_pause
+        POST_DRILL_DROP_COUNT=$((POST_DRILL_DROP_COUNT + 1))
         DRILL_WORKER_PAUSE=1
         LAST_OP=worker_pause
         NEXT_DRILL=maint_lock
@@ -582,6 +632,8 @@ SQL
         sleep 32
         wait "$MAINT_PID" || true
         wait_healthy "public.second_tracked" || die "second_tracked stalled during maint"
+        do_drop_restore_drill post_maint_lock
+        POST_DRILL_DROP_COUNT=$((POST_DRILL_DROP_COUNT + 1))
         DRILL_MAINT_LOCK=1
         LAST_OP=maint_lock
         NEXT_DRILL=local_restore
@@ -606,6 +658,8 @@ SQL
             || die "local restore mutation LSN $RMUT_LSN was not covered"
         q "SELECT flashback_restore_lsn('public.restore_probe', '$RLSN'::pg_lsn);" >/dev/null
         [[ "$(fingerprint_of "public.restore_probe")" == "$RFP" ]] || die "local restore fingerprint"
+        do_drop_restore_drill post_local_restore
+        POST_DRILL_DROP_COUNT=$((POST_DRILL_DROP_COUNT + 1))
         DRILL_LOCAL_RESTORE=1
         LAST_OP=local_restore
         NEXT_DRILL=late_drop
@@ -616,6 +670,18 @@ SQL
         DRILL_LATE_DROP=1
         NEXT_DRILL=none
     fi
+
+    # The product's primary DROP-recovery path is exercised throughout the
+    # active window. Exact mode performs one periodic DROP/restore after every
+    # completed hour (hours 1–23), in addition to early/late and post-drill
+    # probes. The accelerated development mode distributes seven equivalents.
+    while (( PERIODIC_DROP_COUNT < PERIODIC_DROP_TARGET && elapsed >= NEXT_PERIODIC_DROP_AT )); do
+        periodic_no=$((PERIODIC_DROP_COUNT + 1))
+        periodic_tag=$(printf 'periodic_%02d' "$periodic_no")
+        do_drop_restore_drill "$periodic_tag"
+        PERIODIC_DROP_COUNT=$periodic_no
+        NEXT_PERIODIC_DROP_AT=$((PERIODIC_DROP_INTERVAL_SECONDS * (PERIODIC_DROP_COUNT + 1)))
+    done
 
     enforce_resource_bounds
     if [[ "$HEAVY_WRITES_ENABLED" == "1" ]]; then
@@ -652,6 +718,11 @@ enforce_resource_bounds
 [[ "$DRILL_EARLY_DROP" == "1" && "$DRILL_LATE_DROP" == "1" && "$DRILL_RESTART" == "1" \
    && "$DRILL_WORKER_PAUSE" == "1" && "$DRILL_MAINT_LOCK" == "1" && "$DRILL_LOCAL_RESTORE" == "1" ]] \
     || die "not all scheduled drills completed"
+[[ "$DROP_DRILLS_ATTEMPTED" == "$DROP_DRILL_TARGET" \
+   && "$DROP_DRILLS_PASSED" == "$DROP_DRILL_TARGET" \
+   && "$PERIODIC_DROP_COUNT" == "$PERIODIC_DROP_TARGET" \
+   && "$POST_DRILL_DROP_COUNT" == "$POST_DRILL_DROP_TARGET" ]] \
+    || die "DROP coverage incomplete: passed=$DROP_DRILLS_PASSED target=$DROP_DRILL_TARGET periodic=$PERIODIC_DROP_COUNT/$PERIODIC_DROP_TARGET post=$POST_DRILL_DROP_COUNT/$POST_DRILL_DROP_TARGET"
 exact_candidate_verify_installed || die "binary hash mismatch at end"
 STATUS=passed
 log "stability soak assertions passed"

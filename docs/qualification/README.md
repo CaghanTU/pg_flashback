@@ -92,6 +92,11 @@ destructive boundaries, concurrent commits during the medium restore, and
 restore latency distributions. A release must not describe DROP recovery as
 stress-qualified unless this exact-candidate gate passes.
 
+Gate C also exercises the primary product path throughout the full active day:
+23 hourly DROP/restores, early and late probes, plus one DROP after each of
+restart, worker pause, maintenance lock and local restore (29 total). Its final
+assertion requires every DROP attempt and restored fingerprint to pass.
+
 `scripts/run_exact_rc_harness_selftest.sh` is accelerated harness regression
 only (`qualification_kind=exact_rc_harness_selftest`) and must never emit a
 24h release PASS. `scripts/run_development_stability_15m.sh` separately runs

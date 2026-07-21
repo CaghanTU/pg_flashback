@@ -129,15 +129,15 @@ else
     fail "local restore LSN wait discipline missing"
 fi
 
-# 11) Early/late DROP drills use distinct tracking identities.
+# 11) Every stability DROP drill uses a distinct tracking identity.
 if rg -n 'local table_name="drop_probe_\$\{tag\}"' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
     pass "DROP drills use distinct relations instead of retracking one lifecycle"
 else
     fail "DROP drills can collide on one tracking lifecycle"
 fi
 
-# 12) DROP product claims come from a dedicated destructive gate, not Gate C's
-# DML counters or its two tiny scheduled probes.
+# 12) DROP breadth/scale claims come from a dedicated destructive gate rather
+# than being inferred from Gate C's DML counters.
 if rg -n 'PGFB_DROP_REPEAT_COUNT:-100' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
    && rg -n 'perform_local_drop_restore repeated_same_lifecycle' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
    && rg -n 'record_case backup retained_full_plus_wal' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
@@ -180,6 +180,20 @@ if [[ "$ARCHIVE_CONTENT_OK" == "1" ]]; then
     pass "candidate archives contain required notices and recovery documentation"
 else
     fail "candidate archive legal/security/operator content is incomplete"
+fi
+
+# 15) Exact Gate C distributes DROP recovery across the full day: 23 hourly,
+# two early/late and four immediately after state-changing drills.
+if rg -n 'PERIODIC_DROP_TARGET=23' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && rg -n 'PERIODIC_DROP_INTERVAL_SECONDS=3600' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && rg -n 'POST_DRILL_DROP_TARGET=4' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && rg -n 'DROP_DRILL_TARGET=\$\(\(2 \+ PERIODIC_DROP_TARGET \+ POST_DRILL_DROP_TARGET\)\)' \
+        "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null \
+   && [[ "$(rg -c 'do_drop_restore_drill post_' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh")" == "4" ]] \
+   && rg -n 'DROP coverage incomplete' "$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh" >/dev/null; then
+    pass "24-hour stability gate requires 29 time-distributed DROP restorations"
+else
+    fail "24-hour DROP schedule or final count assertion is incomplete"
 fi
 
 STATUS=failed
