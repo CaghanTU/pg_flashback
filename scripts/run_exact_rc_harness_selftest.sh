@@ -196,6 +196,101 @@ else
     fail "24-hour DROP schedule or final count assertion is incomplete"
 fi
 
+SOAK="$REPO_ROOT/scripts/run_exact_rc_24h_stability_soak.sh"
+
+# 16) Observer-only: no executable flashback_consume_wal in Gate C soak.
+consume_fn="flashback_""consume_wal"
+if ! rg -n "^[^#]*${consume_fn}" "$SOAK" >/dev/null; then
+    pass "Gate C soak is observer-only (no manual WAL consume)"
+else
+    fail "Gate C soak still drives capture via ${consume_fn}"
+fi
+
+# 17) Maintenance lock drill must take ACCESS EXCLUSIVE inside a transaction
+# and verify the lock from an independent session.
+if rg -n 'BEGIN;' "$SOAK" >/dev/null \
+   && rg -n 'LOCK TABLE public.steady_dml IN ACCESS EXCLUSIVE MODE;' "$SOAK" >/dev/null \
+   && rg -n 'AccessExclusiveLock' "$SOAK" >/dev/null \
+   && rg -n 'ON_ERROR_STOP=1' "$SOAK" >/dev/null \
+   && rg -n 'maintenance ACCESS EXCLUSIVE lock was not observed' "$SOAK" >/dev/null; then
+    pass "maintenance lock drill requires real ACCESS EXCLUSIVE proof"
+else
+    fail "maintenance lock drill can pass without holding a transaction lock"
+fi
+
+# 18) Expected vs observed DML counts are asserted, not only reported.
+if rg -n 'INSERT count mismatch expected=' "$SOAK" >/dev/null \
+   && rg -n 'UPDATE count mismatch expected=' "$SOAK" >/dev/null \
+   && rg -n 'DELETE count mismatch expected=' "$SOAK" >/dev/null \
+   && rg -n 'observed_event_counts' "$SOAK" >/dev/null; then
+    pass "soak compares expected and observed committed DML counts"
+else
+    fail "soak does not fail closed on missing DML events"
+fi
+
+# 19) DROP restore uses disaster discovery rather than a pre-stored shell LSN only.
+if rg -n 'flashback_disaster_points' "$SOAK" >/dev/null \
+   && rg -n 'safe_target_lsn' "$SOAK" >/dev/null \
+   && rg -n 'contract_verified:true' "$SOAK" >/dev/null; then
+    pass "DROP drills use disaster_points and contract verification"
+else
+    fail "DROP drills still rely on opaque pre-stored LSN-only restore"
+fi
+
+# 20) Capture worker kill/restart is verified with new PID + slot catch-up.
+if rg -n 'kill -TERM' "$SOAK" >/dev/null \
+   && rg -n 'capture worker did not restart with a new pid' "$SOAK" >/dev/null \
+   && rg -n 'wait_slot_catchup' "$SOAK" >/dev/null; then
+    pass "worker pause drill requires restart PID and lag catch-up"
+else
+    fail "worker pause drill does not prove capture restart/catch-up"
+fi
+
+# 21) Continuous health asserts more than slot_lost.
+if rg -n 'assert_continuous_health' "$SOAK" >/dev/null \
+   && rg -n 'capture worker missing outside grace' "$SOAK" >/dev/null \
+   && rg -n 'slot lag growing uncontrollably' "$SOAK" >/dev/null \
+   && rg -n 'begin_worker_grace' "$SOAK" >/dev/null; then
+    pass "continuous health asserts worker/slot/coverage faults with bounded grace"
+else
+    fail "continuous health assertions remain too narrow"
+fi
+
+# 22) Single-instance soak lock prevents concurrent Gate C starts.
+if rg -n 'acquire_soak_lock' "$SOAK" >/dev/null \
+   && rg -n 'another Gate C soak is already running' "$SOAK" >/dev/null; then
+    pass "concurrent soak starts are fail-closed by a lock guard"
+else
+    fail "soak lacks a single-instance lock guard"
+fi
+
+# 23) Local Gate C does not require PGBACKREST; chaos remains a separate suite.
+if ! rg -n 'require_executable "\$PGBACKREST"' "$SOAK" >/dev/null \
+   && rg -n 'gate_profile: "local_delta"' "$SOAK" >/dev/null \
+   && rg -n 'PG_FLASHBACK_CHAOS_SUITE' "$REPO_ROOT/scripts/run_exact_rc_24h_soak.sh" >/dev/null; then
+    pass "Gate C local soak is decoupled from PGBACKREST; chaos stays on the orchestrator"
+else
+    fail "Gate C start contract still confuses local soak with backup/chaos deps"
+fi
+
+# 24) Negative proof: a mutated soak copy that reintroduces manual consume is detected.
+tmpdir=$(mktemp -d)
+cp "$SOAK" "$tmpdir/soak.sh"
+printf '\nq "SELECT flashback_consume_wal(1);"\n' >> "$tmpdir/soak.sh"
+if rg -n "^[^#]*${consume_fn}" "$tmpdir/soak.sh" >/dev/null; then
+    pass "selftest detects reintroduced manual WAL consume"
+else
+    fail "selftest cannot detect reintroduced manual WAL consume"
+fi
+rm -rf "$tmpdir"
+
+# 25) Negative proof: lock drill without AccessExclusiveLock verification is rejected by checks above.
+if rg -n 'lock_held=1' "$SOAK" >/dev/null; then
+    pass "lock-held observation gate is present for negative lock failures"
+else
+    fail "lock-held observation gate missing"
+fi
+
 STATUS=failed
 [[ "$FAILED" == "0" ]] && STATUS=passed
 jq -n \
