@@ -301,6 +301,16 @@ wait_healthy() {
     return 1
 }
 
+wait_capture_ready() {
+    local _i state
+    for _i in $(seq 1 400); do
+        state="$(q "SELECT admission_state FROM flashback_worker_readiness();")"
+        [[ "$state" == ready || "$state" == maintenance_missing ]] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
 wait_event_covered() {
     local tracking_id=$1 event_type=$2 after_event_id=$3 attempts=${4:-400}
     local _i lsn covered
@@ -456,6 +466,7 @@ PRIMARY_STARTED=1
 "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" "$DB_NAME"
 pgbr stanza-create
 q "CREATE EXTENSION pg_flashback;"
+wait_capture_ready || die "capture worker not ready before first track"
 q "CREATE ROLE drop_owner LOGIN; CREATE ROLE drop_reader LOGIN;"
 write_helper_config
 enforce_resource_bounds
