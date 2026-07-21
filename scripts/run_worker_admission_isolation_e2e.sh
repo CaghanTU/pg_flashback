@@ -113,10 +113,10 @@ wait_workers() {
     return 1
 }
 
-CAP_A=$(wait_workers "$DB_A" capture) || { echo "FAIL: DB_A capture worker missing" >&2; exit 1; }
+wait_workers "$DB_A" capture >/dev/null || { echo "FAIL: DB_A capture worker missing" >&2; exit 1; }
 MAIN_A=$(wait_workers "$DB_A" maintenance) || { echo "FAIL: DB_A maintenance worker missing" >&2; exit 1; }
-CAP_B=$(wait_workers "$DB_B" capture) || { echo "FAIL: DB_B capture worker missing" >&2; exit 1; }
-MAIN_B=$(wait_workers "$DB_B" maintenance) || { echo "FAIL: DB_B maintenance worker missing" >&2; exit 1; }
+wait_workers "$DB_B" capture >/dev/null || { echo "FAIL: DB_B capture worker missing" >&2; exit 1; }
+wait_workers "$DB_B" maintenance >/dev/null || { echo "FAIL: DB_B maintenance worker missing" >&2; exit 1; }
 
 # DB_C is configured but beyond max_workers=2.
 STATE_C=$(q "$DB_C" "SELECT admission_state FROM flashback_worker_readiness();")
@@ -298,8 +298,6 @@ while (( $(date +%s) <= drain_deadline )); do
     events_after=$(q "$DB_A" "SELECT count(*) FROM flashback.delta_log
                               WHERE rel_oid='public.events'::regclass
                                 AND event_type='INSERT';")
-    final_confirmed=$(q "$DB_A" "SELECT confirmed_flush_lsn
-                                 FROM pg_replication_slots WHERE slot_name='$SLOT';")
     final_lag=$(q "$DB_A" "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn),0)::bigint
                            FROM pg_replication_slots WHERE slot_name='$SLOT';")
     if [[ "$events_after" == "$EXPECTED_EVENTS" ]] && (( final_lag <= 65536 )); then
