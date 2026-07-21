@@ -346,13 +346,18 @@ BEGIN
             v_health := 'slot_lost';
             v_action := 'recreate_logical_slot_and_reanchor';
             v_reason := COALESCE(rec.invalidation_reason, slot.wal_status, 'logical slot lost');
-        ELSIF workers.admission_state IN ('not_configured', 'beyond_max_workers', 'capacity_insufficient')
-           OR NOT workers.capture_running
+        ELSIF workers.admission_state IN ('beyond_max_workers', 'capacity_insufficient')
+           OR (
+               workers.admission_state IS DISTINCT FROM 'not_configured'
+               AND NOT workers.capture_running
+           )
         THEN
             v_health := 'capture_worker_missing';
             v_action := 'restore_admitted_capture_worker';
             v_reason := workers.reason;
-        ELSIF NOT workers.maintenance_running THEN
+        ELSIF workers.admission_state IS DISTINCT FROM 'not_configured'
+           AND NOT workers.maintenance_running
+        THEN
             v_health := 'maintenance_worker_missing';
             v_action := 'restore_maintenance_worker';
             v_reason := workers.reason;
