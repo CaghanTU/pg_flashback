@@ -293,17 +293,15 @@ BEGIN
         v_post_restore_gap := rec.post_restore_gap_count > 0
             OR COALESCE(rec.pending_state_reason, '') = 'post_restore_unanchored';
 
-        -- Worker absence must never project as healthy. Capture loss is
-        -- correctness-critical; maintenance loss is an actionable degraded state.
+        -- Capture absence must never project as healthy. Slot loss is checked
+        -- before maintenance absence so a stopped maintenance worker cannot
+        -- hide a lost logical slot. Maintenance absence remains a degraded,
+        -- non-healthy state when capture and the slot are otherwise OK.
         IF workers.admission_state IN ('not_configured', 'beyond_max_workers', 'capacity_insufficient')
            OR NOT workers.capture_running
         THEN
             v_health := 'capture_worker_missing';
             v_action := 'restore_admitted_capture_worker';
-            v_reason := workers.reason;
-        ELSIF NOT workers.maintenance_running THEN
-            v_health := 'maintenance_worker_missing';
-            v_action := 'restore_maintenance_worker';
             v_reason := workers.reason;
         ELSIF (
                rec.recovery_profile = 'local_delta'
@@ -324,6 +322,10 @@ BEGIN
             v_health := 'slot_lost';
             v_action := 'recreate_logical_slot_and_reanchor';
             v_reason := COALESCE(rec.invalidation_reason, slot.wal_status, 'logical slot lost');
+        ELSIF NOT workers.maintenance_running THEN
+            v_health := 'maintenance_worker_missing';
+            v_action := 'restore_maintenance_worker';
+            v_reason := workers.reason;
         ELSIF COALESCE(rec.generation_state_reason, '') = 'timeline_mismatch_frontier_frozen'
            OR rec.timeline_gap_count > 0
         THEN
