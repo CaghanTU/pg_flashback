@@ -131,8 +131,8 @@ DROP_DRILLS_ATTEMPTED=0
 DROP_DRILLS_PASSED=0
 PERIODIC_DROP_COUNT=0
 POST_DRILL_DROP_COUNT=0
-START_MONO_NS=0
-LAST_HB_MONO_NS=0
+START_MONO_NS="$(exact_candidate_monotonic_now_ns)"
+LAST_HB_MONO_NS="$START_MONO_NS"
 START_UTC=""
 PEAK_WORK_BYTES=0
 START_FS_FREE=0
@@ -244,8 +244,8 @@ sample_resources() {
     readiness_row="$(q "SELECT COALESCE(capture_worker_pid::text,''),
                                COALESCE(maintenance_worker_pid::text,''),
                                admission_state,
-                               capture_running::text,
-                               maintenance_running::text
+                               capture_running,
+                               maintenance_running
                         FROM flashback_worker_readiness();")"
     LAST_CAPTURE_PID="$(printf '%s\n' "$readiness_row" | cut -d'|' -f1)"
     LAST_MAINT_PID="$(printf '%s\n' "$readiness_row" | cut -d'|' -f2)"
@@ -371,8 +371,8 @@ wait_workers_ready() {
     local label=$1 attempts=${2:-200} _i state cap maint
     for _i in $(seq 1 "$attempts"); do
         state=$(q "SELECT admission_state FROM flashback_worker_readiness();")
-        cap=$(q "SELECT capture_running::text FROM flashback_worker_readiness();")
-        maint=$(q "SELECT maintenance_running::text FROM flashback_worker_readiness();")
+        cap=$(q "SELECT capture_running FROM flashback_worker_readiness();")
+        maint=$(q "SELECT maintenance_running FROM flashback_worker_readiness();")
         if [[ "$state" == "ready" && "$cap" == "t" && "$maint" == "t" ]]; then
             return 0
         fi
@@ -989,7 +989,7 @@ SQL
         do_cycle
     else
         LAST_OP="idle_sample_$elapsed"
-        [[ "$(q "SELECT capture_running::text FROM flashback_worker_readiness();")" == "t" ]] \
+        [[ "$(q "SELECT capture_running FROM flashback_worker_readiness();")" == "t" ]] \
             || die "capture worker missing during idle sampling"
     fi
 
