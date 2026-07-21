@@ -211,13 +211,13 @@ The backup profile records schema/DDL metadata and verified physical coverage;
 it does not create a local row snapshot or duplicate DML into `delta_log`.
 
 Initial backup tracking is unanchored. Its transaction writes a durable LOGGED
-tracking marker whose real commit coordinate is resolved after commit. Only a
-new completed and verified **full** backup whose start LSN is
-strictly after that resolved marker commit may create the first active backup
-generation. A backup that predates or overlaps tracking cannot qualify merely
-because its stop boundary is later. The verified backup stop boundary is the
-first physical-backup anchor; targets between the tracking marker and that
-anchor are not advertised.
+tracking marker whose real commit coordinate is resolved after commit. The
+first active backup generation may use either a completed verified **full**
+backup whose start LSN is strictly after that marker, or a retained FULL whose
+stop is no later than the marker plus contiguous verified WAL through it. An
+overlapping backup cannot qualify. The verified backup stop remains the
+physical anchor; retained activation separately records the marker as its
+advertised coverage lower bound.
 
 A target is eligible only when a completed full backup precedes it and all WAL
 through the selected verified recovery coordinate is present and revalidated.
@@ -241,7 +241,7 @@ never initiates FULL backups.
 The chosen full backup is not represented by a profile name or LSN alone. An
 immutable anchor binds its lifecycle, repository key, stanza, backup label,
 FULL type, database system identifier, timeline, manifest reference/digest,
-post-marker start and stop LSN. pgBackRest establishes the start LSN after its
+tracking/swap marker and backup start/stop LSNs. pgBackRest establishes the start LSN after its
 backup-start checkpoint. A generation's boundary LSN must be that same
 anchor's stop LSN. Missing or mismatched identity evidence rejects activation.
 
@@ -443,8 +443,8 @@ Release remains blocked until at least:
   and the resolver continues to reject non-prefix timestamp mappings;
 - generation/stream/gap metadata is completed for the backup profile;
 - initial backup tracking remains unanchored until a durable tracking marker
-  is resolved and a new verified full backup whose start LSN is strictly
-  after that marker activates at its stop boundary;
+  is resolved and either a verified fresh post-marker FULL or a retained FULL
+  with contiguous WAL through the marker activates;
 - concurrent first-track calls share one pre-identity bootstrap lock and cannot
   allocate divergent tracking identities;
 - local base and maintenance boundaries use the exact lock protocol;

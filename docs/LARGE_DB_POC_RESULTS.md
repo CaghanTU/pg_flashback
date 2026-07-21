@@ -157,16 +157,13 @@ The following remain rejected, deferred or gated:
 - incremental/differential backup-set selection and hardlink closure;
 - tablespaces, symlinked relation storage and direct snapshot access to a
   non-plain/encrypted repository;
-- aggregate work-root quota plus successful-artifact expiry/GC;
 - importing very large tables and minimizing the final production swap window;
 - a production-like high-WAL benchmark on larger external storage;
-- coverage-generation integration, including the backup-profile post-restore
-  unanchored gap, intentional zero-active state, and re-anchor only at the stop
-  boundary of a new verified full backup whose start LSN is strictly
-  after the resolved swap commit;
-- initial backup tracking activation only after a durable tracking marker is
-  resolved and a new verified full backup starts strictly after
-  that marker, rather than adopting a pre-existing or overlapping backup.
+
+Aggregate work-root quota/GC and coverage-generation integration landed after
+this PoC. Initial tracking now accepts either a fresh post-marker FULL or a
+retained pre-marker FULL with contiguous verified WAL; post-swap re-anchor
+still requires a fresh FULL whose start is after the resolved swap commit.
 
 The authoritative current gates are
 [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) and

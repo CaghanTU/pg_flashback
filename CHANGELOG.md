@@ -11,8 +11,10 @@ not a published release. Do not treat it as shipping until every gate in
 [`docs/RELIABLE_RELEASE_PLAN.md`](docs/RELIABLE_RELEASE_PLAN.md) passes for the
 exact release commit.
 
-Platform note: tagged prebuilt artifacts and release qualification target
-Linux x86_64. aarch64 is source-build only and is not release-qualified.
+Platform note: the exact 24-hour candidate gate targets PG17 Linux/aarch64
+under Lima on Apple Silicon. Tagged prebuilt x86_64 artifacts have separate
+hosted build and clean-host gates and are not described as 24-hour qualified.
+Native macOS is unsupported.
 
 ### Added
 
@@ -49,6 +51,8 @@ Linux x86_64. aarch64 is source-build only and is not release-qualified.
 - Made logical slot creation database-aware and fail-closed.
 - Escaped decoded identifiers and represented non-finite numeric values as
   valid JSON.
+- Preserved identity definitions/sequence state after DROP recovery and kept
+  JSON/JSONB/array values structured during WAL replay.
 - Preserved logical-decoding commit time/change LSN and deterministic event
   ordering.
 - Isolated capture drain from maintenance workers, rejected newer repository

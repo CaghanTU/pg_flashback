@@ -131,7 +131,9 @@ binds `tracking_id`, helper profile, repository key, stanza, backup label,
 FULL type, database system identifier, timeline, manifest reference and
 SHA-256, durable tracking/swap marker LSN, backup start/stop LSNs and
 verification audit. pgBackRest establishes the start LSN only after its
-backup-start checkpoint; that start LSN must be strictly after the marker.
+backup-start checkpoint. Fresh initial/post-swap anchors require start after
+the marker; retained initial anchors instead require stop no later than the
+marker plus contiguous verified WAL through it.
 `coverage_generations` references the tuple
 `(backup_anchor_id, tracking_id, backup_stop_lsn)`, so neither an anchor from a
 different lifecycle nor a naked/mismatched stop LSN can activate a generation.

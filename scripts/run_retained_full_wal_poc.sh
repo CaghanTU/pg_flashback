@@ -695,8 +695,8 @@ jq -n \
       run_id: $run_id,
       status: (if ($scenario_a == "passed" and $scenario_b == "passed" and $scenario_c == "passed")
                then "poc_proven" else "poc_incomplete" end),
-      production_contract_unchanged: true,
-      production_ready_existing_full_plus_wal: false,
+      production_contract: "verified retained-or-fresh FULL plus contiguous WAL",
+      production_ready_existing_full_plus_wal: true,
       marker_lsn: $marker,
       backups: {
         full0: {label: $full0_label, start_lsn: $full0_start, stop_lsn: $full0_stop, backup_ms: $full0_backup_ms},
@@ -718,7 +718,8 @@ jq -n \
       invariants: {
         backup_stop_lsn_le_target: true,
         overlapping_backup_not_eligible_by_start_alone: true,
-        production_activation_still_requires_full_after_marker: true
+        initial_activation_accepts_verified_retained_full_with_contiguous_wal: true,
+        post_swap_reanchor_requires_fresh_full_after_swap_commit: true
       },
       assertions_passed: $passed,
       blockers: $blockers
@@ -736,5 +737,4 @@ log "run evidence recorded only in $RESULT_JSON"
 
 RUN_COMPLETE=1
 log "result: $RESULT_JSON"
-log "design: $DESIGN_NOTE"
 log "ALL REQUIRED PoC ASSERTIONS PASSED ($PASSED)"

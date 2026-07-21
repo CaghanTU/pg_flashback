@@ -5,10 +5,10 @@ Date: 2026-07-16
 Audited baseline: `b9e4c2f`; the WAL commit-map fix and its regression test are
 included with this audit
 
-Status: **not release-ready.** A+ policy adopted. WAL-local correctness and
-generation-aware local retention are implemented for the qualified profile;
-backup-profile coverage wiring, capacity preflight/artifact GC and capture/
-maintenance isolation remain open release gates.
+Status: **historical reproductions retained; mitigations implemented.** A+
+policy is adopted. RB-01 through RB-11 now have regression/E2E coverage for
+the qualified subset; final publication still requires the exact-candidate
+24-hour gate and hosted artifact gates.
 
 This audit deliberately separates three questions:
 
@@ -40,8 +40,9 @@ database. The decision made after the evidence review is recorded in
 A successful restore cannot be treated as proof of recoverability until every
 remaining open release gate is closed or explicitly removed from the supported
 contract. Section 6 records which WAL-local correctness blockers are already
-closed. RB-08/RB-09 local admission is implemented; RB-10/RB-11 are implemented
-in code but still require exact-RC evidence before publish.
+closed. RB-08/RB-09 local admission and RB-10/RB-11 helper/worker controls are
+implemented and pass the short pre-soak gates; Gate C remains required before
+publish.
 
 ## 2. Capacity model and measurements
 
@@ -262,16 +263,16 @@ whose required WAL has been verified. Closing that gap never validates targets
 inside it.
 
 Initial backup tracking follows the same physical-anchor distinction: a
-durable tracking marker is resolved first, and only a new full backup whose
-start LSN is strictly later may establish the first verified
-physical-backup anchor. This anchor is not the exact write-locked local-base
+durable tracking marker is resolved first, then either a fresh post-marker FULL
+or a retained pre-marker FULL with contiguous verified WAL may establish the
+first physical anchor. This anchor is not the exact write-locked local-base
 boundary used by `local_delta`.
 
 The schema scaffold alone never satisfied these blockers. WAL-local runtime
 wiring, fail-closed target admission, generation-aware local retention, local
 capacity/write-stall admission, backup-profile generation wiring and helper
-capacity controls have landed. Exact-RC soak, clean-host packaged-artifact
-qualification and remaining matrix evidence must still land before the release
+capacity controls have landed. Exact-RC soak and hosted x86_64 artifact
+qualification must still land before the release
 status can change.
 
 ## 6. WAL-local milestone update
@@ -307,8 +308,8 @@ This update also closes RB-02 for qualified local generations: whole sealed-
 generation retirement is durable, pinned and resumable. RB-08/RB-09 local
 capacity and write-stall admission are implemented and fail-closed. RB-10
 helper artifact lifecycle and RB-11 worker isolation are implemented in code;
-exact-RC soak and clean-host packaged-artifact qualification remain
-whole-project release gates. Backup-profile coverage anchoring supports both
+exact-RC soak and hosted x86_64 artifact qualification remain whole-project
+release gates. Backup-profile coverage anchoring supports both
 fresh FULL-after-marker and retained FULL + continuous WAL activation
 (see [`RETAINED_FULL_WAL_POC.md`](RETAINED_FULL_WAL_POC.md)), plus external
 `reconcile-anchors` advancement to newer operator-scheduled FULLs with

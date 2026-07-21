@@ -75,8 +75,8 @@ package_sql="$(find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' -p
 install -m 0755 "$package_so" "$EXT_DIR/lib/pg_flashback.so"
 install -m 0644 "$package_control" "$package_sql" "$EXT_DIR/share/extension/"
 printf '%s\n' "$PG_MAJOR" > "$EXT_DIR/PG_MAJOR"
-cp README.md LICENSE CHANGELOG.md "$EXT_DIR/" 2>/dev/null || true
-cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md "$EXT_DIR/docs/" 2>/dev/null || true
+cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
+cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md "$EXT_DIR/docs/"
 mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
@@ -104,7 +104,9 @@ install -m 0755 \
     "$HELPER_DIR/bin/"
 cp "$ROOT/tools/pg_flashback_recovery/examples/"*.json "$HELPER_DIR/examples/" 2>/dev/null || true
 cp "$ROOT/tools/pg_flashback_recovery/README.md" "$HELPER_DIR/README.md"
-cp LICENSE CHANGELOG.md "$HELPER_DIR/" 2>/dev/null || true
+cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$HELPER_DIR/"
+cp docs/RECOVERY_HELPER_DESIGN.md docs/BACKUP_RESTORE_RUNBOOK.md \
+    docs/RELEASE_SCOPE.md "$HELPER_DIR/docs/"
 mkdir -p "$HELPER_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \

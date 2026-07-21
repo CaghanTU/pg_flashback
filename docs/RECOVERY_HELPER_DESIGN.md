@@ -45,8 +45,9 @@ sequenceDiagram
     O->>E: activate generation at verified full-backup stop boundary
 ```
 
-The final three coverage steps describe the required first-release protocol;
-they are not wired by the current finalizer yet.
+The final three coverage steps describe the wired first-release post-swap
+protocol. The successor remains fail-closed until the fresh FULL proof is
+consumed.
 
 ## Recovery profiles
 
@@ -89,15 +90,14 @@ resolver may attach the real COMMIT LSN, seal the predecessor at that exclusive
 coordinate and leave the successor `building`; a pre-commit LSN is not
 substituted and resolving it does not close the gap. The resulting zero-active
 state is intentional, and admission must not fall back to the predecessor.
-Until coverage integration lands, the current finalizer's success is not a
-claim of continued recoverability.
+The current finalizer persists that state; its swap success is deliberately not
+a claim of continued recoverability until the successor anchor activates.
 
 Initial backup tracking uses the same fail-closed anchoring discipline. It
-first commits and resolves a durable LOGGED tracking marker, then requires a
-new full backup whose start LSN is strictly after that marker commit.
-Only the verified stop boundary of that qualifying backup activates the first
-generation. Existing or already-running backups cannot be adopted as the
-initial anchor.
+first commits and resolves a durable LOGGED tracking marker, then activates
+either a fresh FULL whose start is strictly after the marker or a retained FULL
+whose stop is no later than the marker and whose WAL prefix is verified through
+it. Overlapping/in-progress backups cannot be adopted.
 
 ## Helper commands
 

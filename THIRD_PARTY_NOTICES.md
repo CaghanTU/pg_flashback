@@ -32,6 +32,8 @@ transitive dependencies and exact versions are recorded in `Cargo.lock` and
 |---|---|---|
 | `pgrx`, `pgrx-tests` | PostgreSQL extension framework and tests | MIT |
 | `serde`, `serde_json` | JSON serialization | MIT OR Apache-2.0 |
+| `hmac` | HMAC proof authentication | MIT OR Apache-2.0 |
+| `sha1` | PostgreSQL WAL segment checksum compatibility | MIT OR Apache-2.0 |
 | `sha2` | SHA-256 implementation | MIT OR Apache-2.0 |
 | `clap` | Helper command-line parser | MIT OR Apache-2.0 |
 | `fs2` | File locking | MIT OR Apache-2.0 |

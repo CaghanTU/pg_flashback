@@ -147,6 +147,41 @@ else
     fail "dedicated DROP claim gate is missing or under-specified"
 fi
 
+# 13) The retained-FULL PoC must not fail after writing successful evidence by
+# referencing the removed, formerly tracked design-note output path.
+if ! rg -n 'DESIGN_NOTE' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null \
+   && rg -n 'RUN_COMPLETE=1' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null \
+   && rg -n 'ALL REQUIRED PoC ASSERTIONS PASSED' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null; then
+    pass "retained-FULL PoC exits from its machine-readable result without stale design-note state"
+else
+    fail "retained-FULL PoC can fail after successful evidence generation"
+fi
+
+# 14) Candidate archives must carry the legal/security notices and the
+# operator-facing recovery contract that the release checklist promises.
+EXT_ARCHIVE="$(jq -r '.artifacts.extension_archive.name' "$ORIG_CANDIDATE_DIR/MANIFEST.json")"
+HELPER_ARCHIVE="$(jq -r '.artifacts.helper_archive.name' "$ORIG_CANDIDATE_DIR/MANIFEST.json")"
+EXT_LIST="$(mktemp)"
+HELPER_LIST="$(mktemp)"
+tar -tzf "$ORIG_CANDIDATE_DIR/$EXT_ARCHIVE" > "$EXT_LIST"
+tar -tzf "$ORIG_CANDIDATE_DIR/$HELPER_ARCHIVE" > "$HELPER_LIST"
+ARCHIVE_CONTENT_OK=1
+for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
+    docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md; do
+    rg -F "/$required" "$EXT_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
+done
+for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
+    docs/RECOVERY_HELPER_DESIGN.md docs/RELEASE_SCOPE.md \
+    docs/BACKUP_RESTORE_RUNBOOK.md; do
+    rg -F "/$required" "$HELPER_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
+done
+rm -f "$EXT_LIST" "$HELPER_LIST"
+if [[ "$ARCHIVE_CONTENT_OK" == "1" ]]; then
+    pass "candidate archives contain required notices and recovery documentation"
+else
+    fail "candidate archive legal/security/operator content is incomplete"
+fi
+
 STATUS=failed
 [[ "$FAILED" == "0" ]] && STATUS=passed
 jq -n \

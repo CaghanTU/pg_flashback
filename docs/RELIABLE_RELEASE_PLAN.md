@@ -1,7 +1,7 @@
 # Reliable v0.1.0 release plan
 
-Status: **proposed execution plan — Milestone 0 docs contract freeze ready for
-review; implementation gates remain open**
+Status: **pre-soak release freeze — implementation and short local gates are
+closing; exact 24-hour and hosted x86_64/publication gates remain open**
 
 Last updated: 2026-07-17
 
@@ -9,6 +9,9 @@ This document turns the supported contract in
 [`RELEASE_SCOPE.md`](RELEASE_SCOPE.md) and the publication gates in
 [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) into an ordered execution plan
 for the first reliable public release of pg_flashback.
+
+The closed pre-soak inventory and the rule against adding surprise post-soak
+gates are recorded in [`PRE_SOAK_RELEASE_FREEZE.md`](PRE_SOAK_RELEASE_FREEZE.md).
 
 The target is `v0.1.0`. It is not a promise that every PostgreSQL topology or
 table shape is supported. It is a fail-closed release for the explicitly
@@ -50,7 +53,7 @@ The current `large-db-poc` baseline already contains:
 - a recovery helper with snapshot-direct and classic pgBackRest engines;
 - recovery-helper E2E coverage including identical recovered fingerprints.
 
-Current implementation status on `work/v0.1.0-overnight`:
+Current implementation status on `work/v0.1.0-overnight-sanitized`:
 
 1. backup-profile generation wiring, authenticated proof installation,
    post-swap FULL re-anchor, durable coordinated expire, newer-timeline freeze
@@ -78,10 +81,12 @@ Current implementation status on `work/v0.1.0-overnight`:
    `deploy/pg-flashback-reconcile-anchors.{service,timer}`;
 7. capture and bounded maintenance run in separate per-database workers; the
    exact-commit qualification harness enforces the stated p95/max SLOs;
-8. release-mode packages build for PostgreSQL 15–18 and the helper; release
-   versioning and clean-host installation remain open;
+8. release-mode packages build for PostgreSQL 15–18 and the helper; a packaged
+   PG17 Linux/aarch64 clean-host smoke passes, while hosted x86_64 packaging is
+   blocked until GitHub Actions billing is restored;
 9. exact-RC 24-hour soak remains open;
-10. aarch64 remains source-build only / not release-qualified;
+10. PG17 Linux/aarch64 under Lima is the declared exact 24-hour host class;
+    x86_64 prebuilt artifacts have a separate hosted CI/clean-host gate;
 11. do not claim 100+ GiB performance from current evidence.
 
 ## 3. Milestone 0 — Freeze the release contract
@@ -104,8 +109,9 @@ Estimated duration: **1–2 working days**
 - Remove hard-coded test-count claims. Qualification records report pass/fail
   for the exact commit and matrix entry instead of embedding a suite size in
   long-lived documentation.
-- Keep aarch64 support consistently labeled as source-build only and not
-  release-qualified across the README, release scope and release notes.
+- Keep architecture claims scoped consistently: Linux/aarch64 PG17 is the
+  exact-candidate soak host class; x86_64 is a separately hosted artifact
+  claim; native macOS remains unsupported.
 - Audit every public API and feature table entry for the words `supported`,
   `implemented`, `experimental`, `legacy` and `pending`.
 - Ensure unsupported paths reject the request instead of returning an
@@ -134,7 +140,8 @@ The required protocol is:
 1. `flashback_track_backup()` creates a durable tracking marker.
 2. The marker transaction commits before it can be resolved.
 3. The worker resolves its real COMMIT LSN.
-4. A backup that predates or overlaps that marker is rejected.
+4. A backup overlapping that marker is rejected; a retained FULL ending no
+   later than the marker is eligible only with continuous verified WAL.
 5. Activation is via `verify-anchor`: either a fresh FULL that starts after the
    marker COMMIT LSN, or a retained FULL with contiguous WAL
    (`retained_full_plus_wal`).
@@ -227,7 +234,7 @@ ambiguous timeline, incomplete archive prefix or unanchored post-swap state.
 ## 5. Milestone 2 — Bound capacity and artifact retention
 
 Implementation status: **local capacity/write-stall admission and helper
-work-root/GC controls are implemented; exact-RC soak and clean-host
+work-root/GC controls are implemented; exact-RC soak and hosted x86_64
 packaged-artifact qualification remain open.**
 
 Estimated duration: **3–5 working days**
@@ -436,8 +443,9 @@ historical version string can be migrated safely.
 - `LICENSE`, `THIRD_PARTY_NOTICES.md`, security policy, release scope and
   operator runbook.
 
-Source builds may support aarch64, but the release must not call aarch64
-`verified` until it is installed and exercised on a real ARM host.
+PG17 Linux/aarch64 is called stability-qualified only after the exact packaged
+candidate passes Gate C under Lima. x86_64 archives require their own hosted
+build and clean-host evidence and are not described as 24-hour qualified.
 
 ### 7.4 Clean-host smoke installation
 

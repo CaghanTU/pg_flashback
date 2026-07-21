@@ -11,6 +11,9 @@ required item is checked against the exact commit being released.
       `CHANGELOG.md` and the tag agree on the semantic version.
 - [ ] `docs/RELEASE_SCOPE.md` describes the actually tested PostgreSQL,
       pgBackRest, repository and table topologies.
+- [ ] Architecture claims are scoped independently: the exact 24-hour gate
+      names its Linux/architecture/host class, while x86_64 release artifacts
+      are not called qualified until hosted CI and clean-host packaging pass.
 - [ ] `docs/STORAGE_POLICY.md`, `docs/COVERAGE_MODEL.md`, README and runtime
       behavior agree; no scaffold-only feature is described as enforced.
 - [ ] T-01/A remains closed in the release scope: qualified local capture is
@@ -186,14 +189,17 @@ scripts/run_recovery_helper_e2e.sh
       opens a durable gap; it does not create a local row snapshot, and both
       the result and `flashback_health()` report the required next full backup.
 - [ ] Initial backup tracking commits and resolves a durable LOGGED marker,
-      then remains at zero active generations until a new completed full whose
-      start LSN is strictly after that marker activates at its verified
-      stop anchor; pre-existing and overlapping backups are rejected.
+      then remains at zero active generations until `verify-anchor` activates
+      either (a) a completed fresh FULL whose start LSN is strictly after the
+      marker, or (b) a retained FULL whose stop is no later than the marker and
+      whose contiguous archived WAL is verified through it. An overlapping
+      backup and an incomplete archive prefix are rejected.
 - [ ] The active backup generation pins one immutable anchor containing
       repository/stanza/label, FULL type, system identifier, timeline,
-      manifest reference/SHA-256 and marker/start/stop LSNs; its
-      boundary is the same anchor's stop LSN and cross-lifecycle references
-      fail.
+      manifest reference/SHA-256 and marker/start/stop LSNs; its physical
+      boundary is the same anchor's stop LSN, while retained activation
+      separately records the marker as `coverage_start_lsn`; cross-lifecycle
+      references fail.
 - [ ] WAL/backup LSNs are admitted only within their recorded physical
       timeline; a timeline mismatch or promotion freezes coverage and opens a
       gap rather than comparing bare LSNs across timelines.

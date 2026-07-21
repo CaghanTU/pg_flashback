@@ -152,8 +152,10 @@ the missing interval never becomes valid retroactively.
 on each major for the exact release commit; record suite counts in
 qualification artifacts rather than embedding them here.
 **Compile-supported:** PostgreSQL 15 – 18 (pgrx feature flags)
-**Release artifacts:** Linux x86_64 only. aarch64 is source-build only and is
-not release-qualified.
+**Qualification scope:** PG17 Linux/aarch64 under Lima is the exact 24-hour
+candidate host class. Tagged x86_64 archives have separate hosted build and
+clean-host gates; they are not described as 24-hour qualified. Native macOS is
+unsupported.
 
 **Legacy smoke evidence:** both capture modes completed limited 1,000+ row
 mass-delete/update scenarios (trigger restore ~58 ms, WAL restore ~82 ms). Those
@@ -234,10 +236,10 @@ sudo install -m 0644 share/extension/pg_flashback.control \
   share/extension/pg_flashback--*.sql "$(pg_config --sharedir)/extension/"
 ```
 
-Prebuilt release archives target x86_64 Linux and are the only release-
-qualified platform. aarch64 and other Linux architectures may build the same
-tagged source with the commands above, but those builds are source-only and
-are not release-qualified.
+Prebuilt release archives target x86_64 Linux and require hosted build plus
+clean-host evidence. The exact stability candidate is separately built and
+tested on PG17 Linux/aarch64 under Lima. Qualification on either architecture
+does not imply native macOS support or qualification on the other.
 
 ### Enable the Extension
 
@@ -595,7 +597,8 @@ GitHub Actions pipeline runs on every push to `main` and on every pull request:
   archive the exact check count for the commit under test
 - **Release workflow**: signed-off `v*.*.*` tags build portable x86_64 Linux
   PostgreSQL 15–18 and helper artifacts, checksums, and a draft GitHub Release.
-  aarch64 remains source-build only and is not release-qualified.
+  Those artifacts require hosted CI and clean-host evidence. PG17
+  Linux/aarch64 has its own exact-candidate stability gate under Lima.
 
 Local:
 ```bash

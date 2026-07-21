@@ -1,7 +1,7 @@
 # First release scope
 
-Status: **T-01/A WAL-local scope implemented; not publishable until every
-remaining release gate passes**
+Status: **T-01/A WAL-local scope implemented; pre-soak freeze in progress;
+not publishable until Gate C and the remaining hosted/publication gates pass**
 
 This document defines the fail-closed supported subset for the first
 publishable pg_flashback release. The cross-profile rules in
@@ -11,9 +11,11 @@ optimistically.
 
 ## Common supported contract
 
-- PostgreSQL 15–18 on Linux. Tagged prebuilt extension archives and release
-  qualification target x86_64. aarch64 is source-build only and is not
-  release-qualified
+- PostgreSQL 15–18 on Linux. Regression and package builds are verified for all
+  four majors on Linux/aarch64. The exact 24-hour candidate gate targets PG17
+  Linux/aarch64 under Lima on an Apple Silicon host. Tagged prebuilt x86_64
+  archives remain a separately scoped artifact claim and require hosted CI and
+  clean-host success; no native macOS claim is made
 - ordinary logged tables whose stable tracking identity can be proven
 - a target contained by exactly one `active` or `sealed` generation's
   half-open applicability interval and at or before its separate inclusive
@@ -79,8 +81,9 @@ predecessors remain pinned until retention retires their exclusive range.
 durably freezes the affected generation. The real-repository E2E also covers a
 newer timeline, missing anchors, an expire/activation race and a failed-expire
 lease resume, plus post-swap fresh-FULL re-anchor and automatic FULL
-advancement. Release status remains **PARTIAL** until the exact-RC 24-hour and
-clean-host packaged-artifact gates pass. Do not report recoverability from an
+advancement. Release status remains **PARTIAL** until the final exact-candidate
+short gates, 24-hour stability gate and hosted x86_64 artifact gates pass. Do
+not report recoverability from an
 unverified or frozen generation. Differential/incremental chains and
 non-pgBackRest providers remain unsupported.
 
@@ -134,8 +137,9 @@ non-pgBackRest providers remain unsupported.
 - a local “skip post-restore base” escape hatch
 - backup post-restore coverage before a new completed, verified full backup
   stop boundary
-- adopting a backup that predates or overlaps initial backup tracking or a
-  production swap, even when it completes later
+- adopting an overlapping backup at initial tracking, or any backup that
+  predates/overlaps a production swap. A retained pre-marker FULL is allowed
+  only for initial tracking when contiguous WAL through the marker is proven
 - differential or incremental backup selection
 - tablespaces/symlinked relation storage
 - symlinked PostgreSQL configuration files in the recovered cluster
@@ -241,8 +245,8 @@ non-pgBackRest providers remain unsupported.
   activates at its stop boundary, and `[swap commit, backup stop)` stays
   permanently rejected;
 - initial backup tracking remains unanchored with zero active generations until
-  a durable marker is resolved and a new full whose start LSN is strictly
-  after that marker activates at its verified stop anchor;
+  a durable marker is resolved and either a fresh post-marker FULL or a
+  retained pre-marker FULL with verified contiguous WAL activates;
 - sealed ownership/applicability remains immutable while bound backlog advances
   the watermark monotonically only to the upper coordinate; retirement waits
   for complete drain proof;
