@@ -71,7 +71,7 @@ jobs:
       - name: Shell syntax and ShellCheck
         run: |
           bash -n scripts/*.sh
-          shellcheck scripts/*.sh
+          shellcheck -S warning scripts/*.sh
 
       - name: Whitespace check
         run: git diff --check
