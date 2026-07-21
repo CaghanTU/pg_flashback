@@ -649,32 +649,22 @@ BEGIN
         RAISE EXCEPTION 'flashback_track: table is already tracked with the backup profile; untrack it first';
     END IF;
 
-    -- The background worker only serves the databases listed in
-    -- pg_flashback.target_databases / target_database. If this database is
-    -- not covered, captured events are never flushed (trigger mode) nor
-    -- consumed from the slot (WAL mode) — capture silently does nothing.
-    DECLARE
-        v_db_list text;
-    BEGIN
-        v_db_list := COALESCE(
-            NULLIF(current_setting('pg_flashback.target_databases', true), ''),
-            NULLIF(current_setting('pg_flashback.target_database', true), ''),
-            'postgres'
-        );
-        IF NOT EXISTS (
-            SELECT 1 FROM unnest(string_to_array(v_db_list, ',')) AS d
-            WHERE trim(d) = current_database()
-        ) THEN
-            IF flashback_effective_capture_mode() = 'wal' THEN
-                RAISE EXCEPTION 'pg_flashback: database % is not covered by a background worker (pg_flashback.target_databases = %)',
-                    current_database(), v_db_list
-                    USING HINT = 'Add this database to pg_flashback.target_databases and restart PostgreSQL before tracking.';
-            ELSE
-                RAISE WARNING 'pg_flashback: database % is NOT covered by any background worker (pg_flashback.target_databases = %). Captured events will not be processed until this database is added and PostgreSQL is restarted.',
-                    current_database(), v_db_list;
+    -- Fail closed when this database has no admitted, running capture worker.
+    -- Membership in target_databases is not enough: max_workers truncation or a
+    -- missing process would otherwise create a lifecycle that never consumes WAL.
+    IF flashback_effective_capture_mode() = 'wal' THEN
+        PERFORM flashback_require_admitted_capture_worker('flashback_track()');
+    ELSE
+        DECLARE
+            v_ready record;
+        BEGIN
+            SELECT * INTO STRICT v_ready FROM flashback_worker_readiness();
+            IF NOT v_ready.admitted OR NOT v_ready.capture_running THEN
+                RAISE WARNING 'pg_flashback: % — captured events will not be processed until admission and capture worker are healthy',
+                    v_ready.reason;
             END IF;
-        END IF;
-    END;
+        END;
+    END IF;
 
     -- In WAL mode, ensure the replication slot exists. The slot is created
     -- HERE and only here — the background worker merely checks for it — so

@@ -124,6 +124,7 @@ AS $$
 DECLARE
     rec record;
     slot record;
+    workers record;
     v_health text;
     v_action text;
     v_reason text;
@@ -134,6 +135,7 @@ DECLARE
     v_post_restore_gap boolean;
 BEGIN
     SELECT * INTO slot FROM flashback_slot_status_snapshot() LIMIT 1;
+    SELECT * INTO STRICT workers FROM flashback_worker_readiness();
 
     v_lag_warn := COALESCE(
         flashback_local_guc_bytes('pg_flashback.slot_lag_warning_bytes', '256MB'),
@@ -291,7 +293,19 @@ BEGIN
         v_post_restore_gap := rec.post_restore_gap_count > 0
             OR COALESCE(rec.pending_state_reason, '') = 'post_restore_unanchored';
 
-        IF (
+        -- Worker absence must never project as healthy. Capture loss is
+        -- correctness-critical; maintenance loss is an actionable degraded state.
+        IF workers.admission_state IN ('not_configured', 'beyond_max_workers', 'capacity_insufficient')
+           OR NOT workers.capture_running
+        THEN
+            v_health := 'capture_worker_missing';
+            v_action := 'restore_admitted_capture_worker';
+            v_reason := workers.reason;
+        ELSIF NOT workers.maintenance_running THEN
+            v_health := 'maintenance_worker_missing';
+            v_action := 'restore_maintenance_worker';
+            v_reason := workers.reason;
+        ELSIF (
                rec.recovery_profile = 'local_delta'
                AND (
                    COALESCE(slot.wal_status, '') = 'lost'

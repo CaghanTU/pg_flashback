@@ -1319,7 +1319,7 @@ $PSQL -d "$UNCOV_DB" -qc "CREATE EXTENSION pg_flashback" -c "CREATE TABLE t (id 
 UNCOV_RC=0
 $PSQL -d "$UNCOV_DB" -qc "SELECT flashback_track('t')" > /tmp/pg_flashback_uncov.out 2>&1 || UNCOV_RC=$?
 [[ "$UNCOV_RC" != "0" ]] || { echo "FAIL: kapsam dışı DB tracking'i reddedilmedi"; exit 1; }
-grep -q "not covered by a background worker" /tmp/pg_flashback_uncov.out
+grep -Eq 'not listed in pg_flashback\.target_databases|not covered by a background worker|flashback_track\(\) refused' /tmp/pg_flashback_uncov.out
 echo "  ok: kapsam dışı DB tracking'i kalıcı metadata oluşturmadan reddedildi"
 
 exit 0

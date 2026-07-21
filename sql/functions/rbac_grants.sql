@@ -102,6 +102,12 @@ GRANT EXECUTE ON FUNCTION flashback_query_lsn(text, pg_lsn, text)     TO flashba
 GRANT EXECUTE ON FUNCTION flashback_resolve_target(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_health()                          TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_slot_status_snapshot()            TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_worker_readiness()                TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_canonical_target_databases()      TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_admitted_target_databases()       TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_max_worker_pairs()                TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_capture_worker_pid()              TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintenance_worker_pid()         TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_history(text, interval)           TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_retention_status()                TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)       TO flashback_admin;
@@ -192,12 +198,22 @@ GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)    TO pg_monitor
 GRANT EXECUTE ON FUNCTION flashback_health()                       TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_advise(regclass)                TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_slot_status_snapshot()         TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_worker_readiness()             TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_canonical_target_databases()   TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_admitted_target_databases()    TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_max_worker_pairs()             TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_capture_worker_pid()           TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_maintenance_worker_pid()      TO pg_monitor;
 
 -- ================================================================
 -- COMMENT ON FUNCTION: \df+ documentation
 -- ================================================================
 COMMENT ON FUNCTION flashback_track(text)
-    IS 'Start tracking a table — attaches capture triggers, takes base snapshot, records schema version.';
+    IS 'Start local_delta tracking: require an admitted running capture worker, create/ensure the logical slot, take an exact base snapshot, and open a coverage generation. Qualified WAL capture does not attach row triggers.';
+COMMENT ON FUNCTION flashback_doctor()
+    IS 'Read-only operational diagnosis (scope/check_name/status/observed/expected/action). Granted to flashback_admin and pg_monitor; not PUBLIC.';
+COMMENT ON FUNCTION flashback_disaster_points(text, interval)
+    IS 'Discover safe pre-DROP/TRUNCATE/ALTER COMMIT-LSN prefixes for local_delta tables without requiring a pre-recorded timestamp.';
 COMMENT ON FUNCTION flashback_untrack(text)
     IS 'Stop tracking a table — detaches triggers, drops snapshots, purges all flashback data for that table.';
 COMMENT ON FUNCTION flashback_restore(text, timestamptz)

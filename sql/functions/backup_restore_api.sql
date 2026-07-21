@@ -193,6 +193,10 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: flashback_track_backup() requires wal_level=logical so the tracking marker COMMIT LSN can be resolved';
     END IF;
 
+    -- Marker resolution and frontier advancement require the admitted capture
+    -- worker. Refuse before creating a lifecycle when admission is false.
+    PERFORM flashback_require_admitted_capture_worker('flashback_track_backup()');
+
     v_rel_oid := to_regclass(target_table);
     IF v_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_track_backup: table % does not exist', target_table;

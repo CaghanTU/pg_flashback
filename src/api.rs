@@ -13,12 +13,24 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/worker_admission.sql",
+    name = "flashback_worker_admission",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        flashback_canonical_target_databases,
+        flashback_admitted_target_databases,
+        flashback_max_worker_pairs,
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/api_track_capture.sql",
     name = "flashback_api_track_capture",
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_payload_ownership_helpers",
-        "flashback_local_capacity"
+        "flashback_local_capacity",
+        "flashback_worker_admission"
     ],
 );
 
@@ -39,9 +51,11 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_api_track_capture",
         "flashback_coverage_runtime",
-        "flashback_local_capacity"
+        "flashback_local_capacity",
+        "flashback_worker_admission"
     ],
 );
+
 
 extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
@@ -61,6 +75,7 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_payload_ownership_helpers",
         "flashback_restore_replay_helpers",
+        "flashback_worker_admission",
         flashback_sha256
     ],
 );

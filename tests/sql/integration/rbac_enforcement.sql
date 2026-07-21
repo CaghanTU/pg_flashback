@@ -152,6 +152,12 @@ BEGIN
             ('flashback_admin', 'public.flashback_resolve_target(text,timestamp with time zone)'),
             ('flashback_admin', 'public.flashback_health()'),
             ('flashback_admin', 'public.flashback_slot_status_snapshot()'),
+            ('flashback_admin', 'public.flashback_worker_readiness()'),
+            ('flashback_admin', 'public.flashback_canonical_target_databases()'),
+            ('flashback_admin', 'public.flashback_admitted_target_databases()'),
+            ('flashback_admin', 'public.flashback_max_worker_pairs()'),
+            ('flashback_admin', 'public.flashback_capture_worker_pid()'),
+            ('flashback_admin', 'public.flashback_maintenance_worker_pid()'),
             ('flashback_admin', 'public.flashback_history(text,interval)'),
             ('flashback_admin', 'public.flashback_retention_status()'),
             ('flashback_admin', 'public.flashback_is_restore_in_progress(oid)'),
@@ -199,7 +205,13 @@ BEGIN
             ('pg_monitor', 'public.flashback_is_restore_in_progress(oid)'),
             ('pg_monitor', 'public.flashback_health()'),
             ('pg_monitor', 'public.flashback_advise(regclass)'),
-            ('pg_monitor', 'public.flashback_slot_status_snapshot()')
+            ('pg_monitor', 'public.flashback_slot_status_snapshot()'),
+            ('pg_monitor', 'public.flashback_worker_readiness()'),
+            ('pg_monitor', 'public.flashback_canonical_target_databases()'),
+            ('pg_monitor', 'public.flashback_admitted_target_databases()'),
+            ('pg_monitor', 'public.flashback_max_worker_pairs()'),
+            ('pg_monitor', 'public.flashback_capture_worker_pid()'),
+            ('pg_monitor', 'public.flashback_maintenance_worker_pid()')
     ), actual AS (
         SELECT pg_get_userbyid(routine_acl.grantee) AS grantee,
                format('%I.%I(%s)',

@@ -366,17 +366,34 @@ pub fn register_worker_and_guc() {
     }
 }
 
+/// Canonical target-database list contract shared by worker registration and
+/// SQL admission. Comma-split, trim, drop empties, first-wins dedupe. Duplicate
+/// names must not consume additional worker indices.
+pub fn parse_target_databases(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn max_worker_pairs() -> usize {
+    MAX_WORKERS_GUC.get().clamp(1, 8) as usize
+}
+
 /// Resolve the list of target databases from GUCs.
 /// Priority: target_databases (comma-separated) > target_database > "postgres".
 fn resolve_database_list() -> Vec<String> {
     // Check target_databases first (comma-separated list)
     if let Some(cs) = TARGET_DATABASES_GUC.get() {
         if let Ok(s) = cs.to_str() {
-            let dbs: Vec<String> = s
-                .split(',')
-                .map(|d| d.trim().to_string())
-                .filter(|d| !d.is_empty())
-                .collect();
+            let dbs = parse_target_databases(s);
             if !dbs.is_empty() {
                 return dbs;
             }
@@ -389,7 +406,49 @@ fn resolve_database_list() -> Vec<String> {
         .as_deref()
         .and_then(|cs| cs.to_str().ok())
         .unwrap_or("postgres");
-    vec![db_name.to_string()]
+    parse_target_databases(db_name)
+}
+
+fn admitted_database_list() -> Vec<String> {
+    let max_w = max_worker_pairs();
+    resolve_database_list().into_iter().take(max_w).collect()
+}
+
+/// Canonical configured database list (deduped; not truncated by max_workers).
+#[pg_extern(stable, name = "flashback_canonical_target_databases")]
+fn flashback_canonical_target_databases() -> Vec<String> {
+    resolve_database_list()
+}
+
+/// Databases that receive a registered capture/maintenance worker pair.
+#[pg_extern(stable, name = "flashback_admitted_target_databases")]
+fn flashback_admitted_target_databases() -> Vec<String> {
+    admitted_database_list()
+}
+
+/// Effective `pg_flashback.max_workers` clamp used for admission.
+#[pg_extern(stable, name = "flashback_max_worker_pairs")]
+fn flashback_max_worker_pairs() -> i32 {
+    max_worker_pairs() as i32
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::parse_target_databases;
+
+    #[test]
+    fn parses_trims_and_dedupes_first_wins() {
+        assert_eq!(
+            parse_target_databases(" db1, db2 ,db1, ,db3,,db2 "),
+            vec!["db1".to_string(), "db2".to_string(), "db3".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_yield_empty() {
+        assert!(parse_target_databases("").is_empty());
+        assert!(parse_target_databases(" , , ").is_empty());
+    }
 }
 
 pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
@@ -451,9 +510,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
                 // Fail closed: do not apply the new enabled/mode behavior
                 // until the LOGGED discontinuity transaction succeeds.
                 let interval_ms = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
-                if !BackgroundWorker::wait_latch(Some(Duration::from_millis(interval_ms))) {
-                    break;
-                }
+                wait_latch_or_exit_for_restart(Duration::from_millis(interval_ms));
                 continue;
             }
             last_enabled = Some(enabled);
@@ -514,15 +571,8 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
         } else {
             base_interval_ms
         };
-        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(interval_ms))) {
-            break;
-        }
+        wait_latch_or_exit_for_restart(Duration::from_millis(interval_ms));
     }
-
-    if is_capture_enabled() {
-        flush_staging_to_delta_log();
-    }
-    log!("pg_flashback delta worker {worker_index} stopped (database: {db_name})");
 }
 
 pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum) {
@@ -550,11 +600,27 @@ pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum
         let capture_interval = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
         let cadence = MAINTENANCE_EVERY_N_CYCLES_GUC.get().clamp(1, 10_000) as u64;
         let wait_ms = capture_interval.saturating_mul(cadence).min(600_000);
-        if !BackgroundWorker::wait_latch(Some(Duration::from_millis(wait_ms))) {
-            break;
-        }
+        wait_latch_or_exit_for_restart(Duration::from_millis(wait_ms));
     }
-    log!("pg_flashback maintenance worker {worker_index} stopped (database: {db_name})");
+}
+
+/// Wait for the next worker cycle. On SIGTERM while the postmaster is still
+/// alive, exit non-zero so `bgw_restart_time` restarts the worker. A handled
+/// SIGTERM that returns from `main` with status 0 is treated as a voluntary
+/// permanent stop and would leave capture/maintenance absent until a full
+/// PostgreSQL restart.
+fn wait_latch_or_exit_for_restart(timeout: Duration) {
+    if BackgroundWorker::wait_latch(Some(timeout)) {
+        return;
+    }
+    // PostmasterIsAlive() is a header inline; call the exported internal.
+    extern "C" {
+        fn PostmasterIsAliveInternal() -> bool;
+    }
+    let postmaster_alive = unsafe { PostmasterIsAliveInternal() };
+    if postmaster_alive {
+        std::process::exit(1);
+    }
 }
 
 /// Check if any backend is performing a flashback restore by looking for

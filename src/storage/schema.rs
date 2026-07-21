@@ -19,6 +19,7 @@ extension_sql_file!(
         "flashback_api_track_capture",
         "flashback_coverage_runtime",
         "flashback_health_runtime",
+        "flashback_worker_admission",
         "flashback_retention_runtime",
         "flashback_backup_restore_api",
         "flashback_restore_planner_api",
