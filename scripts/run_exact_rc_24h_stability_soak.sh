@@ -509,7 +509,9 @@ do_drop_restore_drill() {
     q "SELECT flashback_track('$rel');" >/dev/null
     wait_healthy "$rel" || die "$tag $table_name not healthy"
     q "INSERT INTO $rel VALUES (1,'$tag', repeat('d', 500));" >/dev/null
-    q "SELECT pg_switch_wal();" >/dev/null
+    # Logical decoding can consume flushed committed WAL from the current
+    # segment. Forced segment switches would manufacture ~32 MiB per drill and
+    # make a time-distributed DROP schedule test artificial disk churn instead.
     lsn=""
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
@@ -534,7 +536,6 @@ do_drop_restore_drill() {
     DROP_DRILLS_ATTEMPTED=$((DROP_DRILLS_ATTEMPTED + 1))
     q "DROP TABLE $rel;" >/dev/null
     [[ "$(q "SELECT to_regclass('$rel') IS NULL;")" == "t" ]] || die "$tag drop failed"
-    q "SELECT pg_switch_wal();" >/dev/null
     for _i in $(seq 1 200); do
         q "SELECT flashback_consume_wal(8192);" >/dev/null || true
         [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE table_name='$rel' AND event_type='DROP';")" -ge 1 ]] && break
