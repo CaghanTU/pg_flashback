@@ -443,6 +443,14 @@ q "CREATE EXTENSION pg_flashback;"
 qn "CREATE EXTENSION pg_flashback;"
 qn "CREATE TABLE public.noise(id bigserial PRIMARY KEY, payload text);"
 
+for _ in $(seq 1 400); do
+    state=$(q "SELECT admission_state FROM flashback_worker_readiness();")
+    [[ "$state" == "ready" || "$state" == "maintenance_missing" ]] && break
+    sleep 0.05
+done
+[[ "${state:-}" == "ready" || "${state:-}" == "maintenance_missing" ]] \
+    || die "capture worker not ready before stability track"
+
 q "CREATE TABLE public.steady_dml(
      id bigserial PRIMARY KEY, marker text NOT NULL, payload text NOT NULL, wide text);"
 q "CREATE TABLE public.second_tracked(
