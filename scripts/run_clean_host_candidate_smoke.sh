@@ -264,6 +264,16 @@ pgbr stanza-create
 primary_sql "CREATE EXTENSION pg_flashback;"
 pass "CREATE EXTENSION from candidate archive"
 
+# Fail-closed track requires an admitted live capture worker before lifecycle creation.
+state=""
+for _ in $(seq 1 200); do
+    state=$(primary_sql "SELECT admission_state FROM flashback_worker_readiness();")
+    [[ "$state" == "ready" || "$state" == "maintenance_missing" ]] && break
+    sleep 0.05
+done
+[[ "${state:-}" == "ready" || "${state:-}" == "maintenance_missing" ]] \
+    || die "capture worker not ready for $DB_NAME (state=${state:-unset})"
+
 # Local track / change / restore (local_delta).
 primary_sql "CREATE TABLE public.local_t(id int PRIMARY KEY, note text NOT NULL);"
 primary_sql "INSERT INTO public.local_t VALUES (1, 'seed');"
