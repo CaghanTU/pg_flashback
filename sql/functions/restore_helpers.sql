@@ -43,12 +43,18 @@ AS $$
             -- For array columns: JSON [1,2,3] → PG '{1,2,3}'
             WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
                 format('%I IS NOT DISTINCT FROM %L::%s', a.attname,
-                    translate(kv.value::text, '[]', '{}'),
+                    CASE WHEN jsonb_typeof(kv.value) = 'string'
+                         THEN kv.value #>> '{}'
+                         ELSE translate(kv.value::text, '[]', '{}') END,
                     pg_catalog.format_type(a.atttypid, a.atttypmod))
-            -- For jsonb/json columns: preserve JSON representation
+            -- WAL decoding uses PostgreSQL's text output inside a JSON string;
+            -- trigger payloads carry a nested JSON value. Accept both without
+            -- turning a JSON object into a JSON string during replay.
             WHEN t.typname IN ('jsonb', 'json') THEN
                 format('%I IS NOT DISTINCT FROM %L::%s', a.attname,
-                    kv.value::text,
+                    CASE WHEN jsonb_typeof(kv.value) = 'string'
+                         THEN kv.value #>> '{}'
+                         ELSE kv.value::text END,
                     pg_catalog.format_type(a.atttypid, a.atttypmod))
             ELSE format(
                 '%I IS NOT DISTINCT FROM %L::%s',
@@ -86,12 +92,16 @@ AS $$
                 -- For array columns: JSON [1,2,3] → PG '{1,2,3}'
                 WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
                     format('%L::%s',
-                        translate(kv.value::text, '[]', '{}'),
+                        CASE WHEN jsonb_typeof(kv.value) = 'string'
+                             THEN kv.value #>> '{}'
+                             ELSE translate(kv.value::text, '[]', '{}') END,
                         pg_catalog.format_type(a.atttypid, a.atttypmod))
-                -- For jsonb/json columns: preserve JSON representation
+                -- Accept both nested trigger JSON and string-encoded WAL text.
                 WHEN t.typname IN ('jsonb', 'json') THEN
                     format('%L::%s',
-                        kv.value::text,
+                        CASE WHEN jsonb_typeof(kv.value) = 'string'
+                             THEN kv.value #>> '{}'
+                             ELSE kv.value::text END,
                         pg_catalog.format_type(a.atttypid, a.atttypmod))
                 ELSE format(
                     '%L::%s',
@@ -143,11 +153,15 @@ AS $$
                     WHEN kv.value = 'null'::jsonb THEN 'NULL'
                     WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
                         format('%L::%s',
-                            translate(kv.value::text, '[]', '{}'),
+                            CASE WHEN jsonb_typeof(kv.value) = 'string'
+                                 THEN kv.value #>> '{}'
+                                 ELSE translate(kv.value::text, '[]', '{}') END,
                             pg_catalog.format_type(a.atttypid, a.atttypmod))
                     WHEN t.typname IN ('jsonb', 'json') THEN
                         format('%L::%s',
-                            kv.value::text,
+                            CASE WHEN jsonb_typeof(kv.value) = 'string'
+                                 THEN kv.value #>> '{}'
+                                 ELSE kv.value::text END,
                             pg_catalog.format_type(a.atttypid, a.atttypmod))
                     ELSE format(
                         '%L::%s',

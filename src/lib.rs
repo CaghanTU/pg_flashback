@@ -267,6 +267,10 @@ mod tests {
         "../tests/sql/integration/identity_schema_roundtrip.sql"
     );
     sql_test!(
+        it_wal_payload_type_replay,
+        "../tests/sql/integration/wal_payload_type_replay.sql"
+    );
+    sql_test!(
         it_rls_policy_restore,
         "../tests/sql/integration/rls_policy_restore.sql"
     );
