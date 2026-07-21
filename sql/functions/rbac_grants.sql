@@ -101,6 +101,8 @@ GRANT EXECUTE ON FUNCTION flashback_query(text, timestamptz, text)    TO flashba
 GRANT EXECUTE ON FUNCTION flashback_query_lsn(text, pg_lsn, text)     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_resolve_target(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_health()                          TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_doctor()                          TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_disaster_points(text, interval)   TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_slot_status_snapshot()            TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_worker_readiness()                TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_canonical_target_databases()      TO flashback_admin;
@@ -196,6 +198,8 @@ GRANT EXECUTE ON FUNCTION flashback_history(text, interval)        TO pg_monitor
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)    TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_health()                       TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_doctor()                       TO pg_monitor;
+GRANT EXECUTE ON FUNCTION flashback_disaster_points(text, interval) TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_advise(regclass)                TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_slot_status_snapshot()         TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_worker_readiness()             TO pg_monitor;

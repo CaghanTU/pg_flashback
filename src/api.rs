@@ -56,6 +56,18 @@ extension_sql_file!(
     ],
 );
 
+extension_sql_file!(
+    "../sql/functions/operator_diagnosis.sql",
+    name = "flashback_operator_diagnosis",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_api_track_capture",
+        "flashback_coverage_runtime",
+        "flashback_health_runtime",
+        "flashback_local_capacity",
+        "flashback_worker_admission"
+    ],
+);
 
 extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
