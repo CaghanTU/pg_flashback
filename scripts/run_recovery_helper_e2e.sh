@@ -780,11 +780,34 @@ pass "externally removed anchor is detected, durably frozen and surfaced by heal
 # separate extension database with no retained anchors so expiration may start,
 # then attempts to create a backup generation while a deliberately slow
 # pgBackRest wrapper keeps the lease open.
+#
+# flashback_track_backup() is fail-closed without an admitted capture worker, so
+# expire_e2e must be listed in target_databases and receive a live worker pair.
 "$PG_BIN/dropdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" --if-exists expire_e2e > /dev/null
 "$PG_BIN/createdb" -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" expire_e2e
 "$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_e2e \
     -c 'CREATE EXTENSION pg_flashback; CREATE TABLE public.expire_candidate(id bigint PRIMARY KEY);' \
     > /dev/null
+if grep -q '^pg_flashback.target_databases' "$RUN_ROOT/primary/postgresql.conf"; then
+    sed -i "s|^pg_flashback.target_databases *=.*|pg_flashback.target_databases = 'pocdb,expire_e2e'|" \
+        "$RUN_ROOT/primary/postgresql.conf"
+else
+    printf "%s\n" "pg_flashback.target_databases = 'pocdb,expire_e2e'" \
+        >> "$RUN_ROOT/primary/postgresql.conf"
+fi
+"$PG_CTL" -D "$RUN_ROOT/primary" stop -m fast -w -t 60 > /dev/null
+"$PG_CTL" -D "$RUN_ROOT/primary" -l "$RUN_ROOT/log/expire-e2e-admit.log" \
+    -o "-c archive_mode=off -p $VERIFY_PORT -k $VERIFY_SOCKET" start -w -t 60 > /dev/null
+PRIMARY_STARTED=1
+EXPIRE_ADMIT_STATE=""
+for _ in $(seq 1 200); do
+    EXPIRE_ADMIT_STATE="$("$PSQL" -X -qAt -h "$VERIFY_SOCKET" -p "$VERIFY_PORT" -d expire_e2e \
+        -c "SELECT admission_state FROM flashback_worker_readiness();")"
+    [[ "$EXPIRE_ADMIT_STATE" == "ready" || "$EXPIRE_ADMIT_STATE" == "maintenance_missing" ]] && break
+    sleep 0.05
+done
+[[ "$EXPIRE_ADMIT_STATE" == "ready" || "$EXPIRE_ADMIT_STATE" == "maintenance_missing" ]] \
+    || die "capture worker not ready for expire_e2e (state=${EXPIRE_ADMIT_STATE:-unset})"
 SLOW_EXPIRE="$RUN_ROOT/slow-pgbackrest-expire.sh"
 cat > "$SLOW_EXPIRE" <<SLOW_EXPIRE_EOF
 #!/usr/bin/env bash
