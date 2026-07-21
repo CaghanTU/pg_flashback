@@ -257,11 +257,49 @@ psql -c "CREATE EXTENSION pg_flashback;"
 cargo pgrx install --no-default-features -F pg17
 ```
 
-## 5. Quick Start
+## 5. Quick Start (local profile)
 
-Configure this database in `pg_flashback.target_databases`, restart PostgreSQL,
-and run each statement below in normal psql autocommit mode. Tracking must be
-the first write in a dedicated READ COMMITTED transaction.
+Use the operator wrapper or the SQL APIs directly. Tracking requires an
+admitted, running capture worker for this database (`pg_flashback.target_databases`
+truncated to `max_workers`).
+
+```bash
+# Diagnose prerequisites (nonzero exit on any error check)
+scripts/pg_flashbackctl doctor
+
+# Capacity / write-stall projection → local vs backup recommendation
+scripts/pg_flashbackctl advise public.orders
+
+# First write in its own autocommit transaction; waits for healthy
+scripts/pg_flashbackctl track public.orders
+scripts/pg_flashbackctl status public.orders
+```
+
+```sql
+SELECT * FROM flashback_doctor();
+SELECT * FROM flashback_advise('public.orders'::regclass);
+SELECT flashback_track('public.orders');
+SELECT * FROM flashback_health();
+```
+
+After an accidental DROP, discover a safe pre-disaster COMMIT-LSN without having
+recorded a timestamp, then restore only with an explicit LSN:
+
+```bash
+scripts/pg_flashbackctl disasters public.orders '2 hours'
+scripts/pg_flashbackctl restore public.orders 0/1A2B3C4 --yes
+```
+
+```sql
+SELECT *
+FROM flashback_disaster_points('public.orders', interval '2 hours')
+WHERE status = 'restorable';
+
+SELECT flashback_restore_lsn('public.orders', '0/1A2B3C4'::pg_lsn);
+SELECT * FROM flashback_health();
+```
+
+Equivalent timestamp workflow when you already have a unique wall-clock cut:
 
 ```sql
 SELECT flashback_track('public.orders');
@@ -300,7 +338,8 @@ SELECT * FROM flashback_health();
 
 The backup profile avoids the initial table copy and continuous row-delta
 duplication. It records DDL markers while pgBackRest remains responsible for
-physical backups and archived WAL:
+physical backups and archived WAL. pgBackRest remains the only qualified backup
+provider for v0.1.0:
 
 ```sql
 SELECT flashback_track_backup('public.orders', 'app_repo2');
@@ -324,8 +363,6 @@ scripts/pg_flashback_backup_restore.sh \
 This path has a deliberately narrower first-release support contract. Read
 the [operator runbook](docs/BACKUP_RESTORE_RUNBOOK.md) and
 [supported scope](docs/RELEASE_SCOPE.md) before enabling it.
-The helper/result contract is implemented, but coverage-generation integration
-is still pending; this is not yet an end-to-end release-qualified procedure.
 Release-qualified initial backup tracking must first commit and resolve a
 durable tracking marker, then remain unanchored until `verify-anchor` activates
 either a fresh FULL that starts after the marker or a retained FULL with
@@ -368,16 +405,19 @@ then establish a new exact boundary with `flashback_reanchor()`.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `flashback_track(table)` | `boolean` | In WAL/auto-logical mode, creates a dedicated lifecycle, verified stream binding and exact locked base. Must be the first write in a dedicated READ COMMITTED transaction and the database must have a configured worker. Explicit trigger mode creates legacy state only. |
+| `flashback_track(table)` | `boolean` | Fail-closed unless this database has an admitted, running capture worker. Creates a dedicated lifecycle, logical slot, verified stream binding and exact locked base. Must be the first write in a dedicated READ COMMITTED transaction. Qualified WAL capture does not attach row triggers. Explicit trigger mode creates legacy state only. |
 | `flashback_reanchor(table)` | `bigint` | After a broken stream, creates a new exact base on the current WAL epoch. The intervening gap remains permanently rejected. The new generation activates only when its real COMMIT record is consumed. |
 | `flashback_untrack(table)` | `void` | Stop tracking and restore the original replica identity. Retires the lifecycle; retracking allocates a new identity. |
-| `flashback_track_backup(table, helper_profile)` | `boolean` | Start backup-profile tracking: building generation + LOGGED marker, zero active until a verified FULL proof is consumed. Ordinary LOGGED, non-partitioned tables only. |
+| `flashback_track_backup(table, helper_profile)` | `boolean` | Same admission gate as `flashback_track`. Start backup-profile tracking: building generation + LOGGED marker, zero active until a verified FULL proof is consumed. Ordinary LOGGED, non-partitioned tables only. |
 | `flashback_set_backup_coverage(table, first_lsn, latest_lsn)` | `void` | Legacy assertion — always rejected (`feature_not_supported`). |
 | `flashback_activate_backup_anchor(...)` | `bigint` | Raw caller-supplied activation — always rejected. Use `flashback_install_verified_backup_proof` + `flashback_consume_verified_backup_proof`. |
 | `flashback_advance_backup_frontier(...)` | `pg_lsn` | Raw caller-supplied frontier — always rejected. Use verified WAL frontier proofs. |
 | `flashback_install_verified_backup_proof(...)` | `bigint` | Recovery-agent/superuser only: install a one-time verified FULL backup proof bound to one tracking lifecycle. |
 | `flashback_consume_verified_backup_proof(proof_id)` | `bigint` | Consume a proof exactly once and activate the building generation. |
-| `flashback_backup_disaster_points(table [, lookback])` | `SETOF record` | List DDL disaster markers and pre-DDL target LSNs. |
+| `flashback_disaster_points(table [, lookback])` | `SETOF record` | Local-profile DROP/TRUNCATE/ALTER discovery: last complete admitted COMMIT-LSN prefix before each disaster transaction, or `non_restorable` when gaps/pending/ambiguous. |
+| `flashback_backup_disaster_points(table [, lookback])` | `SETOF record` | List backup-profile DDL disaster markers and pre-DDL target LSNs. |
+| `flashback_doctor()` | `SETOF record` | Read-only operational checks (`ok`/`warning`/`error`). Granted to `flashback_admin` and `pg_monitor`, never `PUBLIC`. |
+| `flashback_worker_readiness()` | `SETOF record` | Admission projection: list membership, `max_workers` truncation, live capture/maintenance PIDs, bgworker capacity. |
 
 ### Restore
 

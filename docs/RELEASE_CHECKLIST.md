@@ -68,6 +68,12 @@ rm -rf target/test-pgdata && cargo pgrx test pg18
 - [ ] PostgreSQL 17 regression suite passes for the exact release commit.
 - [ ] PostgreSQL 18 regression suite passes for the exact release commit.
 - [ ] The real WAL/worker E2E passes: `scripts/run_wal_e2e.sh`.
+- [ ] Capture/maintenance isolation SLO passes (≥200 commits, p95 <1s, max <5s):
+      `scripts/run_capture_maintenance_isolation_slo.sh`.
+- [ ] Worker admission / kill / restart / max_workers E2E passes:
+      `scripts/run_worker_admission_isolation_e2e.sh`.
+- [ ] Doctor / `pg_flashbackctl` / local DROP discovery workflow E2E passes:
+      `scripts/run_operator_workflow_e2e.sh`.
 - [ ] Local capacity/write-stall adversarial E2E passes:
       `scripts/run_local_capacity_e2e.sh`.
 - [ ] Slot/coverage health action E2E passes (integration

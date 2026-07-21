@@ -16,6 +16,11 @@ optimistically.
   Linux/aarch64 under Lima on an Apple Silicon host. Tagged prebuilt x86_64
   archives remain a separately scoped artifact claim and require hosted CI and
   clean-host success; no native macOS claim is made
+- one capture worker and one maintenance worker per admitted database; databases
+  listed in `target_databases` but beyond `max_workers` are not admitted and
+  `flashback_track` / `flashback_track_backup` fail closed without creating a
+  lifecycle. Missing workers are visible via `flashback_worker_readiness()` /
+  `flashback_health()` / `flashback_doctor()` and never project as `healthy`
 - ordinary logged tables whose stable tracking identity can be proven
 - a target contained by exactly one `active` or `sealed` generation's
   half-open applicability interval and at or before its separate inclusive
