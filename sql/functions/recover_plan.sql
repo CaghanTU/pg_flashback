@@ -186,8 +186,14 @@ BEGIN
         WHEN v_row.reason ILIKE '%gap%' THEN 'coverage_gap'
         ELSE 'non_restorable'
     END;
+    -- Prefer an operator-visible identity conflict reason over the DROP's
+    -- coverage reason when the live OID no longer matches the tracked lifecycle.
     IF v_identity_conflict THEN
         v_status := 'non_restorable';
+        v_row.reason := format(
+            'identity conflict: live relation OID differs from tracked lifecycle OID for %s',
+            v_canonical
+        );
     END IF;
 
     v_token := flashback_sha256(format('%s|%s|%s|%s|%s|%s',
