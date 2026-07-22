@@ -13,7 +13,10 @@
     "cli_binary_sha256": "352c006c5a2a241bba70d19bf603f3e46b802c055fdfb1d640e81570e09f3adb",
     "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
   },
-  "historical_soaks_not_claimed": ["3b392ff", "0e65604"],
+  "historical_soaks_not_claimed": [
+    "3b392ff",
+    "0e65604"
+  ],
   "gates": {
     "rbac_enforcement": "passed",
     "upgrade_e2e_fresh_020": "passed",
@@ -22,5 +25,7 @@
     "ha_promotion_e2e": "PARTIAL_or_not_run"
   },
   "ready_to_start_24h_command": "CANDIDATE_DIR=/home/caghan.linux/table-restore/pg_flashback/target/candidate/86ab5a8c7a1cc9db4584eadfa8a67bddf1a9b93b ./scripts/run_exact_rc_24h_stability_soak.sh",
-  "note": "Do not start 24h soak from this program; freeze is READY_TO_START only. Staging remains HAYIR until tip Gate C."
+  "note": "Candidate binaries bind to candidate_source_commit; freeze_commit may be docs-only tip. Do not start 24h soak from this program; freeze is READY_TO_START only. Staging remains HAYIR until tip Gate C.",
+  "freeze_commit": "b285c0a3a3b923d08e290251dbcca4c55855128a",
+  "freeze_tree": "1863e35fc8f4b44c65808e4e71bb44146edc69ab"
 }
