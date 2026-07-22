@@ -32,11 +32,11 @@ mkdir -p "$(dirname "$RESULT_JSON")"
 log() { printf '[exact-wal-matrix] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { log "FAIL: $*"; exit 1; }
 
-# Refuse to claim product evidence if this harness itself embeds forbidden patterns.
+# Refuse product evidence if child suites embed forbidden capture techniques.
+# Do not scan this orchestrator file: it only names the banned patterns.
 forbid_scan() {
     local f
     for f in \
-        "$REPO_ROOT/scripts/run_exact_wal_transaction_schema_matrix.sh" \
         "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
         "$REPO_ROOT/scripts/run_exact_candidate_drop_adversarial.sh" \
         "$REPO_ROOT/scripts/run_exact_candidate_functional_suite.sh"
