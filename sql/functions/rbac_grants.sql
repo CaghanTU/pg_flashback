@@ -112,6 +112,11 @@ GRANT EXECUTE ON FUNCTION flashback_finalize_recover_operations() TO flashback_a
 GRANT EXECUTE ON FUNCTION flashback_unprotect(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_finalize_unprotect_operations() TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_cleanup(bigint, boolean) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_refresh_storage_summary_cache() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_disk_retention_status() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_disk_retention_status() TO pg_monitor;
+GRANT SELECT ON flashback.storage_summary_cache TO flashback_admin;
+GRANT SELECT ON flashback.storage_summary_cache TO pg_monitor;
 GRANT SELECT ON flashback.operations TO flashback_admin;
 GRANT SELECT ON flashback.operation_events TO flashback_admin;
 GRANT SELECT ON flashback.operation_current_state TO flashback_admin;

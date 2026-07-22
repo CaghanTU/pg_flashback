@@ -116,6 +116,12 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/monitoring_cache.sql",
+    name = "flashback_monitoring_cache",
+    requires = ["flashback_storage_schema_bootstrap"],
+);
+
+extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
     name = "flashback_retention_runtime",
     requires = [

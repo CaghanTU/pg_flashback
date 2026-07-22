@@ -23,6 +23,7 @@ extension_sql_file!(
         "flashback_operation_journal",
         "flashback_recover_plan_api",
         "flashback_unprotect_cleanup_api",
+        "flashback_monitoring_cache",
         "flashback_worker_admission",
         "flashback_retention_runtime",
         "flashback_backup_restore_api",

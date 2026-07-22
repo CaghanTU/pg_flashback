@@ -21,27 +21,38 @@ VERBOSE=0
 YES=0
 LATEST_DROP=0
 DRY_RUN=0
+ALL_DATABASES=0
 AT_TIMESTAMP=""
 AT_LSN=""
 DISASTER_EVENT_ID=""
+CLI_VERSION="0.2.0"
 
 usage() {
     cat <<'EOF'
 Usage: pg_flashback [options] <command> [args]
 
 Commands:
-  doctor [--reconcile]
+  version
+  doctor [--reconcile] [--all-databases]
   protect TABLE
-  status [TABLE]
+  list
+  status [TABLE] [--all-databases]
+  history [TABLE]
+  changes [TABLE]          # optional row-change history (sensitive)
   recover TABLE [--latest-drop] [--yes] [--dry-run]
                 [--event-id ID] [--at TIMESTAMP] [--lsn LSN]
   unprotect TABLE [--yes]
   cleanup --tracking-id ID [--dry-run] [--yes]
 
 Options:
-  --json       Machine-readable JSON on stdout
+  --json       Machine-readable JSON envelope on stdout
   --verbose    Include technical details in human output
   -h, --help   Show this help
+
+Exit codes:
+  0  success
+  1  operational failure
+  2  usage / configuration error
 
 Environment (libpq):
   PGHOST, PGPORT, PGDATABASE, PGUSER, ...
@@ -92,6 +103,48 @@ psql_stdin() {
 
 psql_tuples() {
     psql_stdin -qAt "$@"
+}
+
+psql_tuples_db() {
+    local db=$1
+    shift
+    PGDATABASE="$db" psql_tuples "$@"
+}
+
+emit_envelope() {
+    local command=$1 status=$2 code=$3
+    local data=${4:-null}
+    local err=${5:-null}
+    jq -n \
+        --arg command "$command" \
+        --arg status "$status" \
+        --arg code "$code" \
+        --argjson data "$data" \
+        --argjson error "$err" \
+        '{schema_version:1, command:$command, status:$status, code:$code, data:$data, error:$error}'
+}
+
+list_target_databases() {
+    psql_tuples <<'SQL'
+SELECT datname
+FROM pg_database
+WHERE datallowconn
+  AND NOT datistemplate
+ORDER BY 1;
+SQL
+}
+
+for_each_database() {
+    local fn=$1
+    local db rc=0 any_fail=0
+    while IFS= read -r db; do
+        [[ -n "$db" ]] || continue
+        if ! "$fn" "$db"; then
+            any_fail=1
+            echo "pg_flashback: database $db failed" >&2
+        fi
+    done < <(list_target_databases)
+    return "$any_fail"
 }
 
 canonical_table_name() {
@@ -202,67 +255,51 @@ doctor_action_for_humans() {
     esac
 }
 
-cmd_doctor() {
-    local errors scope check status observed expected action human
-    local reconcile=${DOCTOR_RECONCILE:-0}
-    if [[ "$reconcile" == 1 ]]; then
-        # Mutating reconciler path (not part of read-only doctor checks).
-        local n
-        n=$(psql_tuples <<'SQL'
-SELECT flashback_finalize_recover_operations();
+doctor_one_db() {
+    local db=${1:-}
+    local errors n
+    local psql_cmd=(psql_tuples)
+    if [[ -n "$db" ]]; then
+        psql_cmd=(psql_tuples_db "$db")
+    fi
+    if [[ "${DOCTOR_RECONCILE:-0}" == 1 ]]; then
+        n=$("${psql_cmd[@]}" <<'SQL'
+SELECT flashback_finalize_recover_operations()
+     + flashback_finalize_unprotect_operations();
 SQL
 )
-        if [[ "$JSON_OUT" == 1 ]]; then
-            jq -n --argjson n "${n:-0}" \
-                '{schema_version:1, command:"doctor", status:"ok", code:"reconciled",
-                  data:{verified_or_finalized:$n}, error:null}'
+        if [[ -n "$db" ]]; then
+            echo "Reconciled($db): finalized=$n"
         else
-            echo "Reconciled recover operations: finalized=$n"
+            echo "Reconciled recover/unprotect operations: finalized=$n"
         fi
     fi
     if [[ "$JSON_OUT" == 1 ]]; then
-        psql_tuples <<'SQL'
+        local checks
+        checks=$("${psql_cmd[@]}" <<'SQL'
 SELECT COALESCE(json_agg(row_to_json(d) ORDER BY d.check_name), '[]'::json)
 FROM flashback_doctor() d;
 SQL
+)
+        if [[ -n "$db" ]]; then
+            jq -n --arg db "$db" --argjson checks "$checks" \
+                '{database:$db, checks:$checks}'
+        else
+            emit_envelope doctor ok ok "$checks" null
+        fi
     else
-        echo "pg_flashback doctor"
+        echo "pg_flashback doctor${db:+ ($db)}"
         echo "==================="
         while IFS=$'\t' read -r scope check status observed expected action; do
             human="$(doctor_action_for_humans "$check" "$status" "$action")"
             printf '\n[%s] %s\n' "$status" "$check"
-            case "$check" in
-                shared_preload_libraries)
-                    echo "  Problem scope: PostgreSQL must load the extension at startup."
-                    ;;
-                wal_level|effective_capture_mode)
-                    echo "  Problem scope: change capture needs logical WAL."
-                    ;;
-                worker_admission|worker_pair_capacity)
-                    echo "  Problem scope: background recovery workers."
-                    ;;
-                logical_slot)
-                    echo "  Problem scope: the WAL capture slot that remembers progress."
-                    ;;
-                filesystem_*|local_capacity*|capacity*|disk*)
-                    echo "  Problem scope: disk / capacity budget."
-                    ;;
-                recover_verification_pending)
-                    echo "  Problem scope: recover operation journal finalization."
-                    ;;
-                coverage*|tracked*|health*|retention*)
-                    echo "  Problem scope: recovery coverage."
-                    ;;
-                *)
-                    echo "  Scope: $scope"
-                    ;;
-            esac
+            echo "  Scope: ${scope:-database}"
             if [[ "$VERBOSE" == 1 ]]; then
                 echo "  Observed: $observed"
                 echo "  Expected: $expected"
             fi
             echo "  $human"
-        done < <(psql_tuples <<'SQL'
+        done < <("${psql_cmd[@]}" <<'SQL'
 SELECT scope, check_name, status, observed, expected, action
 FROM flashback_doctor()
 ORDER BY CASE status WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
@@ -271,11 +308,128 @@ SQL
 )
         echo
     fi
-    errors=$(psql_tuples <<'SQL'
+    errors=$("${psql_cmd[@]}" <<'SQL'
 SELECT count(*) FROM flashback_doctor() WHERE status='error';
 SQL
 )
-    [[ "$errors" == "0" ]] || exit 1
+    [[ "$errors" == "0" ]]
+}
+
+cmd_doctor() {
+    if [[ "$ALL_DATABASES" == 1 ]]; then
+        local db payloads=() fail=0 chunk
+        while IFS= read -r db; do
+            [[ -n "$db" ]] || continue
+            if chunk=$(doctor_one_db "$db"); then
+                payloads+=("$chunk")
+            else
+                fail=1
+                payloads+=("$chunk")
+                echo "pg_flashback: doctor failed for database $db" >&2
+            fi
+        done < <(list_target_databases)
+        if [[ "$JSON_OUT" == 1 ]]; then
+            local arr
+            arr=$(printf '%s\n' "${payloads[@]+"${payloads[@]}"}" | jq -s '.')
+            if [[ "$fail" == 0 ]]; then
+                emit_envelope doctor ok ok "$arr" null
+            else
+                emit_envelope doctor error partial_failure "$arr" \
+                    '{"message":"one or more databases failed doctor"}'
+                return 1
+            fi
+        fi
+        return "$fail"
+    fi
+    doctor_one_db || exit 1
+}
+
+cmd_version() {
+    local ext
+    ext=$(psql_tuples <<'SQL'
+SELECT COALESCE(
+    (SELECT extversion FROM pg_extension WHERE extname = 'pg_flashback'),
+    'not_installed'
+);
+SQL
+) || ext="unreachable"
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope version ok ok \
+            "$(jq -n --arg cli "$CLI_VERSION" --arg ext "$ext" \
+                '{cli_version:$cli, extension_version:$ext}')" null
+    else
+        echo "pg_flashback cli=$CLI_VERSION extension=$ext"
+    fi
+}
+
+cmd_list() {
+    local payload
+    payload=$(psql_tuples <<'SQL'
+SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'table_name', format('%I.%I', tt.schema_name, tt.table_name),
+    'tracking_id', tt.tracking_id,
+    'is_active', tt.is_active,
+    'protection_state', COALESCE(tt.protection_state, 'active'),
+    'tracked_since', tt.tracked_since,
+    'retention_interval', tt.retention_interval
+) ORDER BY tt.schema_name, tt.table_name), '[]'::jsonb)
+FROM flashback.tracked_tables tt
+WHERE tt.recovery_profile = 'local_delta';
+SQL
+)
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope list ok ok "$payload" null
+    else
+        echo "Protected lifecycles (local_delta)"
+        printf '%s\n' "$payload" | jq -r '.[] | "  \(.table_name) tracking_id=\(.tracking_id) active=\(.is_active) state=\(.protection_state)"'
+    fi
+}
+
+cmd_history() {
+    local table=${1:-}
+    local payload
+    if [[ -n "$table" ]]; then
+        reject_controls table "$table"
+        payload=$(psql_tuples -v "table=$table" <<'SQL'
+SELECT COALESCE(jsonb_agg(to_jsonb(h) ORDER BY h.created_at DESC), '[]'::jsonb)
+FROM flashback_operation_history(NULLIF(:'table',''), interval '7 days') h;
+SQL
+)
+    else
+        payload=$(psql_tuples <<'SQL'
+SELECT COALESCE(jsonb_agg(to_jsonb(h) ORDER BY h.created_at DESC), '[]'::jsonb)
+FROM flashback_operation_history(NULL, interval '7 days') h;
+SQL
+)
+    fi
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope history ok ok "$payload" null
+    else
+        echo "Operation history"
+        printf '%s\n' "$payload" | jq -r '.[] | "  #\(.operation_id) \(.command) \(.table_name // "-") state=\(.state) at=\(.created_at)"'
+    fi
+}
+
+cmd_changes() {
+    local table=${1:-}
+    [[ -n "$table" ]] || die "changes requires TABLE"
+    reject_controls table "$table"
+    local payload
+    payload=$(psql_tuples -v "table=$table" <<'SQL'
+SELECT COALESCE(jsonb_agg(to_jsonb(x) ORDER BY x.event_time DESC), '[]'::jsonb)
+FROM (
+    SELECT event_time, event_type, row_identity
+    FROM flashback_history(:'table', interval '1 hour')
+    LIMIT 100
+) x;
+SQL
+) || fail "changes failed (row history may be restricted by RBAC)"
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope changes ok ok "$payload" null
+    else
+        echo "Recent row-change metadata for $table (payloads omitted in CLI summary)"
+        printf '%s\n' "$payload" | jq -r '.[] | "  \(.event_time) \(.event_type)"'
+    fi
 }
 
 cmd_protect() {
@@ -409,6 +563,7 @@ SELECT jsonb_build_object(
         'safe_wal_size', s.safe_wal_size
     ) END,
     'flashback_disk_bytes', d.flashback_bytes,
+    'disk_retention', flashback_disk_retention_status(),
     'tables', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
             'table_name', r.table_name,
@@ -707,6 +862,41 @@ SQL
 }
 
 # Compatibility aliases kept for existing automation; not shown as primary help.
+cmd_status_dispatch() {
+    local table=${1:-}
+    if [[ "$ALL_DATABASES" != 1 ]]; then
+        cmd_status "$table"
+        return
+    fi
+    local db fail=0 chunk arr
+    local -a payloads=()
+    while IFS= read -r db; do
+        [[ -n "$db" ]] || continue
+        if chunk=$(
+            JSON_OUT=1
+            PGDATABASE="$db" cmd_status "$table"
+        ); then
+            payloads+=("$(jq -n --arg db "$db" --argjson data "$chunk" '{database:$db, status:$data, error:null}')")
+        else
+            fail=1
+            echo "pg_flashback: status failed for database $db" >&2
+            payloads+=("$(jq -n --arg db "$db" '{database:$db, status:null, error:"status failed"}')")
+        fi
+    done < <(list_target_databases)
+    arr=$(printf '%s\n' "${payloads[@]+"${payloads[@]}"}" | jq -s '.')
+    if [[ "$JSON_OUT" == 1 ]]; then
+        if [[ "$fail" == 0 ]]; then
+            emit_envelope status ok ok "$arr" null
+        else
+            emit_envelope status error partial_failure "$arr" \
+                '{"message":"one or more databases failed status"}'
+        fi
+    else
+        printf '%s\n' "$arr" | jq -r '.[] | "database=\(.database) ok=\(.error == null)"'
+    fi
+    return "$fail"
+}
+
 cmd_unprotect() {
     local table=$1
     local canon out status
@@ -779,6 +969,7 @@ while [[ $# -gt 0 ]]; do
         --latest-drop) LATEST_DROP=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --reconcile) DOCTOR_RECONCILE=1; shift ;;
+        --all-databases) ALL_DATABASES=1; shift ;;
         --event-id)
             [[ $# -ge 2 ]] || die "--event-id requires ID"
             DISASTER_EVENT_ID=$2
@@ -852,6 +1043,7 @@ case "$cmd" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --reconcile) DOCTOR_RECONCILE=1; shift ;;
+                --all-databases) ALL_DATABASES=1; shift ;;
                 --json) JSON_OUT=1; shift ;;
                 --verbose|-v) VERBOSE=1; shift ;;
                 -*) die "unknown doctor option: $1" ;;
@@ -860,6 +1052,26 @@ case "$cmd" in
         done
         command -v jq >/dev/null || die "jq is required"
         cmd_doctor
+        ;;
+    version)
+        [[ $# -eq 0 ]] || die "version takes no arguments"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_version
+        ;;
+    list)
+        [[ $# -eq 0 ]] || die "list takes no arguments"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_list
+        ;;
+    history)
+        [[ $# -le 1 ]] || die "history accepts optional TABLE"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_history "${1:-}"
+        ;;
+    changes)
+        [[ $# -eq 1 ]] || die "changes requires TABLE"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_changes "$1"
         ;;
     protect)
         [[ $# -eq 1 ]] || die "protect requires TABLE"
@@ -873,9 +1085,18 @@ case "$cmd" in
         cmd_track "$1"
         ;;
     status)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --all-databases) ALL_DATABASES=1; shift ;;
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown status option: $1" ;;
+                *) break ;;
+            esac
+        done
         [[ $# -le 1 ]] || die "status accepts optional TABLE"
         command -v jq >/dev/null || die "jq is required"
-        cmd_status "${1:-}"
+        cmd_status_dispatch "${1:-}"
         ;;
     recover)
         [[ $# -eq 1 ]] || die "recover requires TABLE"
@@ -888,7 +1109,7 @@ case "$cmd" in
         cmd_unprotect "$1"
         ;;
     cleanup)
-        local tid=""
+        tid=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --tracking-id)
