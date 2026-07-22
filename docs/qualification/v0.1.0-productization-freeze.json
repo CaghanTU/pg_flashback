@@ -1,0 +1,97 @@
+{
+  "freeze_kind": "productization_short_matrix",
+  "branch": "work/v0.1.0-overnight-sanitized",
+  "product_commit": "0e656047f3301d96ea2ff580577d0bc818c6c704",
+  "product_tree": "84d4d72b1041a28c6aa9f2caee8a43fff4f99678",
+  "candidate_dir": "target/candidate/0e656047f3301d96ea2ff580577d0bc818c6c704",
+  "readiness": "READY_TO_START",
+  "exact_rc_24h_soak": "not_started",
+  "gate_c_profile": "local_delta_observer_only",
+  "claim_host": "PostgreSQL 17 on Linux/aarch64",
+  "core_binary_changed_vs_gate_c_3b392ff": true,
+  "gate_c_binary_reuse": {
+    "allowed": false,
+    "reason": "Extension SQL/Rust changed (topology guards, identity conflict, RBAC); extension_binary_sha256 differs from soaked 05d2db77…",
+    "soaked_extension_binary_sha256": "05d2db77b7430ea70c1fd93dfbbbce1e9c89c5253759ba9e84fd3154cd91485b",
+    "tip_extension_binary_sha256": "cb1f02f6bf7b3d5816b0071db153687cb23a3f70427cd9931b83bbc0763c5570",
+    "helper_binary_sha256_unchanged": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6",
+    "soaked_evidence": "docs/qualification/v0.1.0-gate-c-24h-exact-candidate-3b392ff.json"
+  },
+  "section6_short_matrix": {
+    "git_diff_check": "passed",
+    "bash_n_scripts": "passed",
+    "shellcheck_cli_and_adversarial": "passed",
+    "rust_fmt_clippy_extension": "passed",
+    "helper_fmt_clippy_tests": "passed_22",
+    "cargo_audit": "passed_0_vulns_warnings_present",
+    "cargo_deny": "passed",
+    "pgrx_pg15": "passed_81",
+    "pgrx_pg16": "passed_81",
+    "pgrx_pg17": "passed_81",
+    "pgrx_pg18": "passed_81",
+    "wal_e2e": "passed",
+    "worker_admission_isolation_e2e": "passed",
+    "local_capacity_e2e": "passed",
+    "operator_workflow_e2e": "passed",
+    "exact_candidate_drop_qualification": "passed_103_103",
+    "exact_candidate_drop_adversarial": "passed_11_11",
+    "exact_rc_harness_selftest": "passed",
+    "clean_host_candidate_smoke": "passed_12",
+    "fault_injection_smoke": "passed",
+    "exact_rc_chaos_suite": "passed_8",
+    "accelerated_15m_stability": "passed"
+  },
+  "accelerated_stability_evidence": "target/development-accelerated-stability/results/development-accelerated-stability-20260722T222930Z-1881977.json",
+  "accelerated_stability_summary": {
+    "status": "passed",
+    "observer_only": true,
+    "gate_profile": "local_delta",
+    "expected_dml": {"INSERT": 1240, "UPDATE": 620, "DELETE": 620},
+    "observed_dml": {"INSERT": 1240, "UPDATE": 620, "DELETE": 620},
+    "drop_restores_passed": 13,
+    "elapsed_active_seconds": 955
+  },
+  "artifacts": {
+    "source_archive": {
+      "name": "pg_flashback-candidate-0e656047f330-src.tar.gz",
+      "sha256": "0831341909f39805992a217d1ae6d1f0ac6623ec3c94acdf3eaf1e85b2969803"
+    },
+    "extension_archive": {
+      "name": "pg_flashback-candidate-0e656047f330-pg17-aarch64-linux.tar.gz",
+      "sha256": "216779339cafff1d7431ae97f0ee1bf1e0dce482a0c143d6e3b924f7821886c5"
+    },
+    "helper_archive": {
+      "name": "pg-flashback-recovery-candidate-0e656047f330-aarch64-linux.tar.gz",
+      "sha256": "356dc7b8820c64c1ae4b9879aa5ea477bf412230e69769a8b621447319d04015"
+    },
+    "extension_binary_sha256": "cb1f02f6bf7b3d5816b0071db153687cb23a3f70427cd9931b83bbc0763c5570",
+    "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6",
+    "cli_binary_sha256": "affcc8d138db9305e7d1abf0e899d83d2526406b1227e104ce485e1d9f08d219",
+    "package_sha256": "216779339cafff1d7431ae97f0ee1bf1e0dce482a0c143d6e3b924f7821886c5"
+  },
+  "operator_owned_start_command": "mkdir -p target/qualification && CANDIDATE_DIR=$PWD/target/candidate/0e656047f3301d96ea2ff580577d0bc818c6c704 PG_BIN=/usr/local/pgsql-17/bin PG_FLASHBACK_STABILITY_MODE=exact PG_FLASHBACK_REQUIRE_CLEAN_TREE=1 nohup ./scripts/run_exact_rc_24h_stability_soak.sh > target/qualification/exact-rc-24h-stability.nohup.out 2>&1 & echo $!",
+  "operator_monitor_commands": [
+    "tail -f target/qualification/exact-rc-24h-stability.nohup.out",
+    "latest=$(ls -1t target/exact-rc-24h-stability/runs/*/heartbeat.txt 2>/dev/null | head -1); test -n \"$latest\" && cat \"$latest\"",
+    "latest=$(ls -1t target/exact-rc-24h-stability/results/*.json 2>/dev/null | head -1); test -n \"$latest\" && jq '{status,elapsed_active_monotonic_seconds,expected_event_counts,observed_event_counts,drop_restores,worker_restarts,observer_only,gate_profile,identity}' \"$latest\""
+  ],
+  "remaining_blockers": [
+    "exact 86400s Gate C local_delta stability soak not started (operator-owned; REQUIRED before release qualification of tip binaries)",
+    "pgBackRest 2.58.x compatibility NOT_RUN on this host (host has 2.53.1)",
+    "GitHub Actions billing/spending limit may still block hosted x86_64 CI/package matrix",
+    "No merge to main, tag, or release"
+  ],
+  "explicit_non_actions": {
+    "24h_soak_started": false,
+    "merged_to_main": false,
+    "tag_or_release_created": false,
+    "pr_marked_ready": false,
+    "gate_c_3b392ff_reused_for_tip_package": false
+  },
+  "development_pass_vs_release_qualification": {
+    "development_pass": true,
+    "package_pass_clean_host": true,
+    "release_qualification": false,
+    "note": "Short matrix + accelerated soak + clean-host prove development/package fitness. Release qualification still requires a new Gate C 86400s soak on tip extension binary cb1f02f6…"
+  }
+}
