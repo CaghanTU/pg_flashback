@@ -56,7 +56,7 @@ cleanup() {
         --argjson passed "$PASSED" --argjson failed "$FAILED" \
         --argjson identity "$([[ "${EC_BOUND:-0}" == 1 ]] && exact_candidate_identity_json || echo '{}')" \
         --slurpfile cases "$CASES_JSONL" \
-        '{status:$status,passed:$passed,failed:$failed,cases:$cases[0],identity:$identity}' \
+        '{status:$status,passed:$passed,failed:$failed,cases:$cases,identity:$identity}' \
         > "$RESULT_JSON"
     log "result: $RESULT_JSON status=$STATUS passed=$PASSED failed=$FAILED"
     if [[ "$KEEP" != 1 && "$STATUS" == passed ]]; then
