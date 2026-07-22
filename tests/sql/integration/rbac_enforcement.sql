@@ -157,6 +157,9 @@ BEGIN
             ('flashback_admin', 'public.flashback_recover_execute(text,text,interval,bigint,timestamp with time zone,pg_lsn)'),
             ('flashback_admin', 'public.flashback_operation_history(text,interval)'),
             ('flashback_admin', 'public.flashback_finalize_recover_operations()'),
+            ('flashback_admin', 'public.flashback_unprotect(text)'),
+            ('flashback_admin', 'public.flashback_finalize_unprotect_operations()'),
+            ('flashback_admin', 'public.flashback_cleanup(bigint,boolean)'),
             ('flashback_admin', 'public.flashback_slot_status_snapshot()'),
             ('flashback_admin', 'public.flashback_worker_readiness()'),
             ('flashback_admin', 'public.flashback_canonical_target_databases()'),
@@ -364,7 +367,9 @@ BEGIN
             ('flashback_recover_deleted_lsn'),
             ('flashback_recover_execute'),
             ('flashback_operation_begin'),
-            ('flashback_finalize_recover_operations')
+            ('flashback_finalize_recover_operations'),
+            ('flashback_unprotect'),
+            ('flashback_cleanup')
         ) AS expected(proname)
         WHERE NOT EXISTS (
             SELECT 1

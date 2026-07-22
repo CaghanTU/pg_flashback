@@ -104,6 +104,18 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/unprotect_cleanup.sql",
+    name = "flashback_unprotect_cleanup_api",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_api_track_capture",
+        "flashback_operation_journal",
+        "flashback_worker_admission",
+        "flashback_payload_ownership_helpers"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
     name = "flashback_retention_runtime",
     requires = [

@@ -109,6 +109,9 @@ GRANT EXECUTE ON FUNCTION flashback_recover_plan(text, interval, bigint, timesta
 GRANT EXECUTE ON FUNCTION flashback_recover_execute(text, text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_operation_history(text, interval) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_finalize_recover_operations() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_unprotect(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_finalize_unprotect_operations() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_cleanup(bigint, boolean) TO flashback_admin;
 GRANT SELECT ON flashback.operations TO flashback_admin;
 GRANT SELECT ON flashback.operation_events TO flashback_admin;
 GRANT SELECT ON flashback.operation_current_state TO flashback_admin;

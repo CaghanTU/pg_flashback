@@ -1727,6 +1727,12 @@ BEGIN
           AND cg.stream_id IS NULL
           AND cg.state = 'building'
           AND cg.boundary_xid = c.source_xid
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM flashback.tracked_tables tt
+        WHERE COALESCE(tt.protection_state, 'active') = 'stopping'
+          AND tt.stop_marker_xid = c.source_xid
     );
     CREATE UNIQUE INDEX ON _fb_wal_relevant_commits(source_xid);
     CREATE UNIQUE INDEX ON _fb_wal_relevant_commits(commit_lsn);

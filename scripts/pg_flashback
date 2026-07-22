@@ -30,11 +30,13 @@ usage() {
 Usage: pg_flashback [options] <command> [args]
 
 Commands:
-  doctor
+  doctor [--reconcile]
   protect TABLE
   status [TABLE]
   recover TABLE [--latest-drop] [--yes] [--dry-run]
                 [--event-id ID] [--at TIMESTAMP] [--lsn LSN]
+  unprotect TABLE [--yes]
+  cleanup --tracking-id ID [--dry-run] [--yes]
 
 Options:
   --json       Machine-readable JSON on stdout
@@ -705,6 +707,60 @@ SQL
 }
 
 # Compatibility aliases kept for existing automation; not shown as primary help.
+cmd_unprotect() {
+    local table=$1
+    local canon out status
+    reject_controls table "$table"
+    canon="$(canonical_table_name "$table")"
+    if ! confirm_yes "$canon koruma dışı bırakılsın mı (unprotect)? [y/N]"; then
+        echo "Unprotect cancelled."
+        exit 1
+    fi
+    out="$(psql_tuples -v "table=$table" <<'SQL'
+SELECT flashback_unprotect(:'table');
+SQL
+)"
+    status=$(printf '%s' "$out" | jq -r '.status // empty')
+    if [[ "$JSON_OUT" == 1 ]]; then
+        jq -n --argjson data "$out" \
+            '{schema_version:1, command:"unprotect", status:"ok", code:($data.code // "ok"), data:$data, error:null}'
+    else
+        echo "Unprotect started for $canon (status=$status)."
+        echo "  Decoder filtering stays on until the stop marker COMMIT is consumed."
+        echo "  Then run: pg_flashback cleanup --tracking-id $(printf '%s' "$out" | jq -r '.tracking_id')"
+        if [[ "$VERBOSE" == 1 ]]; then
+            echo "  Technical: $out"
+        fi
+    fi
+}
+
+cmd_cleanup() {
+    local tid=$1
+    local out status
+    reject_controls tracking_id "$tid"
+    [[ "$tid" =~ ^[0-9]+$ ]] || die "cleanup --tracking-id requires a numeric id"
+    if [[ "$DRY_RUN" != 1 ]]; then
+        if ! confirm_yes "tracking_id=$tid payload cleanup? [y/N]"; then
+            echo "Cleanup cancelled."
+            exit 1
+        fi
+    fi
+    out="$(psql_tuples -v "tid=$tid" -v "dry=${DRY_RUN:-0}" <<'SQL'
+SELECT flashback_cleanup(:'tid'::bigint, (:'dry'::text IN ('1','true','t','yes')));
+SQL
+)"
+    status=$(printf '%s' "$out" | jq -r '.status // empty')
+    if [[ "$JSON_OUT" == 1 ]]; then
+        jq -n --argjson data "$out" \
+            '{schema_version:1, command:"cleanup", status:"ok", code:($data.code // "ok"), data:$data, error:null}'
+    else
+        echo "Cleanup $status for tracking_id=$tid"
+        if [[ "$VERBOSE" == 1 || "$DRY_RUN" == 1 ]]; then
+            echo "  Details: $out"
+        fi
+    fi
+}
+
 cmd_track() { cmd_protect "$1"; }
 cmd_restore_compat() {
     # Advanced escape hatch: restore TABLE LSN --yes
@@ -825,6 +881,32 @@ case "$cmd" in
         [[ $# -eq 1 ]] || die "recover requires TABLE"
         command -v jq >/dev/null || die "jq is required"
         cmd_recover "$1"
+        ;;
+    unprotect)
+        [[ $# -eq 1 ]] || die "unprotect requires TABLE"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_unprotect "$1"
+        ;;
+    cleanup)
+        local tid=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --tracking-id)
+                    [[ $# -ge 2 ]] || die "--tracking-id requires ID"
+                    tid=$2; shift 2 ;;
+                --dry-run) DRY_RUN=1; shift ;;
+                --yes) YES=1; shift ;;
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                *) die "unknown cleanup option: $1" ;;
+            esac
+        done
+        [[ -n "$tid" ]] || die "cleanup requires --tracking-id ID"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_cleanup "$tid"
+        ;;
+    untrack)
+        die "untrack is deprecated; use: pg_flashback unprotect TABLE && pg_flashback cleanup --tracking-id ID"
         ;;
     restore)
         # Compatibility with older pg_flashbackctl restore TABLE LSN --yes
