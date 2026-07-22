@@ -80,6 +80,30 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/operation_journal.sql",
+    name = "flashback_operation_journal",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_health_runtime",
+        "flashback_worker_admission"
+    ],
+);
+
+extension_sql_file!(
+    "../sql/functions/recover_plan.sql",
+    name = "flashback_recover_plan_api",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_operator_diagnosis",
+        "flashback_operation_journal",
+        "flashback_restore_lsn_api",
+        "flashback_drop_dependency_manifest",
+        "flashback_worker_admission",
+        flashback_sha256
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
     name = "flashback_retention_runtime",
     requires = [

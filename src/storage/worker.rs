@@ -882,6 +882,9 @@ fn run_retention_purge() {
         "RETENTION_PURGE",
         "DO $$
                          BEGIN
+                             IF to_regprocedure('flashback_finalize_recover_operations()') IS NOT NULL THEN
+                                 PERFORM flashback_finalize_recover_operations();
+                             END IF;
                              IF to_regprocedure('flashback_apply_retention()') IS NOT NULL THEN
                                  PERFORM flashback_apply_retention();
                              END IF;

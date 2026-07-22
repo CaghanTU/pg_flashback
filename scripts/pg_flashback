@@ -20,8 +20,10 @@ JSON_OUT=0
 VERBOSE=0
 YES=0
 LATEST_DROP=0
+DRY_RUN=0
 AT_TIMESTAMP=""
 AT_LSN=""
+DISASTER_EVENT_ID=""
 
 usage() {
     cat <<'EOF'
@@ -31,8 +33,8 @@ Commands:
   doctor
   protect TABLE
   status [TABLE]
-  recover TABLE [--latest-drop] [--yes]
-                [--at TIMESTAMP] [--lsn LSN]   # advanced; prefer --latest-drop
+  recover TABLE [--latest-drop] [--yes] [--dry-run]
+                [--event-id ID] [--at TIMESTAMP] [--lsn LSN]
 
 Options:
   --json       Machine-readable JSON on stdout
@@ -200,6 +202,22 @@ doctor_action_for_humans() {
 
 cmd_doctor() {
     local errors scope check status observed expected action human
+    local reconcile=${DOCTOR_RECONCILE:-0}
+    if [[ "$reconcile" == 1 ]]; then
+        # Mutating reconciler path (not part of read-only doctor checks).
+        local n
+        n=$(psql_tuples <<'SQL'
+SELECT flashback_finalize_recover_operations();
+SQL
+)
+        if [[ "$JSON_OUT" == 1 ]]; then
+            jq -n --argjson n "${n:-0}" \
+                '{schema_version:1, command:"doctor", status:"ok", code:"reconciled",
+                  data:{verified_or_finalized:$n}, error:null}'
+        else
+            echo "Reconciled recover operations: finalized=$n"
+        fi
+    fi
     if [[ "$JSON_OUT" == 1 ]]; then
         psql_tuples <<'SQL'
 SELECT COALESCE(json_agg(row_to_json(d) ORDER BY d.check_name), '[]'::json)
@@ -226,6 +244,9 @@ SQL
                     ;;
                 filesystem_*|local_capacity*|capacity*|disk*)
                     echo "  Problem scope: disk / capacity budget."
+                    ;;
+                recover_verification_pending)
+                    echo "  Problem scope: recover operation journal finalization."
                     ;;
                 coverage*|tracked*|health*|retention*)
                     echo "  Problem scope: recovery coverage."
@@ -564,28 +585,40 @@ SQL
 
 cmd_recover() {
     local table=$1
-    local canon target status reason lsn disaster_time selection candidates live_oid
+    local canon plan status reason lsn disaster_time selection token op_id health
     reject_controls table "$table"
     canon="$(canonical_table_name "$table")"
 
-    if [[ -z "$AT_LSN" && -z "$AT_TIMESTAMP" ]]; then
+    if [[ -z "$AT_LSN" && -z "$AT_TIMESTAMP" && -z "$DISASTER_EVENT_ID" ]]; then
         LATEST_DROP=1
     fi
-    # LATEST_DROP currently only selects the default disaster_points path;
-    # keep the flag for CLI symmetry with --latest-drop documentation.
     : "${LATEST_DROP:=1}"
 
-    target="$(pick_recover_target "$table")"
-    status=$(printf '%s' "$target" | jq -r '.status')
-    reason=$(printf '%s' "$target" | jq -r '.reason // empty')
-    lsn=$(printf '%s' "$target" | jq -r '.safe_target_lsn // empty')
-    disaster_time=$(printf '%s' "$target" | jq -r '.disaster_time // empty')
-    selection=$(printf '%s' "$target" | jq -r '.selection')
-    candidates=$(printf '%s' "$target" | jq -r '.candidates // 0')
+    # Server-side authority: do not assemble selection from raceable shell queries.
+    plan="$(psql_tuples -v "table=$table" -v "lookback=${LOOKBACK:-24 hours}" \
+        -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
+SELECT flashback_recover_plan(
+    :'table',
+    :'lookback'::interval,
+    NULLIF(:'event_id', '')::bigint,
+    NULLIF(:'ts', '')::timestamptz,
+    NULLIF(:'lsn', '')::pg_lsn
+);
+SQL
+)"
+    status=$(printf '%s' "$plan" | jq -r '.status // empty')
+    reason=$(printf '%s' "$plan" | jq -r '.reason // .code // empty')
+    lsn=$(printf '%s' "$plan" | jq -r '.target_lsn // empty')
+    disaster_time=$(printf '%s' "$plan" | jq -r '.disaster_time // empty')
+    selection=$(printf '%s' "$plan" | jq -r '.selection // empty')
+    token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')
 
     if [[ "$status" != "restorable" || -z "$lsn" || "$lsn" == "null" ]]; then
         if [[ "$JSON_OUT" == 1 ]]; then
-            jq -n --argjson target "$target" '{command:"recover", result:"failed", target:$target}'
+            jq -n --argjson plan "$plan" \
+                '{schema_version:1, command:"recover", status:"error",
+                  code:($plan.code // "non_restorable"), data:{plan:$plan},
+                  error:{message:($plan.reason // $plan.code // "not restorable")}}'
         else
             echo "Cannot recover $canon"
             echo "  Status: ${status:-missing}"
@@ -596,52 +629,31 @@ cmd_recover() {
         exit 1
     fi
 
-    # Identity conflict: a new live relation with the same name must not be overwritten silently.
-    live_oid=$(psql_tuples -v "table=$table" <<'SQL'
-SELECT CASE
-    WHEN to_regclass(:'table') IS NULL THEN 'absent'
-    WHEN EXISTS (
-        SELECT 1
-        FROM flashback.tracked_tables tt
-        WHERE tt.recovery_profile = 'local_delta'
-          AND format('%I.%I', tt.schema_name, tt.table_name) = (
-              SELECT format('%I.%I', n.nspname, c.relname)
-              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE c.oid = to_regclass(:'table')
-          )
-          AND tt.rel_oid IS DISTINCT FROM to_regclass(:'table')
-    ) THEN 'identity_conflict'
-    WHEN EXISTS (
-        SELECT 1
-        FROM flashback.tracked_tables tt
-        WHERE tt.recovery_profile = 'local_delta'
-          AND tt.is_active
-          AND tt.rel_oid = to_regclass(:'table')
-    ) THEN 'still_present'
-    ELSE 'present_untracked'
-END;
-SQL
-)
-    if [[ "$live_oid" == "identity_conflict" ]]; then
-        fail "refusing recover for $canon: a different relation already uses this name (identity conflict). Rename/move the new table or untrack explicitly before recover."
-    fi
-    if [[ "$selection" == "latest_drop" && "$live_oid" == "still_present" ]]; then
-        fail "refusing DROP recover for $canon: the table still exists. DROP recovery is for tables that were dropped."
+    if [[ "$JSON_OUT" == 1 && "$DRY_RUN" == 1 ]]; then
+        jq -n --argjson plan "$plan" \
+            '{schema_version:1, command:"recover", status:"ok", code:"dry_run", data:{plan:$plan}, error:null}'
+        return 0
     fi
 
     if [[ "$JSON_OUT" != 1 ]]; then
         echo "Recover plan for $canon"
         echo "  Found DROP time: ${disaster_time:-unknown}"
         echo "  Safe recovery point: just before that DROP"
-        if (( candidates > 1 )) && [[ "$selection" == "latest_drop" ]]; then
-            echo "  Note: $candidates DROP-related events were found; selecting the newest restorable DROP."
-        fi
         echo "  Coverage status: restorable"
         echo "  Operation: restore the table as it was immediately before the DROP"
+        if [[ "$DRY_RUN" == 1 ]]; then
+            echo "  Mode: dry-run (no mutation; plan_token is identity only)"
+        fi
         if [[ "$VERBOSE" == 1 ]]; then
             echo "  Technical target LSN: $lsn"
             echo "  Selection mode: $selection"
+            echo "  plan_token: $token"
         fi
+    fi
+
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "Dry-run complete; no restore executed."
+        return 0
     fi
 
     if ! confirm_yes "$canon geri getirilsin mi? [y/N]"; then
@@ -649,28 +661,45 @@ SQL
         exit 1
     fi
 
-    # Capacity preflight happens inside flashback_restore_lsn / local_restore_preflight.
-    # Call an explicit preflight when the live relation exists; for DROP absence the
-    # restore path budgets from the boundary snapshot.
-    psql_tuples -v "table=$table" -v "lsn=$lsn" <<'SQL' >/dev/null
-SELECT CASE
-    WHEN to_regclass(:'table') IS NULL THEN 0
-    ELSE flashback_local_restore_preflight(to_regclass(:'table'))
-END;
-SELECT flashback_restore_lsn(:'table', :'lsn'::pg_lsn);
+    local exec_json
+    exec_json="$(psql_tuples -v "table=$table" -v "token=$token" \
+        -v "lookback=${LOOKBACK:-24 hours}" \
+        -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
+SELECT flashback_recover_execute(
+    :'table',
+    :'token',
+    :'lookback'::interval,
+    NULLIF(:'event_id', '')::bigint,
+    NULLIF(:'ts', '')::timestamptz,
+    NULLIF(:'lsn', '')::pg_lsn
+);
 SQL
+)"
+    op_id=$(printf '%s' "$exec_json" | jq -r '.operation_id // empty')
 
-    local health
     health="$(wait_health "$table" "$RECOVER_HEALTH_TIMEOUT_S" "recover")"
+    # Worker/finalizer owns verified; CLI only observes the projection.
+    local state="" i
+    for i in $(seq 1 "$RECOVER_HEALTH_TIMEOUT_S"); do
+        state=$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT state FROM flashback.operation_current_state WHERE operation_id = :'opid'::bigint;
+SQL
+)
+        [[ "$state" == "verified" || "$state" == "failed" ]] && break
+        sleep 1
+    done
+    [[ "$state" == "verified" ]] || fail "recover applied but not verified (state=${state:-missing}); run: pg_flashback doctor --reconcile"
 
     if [[ "$JSON_OUT" == 1 ]]; then
-        jq -n --arg table "$canon" --arg health "$health" --argjson target "$target" \
-            '{command:"recover", result:"restored", table:$table, health:$health, target:$target}'
+        jq -n --arg table "$canon" --arg health "$health" --arg state "$state" \
+            --argjson plan "$plan" --argjson exec "$exec_json" \
+            '{schema_version:1, command:"recover", status:"ok", code:"verified",
+              data:{table:$table, health:$health, state:$state, plan:$plan, execute:$exec}, error:null}'
     else
         echo "Recovered: $canon"
-        echo "Coverage is healthy again."
+        echo "Coverage is healthy again (operation verified)."
         if [[ "$VERBOSE" == 1 ]]; then
-            echo "Technical: health=$health lsn=$lsn"
+            echo "Technical: health=$health state=$state operation_id=$op_id"
         fi
     fi
 }
@@ -692,6 +721,13 @@ while [[ $# -gt 0 ]]; do
         --verbose|-v) VERBOSE=1; shift ;;
         --yes) YES=1; shift ;;
         --latest-drop) LATEST_DROP=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --reconcile) DOCTOR_RECONCILE=1; shift ;;
+        --event-id)
+            [[ $# -ge 2 ]] || die "--event-id requires ID"
+            DISASTER_EVENT_ID=$2
+            shift 2
+            ;;
         --at)
             [[ $# -ge 2 ]] || die "--at requires TIMESTAMP"
             AT_TIMESTAMP=$2
@@ -723,6 +759,12 @@ case "$cmd" in
                 --verbose|-v) VERBOSE=1; shift ;;
                 --yes) YES=1; shift ;;
                 --latest-drop) LATEST_DROP=1; shift ;;
+                --dry-run) DRY_RUN=1; shift ;;
+                --event-id)
+                    [[ $# -ge 2 ]] || die "--event-id requires ID"
+                    DISASTER_EVENT_ID=$2
+                    shift 2
+                    ;;
                 --at)
                     [[ $# -ge 2 ]] || die "--at requires TIMESTAMP"
                     AT_TIMESTAMP=$2
@@ -751,7 +793,15 @@ esac
 
 case "$cmd" in
     doctor)
-        [[ $# -eq 0 ]] || die "doctor takes no arguments"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --reconcile) DOCTOR_RECONCILE=1; shift ;;
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown doctor option: $1" ;;
+                *) die "doctor takes no positional arguments" ;;
+            esac
+        done
         command -v jq >/dev/null || die "jq is required"
         cmd_doctor
         ;;

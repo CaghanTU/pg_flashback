@@ -32,6 +32,7 @@ DECLARE
     v_unhealthy bigint;
     v_gaps bigint;
     v_pending bigint;
+    v_pending_verify bigint;
     v_backup_lifecycles bigint;
 BEGIN
     v_mode := flashback_effective_capture_mode();
@@ -188,6 +189,26 @@ BEGIN
         action := 'wait for pending boundary COMMIT LSN resolution';
     ELSE
         status := 'ok'; action := 'none';
+    END IF;
+    RETURN NEXT;
+
+    -- Stale recover projections: worker/finalizer should append verified/failed.
+    -- Doctor remains read-only; operators heal via doctor --reconcile / maintenance.
+    v_pending_verify := 0;
+    IF to_regclass('flashback.operation_current_state') IS NOT NULL THEN
+        SELECT count(*) INTO v_pending_verify
+        FROM flashback.operation_current_state s
+        WHERE s.command IN ('recover', 'restore_lsn')
+          AND s.state = 'applied_coverage_pending';
+    END IF;
+    scope := 'database'; check_name := 'recover_verification_pending';
+    observed := format('applied_coverage_pending=%s', COALESCE(v_pending_verify, 0));
+    expected := '0 pending recover finalizations';
+    IF COALESCE(v_pending_verify, 0) = 0 THEN
+        status := 'ok'; action := 'none';
+    ELSE
+        status := 'warning';
+        action := 'wait for maintenance finalizer or run: pg_flashback doctor --reconcile';
     END IF;
     RETURN NEXT;
 

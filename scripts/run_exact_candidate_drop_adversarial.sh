@@ -341,8 +341,9 @@ wait_drop_restorable public.adv_fallback || die "first DROP not restorable"
 # Recreate same name as new lifecycle is not started; inject a newer synthetic DROP
 # that is non_restorable by opening a coverage gap intersecting the prefix.
 TID=$(q "SELECT tracking_id FROM flashback.tracked_tables WHERE format('%I.%I',schema_name,table_name)='public.adv_fallback' ORDER BY tracked_since DESC LIMIT 1;")
-q "INSERT INTO flashback.coverage_gaps(tracking_id, gap_start_lsn, gap_end_lsn, lower_bound_inclusive, reason)
-   SELECT $TID, pg_current_wal_lsn(), NULL, true, 'adversarial_gap';"
+GID=$(q "SELECT generation_id FROM flashback.coverage_generations WHERE tracking_id=$TID AND state IN ('active','sealed') ORDER BY generation_no DESC LIMIT 1;")
+q "INSERT INTO flashback.coverage_gaps(tracking_id, source_generation_id, gap_start_lsn, gap_end_lsn, lower_bound_inclusive, reason)
+   VALUES ($TID, $GID, pg_current_wal_lsn(), NULL, true, 'adversarial_gap');"
 # Ensure disaster_points still lists the older DROP; CLI must evaluate latest by LSN.
 # With an open gap, latest DROP becomes non_restorable; older must NOT be chosen.
 rc=0
