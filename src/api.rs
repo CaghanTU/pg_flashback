@@ -24,13 +24,23 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/drop_dependency_manifest.sql",
+    name = "flashback_drop_dependency_manifest",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_worker_admission"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/api_track_capture.sql",
     name = "flashback_api_track_capture",
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_payload_ownership_helpers",
         "flashback_local_capacity",
-        "flashback_worker_admission"
+        "flashback_worker_admission",
+        "flashback_drop_dependency_manifest"
     ],
 );
 

@@ -310,25 +310,47 @@ BEGIN
         ) THEN
             v_reason := 'frozen watermark / missing anchor on an eligible generation';
         ELSE
-            SELECT g.* INTO v_gen
-            FROM flashback.coverage_generations g
-            WHERE g.tracking_id = v_tracking_id
-              AND g.recovery_profile = 'local_delta'
-              AND g.state IN ('active', 'sealed')
-              AND (
-                  (rec.generation_id IS NOT NULL AND g.generation_id = rec.generation_id)
-                  OR (
-                      rec.generation_id IS NULL
-                      AND g.boundary_lsn < rec.commit_lsn
-                      AND (g.superseded_before_lsn IS NULL
-                           OR rec.commit_lsn <= g.superseded_before_lsn)
+            -- Fail closed when multiple generations match: never pick newest
+            -- generation_no and hope. A single matching generation is required.
+            IF (
+                SELECT count(*)::integer
+                FROM flashback.coverage_generations g
+                WHERE g.tracking_id = v_tracking_id
+                  AND g.recovery_profile = 'local_delta'
+                  AND g.state IN ('active', 'sealed')
+                  AND (
+                      (rec.generation_id IS NOT NULL AND g.generation_id = rec.generation_id)
+                      OR (
+                          rec.generation_id IS NULL
+                          AND g.boundary_lsn < rec.commit_lsn
+                          AND (g.superseded_before_lsn IS NULL
+                               OR rec.commit_lsn <= g.superseded_before_lsn)
+                      )
                   )
-              )
-            ORDER BY g.generation_no DESC
-            LIMIT 1;
+            ) > 1 THEN
+                v_reason := 'ambiguous_coverage_generation: multiple eligible generations for the disaster event';
+            ELSE
+                SELECT g.* INTO v_gen
+                FROM flashback.coverage_generations g
+                WHERE g.tracking_id = v_tracking_id
+                  AND g.recovery_profile = 'local_delta'
+                  AND g.state IN ('active', 'sealed')
+                  AND (
+                      (rec.generation_id IS NOT NULL AND g.generation_id = rec.generation_id)
+                      OR (
+                          rec.generation_id IS NULL
+                          AND g.boundary_lsn < rec.commit_lsn
+                          AND (g.superseded_before_lsn IS NULL
+                               OR rec.commit_lsn <= g.superseded_before_lsn)
+                      )
+                  )
+                ORDER BY g.generation_no DESC
+                LIMIT 1;
 
             IF v_gen.generation_id IS NULL THEN
-                v_reason := 'ambiguous or missing coverage generation for the disaster event';
+                IF v_reason IS NULL THEN
+                    v_reason := 'ambiguous or missing coverage generation for the disaster event';
+                END IF;
             ELSIF EXISTS (
                 SELECT 1
                 FROM flashback.coverage_gaps gap
@@ -396,6 +418,7 @@ BEGIN
                     END IF;
                 END IF;
             END IF;
+            END IF; -- count > 1 vs single generation
         END IF;
 
         table_name := v_qual;

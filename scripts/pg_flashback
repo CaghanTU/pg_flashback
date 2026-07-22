@@ -525,41 +525,39 @@ SQL
         return 0
     fi
 
-    # Default / --latest-drop: newest restorable DROP.
+    # Default / --latest-drop: chronologically latest DROP by COMMIT LSN only.
+    # Evaluate that single event. Never fall back to an older restorable DROP.
     psql_tuples -v "table=$table" -v "lookback=$lookback" <<'SQL'
 WITH d AS (
     SELECT *
     FROM flashback_disaster_points(:'table', :'lookback'::interval)
     WHERE event_type = 'DROP'
-    ORDER BY disaster_time DESC NULLS LAST, disaster_commit_lsn DESC NULLS LAST
 ),
-restorable AS (
-    SELECT * FROM d WHERE status = 'restorable' AND safe_target_lsn IS NOT NULL
+latest AS (
+    SELECT *
+    FROM d
+    ORDER BY disaster_commit_lsn DESC NULLS LAST, disaster_time DESC NULLS LAST
+    LIMIT 1
 )
 SELECT jsonb_build_object(
     'selection', 'latest_drop',
-    'table_name', COALESCE((SELECT table_name FROM d LIMIT 1), :'table'),
-    'safe_target_lsn', (SELECT safe_target_lsn FROM restorable LIMIT 1),
-    'disaster_time', (SELECT disaster_time FROM restorable LIMIT 1),
-    'status', COALESCE((SELECT status FROM restorable LIMIT 1),
-                       (SELECT status FROM d LIMIT 1),
-                       'missing'),
-    'reason', COALESCE((SELECT reason FROM restorable LIMIT 1),
-                       (SELECT reason FROM d LIMIT 1),
-                       'no DROP events found in lookback window'),
+    'table_name', COALESCE((SELECT table_name FROM latest), :'table'),
+    'safe_target_lsn', (SELECT safe_target_lsn FROM latest
+                        WHERE status = 'restorable' AND safe_target_lsn IS NOT NULL),
+    'disaster_time', (SELECT disaster_time FROM latest),
+    'disaster_commit_lsn', (SELECT disaster_commit_lsn FROM latest),
+    'generation_id', (SELECT generation_id FROM latest),
+    'status', COALESCE((SELECT status FROM latest), 'missing'),
+    'reason', COALESCE(
+        (SELECT reason FROM latest),
+        'no DROP events found in lookback window'
+    ),
     'candidates', (SELECT count(*) FROM d),
-    'restorable_candidates', (SELECT count(*) FROM restorable),
-    'latest_non_restorable', (
-        SELECT jsonb_build_object(
-            'status', status,
-            'reason', reason,
-            'disaster_time', disaster_time
-        )
-        FROM d
-        WHERE status <> 'restorable' OR safe_target_lsn IS NULL
-        ORDER BY disaster_time DESC NULLS LAST
-        LIMIT 1
-    )
+    'restorable_candidates', (
+        SELECT count(*) FROM d
+        WHERE status = 'restorable' AND safe_target_lsn IS NOT NULL
+    ),
+    'silent_fallback_forbidden', true
 );
 SQL
 }

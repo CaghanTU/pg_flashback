@@ -202,7 +202,6 @@ BEGIN
             ('flashback_recovery_agent', 'public.flashback_wal_frontier_attestation_payload(text,bigint,bigint,text,text,text,bigint,pg_lsn,text)'),
             ('flashback_recovery_agent', 'public.flashback_consume_verified_backup_proof(bigint)'),
             ('flashback_recovery_agent', 'public.flashback_consume_verified_wal_frontier_proof(bigint)'),
-            ('pg_monitor', 'public.flashback_history(text,interval)'),
             ('pg_monitor', 'public.flashback_retention_status()'),
             ('pg_monitor', 'public.flashback_is_restore_in_progress(oid)'),
             ('pg_monitor', 'public.flashback_health()'),
@@ -332,9 +331,13 @@ BEGIN
         RAISE EXCEPTION 'flashback_recovery_agent can execute production restore';
     END IF;
 
-    IF NOT has_function_privilege(
+    -- pg_monitor must NOT execute payload-bearing flashback_history().
+    IF has_function_privilege(
         'pg_monitor', 'public.flashback_history(text,interval)', 'EXECUTE'
-    ) OR has_function_privilege(
+    ) THEN
+        RAISE EXCEPTION 'pg_monitor must not execute flashback_history (row payloads)';
+    END IF;
+    IF has_function_privilege(
         'pg_monitor',
         'public.flashback_restore(text,timestamp with time zone)',
         'EXECUTE'

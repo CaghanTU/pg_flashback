@@ -691,6 +691,7 @@ DECLARE
     v_schema_def jsonb;
     v_row_count bigint;
 BEGIN
+    PERFORM flashback_require_primary('flashback_track');
     v_requested_mode := COALESCE(current_setting('pg_flashback.capture_mode', true), 'auto');
 
     -- The release-qualified local profile is WAL-only. Explicit trigger mode
@@ -2280,6 +2281,7 @@ DECLARE
     v_has_generations boolean := false;
     snap_rec record;
 BEGIN
+    PERFORM flashback_require_primary('flashback_untrack');
     SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.recovery_profile
       INTO v_rel_oid, v_tracking_id, v_schema_name, v_table_name, v_base_snapshot, v_recovery_profile
     FROM flashback.tracked_tables tt

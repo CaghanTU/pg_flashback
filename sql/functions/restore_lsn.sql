@@ -450,6 +450,7 @@ DECLARE
     v_identity_start bigint;
     v_identity_increment bigint;
 BEGIN
+    PERFORM flashback_require_primary('flashback_restore_lsn');
     PERFORM flashback_set_restore_in_progress(true);
 
     -- Stream serialization is the outermost lock in every WAL lifecycle
@@ -467,6 +468,9 @@ BEGIN
                                   hashint8(admission.tracking_id));
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
+
+    -- Conservative CASCADE: use pre-DROP ProcessUtility manifest, not live catalog.
+    PERFORM flashback_require_supported_drop_manifest(admission.tracking_id);
 
     v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
     IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
@@ -543,10 +547,23 @@ BEGIN
     v_old_rel_oid := admission.rel_oid;
     v_shadow_name := format('__fb_lsn_shadow_%s', admission.tracking_id);
 
+    -- Deterministic test barrier (SUSET GUC; empty/off in release defaults).
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'before_materialize' THEN
+        RAISE EXCEPTION 'pg_flashback: test_restore_failpoint=before_materialize'
+            USING ERRCODE = 'query_canceled';
+    END IF;
+
     SELECT * INTO STRICT materialized
     FROM flashback_materialize_lsn(
         p_target_table, p_target_lsn, 'flashback', v_shadow_name, true
     );
+
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_materialize_before_swap' THEN
+        RAISE EXCEPTION 'pg_flashback: test_restore_failpoint=after_materialize_before_swap'
+            USING ERRCODE = 'query_canceled';
+    END IF;
 
     v_new_rel_oid := flashback_finalize_shadow_swap(
         materialized.source_schema_name,
@@ -556,6 +573,12 @@ BEGIN
     );
     IF v_new_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_restore_lsn: shadow swap failed for %', p_target_table;
+    END IF;
+
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_before_commit' THEN
+        RAISE EXCEPTION 'pg_flashback: test_restore_failpoint=after_swap_before_commit'
+            USING ERRCODE = 'query_canceled';
     END IF;
 
     IF v_new_rel_oid <> v_old_rel_oid THEN

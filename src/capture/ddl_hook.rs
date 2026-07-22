@@ -142,6 +142,17 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         // Do NOT use catch_unwind around SPI calls — it leaks the SPI
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
+            // Pre-DROP dependency manifests must be written while target OIDs
+            // still exist, before standard_ProcessUtility, in this same TX.
+            if event_type == "DROP" {
+                let cascade = unsafe { drop_stmt_requests_cascade(pstmt) };
+                if let Err(err) = capture_drop_dependency_manifests(&targets, cascade) {
+                    error!(
+                        "pg_flashback: DROP dependency manifest capture failed: {}",
+                        err
+                    );
+                }
+            }
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
                 // Do not let a table DDL commit after its protected capture
                 // path failed.  Logging and continuing would create exactly
@@ -389,6 +400,42 @@ unsafe fn parse_post_utility_targets(
         }
         _ => None,
     }
+}
+
+unsafe fn drop_stmt_requests_cascade(pstmt: *mut pg_sys::PlannedStmt) -> bool {
+    let utility_stmt = (*pstmt).utilityStmt;
+    if utility_stmt.is_null() {
+        return false;
+    }
+    if (*utility_stmt).type_ != pg_sys::NodeTag::T_DropStmt {
+        return false;
+    }
+    let stmt = utility_stmt as *mut pg_sys::DropStmt;
+    (*stmt).behavior == pg_sys::DropBehavior::DROP_CASCADE
+}
+
+fn capture_drop_dependency_manifests(
+    targets: &[UtilityTarget],
+    cascade_requested: bool,
+) -> Result<(), SpiError> {
+    let extension_owner = Spi::get_one::<pg_sys::Oid>(
+        "SELECT extowner FROM pg_extension WHERE extname = 'pg_flashback'",
+    )?
+    .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
+    let _security_context = SecurityContextGuard::switch_to(extension_owner);
+
+    for target in targets {
+        let schema = target.schema.as_deref().unwrap_or("");
+        Spi::run_with_args(
+            "SELECT public.flashback_capture_drop_dependency_manifest(NULLIF($1, ''), $2, $3)",
+            &[
+                schema.into(),
+                target.table.as_str().into(),
+                cascade_requested.into(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn capture_ddl_for_targets(event_type: &str, targets: &[UtilityTarget]) -> Result<(), SpiError> {

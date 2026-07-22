@@ -473,6 +473,7 @@ DECLARE
     v_schema_def jsonb;
     v_row_count bigint;
 BEGIN
+    PERFORM flashback_require_primary('flashback_reanchor');
     IF flashback_effective_capture_mode() IS DISTINCT FROM 'wal' THEN
         RAISE EXCEPTION 'pg_flashback: local re-anchor requires WAL capture';
     END IF;

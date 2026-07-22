@@ -217,3 +217,28 @@ COMMENT ON FUNCTION flashback_worker_readiness() IS
     'Read-only admission projection for the current database: list membership, max_workers truncation, live capture/maintenance process identity, and bgworker capacity.';
 COMMENT ON FUNCTION flashback_require_admitted_capture_worker(text) IS
     'Fail-closed gate used by flashback_track/flashback_track_backup before creating a lifecycle without a running admitted capture worker.';
+
+-- =================================================================
+-- Primary-only mutating API guard (HA / physical standby fail-closed)
+-- =================================================================
+
+CREATE OR REPLACE FUNCTION flashback_require_primary(p_api text DEFAULT 'flashback API')
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION
+            'pg_flashback: % refused because this session is connected to a standby (pg_is_in_recovery)',
+            p_api
+            USING ERRCODE = 'read_only_sql_transaction',
+                  HINT = 'Run protect/recover/unprotect/cleanup/re-anchor on the primary. pg_flashback does not solve split-brain; fence the old primary externally before promoting.';
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION flashback_require_primary(text) IS
+    'Fail-closed guard for mutating local APIs on physical standbys. External fencing is operator-owned.';

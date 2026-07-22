@@ -327,4 +327,57 @@ grep -Eiq 'no DROP|Cannot recover|missing' /tmp/pgfb-adv-nodrop.out \
     || fail_case "zero_drop_events" "unclear zero-DROP error"
 pass "zero_drop_events"
 
+# Latest DROP by COMMIT LSN only: newer non-restorable must not fall back to older restorable.
+q "CREATE TABLE public.adv_fallback(id int PRIMARY KEY, v text);"
+q "SELECT flashback_track('public.adv_fallback');" >/dev/null
+wait_healthy public.adv_fallback || die "adv_fallback not healthy"
+q "INSERT INTO public.adv_fallback VALUES (1,'old');"
+for _ in $(seq 1 200); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='public.adv_fallback'::regclass AND event_type='INSERT' AND commit_lsn IS NOT NULL;")" -ge 1 ]] && break
+    sleep 0.05
+done
+q "DROP TABLE public.adv_fallback;"
+wait_drop_restorable public.adv_fallback || die "first DROP not restorable"
+# Recreate same name as new lifecycle is not started; inject a newer synthetic DROP
+# that is non_restorable by opening a coverage gap intersecting the prefix.
+TID=$(q "SELECT tracking_id FROM flashback.tracked_tables WHERE format('%I.%I',schema_name,table_name)='public.adv_fallback' ORDER BY tracked_since DESC LIMIT 1;")
+q "INSERT INTO flashback.coverage_gaps(tracking_id, gap_start_lsn, gap_end_lsn, lower_bound_inclusive, reason)
+   SELECT $TID, pg_current_wal_lsn(), NULL, true, 'adversarial_gap';"
+# Ensure disaster_points still lists the older DROP; CLI must evaluate latest by LSN.
+# With an open gap, latest DROP becomes non_restorable; older must NOT be chosen.
+rc=0
+"$CLI" recover public.adv_fallback --latest-drop --yes >/tmp/pgfb-adv-fallback.out 2>&1 || rc=$?
+[[ "$rc" != 0 ]] || fail_case "latest_drop_no_silent_fallback" "CLI fell back to older restorable DROP"
+grep -Eiq 'Cannot recover|non_restorable|ambiguous|gap|Action' /tmp/pgfb-adv-fallback.out \
+    || fail_case "latest_drop_no_silent_fallback" "unclear refusal"
+pass "latest_drop_no_silent_fallback"
+
+# Failpoint cancel before materialize + retry (deterministic; not timing-only).
+q "CREATE TABLE public.adv_fp(id int PRIMARY KEY, v text);"
+q "SELECT flashback_track('public.adv_fp');" >/dev/null
+wait_healthy public.adv_fp || die "adv_fp not healthy"
+q "INSERT INTO public.adv_fp VALUES (1,'x');"
+for _ in $(seq 1 200); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE rel_oid='public.adv_fp'::regclass AND commit_lsn IS NOT NULL;")" -ge 1 ]] && break
+    sleep 0.05
+done
+FP_FP=$(fingerprint public.adv_fp)
+q "DROP TABLE public.adv_fp;"
+wait_drop_restorable public.adv_fp || die "adv_fp DROP not restorable"
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc \
+    "ALTER SYSTEM SET pg_flashback.test_restore_failpoint = 'before_materialize';" >/dev/null
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc "SELECT pg_reload_conf();" >/dev/null
+rc=0
+"$CLI" recover public.adv_fp --latest-drop --yes >/tmp/pgfb-adv-fp1.out 2>&1 || rc=$?
+[[ "$rc" != 0 ]] || fail_case "failpoint_before_materialize" "failpoint did not cancel restore"
+[[ "$(q "SELECT to_regclass('public.adv_fp') IS NULL;")" == t ]] \
+    || fail_case "failpoint_before_materialize" "table mutated despite cancel"
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc \
+    "ALTER SYSTEM RESET pg_flashback.test_restore_failpoint;" >/dev/null
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc "SELECT pg_reload_conf();" >/dev/null
+"$CLI" recover public.adv_fp --latest-drop --yes >/tmp/pgfb-adv-fp2.out
+[[ "$(fingerprint public.adv_fp)" == "$FP_FP" ]] \
+    || fail_case "failpoint_before_materialize" "retry fingerprint mismatch"
+pass "failpoint_before_materialize"
+
 [[ "$FAILED" == 0 ]]

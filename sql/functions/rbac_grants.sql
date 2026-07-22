@@ -196,7 +196,8 @@ GRANT SELECT ON flashback.coverage_generations TO pg_monitor;
 GRANT SELECT ON flashback.coverage_gaps TO pg_monitor;
 GRANT SELECT ON flashback.generation_payload_retirements TO pg_monitor;
 GRANT SELECT ON flashback.backup_restore_requests TO pg_monitor;
-GRANT EXECUTE ON FUNCTION flashback_history(text, interval)        TO pg_monitor;
+-- Intentionally NOT granted: flashback_history() returns old_data/new_data
+-- row payloads. Monitoring roles may see health/metadata only.
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)    TO pg_monitor;
 GRANT EXECUTE ON FUNCTION flashback_health()                       TO pg_monitor;

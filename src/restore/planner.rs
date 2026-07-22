@@ -20,6 +20,8 @@ extension_sql_file!(
         "flashback_restore_replay_helpers",
         "flashback_coverage_runtime",
         "flashback_restore_planner_api",
-        "flashback_local_capacity"
+        "flashback_local_capacity",
+        "flashback_worker_admission",
+        "flashback_drop_dependency_manifest"
     ],
 );
