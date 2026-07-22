@@ -262,17 +262,21 @@ FP_CONC=$(fingerprint public.adv_conc)
 q "DROP TABLE public.adv_conc;"
 wait_drop_restorable public.adv_conc || die "adv_conc DROP not restorable"
 (
+  set +e
   "$CLI" recover public.adv_conc --latest-drop --yes >/tmp/pgfb-adv-conc1.out 2>&1
   echo $? >"$RUN_ROOT/conc1.rc"
 ) &
 PID1=$!
 (
+  set +e
   "$CLI" recover public.adv_conc --latest-drop --yes >/tmp/pgfb-adv-conc2.out 2>&1
   echo $? >"$RUN_ROOT/conc2.rc"
 ) &
 PID2=$!
 wait "$PID1" || true
 wait "$PID2" || true
+[[ -f "$RUN_ROOT/conc1.rc" && -f "$RUN_ROOT/conc2.rc" ]] \
+    || fail_case "concurrent_recover" "concurrent recover workers did not record exit codes"
 RC1=$(cat "$RUN_ROOT/conc1.rc")
 RC2=$(cat "$RUN_ROOT/conc2.rc")
 # Exactly one success is ideal; both success only if second is idempotent healthy no-op.
