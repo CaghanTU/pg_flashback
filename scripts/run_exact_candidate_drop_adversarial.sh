@@ -304,11 +304,15 @@ q "SELECT flashback_track('public.adv_cap');" >/dev/null
 wait_healthy public.adv_cap || die "adv_cap not healthy"
 q "DROP TABLE public.adv_cap;"
 wait_drop_restorable public.adv_cap || die "adv_cap DROP not restorable"
-q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '1kB';
-    SELECT pg_reload_conf();" >/dev/null
+# ALTER SYSTEM must not share a multi-statement implicit transaction.
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc \
+    "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '1kB';" >/dev/null
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc "SELECT pg_reload_conf();" >/dev/null
 rc=0
 "$CLI" recover public.adv_cap --latest-drop --yes >/tmp/pgfb-adv-cap.out 2>&1 || rc=$?
-q "ALTER SYSTEM RESET pg_flashback.local_max_restore_peak_bytes; SELECT pg_reload_conf();" >/dev/null
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc \
+    "ALTER SYSTEM RESET pg_flashback.local_max_restore_peak_bytes;" >/dev/null
+"$EC_PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAtc "SELECT pg_reload_conf();" >/dev/null
 [[ "$rc" != 0 ]] || fail_case "capacity_reject_recover" "recover ignored tiny restore budget"
 pass "capacity_reject_recover"
 
