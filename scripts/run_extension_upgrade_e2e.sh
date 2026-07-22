@@ -22,7 +22,8 @@ log() { printf '[upgrade-e2e] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { log "FAIL: $*"; exit 1; }
 
 DATA="$WORK/data"
-SOCKET="$WORK/socket"
+# Unix socket paths are capped (~107 bytes); keep under /tmp.
+SOCKET="/tmp/pgfb-upgrade-$RUN_ID"
 mkdir -p "$SOCKET"
 cleanup() { "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true; }
 trap cleanup EXIT
@@ -42,7 +43,7 @@ unix_socket_directories = '$SOCKET'
 port = 28981
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
-pg_flashback.worker_interval_ms = 25
+pg_flashback.worker_interval_ms = 50
 pg_flashback.target_database = postgres
 pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB

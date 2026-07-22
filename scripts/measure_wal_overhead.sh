@@ -26,7 +26,7 @@ exact_candidate_install_into_prefix || die "install failed"
 trap 'exact_candidate_restore_prefix || true; cleanup || true' EXIT
 
 DATA="$WORK_ROOT/data"
-SOCKET="$WORK_ROOT/socket"
+SOCKET="/tmp/pgfb-walov-$RUN_ID"
 mkdir -p "$SOCKET"
 cleanup() {
     "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
@@ -42,7 +42,7 @@ unix_socket_directories = '$SOCKET'
 port = 28957
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
-pg_flashback.worker_interval_ms = 25
+pg_flashback.worker_interval_ms = 50
 pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB

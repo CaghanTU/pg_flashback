@@ -41,7 +41,7 @@ exact_candidate_install_into_prefix || die "install candidate failed"
 trap 'exact_candidate_restore_prefix || true; cleanup || true' EXIT
 
 DATA="$WORK/data"
-SOCKET="$WORK/socket"
+SOCKET="/tmp/pgfb-bench-$RUN_ID"
 mkdir -p "$SOCKET"
 cleanup() {
     "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
@@ -57,7 +57,7 @@ unix_socket_directories = '$SOCKET'
 port = 28971
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
-pg_flashback.worker_interval_ms = 25
+pg_flashback.worker_interval_ms = 50
 pg_flashback.target_database = postgres
 pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
