@@ -29,10 +29,10 @@ This matrix is updated as Phase 1–5 cases land. Prefer code+tests over comment
 
 | Case | Class | Notes |
 |---|---|---|
-| Latest DROP by COMMIT LSN, restorable | pending-qualification → supported-preserved | Phase 1 selection fix |
+| Latest DROP by COMMIT LSN, restorable | supported-preserved | Phase 1 + matrix harness |
 | Latest DROP non-restorable/ambiguous | fail-closed-rejected | No older-DROP silent fallback |
-| Older DROP via explicit event-id | pending-qualification | |
-| Timestamp UX → proven LSN prefix | pending-qualification | Inversion test required |
+| Older DROP via explicit event-id | supported-with-limit | `flashback_recover_plan` event-id path |
+| Timestamp UX → proven LSN prefix | pending-qualification | LSN wins over wall-clock; inversion case accrues |
 | Advanced operator LSN | supported-with-limit | Escape hatch; not primary UX |
 | Same-name live OID ≠ tracked OID | fail-closed-rejected | Identity conflict |
 
@@ -66,8 +66,8 @@ same DROP transaction, while OIDs exist. Not WAL-decoder post-DROP catalog.
 |---|---|---|
 | `protect` / `flashback_track` | supported-preserved | |
 | Destructive `flashback_untrack` | supported-with-limit | Deprecated vs unprotect/cleanup |
-| Two-phase `unprotect` | pending-qualification | Phase 4 |
-| `cleanup` by tracking_id | pending-qualification | Phase 4 |
+| Two-phase `unprotect` | supported-with-limit | Stopping marker → COMMIT consume → seal |
+| `cleanup` by tracking_id | supported-with-limit | Dry-run + durable retirement; journal retained |
 | Re-protect after unprotect | supported-with-limit | New lifecycle only |
 
 ## Security / RBAC
@@ -84,7 +84,7 @@ same DROP transaction, while OIDs exist. Not WAL-decoder post-DROP catalog.
 | Case | Class | Notes |
 |---|---|---|
 | Fresh install 0.1.0 bootstrap | supported-preserved | |
-| Versioned extension upgrade | pending-qualification | ADR in Phase 7 |
+| Versioned extension upgrade | supported-with-limit | ADR 0001: `0.1.0`→`0.2.0` only; no downgrade |
 | Downgrade | intentionally-unsupported until proven | Refuse/document |
 | PG major `pg_upgrade` | intentionally-unsupported | Separate decision |
 | Candidate MANIFEST/SHA256SUMS | supported-preserved | |
