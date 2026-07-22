@@ -220,8 +220,8 @@ q "DROP TABLE sales.orders;"
 pass "same_name_identity_conflict"
 
 # Slot loss => non-restorable / fail-closed recover
-q "CREATE TABLE public.adv_slot(id int PRIMARY KEY, v text);
-    SELECT flashback_track('public.adv_slot');" >/dev/null
+q "CREATE TABLE public.adv_slot(id int PRIMARY KEY, v text);"
+q "SELECT flashback_track('public.adv_slot');" >/dev/null
 wait_healthy public.adv_slot || die "adv_slot not healthy"
 q "INSERT INTO public.adv_slot VALUES (1,'x');"
 for _ in $(seq 1 200); do
@@ -250,8 +250,8 @@ else
 fi
 
 # Concurrent recover calls fail-closed / serialize safely
-q "CREATE TABLE public.adv_conc(id int PRIMARY KEY, v text);
-    SELECT flashback_track('public.adv_conc');" >/dev/null
+q "CREATE TABLE public.adv_conc(id int PRIMARY KEY, v text);"
+q "SELECT flashback_track('public.adv_conc');" >/dev/null
 wait_healthy public.adv_conc || die "adv_conc not healthy"
 q "INSERT INTO public.adv_conc VALUES (1,'a'),(2,'b');"
 for _ in $(seq 1 200); do
@@ -294,9 +294,9 @@ grep -Eiq 'Already protected|Protected:' /tmp/pgfb-adv-prot2.out \
 pass "protect_idempotent"
 
 # Capacity rejection on recover preflight
-q "CREATE TABLE public.adv_cap(id bigint PRIMARY KEY, payload text NOT NULL);
-    INSERT INTO public.adv_cap SELECT g, repeat('x', 200) FROM generate_series(1,2000) g;
-    SELECT flashback_track('public.adv_cap');" >/dev/null
+q "CREATE TABLE public.adv_cap(id bigint PRIMARY KEY, payload text NOT NULL);"
+q "INSERT INTO public.adv_cap SELECT g, repeat('x', 200) FROM generate_series(1,2000) g;"
+q "SELECT flashback_track('public.adv_cap');" >/dev/null
 wait_healthy public.adv_cap || die "adv_cap not healthy"
 q "DROP TABLE public.adv_cap;"
 wait_drop_restorable public.adv_cap || die "adv_cap DROP not restorable"
@@ -309,8 +309,8 @@ q "ALTER SYSTEM RESET pg_flashback.local_max_restore_peak_bytes; SELECT pg_reloa
 pass "capacity_reject_recover"
 
 # Zero DROP events
-q "CREATE TABLE public.adv_nodrop(id int PRIMARY KEY);
-    SELECT flashback_track('public.adv_nodrop');" >/dev/null
+q "CREATE TABLE public.adv_nodrop(id int PRIMARY KEY);"
+q "SELECT flashback_track('public.adv_nodrop');" >/dev/null
 wait_healthy public.adv_nodrop || die "adv_nodrop not healthy"
 rc=0
 "$CLI" recover public.adv_nodrop --latest-drop --yes >/tmp/pgfb-adv-nodrop.out 2>&1 || rc=$?
