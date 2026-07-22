@@ -29,7 +29,7 @@ remain historical only and must not qualify new binaries.
 | 7 | Upgrade ADR | COMPLETE | ADR 0001 → `0.2.0` from `0.1.0` |
 | 8 | Package / SBOM | COMPLETE | SBOM + SOURCE_DATE_EPOCH in candidate build |
 | 9 | Exact benchmarks | COMPLETE | WAL-only scripts require CANDIDATE_DIR |
-| 10 | Qualify freeze | PENDING | READY_TO_START; no 24h start |
+| 10 | Qualify freeze | COMPLETE | READY_TO_START; no 24h start; staging HAYIR |
 
 ## Exit criteria (summary)
 

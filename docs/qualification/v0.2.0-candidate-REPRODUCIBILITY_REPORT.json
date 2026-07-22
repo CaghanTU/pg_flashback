@@ -1,0 +1,16 @@
+{
+  "kind": "reproducibility_report",
+  "build": 1,
+  "source_commit": "86ab5a8c7a1cc9db4584eadfa8a67bddf1a9b93b",
+  "SOURCE_DATE_EPOCH": "1784763685",
+  "toolchain": {
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+  },
+  "digests": {
+    "package_sha256": "950ca9f0ad2f1c9b35fa0bec6e985d92dc8ad7f9a9f6e13ad732ed9329e49c76",
+    "extension_binary_sha256": "aaaa1ef4f728e40a3b13a7a688c3c434ddff11dc0e7eeaa7d8b0e46300933637",
+    "cli_binary_sha256": "352c006c5a2a241bba70d19bf603f3e46b802c055fdfb1d640e81570e09f3adb",
+    "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
+  },
+  "note": "Run a second build with the same SOURCE_DATE_EPOCH and compare digests; mismatch => refuse candidate claim."
+}

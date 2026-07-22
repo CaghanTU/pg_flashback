@@ -1,0 +1,29 @@
+{
+  "provenance": {
+    "source_commit": "86ab5a8c7a1cc9db4584eadfa8a67bddf1a9b93b",
+    "source_tree": "5f48fafac51d3284f1cf58ec0cd31e9216e4651f",
+    "pg_major": "17",
+    "arch": "aarch64",
+    "postgresql_version": "PostgreSQL 17.3",
+    "built_at": "2026-07-22T23:41:28Z",
+    "tree_clean": true
+  },
+  "artifacts": {
+    "source_archive": {
+      "name": "pg_flashback-candidate-86ab5a8c7a1c-src.tar.gz",
+      "sha256": "b90004f4ae8b7fbb6aee66f3fac204e21667f42bb709f996a8e292e3e808d738"
+    },
+    "extension_archive": {
+      "name": "pg_flashback-candidate-86ab5a8c7a1c-pg17-aarch64-linux.tar.gz",
+      "sha256": "950ca9f0ad2f1c9b35fa0bec6e985d92dc8ad7f9a9f6e13ad732ed9329e49c76"
+    },
+    "helper_archive": {
+      "name": "pg-flashback-recovery-candidate-86ab5a8c7a1c-aarch64-linux.tar.gz",
+      "sha256": "38b591b6afa61fbb50a3faba4e6e2d0e9516a06ba3df71598900a4af854d22e8"
+    },
+    "extension_binary_sha256": "aaaa1ef4f728e40a3b13a7a688c3c434ddff11dc0e7eeaa7d8b0e46300933637",
+    "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6",
+    "cli_binary_sha256": "352c006c5a2a241bba70d19bf603f3e46b802c055fdfb1d640e81570e09f3adb",
+    "package_sha256": "950ca9f0ad2f1c9b35fa0bec6e985d92dc8ad7f9a9f6e13ad732ed9329e49c76"
+  }
+}

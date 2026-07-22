@@ -1,0 +1,94 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:16e2f9e1-7494-4407-8228-9071c7db635f",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-07-22T23:41:28Z",
+    "component": {
+      "type": "application",
+      "name": "pg_flashback",
+      "version": "0.2.0",
+      "bom-ref": "pkg:generic/pg_flashback@0.2.0"
+    },
+    "tools": [
+      {
+        "name": "rustc",
+        "version": "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+      },
+      {
+        "name": "cargo",
+        "version": "cargo 1.92.0 (344c4567c 2025-10-21)"
+      }
+    ],
+    "properties": [
+      {
+        "name": "source_commit",
+        "value": "86ab5a8c7a1cc9db4584eadfa8a67bddf1a9b93b"
+      },
+      {
+        "name": "source_tree",
+        "value": "5f48fafac51d3284f1cf58ec0cd31e9216e4651f"
+      },
+      {
+        "name": "SOURCE_DATE_EPOCH",
+        "value": "1784763685"
+      },
+      {
+        "name": "postgresql_version",
+        "value": "PostgreSQL 17.3"
+      },
+      {
+        "name": "extension_binary_sha256",
+        "value": "aaaa1ef4f728e40a3b13a7a688c3c434ddff11dc0e7eeaa7d8b0e46300933637"
+      },
+      {
+        "name": "cli_binary_sha256",
+        "value": "352c006c5a2a241bba70d19bf603f3e46b802c055fdfb1d640e81570e09f3adb"
+      },
+      {
+        "name": "helper_binary_sha256",
+        "value": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
+      },
+      {
+        "name": "package_sha256",
+        "value": "950ca9f0ad2f1c9b35fa0bec6e985d92dc8ad7f9a9f6e13ad732ed9329e49c76"
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "pg_flashback.so",
+      "version": "0.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "aaaa1ef4f728e40a3b13a7a688c3c434ddff11dc0e7eeaa7d8b0e46300933637"
+        }
+      ]
+    },
+    {
+      "type": "application",
+      "name": "pg_flashback",
+      "version": "0.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "352c006c5a2a241bba70d19bf603f3e46b802c055fdfb1d640e81570e09f3adb"
+        }
+      ]
+    },
+    {
+      "type": "application",
+      "name": "pg-flashback-recovery",
+      "version": "0.2.0",
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
+        }
+      ]
+    }
+  ]
+}
