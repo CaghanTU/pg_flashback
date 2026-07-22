@@ -75,6 +75,7 @@ exact_candidate_install_into_prefix || die "candidate install failed"
 PREFIX_INSTALLED=1
 exact_candidate_verify_installed || die "installed identity mismatch"
 
+EC_PG_BIN="${PG_BIN:?PG_BIN unset after candidate bind}"
 CLI="$EC_EXT_ROOT/bin/pg_flashback"
 [[ -x "$CLI" ]] || die "packaged CLI missing: $CLI"
 export PATH="$EC_PG_BIN:$PATH"
