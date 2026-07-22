@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Real-session E2E for the supported local operator workflow:
-# doctor → advise → track → healthy → DROP → disaster discovery → restore → healthy
+# Real-session E2E for the supported local operator CLI workflow:
+# doctor → protect → healthy → DROP → recover → healthy
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,7 +11,7 @@ qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
-CTL="$ROOT/scripts/pg_flashbackctl"
+CTL="$ROOT/scripts/pg_flashback"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 PORT="${PG_FLASHBACK_OPERATOR_PORT:-28947}"
 WORK_ROOT="${PG_FLASHBACK_OPERATOR_WORK_ROOT:-$ROOT/target/operator-workflow-e2e/$RUN_ID}"
@@ -21,6 +21,8 @@ RESULT_DIR="${PG_FLASHBACK_OPERATOR_RESULT_DIR:-$ROOT/target/qualification}"
 RESULT_JSON="$RESULT_DIR/operator-workflow-$RUN_ID.json"
 DB=postgres
 export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE="$DB"
+export PSQL_BIN="$PSQL"
+export PATH="$PG_BIN:$PATH"
 
 cleanup() {
     local rc=$?
@@ -58,7 +60,6 @@ EOF
 q() { "$PSQL" -X -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAtc "$1"; }
 
 q "CREATE EXTENSION pg_flashback;"
-# Wait for workers
 for _ in $(seq 1 100); do
     state=$(q "SELECT admission_state FROM flashback_worker_readiness();")
     [[ "$state" == "ready" ]] && break
@@ -66,7 +67,6 @@ for _ in $(seq 1 100); do
 done
 [[ "$state" == "ready" ]] || { echo "FAIL: workers not ready ($state)" >&2; exit 1; }
 
-"$CTL" doctor >/dev/null
 doctor_rc=0
 "$CTL" doctor >/tmp/pgfb-doctor.out 2>&1 || doctor_rc=$?
 [[ "$doctor_rc" == "0" ]] || { echo "FAIL: doctor exit $doctor_rc"; cat /tmp/pgfb-doctor.out; exit 1; }
@@ -78,12 +78,13 @@ q "INSERT INTO public.op_flow VALUES (1,'a'),(2,'b');"
 q "INSERT INTO public.medium_op SELECT g, repeat(md5(g::text), 8)
    FROM generate_series(1,5000) g;"
 
-"$CTL" advise public.op_flow | tee "$WORK_ROOT/advise.txt" >/dev/null
-grep -Eq 'local profile|backup profile|configure local' "$WORK_ROOT/advise.txt"
+"$CTL" protect public.op_flow
+"$CTL" protect 'public."Weird Name"'
+"$CTL" protect public.medium_op
 
-"$CTL" track public.op_flow
-"$CTL" track 'public."Weird Name"'
-"$CTL" track public.medium_op
+# Idempotent protect
+"$CTL" protect public.op_flow | tee "$WORK_ROOT/protect-idempotent.txt" >/dev/null
+grep -Eiq 'Already protected' "$WORK_ROOT/protect-idempotent.txt"
 
 health=$(q "SELECT string_agg(health, ',' ORDER BY table_name)
             FROM flashback_health()
@@ -96,7 +97,6 @@ health=$(q "SELECT string_agg(health, ',' ORDER BY table_name)
 q "INSERT INTO public.op_flow VALUES (3,'c');
    UPDATE public.op_flow SET payload='b2' WHERE id=2;
    DELETE FROM public.op_flow WHERE id=1;"
-# Wait for coverage
 for _ in $(seq 1 200); do
     n=$(q "SELECT count(*) FROM flashback.delta_log
            WHERE rel_oid='public.op_flow'::regclass;")
@@ -108,51 +108,40 @@ fp=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM pub
 owner=$(q "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.op_flow'::regclass;")
 acl=$(q "SELECT COALESCE(array_to_string(relacl,','),'') FROM pg_class WHERE oid='public.op_flow'::regclass;")
 
-# Same-transaction DML+DROP
 q "BEGIN;
    INSERT INTO public.op_flow VALUES (99,'gone');
    DROP TABLE public.op_flow;
    COMMIT;"
 
-# Discover disaster point (no pre-recorded LSN)
-safe_lsn=""
 for _ in $(seq 1 200); do
-    q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-    safe_lsn=$(q "SELECT safe_target_lsn::text
-                  FROM flashback_disaster_points('public.op_flow', interval '1 hour')
-                  WHERE event_type='DROP' AND status='restorable'
-                  ORDER BY disaster_time DESC LIMIT 1;")
-    [[ -n "$safe_lsn" ]] && break
+    restorable=$(q "SELECT count(*) FROM flashback_disaster_points('public.op_flow', interval '1 hour')
+                    WHERE event_type='DROP' AND status='restorable';")
+    (( restorable >= 1 )) && break
     sleep 0.05
 done
-[[ -n "$safe_lsn" ]] || {
+(( restorable >= 1 )) || {
     echo "FAIL: disaster_points did not yield a restorable DROP target" >&2
-    q "SELECT * FROM flashback_disaster_points('public.op_flow', interval '1 hour');" >&2 || true
     exit 1
 }
 
-"$CTL" disasters public.op_flow '1 hour' >"$WORK_ROOT/disasters.txt"
-grep -q "$safe_lsn" "$WORK_ROOT/disasters.txt"
-
-# Restore requires --yes
+# recover without --yes must refuse in non-interactive mode
 restore_rc=0
-"$CTL" restore public.op_flow "$safe_lsn" >/tmp/pgfb-restore-deny.out 2>&1 || restore_rc=$?
-[[ "$restore_rc" != "0" ]] || { echo "FAIL: restore without --yes succeeded" >&2; exit 1; }
+"$CTL" recover public.op_flow --latest-drop >/tmp/pgfb-restore-deny.out 2>&1 || restore_rc=$?
+[[ "$restore_rc" != "0" ]] || { echo "FAIL: recover without --yes succeeded" >&2; exit 1; }
 
-"$CTL" restore public.op_flow "$safe_lsn" --yes
+"$CTL" recover public.op_flow --latest-drop --yes
 
 [[ "$(q "SELECT to_regclass('public.op_flow') IS NOT NULL;")" == "t" ]]
 fp2=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.op_flow;")
-[[ "$fp2" == "$fp" ]] || { echo "FAIL: fingerprint mismatch after restore ($fp2 vs $fp)" >&2; exit 1; }
+[[ "$fp2" == "$fp" ]] || { echo "FAIL: fingerprint mismatch after recover ($fp2 vs $fp)" >&2; exit 1; }
 [[ "$(q "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.op_flow'::regclass;")" == "$owner" ]]
 [[ "$(q "SELECT COALESCE(array_to_string(relacl,','),'') FROM pg_class WHERE oid='public.op_flow'::regclass;")" == "$acl" ]]
 [[ "$(q "SELECT count(*) FROM pg_index WHERE indrelid='public.op_flow'::regclass AND indisprimary;")" == "1" ]]
 
-# Repeated DROP/recreate cycle via disasters API
+# Repeated DROP/recover via CLI
 for cycle in 1 2; do
     q "UPDATE public.op_flow SET payload='c$cycle' WHERE id=2;" >/dev/null
     for _ in $(seq 1 100); do
-        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
         covered=$(q "SELECT EXISTS(
             SELECT 1 FROM flashback.delta_log
             WHERE rel_oid='public.op_flow'::regclass AND event_type='UPDATE'
@@ -161,24 +150,34 @@ for cycle in 1 2; do
         sleep 0.05
     done
     fp_c=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.op_flow;")
+    prior_drop_lsn=$(q "SELECT COALESCE(
+        (SELECT disaster_commit_lsn::text
+         FROM flashback_disaster_points('public.op_flow', interval '1 hour')
+         WHERE event_type='DROP' AND status='restorable'
+         ORDER BY disaster_time DESC, disaster_commit_lsn DESC
+         LIMIT 1),
+        '0/0');")
     q "DROP TABLE public.op_flow;" >/dev/null
-    safe=""
+    newest=""
     for _ in $(seq 1 200); do
-        q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-        safe=$(q "SELECT safe_target_lsn::text
-                  FROM flashback_disaster_points('public.op_flow', interval '1 hour')
-                  WHERE event_type='DROP' AND status='restorable'
-                  ORDER BY disaster_time DESC LIMIT 1;")
-        [[ -n "$safe" ]] && break
+        newest=$(q "SELECT disaster_commit_lsn::text
+                    FROM flashback_disaster_points('public.op_flow', interval '1 hour')
+                    WHERE event_type='DROP' AND status='restorable'
+                    ORDER BY disaster_time DESC, disaster_commit_lsn DESC
+                    LIMIT 1;")
+        if [[ -n "$newest" && "$newest" != "$prior_drop_lsn" ]]; then
+            break
+        fi
         sleep 0.05
     done
-    [[ -n "$safe" ]] || { echo "FAIL: cycle $cycle disaster discovery failed" >&2; exit 1; }
-    "$CTL" restore public.op_flow "$safe" --yes
+    [[ -n "$newest" && "$newest" != "$prior_drop_lsn" ]] \
+        || { echo "FAIL: cycle $cycle did not observe a newer restorable DROP (prior=$prior_drop_lsn newest=${newest:-none})" >&2; exit 1; }
+    "$CTL" recover public.op_flow --latest-drop --yes
     fp_r=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.op_flow;")
     [[ "$fp_r" == "$fp_c" ]] || { echo "FAIL: cycle $cycle fingerprint mismatch" >&2; exit 1; }
 done
 
-# Capacity rejection before lock: tiny budgets
+# Capacity rejection
 q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '1kB';"
 q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '1kB';"
 q "SELECT pg_reload_conf();" >/dev/null
@@ -191,10 +190,8 @@ q "ALTER SYSTEM RESET pg_flashback.local_max_snapshot_bytes;"
 q "ALTER SYSTEM RESET pg_flashback.local_max_restore_peak_bytes;"
 q "SELECT pg_reload_conf();" >/dev/null
 
-# Quoted identifier still healthy
 [[ "$(q "SELECT health FROM flashback_health() WHERE table_name='public.\"Weird Name\"';")" == "healthy" ]]
 
-# Cleanup lifecycles
 "$PSQL" -X -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAtc \
     "SELECT flashback_untrack('public.op_flow');" >/dev/null
 "$PSQL" -X -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAtc \
@@ -211,8 +208,7 @@ cat >"$RESULT_JSON" <<EOF
   "run_id": "$RUN_ID",
 $(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
   "status": "$status",
-  "safe_target_lsn": "$safe_lsn",
-  "workflow": ["doctor","advise","track","healthy","drop","disasters","restore","successor_healthy"]
+  "workflow": ["doctor","protect","healthy","drop","recover","successor_healthy"]
 }
 EOF
 echo "Operator workflow E2E: $status ($RESULT_JSON)"
