@@ -2,67 +2,86 @@
 
 [![CI](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml/badge.svg)](https://github.com/CaghanTU/pg_flashback/actions/workflows/ci.yml)
 
-Table-level point-in-time recovery and time-travel queries for PostgreSQL.
-The adopted design has a preflighted local snapshot/delta profile and a
-pgBackRest-backed profile for tables that do not fit the local capacity,
-change-rate, write-stall or RTO budget. Profile choice is not a size-only
-heuristic. Built with Rust + pgrx 0.16.1 for PostgreSQL 15–18.
+**Recover an accidentally dropped PostgreSQL table with one command.**
 
-> **Development status:** the WAL-local COMMIT-LSN milestone is implemented and
-> qualified, including generation-aware local retention, but the project as a
-> whole is still pre-release. Fail-closed local capacity/write-stall admission
-> is enforced for qualified local track, re-anchor and restore; exact-RC soak
-> and clean-host artifact installation remain release gates.
-> The initial release establishes the baseline from which later releases must
-> provide versioned update scripts. Read the binding
-> [storage policy](docs/STORAGE_POLICY.md),
-> [coverage design](docs/COVERAGE_MODEL.md) and
-> [release scope](docs/RELEASE_SCOPE.md) before evaluating the project.
-> The first-release target is an ordinary LOGGED, non-partitioned table;
-> broader legacy demos are not release-qualified merely because they run.
+pg_flashback protects ordinary LOGGED tables, captures their changes from WAL,
+detects `DROP TABLE`, and restores the table to the last safe point before that
+DROP — fail-closed, without asking you to copy an LSN.
 
-## 1. Why This Extension?
+Supported product surface:
 
-- The correctness-qualified local path restores only a target COMMIT LSN that
-  belongs to exactly one verified coverage generation and lies at or before
-  its proven capture watermark.
-- The backup helper hides full-cluster PITR and table extraction behind a
-  validated workflow; no manual `pg_dump` surgery against production.
-- **WAL-only qualified local capture:** PostgreSQL logical decoding supplies a
-  total COMMIT-LSN order. Explicit trigger mode remains available only as a
-  legacy/experimental compatibility path and creates no qualified generation.
-- WAL decoding is asynchronous, but it is not free: `REPLICA IDENTITY FULL`
-  increases UPDATE/DELETE WAL volume and the worker stores captured history.
-- **Diff‑only UPDATE capture** — stores only PK columns + changed columns per UPDATE, reducing delta storage by up to 40× on wide tables.
-- DDL captured (TRUNCATE, DROP, ALTER) via `ProcessUtility_hook`.
-- Includes `flashback_query_lsn()` — query an admitted past table state without
-  restoring. It uses the historical schema from `schema_versions` and handles
-  DROP events.
-- **Non-destructive row recovery** — `flashback_recover_deleted_lsn()`
-  re-inserts only rows missing now, after the same generation admission used by
-  restore/query.
-- **DROP TABLE recovery** — the WAL-local LSN path captures trusted DDL through
-  protected pending metadata and reconstructs a dropped table from one proven
-  generation.
-- **SET SCHEMA and RENAME TABLE** are auto-tracked: OID-based lookup detects the change and recreates the capture trigger under the new name/schema.
-- **Classical table inheritance preserved** during restore: child tables are detached before the DROP and re-attached after shadow rename.
-- Per‑table advisory locks allow concurrent restores of unrelated tables.
-- **Multi‑database worker** — single extension install can track tables across multiple databases simultaneously.
-- **Partitioned-table implementation demo** — the current code uses per-row
-  triggers, but partitioned targets are outside the first-release contract.
-- Includes a TOAST size limit, progress reporting, restore audit log, capture
-  switch and monitoring views; their coverage-safe failure semantics are still
-  release blockers.
-- **Backup profile for local-budget-ineligible tables:** no base-table copy and no row-delta
-  duplication; native PostgreSQL PITR runs in a private cluster and returns a
-  validated one-table artifact through snapshot-direct or classic pgBackRest
-  restore. Authenticated anchors, post-swap FULL re-anchor, timeline freeze,
-  durable expiration leases and missing-anchor audits are wired and covered by
-  the real-repository E2E. Tracking reuses an existing FULL when eligible and
-  never auto-starts FULL backups; schedule `pg-flashback-recovery
-  reconcile-anchors` externally to advance to newer operator-created FULLs and
-  retire sealed predecessors only after retention. Exact-RC and clean-host
-  release qualification remain.
+```bash
+pg_flashback doctor
+pg_flashback protect public.orders
+pg_flashback status
+pg_flashback recover public.orders
+```
+
+> **Status:** pre-release. The local DROP recovery path is the product being
+> qualified. Backup-backed / large-database features exist as
+> advanced/experimental work and are **not** the main product promise.
+> See [QUICKSTART_LOCAL_DROP.md](docs/QUICKSTART_LOCAL_DROP.md).
+
+## 1. What problem this solves
+
+- Someone runs `DROP TABLE` on a small/medium ordinary LOGGED table.
+- You want the table back with its data, indexes, constraints, owner and ACLs.
+- You do **not** want a full-cluster restore as the default answer.
+
+## 2. Supported environment and table types
+
+- PostgreSQL **15–18**
+- Ordinary **permanent LOGGED** tables
+- Primary keys, secondary indexes, unique/check constraints, identity/sequences,
+  TOAST/large values, quoted names, non-`public` schemas, owner/ACL
+
+**Rejected fail-closed:**
+
+- Partitioned tables / partitions
+- Foreign tables
+- Materialized views
+- UNLOGGED or TEMP tables
+- Classical `INHERITS` parents with children
+- Guessing across coverage gaps, lost slots, or ambiguous disaster points
+- Silently overwriting a newer same-name relation
+
+## 3. Install
+
+```bash
+sudo install -m 0755 bin/pg_flashback /usr/local/bin/pg_flashback
+```
+
+Configure PostgreSQL:
+
+```
+shared_preload_libraries = 'pg_flashback'
+wal_level = logical
+```
+
+Restart PostgreSQL and run `CREATE EXTENSION pg_flashback;`.
+
+## 4. Doctor / protect / recover
+
+```bash
+pg_flashback doctor
+pg_flashback protect public.orders
+# after DROP TABLE public.orders;
+pg_flashback recover public.orders
+# non-interactive:
+pg_flashback recover public.orders --latest-drop --yes
+pg_flashback status public.orders
+```
+
+## 5. Advanced / experimental (not the main product)
+
+Backup-backed recovery and large-DB workflows are documented in
+`docs/BACKUP_RESTORE_RUNBOOK.md` and `docs/RELEASE_SCOPE.md`. They are not
+required for ordinary local DROP recovery.
+
+---
+
+<details>
+<summary>Architecture notes and contributor reference</summary>
 
 ## 2. Architecture Overview
 
@@ -975,3 +994,5 @@ pg_flashback is released under the [MIT License](LICENSE). pgBackRest remains
 an external MIT-licensed program; its source is neither embedded nor linked.
 Rust dependency and external-tool notices are recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+</details>
