@@ -77,6 +77,7 @@ GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_recovery_agent;
 
 -- Public API (for flashback_admin only)
 GRANT EXECUTE ON FUNCTION flashback_track(text)                       TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_require_supported_local_table(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_untrack(text)                     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)        TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz)      TO flashback_admin;

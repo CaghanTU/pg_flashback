@@ -182,6 +182,10 @@ mod tests {
         "../tests/sql/integration/partitioned_table_restore.sql"
     );
     sql_test!(
+        it_unsupported_local_topology_rejected,
+        "../tests/sql/integration/unsupported_local_topology_rejected.sql"
+    );
+    sql_test!(
         it_post_restore_checkpoint,
         "../tests/sql/integration/post_restore_checkpoint.sql"
     );

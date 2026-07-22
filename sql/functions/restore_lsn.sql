@@ -469,6 +469,11 @@ BEGIN
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
     v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
+    IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
+        RAISE EXCEPTION 'pg_flashback: refusing restore of %.% because a different relation already uses that name (live oid %, tracked oid %)',
+            admission.schema_name, admission.table_name, v_live_oid, admission.rel_oid
+            USING HINT = 'Rename or move the newer table before recover; pg_flashback will not silently overwrite an identity-mismatched relation.';
+    END IF;
     IF v_live_oid IS NOT NULL THEN
         v_capacity_rel := v_live_oid;
     ELSE

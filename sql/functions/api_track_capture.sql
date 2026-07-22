@@ -583,6 +583,89 @@ BEGIN
 END;
 $$;
 
+-- Fail-closed topology gate for the local DROP product profile.
+-- Ordinary permanent LOGGED tables only; partitioned/foreign/matview/temp/unlogged rejected.
+CREATE OR REPLACE FUNCTION flashback_require_supported_local_table(p_rel regclass)
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_relkind "char";
+    v_persistence "char";
+    v_schema text;
+    v_name text;
+    v_parent_relkind "char";
+BEGIN
+    IF p_rel IS NULL THEN
+        RAISE EXCEPTION 'flashback_track: table does not exist';
+    END IF;
+
+    SELECT c.relkind, c.relpersistence, n.nspname, c.relname
+      INTO v_relkind, v_persistence, v_schema, v_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = p_rel;
+
+    IF v_relkind IS NULL THEN
+        RAISE EXCEPTION 'flashback_track: table does not exist';
+    END IF;
+
+    IF v_schema = 'pg_temp' OR v_schema LIKE 'pg_temp_%' OR v_schema LIKE 'pg_toast_temp_%' THEN
+        RAISE EXCEPTION 'flashback_track: temporary tables are not supported by the local DROP recovery product'
+            USING HINT = 'Protect a permanent LOGGED ordinary table instead.';
+    END IF;
+
+    IF v_relkind = 'p' THEN
+        RAISE EXCEPTION 'flashback_track: partitioned tables are not supported by the local DROP recovery product (relkind=p)'
+            USING HINT = 'Protect an ordinary non-partitioned LOGGED table.';
+    ELSIF v_relkind = 'f' THEN
+        RAISE EXCEPTION 'flashback_track: foreign tables are not supported by the local DROP recovery product'
+            USING HINT = 'Protect an ordinary LOGGED table stored in PostgreSQL.';
+    ELSIF v_relkind = 'm' THEN
+        RAISE EXCEPTION 'flashback_track: materialized views are not supported by the local DROP recovery product'
+            USING HINT = 'Protect an ordinary LOGGED table.';
+    ELSIF v_relkind <> 'r' THEN
+        RAISE EXCEPTION 'flashback_track: unsupported relation kind % for local DROP recovery', v_relkind
+            USING HINT = 'First release supports ordinary LOGGED tables only.';
+    END IF;
+
+    IF v_persistence <> 'p' THEN
+        RAISE EXCEPTION 'flashback_track: only permanent LOGGED tables are supported (persistence=%)',
+            v_persistence
+            USING HINT = 'UNLOGGED and temporary tables cannot provide durable DROP recovery.';
+    END IF;
+
+    -- Leaf partitions look like ordinary tables (relkind=r) but inherit from a
+    -- partitioned parent; refuse them for the local product contract.
+    SELECT p.relkind INTO v_parent_relkind
+    FROM pg_inherits i
+    JOIN pg_class p ON p.oid = i.inhparent
+    WHERE i.inhrelid = p_rel
+    LIMIT 1;
+    IF v_parent_relkind = 'p' THEN
+        RAISE EXCEPTION 'flashback_track: table partitions are not supported by the local DROP recovery product'
+            USING HINT = 'Protect an ordinary non-partitioned LOGGED table.';
+    END IF;
+
+    -- Classical inheritance children are destroyed by DROP ... CASCADE on the
+    -- parent. The local product recovers one named table, not a CASCADE tree.
+    IF EXISTS (
+        SELECT 1
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        WHERE i.inhparent = p_rel
+          AND c.relkind = 'r'
+    ) THEN
+        RAISE EXCEPTION 'flashback_track: % has inheritance children; DROP ... CASCADE multi-object recovery is not supported',
+            format('%I.%I', v_schema, v_name)
+            USING HINT = 'pg_flashback recovers one ordinary table. Flatten inheritance or untrack children-first designs outside this release.';
+    END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_track(target_table text)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -639,6 +722,8 @@ BEGIN
     IF v_rel_oid IS NULL THEN
         RAISE EXCEPTION 'flashback_track: table % does not exist', target_table;
     END IF;
+
+    PERFORM flashback_require_supported_local_table(v_rel_oid);
 
     IF EXISTS (
         SELECT 1 FROM flashback.tracked_tables
