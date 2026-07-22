@@ -35,6 +35,9 @@ SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
 SHORT="$(git rev-parse --short=12 HEAD)"
 OUT_ROOT="${CANDIDATE_OUT:-$ROOT/target/candidate/$SOURCE_COMMIT}"
 STAGE="$OUT_ROOT/stage"
+# Reproducible timestamps when requested (Phase 8).
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct HEAD)}"
+export TZ=UTC
 # Drop every prior candidate tree so CI cache/uploads cannot mix digests.
 rm -rf "$ROOT/target/candidate"
 mkdir -p "$STAGE" "$OUT_ROOT"
@@ -76,6 +79,11 @@ install -m 0755 "$package_so" "$EXT_DIR/lib/pg_flashback.so"
 install -m 0755 "$ROOT/scripts/pg_flashback" "$EXT_DIR/bin/pg_flashback"
 install -m 0755 "$ROOT/scripts/pg_flashbackctl" "$EXT_DIR/bin/pg_flashbackctl"
 install -m 0644 "$package_control" "$package_sql" "$EXT_DIR/share/extension/"
+if [[ -f "$ROOT/sql/upgrades/pg_flashback--0.1.0--0.2.0.sql" ]]; then
+    install -m 0644 \
+        "$ROOT/sql/upgrades/pg_flashback--0.1.0--0.2.0.sql" \
+        "$EXT_DIR/share/extension/"
+fi
 printf '%s\n' "$PG_MAJOR" > "$EXT_DIR/PG_MAJOR"
 printf '%s\n' \
     "Install the operator CLI with:" \
@@ -89,13 +97,20 @@ install -m 0755 \
     "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
     "$ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
     "$ROOT/scripts/run_exact_candidate_drop_adversarial.sh" \
+    "$ROOT/scripts/run_exact_wal_transaction_schema_matrix.sh" \
     "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
     "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
     "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
     "$ROOT/scripts/run_exact_rc_harness_selftest.sh" \
     "$EXT_DIR/scripts/"
 install -m 0644 "$ROOT/scripts/lib/exact_candidate_identity.sh" "$EXT_DIR/scripts/lib/"
-tar -C "$STAGE" -czf "$OUT_ROOT/${EXT_NAME}.tar.gz" "$EXT_NAME"
+# Deterministic tar when GNU tar supports --mtime / --sort.
+if tar --help 2>&1 | grep -q -- '--mtime'; then
+    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+        -C "$STAGE" -czf "$OUT_ROOT/${EXT_NAME}.tar.gz" "$EXT_NAME"
+else
+    tar -C "$STAGE" -czf "$OUT_ROOT/${EXT_NAME}.tar.gz" "$EXT_NAME"
+fi
 
 # 3) Recovery helper release binary.
 cargo build --release --locked --manifest-path "$ROOT/tools/pg_flashback_recovery/Cargo.toml"
@@ -125,7 +140,12 @@ install -m 0755 \
     "$ROOT/scripts/run_exact_rc_harness_selftest.sh" \
     "$HELPER_DIR/scripts/"
 install -m 0644 "$ROOT/scripts/lib/exact_candidate_identity.sh" "$HELPER_DIR/scripts/lib/"
-tar -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
+if tar --help 2>&1 | grep -q -- '--mtime'; then
+    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+        -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
+else
+    tar -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
+fi
 
 SRC_SHA="$(sha256sum "$OUT_ROOT/${SRC_NAME}.tar.gz" | awk '{print $1}')"
 EXT_SHA="$(sha256sum "$OUT_ROOT/${EXT_NAME}.tar.gz" | awk '{print $1}')"
@@ -181,5 +201,107 @@ jq -n \
     sha256sum -c SHA256SUMS >/dev/null
 )
 
+# Phase 8: CycloneDX-lite SBOM + toolchain identity (JSON).
+TOOLCHAIN_RUSTC="$(rustc --version 2>/dev/null || echo unknown)"
+TOOLCHAIN_CARGO="$(cargo --version 2>/dev/null || echo unknown)"
+EXT_VERSION="$(grep -E '^version' "$ROOT/Cargo.toml" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+jq -n \
+    --arg bom_format "CycloneDX" \
+    --arg spec_version "1.5" \
+    --arg serial "urn:uuid:$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$SOURCE_COMMIT")" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_tree "$SOURCE_TREE" \
+    --arg source_date_epoch "$SOURCE_DATE_EPOCH" \
+    --arg rustc "$TOOLCHAIN_RUSTC" \
+    --arg cargo "$TOOLCHAIN_CARGO" \
+    --arg pg_version "$("$PG_CONFIG" --version)" \
+    --arg ext_version "$EXT_VERSION" \
+    --arg ext_bin_sha "$EXT_BIN_SHA" \
+    --arg cli_bin_sha "$CLI_BIN_SHA" \
+    --arg helper_bin_sha "$HELPER_BIN_SHA" \
+    --arg package_sha "$EXT_SHA" \
+    '{
+      bomFormat: $bom_format,
+      specVersion: $spec_version,
+      serialNumber: $serial,
+      version: 1,
+      metadata: {
+        timestamp: (now | todateiso8601),
+        component: {
+          type: "application",
+          name: "pg_flashback",
+          version: $ext_version,
+          "bom-ref": ("pkg:generic/pg_flashback@" + $ext_version)
+        },
+        tools: [{name:"rustc", version:$rustc},{name:"cargo", version:$cargo}],
+        properties: [
+          {name:"source_commit", value:$source_commit},
+          {name:"source_tree", value:$source_tree},
+          {name:"SOURCE_DATE_EPOCH", value:$source_date_epoch},
+          {name:"postgresql_version", value:$pg_version},
+          {name:"extension_binary_sha256", value:$ext_bin_sha},
+          {name:"cli_binary_sha256", value:$cli_bin_sha},
+          {name:"helper_binary_sha256", value:$helper_bin_sha},
+          {name:"package_sha256", value:$package_sha}
+        ]
+      },
+      components: [
+        {type:"library", name:"pg_flashback.so", version:$ext_version,
+         hashes:[{alg:"SHA-256", content:$ext_bin_sha}]},
+        {type:"application", name:"pg_flashback", version:$ext_version,
+         hashes:[{alg:"SHA-256", content:$cli_bin_sha}]},
+        {type:"application", name:"pg-flashback-recovery", version:$ext_version,
+         hashes:[{alg:"SHA-256", content:$helper_bin_sha}]}
+      ]
+    }' > "$OUT_ROOT/SBOM.cdx.json"
+
+# SPDX-lite companion
+{
+  echo "SPDXVersion: SPDX-2.3"
+  echo "DataLicense: CC0-1.0"
+  echo "SPDXID: SPDXRef-DOCUMENT"
+  echo "DocumentName: pg_flashback-candidate-$SHORT"
+  echo "DocumentNamespace: https://github.com/CaghanTU/pg_flashback/spdx/$SOURCE_COMMIT"
+  echo "Creator: Tool: pg_flashback-build_candidate_archive"
+  echo "Created: $(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo
+  echo "PackageName: pg_flashback"
+  echo "SPDXID: SPDXRef-Package-pg_flashback"
+  echo "PackageVersion: $EXT_VERSION"
+  echo "PackageDownloadLocation: NOASSERTION"
+  echo "FilesAnalyzed: false"
+  echo "PackageChecksum: SHA256: $EXT_BIN_SHA"
+} > "$OUT_ROOT/SBOM.spdx"
+
+# Two-build reproducibility report template (second build fills actual).
+jq -n \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_date_epoch "$SOURCE_DATE_EPOCH" \
+    --arg package_sha256 "$EXT_SHA" \
+    --arg extension_binary_sha256 "$EXT_BIN_SHA" \
+    --arg cli_binary_sha256 "$CLI_BIN_SHA" \
+    --arg helper_binary_sha256 "$HELPER_BIN_SHA" \
+    --arg rustc "$TOOLCHAIN_RUSTC" \
+    '{
+      kind: "reproducibility_report",
+      build: 1,
+      source_commit: $source_commit,
+      SOURCE_DATE_EPOCH: $source_date_epoch,
+      toolchain: {rustc: $rustc},
+      digests: {
+        package_sha256: $package_sha256,
+        extension_binary_sha256: $extension_binary_sha256,
+        cli_binary_sha256: $cli_binary_sha256,
+        helper_binary_sha256: $helper_binary_sha256
+      },
+      note: "Run a second build with the same SOURCE_DATE_EPOCH and compare digests; mismatch => refuse candidate claim."
+    }' > "$OUT_ROOT/REPRODUCIBILITY_REPORT.json"
+
+# Refuse obviously corrupted archives (zero-length).
+for f in "$OUT_ROOT"/*.tar.gz; do
+    [[ -s "$f" ]] || { echo "FAIL: corrupt/empty archive $f" >&2; exit 1; }
+done
+
 echo "Candidate archives written under $OUT_ROOT"
 jq . "$OUT_ROOT/MANIFEST.json"
+echo "SBOM: $OUT_ROOT/SBOM.cdx.json"
