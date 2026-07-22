@@ -19,16 +19,16 @@ remain historical only and must not qualify new binaries.
 
 | Phase | Title | Status | Notes |
 |---|---|---|---|
-| 0 | Audit docs | IN_PROGRESS | This file + support matrix |
-| 1 | Correctness + security | PENDING | Latest-DROP by COMMIT LSN; ProcessUtility manifest; failpoints; HA; pg_monitor |
-| 2 | Recover plan / dry-run | PENDING | No mutating execute grants |
-| 3 | Journal + validation + execute grants | PENDING | Immutable header + append-only events |
-| 4 | Two-phase unprotect + cleanup | PENDING | Stopping marker protocol |
-| 5 | Unified exact-WAL matrix | PENDING | Candidate-archive consolidation |
-| 6 | CLI / multi-DB / disk UX | PENDING | Monitoring cache ≠ authority |
-| 7 | Upgrade ADR | PENDING | Version not pre-fixed |
-| 8 | Package / SBOM | PENDING | Final binary identity |
-| 9 | Exact benchmarks | PENDING | Bound to Phase 8 identity |
+| 0 | Audit docs | COMPLETE | This file + support matrix |
+| 1 | Correctness + security | COMPLETE | Latest-DROP; manifest; failpoints; primary guard; pg_monitor |
+| 2 | Recover plan / dry-run | COMPLETE | Combined with Phase 3 milestone |
+| 3 | Journal + validation + execute grants | COMPLETE | Immutable header + append-only events |
+| 4 | Two-phase unprotect + cleanup | COMPLETE | Stopping marker protocol |
+| 5 | Unified exact-WAL matrix | COMPLETE | `run_exact_wal_transaction_schema_matrix.sh` |
+| 6 | CLI / multi-DB / disk UX | COMPLETE | version/list/history; disk UX; cache ≠ authority |
+| 7 | Upgrade ADR | COMPLETE | ADR 0001 → `0.2.0` from `0.1.0` |
+| 8 | Package / SBOM | COMPLETE | SBOM + SOURCE_DATE_EPOCH in candidate build |
+| 9 | Exact benchmarks | COMPLETE | WAL-only scripts require CANDIDATE_DIR |
 | 10 | Qualify freeze | PENDING | READY_TO_START; no 24h start |
 
 ## Exit criteria (summary)
