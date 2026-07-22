@@ -102,9 +102,16 @@ EXT_ROOT="$(find "$INSTALL_ROOT/ext" -maxdepth 1 -type d -name 'pg_flashback-can
 HELPER_ROOT="$(find "$INSTALL_ROOT/helper" -maxdepth 1 -type d -name 'pg-flashback-recovery-candidate-*' -print -quit)"
 [[ -n "$EXT_ROOT" && -n "$HELPER_ROOT" ]] || die "archive layout unexpected"
 HELPER="$HELPER_ROOT/bin/pg-flashback-recovery"
+CLI="$EXT_ROOT/bin/pg_flashback"
 require_executable "$HELPER"
+require_executable "$CLI"
 [[ "$(cat "$EXT_ROOT/PG_MAJOR")" == "$("${PG_BIN}/pg_config" --version | awk '{print $2}' | cut -d. -f1)" ]] \
     || die "PG_MAJOR mismatch between archive and PG_BIN"
+CLI_SHA_MANIFEST="$(jq -r '.artifacts.cli_binary_sha256 // empty' "$MANIFEST")"
+if [[ -n "$CLI_SHA_MANIFEST" ]]; then
+    [[ "$(sha256sum "$CLI" | awk '{print $1}')" == "$CLI_SHA_MANIFEST" ]] \
+        || die "packaged CLI sha mismatch vs MANIFEST"
+fi
 
 # Install extension into the PostgreSQL prefix from the archive only.
 PG_CONFIG="$PG_BIN/pg_config"
@@ -114,7 +121,12 @@ install -m 0755 "$EXT_ROOT/lib/pg_flashback.so" "$PKGLIB/pg_flashback.so"
 install -m 0644 "$EXT_ROOT/share/extension/pg_flashback.control" \
     "$EXT_ROOT"/share/extension/pg_flashback--*.sql \
     "$SHARE_EXT/"
-pass "installed extension+helper from candidate archives only"
+# Operator CLI install path used by end users.
+mkdir -p "$WORK/bin"
+install -m 0755 "$CLI" "$WORK/bin/pg_flashback"
+export PATH="$WORK/bin:$PG_BIN:$PATH"
+export PSQL_BIN="$PG_BIN/psql"
+pass "installed extension+helper+CLI from candidate archives only"
 
 pgbr() { "$PGBACKREST" --config="$PGBACKREST_CONFIG" --stanza="$STANZA" "$@"; }
 primary_sql() {
@@ -274,52 +286,84 @@ done
 [[ "${state:-}" == "ready" || "${state:-}" == "maintenance_missing" ]] \
     || die "capture worker not ready for $DB_NAME (state=${state:-unset})"
 
-# Local track / change / restore (local_delta).
+# Product CLI flow: doctor → protect → DML → DROP → recover (no LSN copying).
+export PGHOST="$SOCKET_DIR" PGPORT="$PRIMARY_PORT" PGDATABASE="$DB_NAME"
+"$CLI" doctor >/dev/null || die "pg_flashback doctor failed"
+pass "pg_flashback doctor"
+
+primary_sql "CREATE TABLE public.orders(
+    id int PRIMARY KEY,
+    note text NOT NULL,
+    payload jsonb NOT NULL
+);"
+primary_sql "CREATE INDEX orders_note_idx ON public.orders(note);"
+primary_sql "INSERT INTO public.orders VALUES (1, 'seed', '{\"k\":1}'::jsonb);"
+"$CLI" protect public.orders >/tmp/pgfb-ch-protect.out || {
+    cat /tmp/pgfb-ch-protect.out >&2
+    die "pg_flashback protect failed"
+}
+grep -Eiq 'Protected:|Already protected' /tmp/pgfb-ch-protect.out
+pass "pg_flashback protect"
+
+primary_sql "INSERT INTO public.orders VALUES (2, 'kept', '{\"k\":2}'::jsonb);"
+primary_sql "UPDATE public.orders SET note='changed' WHERE id=1;"
+for _ in $(seq 1 200); do
+    n=$(primary_sql "SELECT count(*) FROM flashback.delta_log
+                     WHERE table_name='public.orders' AND commit_lsn IS NOT NULL;")
+    (( n >= 2 )) && break
+    sleep 0.05
+done
+FP_ORDERS=$(primary_sql "
+    SELECT count(*)::text || '|' ||
+           COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text
+    FROM public.orders t;")
+SCHEMA_ORDERS=$(primary_sql "
+    SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod), ',' ORDER BY a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid='public.orders'::regclass AND a.attnum>0 AND NOT a.attisdropped;")
+primary_sql "DROP TABLE public.orders;"
+[[ "$(primary_sql "SELECT to_regclass('public.orders') IS NULL;")" == "t" ]] \
+    || die "DROP did not remove public.orders"
+restorable=0
+for _ in $(seq 1 400); do
+    restorable=$(primary_sql "SELECT count(*) FROM flashback_disaster_points('public.orders', interval '1 hour')
+                              WHERE event_type='DROP' AND status='restorable';")
+    (( restorable >= 1 )) && break
+    sleep 0.05
+done
+(( restorable >= 1 )) || die "DROP disaster point not restorable"
+
+"$CLI" recover public.orders --latest-drop --yes >/tmp/pgfb-ch-recover.out || {
+    cat /tmp/pgfb-ch-recover.out >&2
+    die "pg_flashback recover failed"
+}
+[[ "$(primary_sql "SELECT to_regclass('public.orders') IS NOT NULL;")" == "t" ]] \
+    || die "recover did not recreate public.orders"
+FP2=$(primary_sql "
+    SELECT count(*)::text || '|' ||
+           COALESCE(bit_xor(hashtextextended(row_to_json(t)::text, 0)), 0)::text
+    FROM public.orders t;")
+[[ "$FP2" == "$FP_ORDERS" ]] || die "recover fingerprint mismatch ($FP2 vs $FP_ORDERS)"
+SCHEMA2=$(primary_sql "
+    SELECT string_agg(a.attname||':'||format_type(a.atttypid,a.atttypmod), ',' ORDER BY a.attnum)
+    FROM pg_attribute a
+    WHERE a.attrelid='public.orders'::regclass AND a.attnum>0 AND NOT a.attisdropped;")
+[[ "$SCHEMA2" == "$SCHEMA_ORDERS" ]] || die "recover schema mismatch"
+[[ "$(primary_sql "SELECT count(*) FROM pg_indexes WHERE tablename='orders' AND indexname='orders_note_idx';")" == "1" ]] \
+    || die "secondary index missing after recover"
+pass "pg_flashback protect/DROP/recover fingerprint"
+
+# Secondary SQL track smoke for a second table.
 primary_sql "CREATE TABLE public.local_t(id int PRIMARY KEY, note text NOT NULL);"
 primary_sql "INSERT INTO public.local_t VALUES (1, 'seed');"
 primary_sql "SELECT flashback_track('public.local_t');" >/dev/null
 for _ in $(seq 1 200); do
-    STATE=$(primary_sql "SELECT state FROM flashback.coverage_generations
-                         WHERE recovery_profile='local_delta' ORDER BY generation_no DESC LIMIT 1;")
-    [[ "$STATE" == "active" ]] && break
-    primary_sql "SELECT flashback_consume_wal(8192);" >/dev/null || true
+    STATE=$(primary_sql "SELECT health FROM flashback_health() WHERE table_name='public.local_t';")
+    [[ "$STATE" == "healthy" ]] && break
     sleep 0.05
 done
-[[ "$(primary_sql "SELECT state FROM flashback.coverage_generations
-                   WHERE recovery_profile='local_delta' ORDER BY generation_no DESC LIMIT 1;")" == "active" ]] \
-    || die "local track did not activate"
-primary_sql "UPDATE public.local_t SET note='changed' WHERE id=1;"
-primary_sql "SELECT pg_switch_wal();" >/dev/null
-TARGET_LOCAL_LSN=""
-for _ in $(seq 1 200); do
-    primary_sql "SELECT flashback_consume_wal(8192);" >/dev/null || true
-    TARGET_LOCAL_LSN=$(primary_sql "
-        SELECT commit_lsn::text
-        FROM flashback.delta_log
-        WHERE table_name = 'public.local_t'
-          AND event_type = 'UPDATE'
-          AND new_data->>'note' = 'changed'
-        ORDER BY commit_lsn DESC
-        LIMIT 1;")
-    VT=$(primary_sql "SELECT valid_through_lsn::text FROM flashback.coverage_generations
-                      WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
-    if [[ -n "$TARGET_LOCAL_LSN" && -n "$VT" ]] && \
-       primary_sql "SELECT CASE WHEN '$VT'::pg_lsn >= '$TARGET_LOCAL_LSN'::pg_lsn
-                               THEN 't' ELSE 'f' END;" | grep -qx t; then
-        break
-    fi
-    sleep 0.05
-done
-[[ -n "$TARGET_LOCAL_LSN" ]] || die "changed row was not captured into delta_log"
-VT=$(primary_sql "SELECT valid_through_lsn::text FROM flashback.coverage_generations
-                  WHERE recovery_profile='local_delta' AND state='active' LIMIT 1;")
-primary_sql "SELECT CASE WHEN '$VT'::pg_lsn >= '$TARGET_LOCAL_LSN'::pg_lsn
-                         THEN true ELSE false END;" | grep -qx t \
-    || die "local watermark $VT has not reached change commit LSN $TARGET_LOCAL_LSN"
-primary_sql "SELECT flashback_restore_lsn('public.local_t', '$TARGET_LOCAL_LSN'::pg_lsn);" >/dev/null
-[[ "$(primary_sql "SELECT note FROM public.local_t WHERE id=1;")" == "changed" ]] \
-    || die "local restore did not retain changed row"
-pass "local track/change/restore"
+[[ "$STATE" == "healthy" ]] || die "local_t track did not become healthy"
+pass "local SQL track activation"
 
 # Backup-profile retained FULL + reconcile + helper restore.
 primary_sql "CREATE TABLE public.target_table(

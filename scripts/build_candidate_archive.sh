@@ -67,21 +67,28 @@ cargo pgrx package \
 
 EXT_NAME="pg_flashback-candidate-${SHORT}-pg${PG_MAJOR}-${ARCH_LABEL}-linux"
 EXT_DIR="$STAGE/$EXT_NAME"
-mkdir -p "$EXT_DIR/lib" "$EXT_DIR/share/extension" "$EXT_DIR/docs" "$EXT_DIR/scripts"
+mkdir -p "$EXT_DIR/lib" "$EXT_DIR/bin" "$EXT_DIR/share/extension" "$EXT_DIR/docs" "$EXT_DIR/scripts"
 package_so="$(find "$STAGE/pgrx-package" -type f -name pg_flashback.so -print -quit)"
 package_control="$(find "$STAGE/pgrx-package" -type f -name pg_flashback.control -print -quit)"
 package_sql="$(find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' -print -quit)"
 [[ -n "$package_so" && -n "$package_control" && -n "$package_sql" ]]
 install -m 0755 "$package_so" "$EXT_DIR/lib/pg_flashback.so"
+install -m 0755 "$ROOT/scripts/pg_flashback" "$EXT_DIR/bin/pg_flashback"
+install -m 0755 "$ROOT/scripts/pg_flashbackctl" "$EXT_DIR/bin/pg_flashbackctl"
 install -m 0644 "$package_control" "$package_sql" "$EXT_DIR/share/extension/"
 printf '%s\n' "$PG_MAJOR" > "$EXT_DIR/PG_MAJOR"
+printf '%s\n' \
+    "Install the operator CLI with:" \
+    "  sudo install -m 0755 bin/pg_flashback /usr/local/bin/pg_flashback" \
+    > "$EXT_DIR/bin/INSTALL.txt"
 cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
-cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md "$EXT_DIR/docs/"
+cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md docs/QUICKSTART_LOCAL_DROP.md "$EXT_DIR/docs/"
 mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
     "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
     "$ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
+    "$ROOT/scripts/run_exact_candidate_drop_adversarial.sh" \
     "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
     "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
     "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
@@ -125,6 +132,11 @@ EXT_SHA="$(sha256sum "$OUT_ROOT/${EXT_NAME}.tar.gz" | awk '{print $1}')"
 HELPER_PKG_SHA="$(sha256sum "$OUT_ROOT/${HELPER_NAME}.tar.gz" | awk '{print $1}')"
 HELPER_BIN_SHA="$(sha256sum "$HELPER_DIR/bin/pg-flashback-recovery" | awk '{print $1}')"
 EXT_BIN_SHA="$(sha256sum "$EXT_DIR/lib/pg_flashback.so" | awk '{print $1}')"
+CLI_BIN_SHA="$(sha256sum "$EXT_DIR/bin/pg_flashback" | awk '{print $1}')"
+[[ -x "$EXT_DIR/bin/pg_flashback" ]] || {
+    echo "FAIL: packaged CLI is not executable" >&2
+    exit 1
+}
 
 jq -n \
     --arg source_commit "$SOURCE_COMMIT" \
@@ -139,6 +151,7 @@ jq -n \
     --arg helper_pkg_sha "$HELPER_PKG_SHA" \
     --arg helper_bin_sha "$HELPER_BIN_SHA" \
     --arg ext_bin_sha "$EXT_BIN_SHA" \
+    --arg cli_bin_sha "$CLI_BIN_SHA" \
     --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg pg_version "$("$PG_CONFIG" --version)" \
     '{
@@ -157,6 +170,7 @@ jq -n \
         helper_archive: {name: $helper_name, sha256: $helper_pkg_sha},
         extension_binary_sha256: $ext_bin_sha,
         helper_binary_sha256: $helper_bin_sha,
+        cli_binary_sha256: $cli_bin_sha,
         package_sha256: $ext_sha
       }
     }' > "$OUT_ROOT/MANIFEST.json"
