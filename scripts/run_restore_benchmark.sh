@@ -1,264 +1,143 @@
 #!/usr/bin/env bash
-# pg_flashback — Restore Performance Benchmark
-# Measures restore speed at 10K / 100K / 500K row scales.
-# Outputs rows-per-second and wall-clock time for each scenario.
+# Exact-candidate WAL-only restore benchmark (Phase 9).
 #
-# Usage: ./scripts/run_restore_benchmark.sh [port] [socket_dir]
-set -euo pipefail
+# Hard requirements:
+#   CANDIDATE_DIR  — Phase 8 final package identity (MANIFEST.json)
+#   Never cargo-builds inside claim runs.
+#   Never installs fake capture triggers.
+#
+# Usage:
+#   CANDIDATE_DIR=/path/to/candidate ./scripts/run_restore_benchmark.sh
+#
+# Scales: PG_FLASHBACK_BENCH_SCALES="1000 10000" (default)
 
-PORT="${1:-28817}"
-SOCKDIR="${2:-$HOME/.pgrx}"
+set -Eeuo pipefail
 
-# Detect psql: prefer pgrx-installed PG17, fall back to PATH
-_RESOLVED=""
-for candidate in "$HOME"/.pgrx/17.*/pgrx-install/bin; do
-  [[ -d "$candidate" ]] && _RESOLVED="$candidate" && break
-done
-if [[ -d "$_RESOLVED" ]]; then
-  PSQL_BIN="$_RESOLVED/psql"
-else
-  PSQL_BIN="$(command -v psql)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/exact_candidate_identity.sh
+source "$REPO_ROOT/scripts/lib/exact_candidate_identity.sh"
+
+CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required for claim runs}"
+SCALES="${PG_FLASHBACK_BENCH_SCALES:-1000 10000}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RESULT_DIR="${PG_FLASHBACK_BENCH_RESULT_DIR:-$REPO_ROOT/target/qualification}"
+RESULT_JSON="$RESULT_DIR/exact-wal-restore-benchmark-$RUN_ID.json"
+WORK="${PG_FLASHBACK_BENCH_WORK:-$REPO_ROOT/target/exact-wal-bench/$RUN_ID}"
+mkdir -p "$RESULT_DIR" "$WORK"
+
+log() { printf '[exact-wal-bench] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
+die() { log "FAIL: $*"; exit 1; }
+
+if grep -Eq '_fb_bench_capture_trigger' "$0"; then
+    die "benchmark harness embeds forbidden fake-trigger technique"
 fi
-PSQL="$PSQL_BIN -h $SOCKDIR -p $PORT -d postgres -v ON_ERROR_STOP=on"
 
-echo "═══════════════════════════════════════════════════════"
-echo "  pg_flashback — Restore Performance Benchmark"
-echo "  Port: $PORT   Socket: $SOCKDIR"
-echo "  Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "═══════════════════════════════════════════════════════"
-echo ""
+exact_candidate_bind_dir "$CANDIDATE_DIR" || die "bind candidate failed"
+IDENTITY="$(exact_candidate_identity_json)"
+PG_BIN="${PG_BIN:-/usr/local/pgsql-${EC_PG_MAJOR}/bin}"
+[[ -x "$PG_BIN/psql" ]] || die "PG_BIN missing psql: $PG_BIN"
 
-# Install benchmark helper trigger (bypasses staging worker → writes direct to delta_log)
-$PSQL -q <<'HELPERS'
-CREATE OR REPLACE FUNCTION _fb_bench_capture_trigger()
-RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_sv bigint;
-BEGIN
-    SELECT schema_version INTO v_sv FROM flashback.tracked_tables
-    WHERE rel_oid = TG_RELID AND is_active;
-    v_sv := coalesce(v_sv, 1);
-    IF TG_OP = 'INSERT' THEN
-        INSERT INTO flashback.delta_log(event_time,event_type,table_name,rel_oid,schema_version,old_data,new_data,committed_at)
-        VALUES(clock_timestamp(),'INSERT',TG_TABLE_SCHEMA||'.'||TG_TABLE_NAME,TG_RELID,v_sv,NULL,to_jsonb(NEW),clock_timestamp());
-        RETURN NEW;
-    ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO flashback.delta_log(event_time,event_type,table_name,rel_oid,schema_version,old_data,new_data,committed_at)
-        VALUES(clock_timestamp(),'UPDATE',TG_TABLE_SCHEMA||'.'||TG_TABLE_NAME,TG_RELID,v_sv,to_jsonb(OLD),to_jsonb(NEW),clock_timestamp());
-        RETURN NEW;
-    ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO flashback.delta_log(event_time,event_type,table_name,rel_oid,schema_version,old_data,new_data,committed_at)
-        VALUES(clock_timestamp(),'DELETE',TG_TABLE_SCHEMA||'.'||TG_TABLE_NAME,TG_RELID,v_sv,to_jsonb(OLD),NULL,clock_timestamp());
-        RETURN OLD;
-    END IF;
-    RETURN NULL;
-END;$$;
-HELPERS
+exact_candidate_install_into_prefix || die "install candidate failed"
+trap 'exact_candidate_restore_prefix || true; cleanup || true' EXIT
 
-# Helper: attach direct-to-delta_log trigger for a table
-attach_bench_trigger() {
-    local schema="$1" table="$2"
-    $PSQL -q -c "
-        DROP TRIGGER IF EXISTS _fb_bench_capture ON ${schema}.${table};
-        CREATE TRIGGER _fb_bench_capture
-        AFTER INSERT OR UPDATE OR DELETE ON ${schema}.${table}
-        FOR EACH ROW EXECUTE FUNCTION _fb_bench_capture_trigger();
-    "
+DATA="$WORK/data"
+SOCKET="$WORK/socket"
+mkdir -p "$SOCKET"
+cleanup() {
+    "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
 }
 
-# Clean up any stale state from previous runs
-$PSQL -q 2>/dev/null <<'CLEANUP'
-DO $$ 
-DECLARE r record;
-BEGIN
-    -- Drop all snapshot tables referenced in tracked_tables for these bench tables
-    FOR r IN SELECT s.snapshot_table
-             FROM flashback.snapshots s
-             JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
-             WHERE tt.table_name IN ('rb_orders','rb_mixed','rb_parallel')
-    LOOP
-        PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table));
-    END LOOP;
-    -- Also drop base_snapshot tables
-    FOR r IN SELECT base_snapshot_table
-             FROM flashback.tracked_tables
-             WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel')
-    LOOP
-        PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
-    END LOOP;
-EXCEPTION WHEN OTHERS THEN NULL;
-END $$;
--- Force-clean all flashback state for bench tables
-DELETE FROM flashback.delta_log
-WHERE table_name IN ('public.rb_orders','public.rb_mixed','public.rb_parallel');
-DELETE FROM flashback.staging_events
-WHERE table_name IN ('public.rb_orders','public.rb_mixed','public.rb_parallel');
-DELETE FROM flashback.snapshots
-WHERE rel_oid IN (
-    SELECT rel_oid FROM flashback.tracked_tables
-    WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel')
-);
-DELETE FROM flashback.schema_versions
-WHERE rel_oid IN (
-    SELECT rel_oid FROM flashback.tracked_tables
-    WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel')
-);
-DELETE FROM flashback.tracked_tables
-WHERE table_name IN ('rb_orders','rb_mixed','rb_parallel');
-DROP TABLE IF EXISTS rb_orders, rb_mixed, rb_parallel CASCADE;
-CLEANUP
+"$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >/dev/null
+cat >>"$DATA/postgresql.conf" <<EOF
+shared_preload_libraries = 'pg_flashback'
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+unix_socket_directories = '$SOCKET'
+port = 28971
+pg_flashback.enabled = on
+pg_flashback.capture_mode = wal
+pg_flashback.worker_interval_ms = 25
+pg_flashback.target_database = postgres
+pg_flashback.local_max_snapshot_bytes = 8GB
+pg_flashback.local_max_restore_peak_bytes = 16GB
+pg_flashback.local_min_filesystem_bytes = 64MB
+pg_flashback.local_safety_reserve_bytes = 16MB
+EOF
 
-run_restore_bench() {
-    local label="$1"
-    local rows="$2"
+"$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK/pg.log" start -w
+PSQL=("$PG_BIN/psql" -h "$SOCKET" -p 28971 -d postgres -v ON_ERROR_STOP=on -qAt)
+"${PSQL[@]}" -c "CREATE EXTENSION pg_flashback;"
 
-    echo "─── $label ($rows rows) ───"
-
-    # Clean up any stale tracking entries before starting
-    $PSQL -q 2>/dev/null <<'INNERCLEAN'
-DO $$
-DECLARE r record;
-BEGIN
-    FOR r IN SELECT s.snapshot_table FROM flashback.snapshots s
-             JOIN flashback.tracked_tables tt ON tt.rel_oid = s.rel_oid
-             WHERE tt.table_name = 'rb_orders'
-    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.snapshot_table)); END LOOP;
-    FOR r IN SELECT base_snapshot_table FROM flashback.tracked_tables WHERE table_name = 'rb_orders'
-    LOOP PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table)); END LOOP;
-EXCEPTION WHEN OTHERS THEN NULL;
-END $$;
-DELETE FROM flashback.delta_log WHERE table_name = 'public.rb_orders';
-DELETE FROM flashback.staging_events WHERE table_name = 'public.rb_orders';
-DELETE FROM flashback.snapshots WHERE rel_oid IN (
-    SELECT rel_oid FROM flashback.tracked_tables WHERE table_name = 'rb_orders');
-DELETE FROM flashback.schema_versions WHERE rel_oid IN (
-    SELECT rel_oid FROM flashback.tracked_tables WHERE table_name = 'rb_orders');
-DELETE FROM flashback.tracked_tables WHERE table_name = 'rb_orders';
-INNERCLEAN
-
-    # Create empty table and track it (snapshot = 0 rows)
-    $PSQL -q <<SQL
-DROP TABLE IF EXISTS rb_orders CASCADE;
-CREATE TABLE rb_orders (
-    id       bigserial PRIMARY KEY,
-    customer text NOT NULL,
-    amount   numeric(12,2),
-    status   text,
-    region   text,
-    notes    text
-);
-
-SELECT flashback_track('rb_orders');
+RESULTS='[]'
+CORRECTNESS=1
+for n in $SCALES; do
+    log "scale=$n"
+    "${PSQL[@]}" <<SQL
+DROP TABLE IF EXISTS public.bench_t CASCADE;
+CREATE TABLE public.bench_t (id int PRIMARY KEY, payload text);
+SELECT flashback_track('public.bench_t');
 SQL
+    h=""
+    for _ in $(seq 1 120); do
+        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='public.bench_t' LIMIT 1;")
+        [[ "$h" == "healthy" ]] && break
+        sleep 0.25
+    done
+    [[ "$h" == "healthy" ]] || die "not healthy before load"
 
-    # Attach direct-to-delta_log trigger (bypass staging worker)
-    attach_bench_trigger public rb_orders
+    "${PSQL[@]}" -c "INSERT INTO public.bench_t SELECT g, 'x' FROM generate_series(1,$n) g;"
+    for _ in $(seq 1 120); do
+        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='public.bench_t' LIMIT 1;")
+        [[ "$h" == "healthy" ]] && break
+        sleep 0.25
+    done
 
-    # Insert rows — these INSERT events land directly in delta_log
-    $PSQL -q -c "
-INSERT INTO rb_orders (customer, amount, status, region, notes)
-SELECT 'customer_' || g,
-       (random() * 9999 + 1)::numeric(12,2),
-       (ARRAY['NEW','PROCESSING','SHIPPED','DELIVERED'])[ceil(random()*4)::int],
-       (ARRAY['US','EU','APAC','LATAM'])[ceil(random()*4)::int],
-       repeat('x', 20)
-FROM generate_series(1, ${rows}) g;
-"
+    FP=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.bench_t;")
+    "${PSQL[@]}" -c "DROP TABLE public.bench_t;"
+    st=""
+    for _ in $(seq 1 180); do
+        st=$("${PSQL[@]}" -c "SELECT status FROM flashback_disaster_points('public.bench_t', interval '1 hour') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
+        [[ "$st" == "restorable" ]] && break
+        sleep 0.25
+    done
 
-    local t_disaster
-    t_disaster=$($PSQL -Atq -c "SELECT clock_timestamp();")
+    START_NS=$(date +%s%N)
+    "${PSQL[@]}" -c "SELECT flashback_recover_execute('public.bench_t', (flashback_recover_plan('public.bench_t'))->>'plan_token');" >/dev/null
+    END_NS=$(date +%s%N)
+    ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
+    FP2=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.bench_t;")
+    ok=true
+    if [[ "$FP" != "$FP2" ]]; then
+        ok=false
+        CORRECTNESS=0
+    fi
+    RPS="unknown"
+    if [[ "$ELAPSED_MS" -gt 0 ]]; then
+        RPS=$(awk -v n="$n" -v ms="$ELAPSED_MS" 'BEGIN { printf "%.1f", n / (ms/1000.0) }')
+    fi
+    RESULTS=$(jq -n --argjson acc "$RESULTS" --argjson n "$n" --argjson ms "$ELAPSED_MS" \
+        --arg rps "$RPS" --argjson ok "$ok" \
+        '$acc + [{rows:$n, elapsed_ms:$ms, rows_per_sec:$rps, fingerprint_ok:$ok}]')
+    log "scale=$n elapsed_ms=$ELAPSED_MS rps=$RPS fp_ok=$ok"
+done
 
-    # Disaster: update ALL rows (events after t_before → replayed during restore)
-    $PSQL -q -c "UPDATE rb_orders SET status = 'DISASTER', notes = repeat('y',20);"
+STATUS=failed
+[[ "$CORRECTNESS" == 1 ]] && STATUS=passed
+jq -n \
+  --arg status "$STATUS" \
+  --argjson identity "$IDENTITY" \
+  --argjson results "$RESULTS" \
+  --argjson correctness_hard_gate "$CORRECTNESS" \
+  '{
+     qualification_kind: "exact_wal_restore_benchmark",
+     status: $status,
+     identity: $identity,
+     correctness_hard_gate: ($correctness_hard_gate == 1),
+     results: $results,
+     duration_estimate_note: "duration_estimate remains unknown in plans unless evidence from this report is attached",
+     note: "Bound to Phase 8 candidate identity; no cargo build in claim run"
+   }' > "$RESULT_JSON"
 
-    # Measure restore — restore to t_disaster (replays the UPDATE disaster back to pre-disaster state)
-    local wall_start
-    wall_start=$(date +%s%N)
-    $PSQL -q -c "SELECT flashback_restore('rb_orders', '${t_disaster}'::timestamptz);" 
-    local wall_end
-    wall_end=$(date +%s%N)
-    local wall_ms=$(( (wall_end - wall_start) / 1000000 ))
-    local rps=$(( rows * 1000 / (wall_ms + 1) ))
-
-    echo "  Restore: ${wall_ms} ms   throughput: ~${rps} rows/s"
-
-    $PSQL -q -c "SELECT flashback_untrack('rb_orders'); DROP TABLE IF EXISTS rb_orders CASCADE;"
-    echo ""
-}
-
-# ── Scenario: 10K rows ──────────────────────────────────────────────
-run_restore_bench "Batch restore" 10000
-
-# ── Scenario: 50K rows ──────────────────────────────────────────────
-run_restore_bench "Batch restore" 50000
-
-# ── Scenario: 100K rows ─────────────────────────────────────────────
-run_restore_bench "Batch restore" 100000
-
-# ── Scenario: 200K rows ─────────────────────────────────────────────
-run_restore_bench "Batch restore" 200000
-
-# ── Scenario: 200K rows — INSERT + DELETE mix ───────────────────────
-echo "─── 200K rows — INSERT then partial DELETE restore ───"
-$PSQL -q <<'SQL'
-DROP TABLE IF EXISTS rb_mixed CASCADE;
-CREATE TABLE rb_mixed (
-    id    bigserial PRIMARY KEY,
-    val   text,
-    score integer
-);
-SELECT flashback_track('rb_mixed');
-SQL
-
-attach_bench_trigger public rb_mixed
-
-$PSQL -q <<'SQL'
-INSERT INTO rb_mixed (val, score)
-SELECT 'item_' || g, (random()*1000)::integer
-FROM generate_series(1, 200000) g;
-SQL
-
-DISASTER_TS=$($PSQL -Atq -c "SELECT clock_timestamp();")
-$PSQL -q -c "DELETE FROM rb_mixed WHERE id % 3 = 0;"   # delete ~66K rows
-
-wall_start=$(date +%s%N)
-$PSQL -q -c "SELECT flashback_restore('rb_mixed', '${DISASTER_TS}'::timestamptz);"
-wall_end=$(date +%s%N)
-wall_ms=$(( (wall_end - wall_start) / 1000000 ))
-echo "  Restore 200K rows (66K DELETEs replayed): ${wall_ms} ms   ~$(( 66666 * 1000 / (wall_ms+1) )) events/s"
-
-$PSQL -q -c "SELECT flashback_untrack('rb_mixed'); DROP TABLE IF EXISTS rb_mixed CASCADE;"
-echo ""
-
-# ── Scenario: parallel restore hint ─────────────────────────────────
-echo "─── flashback_restore_parallel (4 workers hint, 200K rows) ───"
-$PSQL -q <<'SQL'
-DROP TABLE IF EXISTS rb_parallel CASCADE;
-CREATE TABLE rb_parallel (
-    id   bigserial PRIMARY KEY,
-    data text
-);
-SELECT flashback_track('rb_parallel');
-SQL
-
-attach_bench_trigger public rb_parallel
-
-$PSQL -q <<'SQL'
-INSERT INTO rb_parallel (data)
-SELECT repeat('p', 50) FROM generate_series(1, 200000) g;
-SQL
-
-BEFORE_TS=$($PSQL -Atq -c "SELECT clock_timestamp();")
-$PSQL -q -c "UPDATE rb_parallel SET data = repeat('q', 50);"
-
-wall_start=$(date +%s%N)
-$PSQL -q -c "SELECT * FROM flashback_restore_parallel('rb_parallel', '${BEFORE_TS}'::timestamptz, 4);"
-wall_end=$(date +%s%N)
-wall_ms=$(( (wall_end - wall_start) / 1000000 ))
-echo "  flashback_restore_parallel 200K: ${wall_ms} ms"
-
-$PSQL -q -c "SELECT flashback_untrack('rb_parallel'); DROP TABLE IF EXISTS rb_parallel CASCADE;"
-echo ""
-
-echo "═══════════════════════════════════════════════════════"
-echo "  Benchmark complete."
-echo "═══════════════════════════════════════════════════════"
+log "result: $RESULT_JSON"
+[[ "$CORRECTNESS" == 1 ]] || exit 1
