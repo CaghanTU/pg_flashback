@@ -1,0 +1,9 @@
+{
+  "qualification_kind": "extension_upgrade_e2e",
+  "status": "passed",
+  "mode": "fresh_020",
+  "extension_version": "0.2.0",
+  "supported_upgrade": "0.1.0->0.2.0",
+  "downgrade": "refuse",
+  "note": "Downgrade unsupported per ADR 0001; historical tag v0.4.0 is not an upgrade source."
+}
