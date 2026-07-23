@@ -47,7 +47,7 @@ pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
 EOF
-echo "local replication trust" >>"$PRIMARY/pg_hba.conf"
+echo "local replication all trust" >>"$PRIMARY/pg_hba.conf"
 echo "host replication all 127.0.0.1/32 trust" >>"$PRIMARY/pg_hba.conf"
 echo "host all all 127.0.0.1/32 trust" >>"$PRIMARY/pg_hba.conf"
 
