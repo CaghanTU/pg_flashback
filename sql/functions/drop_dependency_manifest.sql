@@ -303,14 +303,19 @@ END;
 $$;
 
 -- Restore preflight: refuse swap unless an exact event-bound dependency
--- manifesto is present and reports only supported dependencies.
--- Never fall back to "latest for tracking_id" and never treat a missing
--- binding as "no dependents".
+-- manifest is present and reports only supported dependencies.
+-- Matching is by disaster_event_id ONLY — never "latest for tracking_id",
+-- never a commit_lsn/xid transitional admit arm, and never a missing
+-- binding treated as "no dependents". flashback_bind_drop_dependency_manifests()
+-- remains the sole path that resolves disaster_event_id (via xid/lsn join
+-- against delta_log) onto a captured manifest row.
+-- Drop the retired 4-arg (tracking_id, event_id, commit_lsn, xid) overload
+-- from earlier installs; CREATE OR REPLACE cannot narrow a signature.
+DROP FUNCTION IF EXISTS flashback_require_supported_drop_manifest(bigint, bigint, pg_lsn, bigint);
+
 CREATE OR REPLACE FUNCTION flashback_require_supported_drop_manifest(
     p_tracking_id bigint,
-    p_disaster_event_id bigint DEFAULT NULL,
-    p_disaster_commit_lsn pg_lsn DEFAULT NULL,
-    p_source_xid bigint DEFAULT NULL
+    p_disaster_event_id bigint DEFAULT NULL
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -322,56 +327,20 @@ DECLARE
     v_row record;
     v_any_manifest boolean;
 BEGIN
-    IF p_disaster_event_id IS NULL
-       AND p_disaster_commit_lsn IS NULL
-       AND p_source_xid IS NULL
-    THEN
+    IF p_disaster_event_id IS NULL THEN
         RAISE EXCEPTION
             'pg_flashback: restore refused: exact DROP identity required for dependency manifest check (tracking_id %)',
             p_tracking_id
             USING ERRCODE = 'invalid_parameter_value',
-                  HINT = 'Pass disaster_event_id (preferred), disaster_commit_lsn, or source_xid from the selected DROP.';
+                  HINT = 'Pass the exact disaster_event_id selected by flashback_recover_plan/flashback_disaster_points.';
     END IF;
 
-    -- Prefer an exact disaster_event_id bind; allow xid/lsn only as
-    -- transitional bind keys for freshly captured rows awaiting worker bind.
     SELECT *
       INTO v_row
     FROM flashback.drop_dependency_manifests m
     WHERE m.tracking_id = p_tracking_id
-      AND (
-          (p_disaster_event_id IS NOT NULL AND m.disaster_event_id = p_disaster_event_id)
-          OR (
-              p_disaster_event_id IS NOT NULL
-              AND m.disaster_event_id IS NULL
-              AND m.source_xid IS NOT NULL
-              AND m.source_xid = (
-                    SELECT dl.source_xid
-                    FROM flashback.delta_log dl
-                    WHERE dl.event_id = p_disaster_event_id
-                    LIMIT 1
-              )
-          )
-          OR (
-              p_disaster_commit_lsn IS NOT NULL
-              AND m.disaster_commit_lsn IS NOT DISTINCT FROM p_disaster_commit_lsn
-          )
-          OR (
-              p_source_xid IS NOT NULL
-              AND m.source_xid = p_source_xid
-          )
-      )
-    ORDER BY
-        CASE
-            WHEN p_disaster_event_id IS NOT NULL
-                 AND m.disaster_event_id = p_disaster_event_id THEN 0
-            WHEN p_disaster_commit_lsn IS NOT NULL
-                 AND m.disaster_commit_lsn IS NOT DISTINCT FROM p_disaster_commit_lsn THEN 1
-            WHEN p_source_xid IS NOT NULL AND m.source_xid = p_source_xid THEN 2
-            ELSE 3
-        END,
-        m.captured_at DESC,
-        m.manifest_id DESC
+      AND m.disaster_event_id = p_disaster_event_id
+    ORDER BY m.captured_at DESC, m.manifest_id DESC
     LIMIT 1;
 
     IF v_row.manifest_id IS NULL THEN
@@ -383,8 +352,8 @@ BEGIN
 
         IF v_any_manifest THEN
             RAISE EXCEPTION
-                'pg_flashback: restore refused: no exact pre-DROP dependency manifest bound to the selected DROP (tracking_id %, disaster_event_id %, commit_lsn %, xid %)',
-                p_tracking_id, p_disaster_event_id, p_disaster_commit_lsn, p_source_xid
+                'pg_flashback: restore refused: no exact pre-DROP dependency manifest bound to the selected DROP (tracking_id %, disaster_event_id %)',
+                p_tracking_id, p_disaster_event_id
                 USING ERRCODE = 'feature_not_supported',
                       HINT = 'Wait for worker bind (flashback_bind_drop_dependency_manifests) or replan; never recovers from another DROP generation''s manifest.';
         END IF;

@@ -17,6 +17,7 @@ STATEMENT_TIMEOUT_MS="${PG_FLASHBACK_STATEMENT_TIMEOUT_MS:-${PG_FLASHBACKCTL_STA
 PROTECT_HEALTH_TIMEOUT_S="${PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S:-${PG_FLASHBACKCTL_TRACK_HEALTH_TIMEOUT_S:-60}}"
 RECOVER_HEALTH_TIMEOUT_S="${PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S:-${PG_FLASHBACKCTL_RESTORE_HEALTH_TIMEOUT_S:-120}}"
 DISCOVERY_TIMEOUT_S="${PG_FLASHBACK_DISCOVERY_TIMEOUT_S:-30}"
+MAINTAIN_FINALIZE_TIMEOUT_S="${PG_FLASHBACK_MAINTAIN_FINALIZE_TIMEOUT_S:-120}"
 JSON_OUT=0
 VERBOSE=0
 YES=0
@@ -604,12 +605,18 @@ SQL
     fi
 
     local capture_running maint_running admission slot_status lag_bytes disk_bytes
+    local dr_used dr_budget dr_reclaimable dr_retention dr_oldest
     capture_running=$(printf '%s' "$payload" | jq -r '.workers.capture_running')
     maint_running=$(printf '%s' "$payload" | jq -r '.workers.maintenance_running')
     admission=$(printf '%s' "$payload" | jq -r '.workers.admission_state')
     slot_status=$(printf '%s' "$payload" | jq -r '.slot.wal_status // "none"')
     lag_bytes=$(printf '%s' "$payload" | jq -r '.slot.retained_bytes // 0')
     disk_bytes=$(printf '%s' "$payload" | jq -r '.flashback_disk_bytes // 0')
+    dr_used=$(printf '%s' "$payload" | jq -r '.disk_retention.used_bytes // empty')
+    dr_budget=$(printf '%s' "$payload" | jq -r '.disk_retention.configured_snapshot_budget // "unknown"')
+    dr_reclaimable=$(printf '%s' "$payload" | jq -r '.disk_retention.reclaimable_bytes // 0')
+    dr_retention=$(printf '%s' "$payload" | jq -r '.disk_retention.configured_retention // "unknown"')
+    dr_oldest=$(printf '%s' "$payload" | jq -r '.disk_retention.oldest_recoverable_point // "unknown"')
 
     echo "pg_flashback status"
     echo "==================="
@@ -625,6 +632,7 @@ SQL
         fi
     fi
     echo "Approx. flashback disk use: $(human_bytes "$disk_bytes")"
+    echo "Disk retention: used=$([[ -n "$dr_used" ]] && human_bytes "$dr_used" || echo unknown), reclaimable=$(human_bytes "$dr_reclaimable"), snapshot_budget=$dr_budget, retention=$dr_retention, oldest_recoverable=$dr_oldest"
     echo
 
     local count
@@ -1116,16 +1124,46 @@ SQL
         return 0
     fi
     [[ "$YES" == 1 ]] || die "maintain requires --yes (or --dry-run)"
-    # Fresh transaction: reanchor must be the first write.
+    # Fresh transaction: reanchor must be the first write. flashback_maintain_execute
+    # is a thin flashback_maintain_begin() wrapper; it commits the reanchor and a
+    # durable flashback.operations row (operation_id) in the same transaction.
     out="$(psql_tuples -v "table=$target" <<'SQL'
 SELECT flashback_maintain_execute(:'table');
 SQL
 )" || fail "maintain execute failed"
+    local op_id
+    op_id=$(printf '%s' "$out" | jq -r '.operation_id // empty')
+
+    # CLI polls flashback_maintain_finalize with separate psql invocations and a
+    # bounded timeout; the server never sleeps on our behalf. Finalize seals the
+    # predecessor generation (retained, not deleted) once the successor is healthy.
+    local final_json="" fstate=""
+    if [[ -n "$op_id" && "$op_id" != "null" ]]; then
+        local deadline
+        deadline=$(( $(date +%s) + MAINTAIN_FINALIZE_TIMEOUT_S ))
+        while true; do
+            final_json="$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_maintain_finalize(:'opid'::bigint);
+SQL
+)" || fail "maintain finalize failed for operation_id=$op_id"
+            fstate=$(printf '%s' "$final_json" | jq -r '.status // empty')
+            [[ "$fstate" == "sealed" ]] && break
+            (( $(date +%s) >= deadline )) && break
+            sleep 1
+        done
+    fi
+
     if [[ "$JSON_OUT" == 1 ]]; then
-        emit_envelope maintain ok ok "$out" null
+        emit_envelope maintain ok ok "$(jq -n --argjson begin "$out" --argjson finalize "${final_json:-null}" \
+            '{begin:$begin, finalize:$finalize}')" null
     else
         echo "Maintain started for $(printf '%s' "$out" | jq -r '.table_name') generation=$(printf '%s' "$out" | jq -r '.new_generation_id')"
-        echo "Wait for successor coverage healthy before cleanup of older generations."
+        if [[ "$fstate" == "sealed" ]]; then
+            echo "Predecessor generation sealed (retained until normal retention retires it)."
+        else
+            echo "Successor coverage not yet healthy after ${MAINTAIN_FINALIZE_TIMEOUT_S}s; predecessor stays active/retained."
+            echo "Re-run 'pg_flashback status $target' or 'pg_flashback doctor' and retry maintain later — no data was lost."
+        fi
     fi
 }
 
