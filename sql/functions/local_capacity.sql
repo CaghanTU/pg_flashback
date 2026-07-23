@@ -490,3 +490,167 @@ COMMENT ON FUNCTION flashback_advise(regclass) IS
 
 COMMENT ON FUNCTION flashback_admit_local_capacity(regclass, text) IS
     'Fail-closed local capacity and write-stall admission shared by track, re-anchor and restore.';
+
+-- =================================================================
+-- Read-only cluster/database config recommendation for local_delta.
+-- Never mutates postgresql.conf. Operators copy/apply lines explicitly.
+-- =================================================================
+CREATE OR REPLACE FUNCTION flashback_config_recommend(
+    p_rel regclass DEFAULT NULL,
+    p_target_database text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_db text := COALESCE(NULLIF(p_target_database, ''), current_database());
+    v_fs bigint;
+    v_heap bigint := 0;
+    v_toast bigint := 0;
+    v_base bigint;
+    v_peak bigint;
+    v_snap_budget text;
+    v_peak_budget text;
+    v_min_fs text;
+    v_safety text;
+    v_lines text[] := ARRAY[]::text[];
+    v_notes text[] := ARRAY[]::text[];
+    v_missing text[] := ARRAY[]::text[];
+    v_cur_snap text;
+    v_cur_peak text;
+    v_cur_min text;
+    v_workers integer;
+    v_max_workers integer;
+    v_slots integer;
+    v_senders integer;
+    v_slot_keep text;
+    v_targets text;
+BEGIN
+    -- Filesystem free space for the default tablespace (cluster-local estimate).
+    SELECT flashback_tablespace_filesystem_available_bytes(0::oid) INTO v_fs;
+    IF v_fs IS NULL OR v_fs < 0 THEN
+        v_fs := 0;
+    END IF;
+
+    IF p_rel IS NOT NULL THEN
+        SELECT COALESCE(pg_relation_size(p_rel), 0),
+               COALESCE(pg_total_relation_size(p_rel) - pg_relation_size(p_rel), 0)
+          INTO v_heap, v_toast;
+        -- Index bytes are not part of base CTAS, but restore rebuilds them.
+        v_base := v_heap + GREATEST(v_toast, 0);
+        v_peak := (2 * v_base) + GREATEST(pg_indexes_size(p_rel), 0);
+    ELSE
+        -- Conservative defaults when no sample table is provided: assume a
+        -- few hundred MiB ordinary table envelope for first-time setup.
+        v_base := 512 * 1024 * 1024;
+        v_peak := 2 * v_base;
+        v_notes := v_notes || ARRAY[
+            'no sample table provided; budgets use a conservative 512MiB base / 1GiB peak envelope — re-run with a regclass for tighter advice'
+        ];
+    END IF;
+
+    -- Round budgets up to nice pg_size_bytes strings with headroom.
+    v_snap_budget := pg_size_pretty(GREATEST(v_base * 2, 256 * 1024 * 1024));
+    v_peak_budget := pg_size_pretty(GREATEST(v_peak * 2, 512 * 1024 * 1024));
+    v_min_fs := pg_size_pretty(GREATEST((v_fs / 10), 1024 * 1024 * 1024)); -- ~10% free or 1GiB
+    IF v_fs > 0 AND (v_fs / 10) < (1024 * 1024 * 1024) THEN
+        v_min_fs := pg_size_pretty(GREATEST(v_fs / 10, 256 * 1024 * 1024));
+    END IF;
+    v_safety := '64MB';
+
+    v_cur_snap := NULLIF(current_setting('pg_flashback.local_max_snapshot_bytes', true), '');
+    v_cur_peak := NULLIF(current_setting('pg_flashback.local_max_restore_peak_bytes', true), '');
+    v_cur_min := NULLIF(current_setting('pg_flashback.local_min_filesystem_bytes', true), '');
+    IF v_cur_snap IS NULL THEN
+        v_missing := v_missing || ARRAY['pg_flashback.local_max_snapshot_bytes'];
+    END IF;
+    IF v_cur_peak IS NULL THEN
+        v_missing := v_missing || ARRAY['pg_flashback.local_max_restore_peak_bytes'];
+    END IF;
+    IF v_cur_min IS NULL THEN
+        v_missing := v_missing || ARRAY['pg_flashback.local_min_filesystem_bytes'];
+    END IF;
+
+    v_targets := COALESCE(
+        NULLIF(current_setting('pg_flashback.target_databases', true), ''),
+        NULLIF(current_setting('pg_flashback.target_database', true), ''),
+        v_db
+    );
+    v_workers := COALESCE(NULLIF(current_setting('pg_flashback.max_workers', true), '')::integer, 4);
+    v_max_workers := current_setting('max_worker_processes')::integer;
+    v_slots := current_setting('max_replication_slots')::integer;
+    v_senders := current_setting('max_wal_senders')::integer;
+    v_slot_keep := current_setting('max_slot_wal_keep_size', true);
+
+    v_lines := ARRAY[
+        format('shared_preload_libraries = ''pg_flashback'''),
+        format('wal_level = logical'),
+        format('max_worker_processes = %s', GREATEST(v_max_workers, v_workers * 2 + 4)),
+        format('max_replication_slots = %s', GREATEST(v_slots, 8)),
+        format('max_wal_senders = %s', GREATEST(v_senders, 8)),
+        format('pg_flashback.enabled = on'),
+        format('pg_flashback.capture_mode = wal'),
+        format('pg_flashback.target_databases = ''%s''', replace(v_targets, '''', '''''')),
+        format('pg_flashback.max_workers = %s', v_workers),
+        format('pg_flashback.local_max_snapshot_bytes = ''%s''', v_snap_budget),
+        format('pg_flashback.local_max_restore_peak_bytes = ''%s''', v_peak_budget),
+        format('pg_flashback.local_min_filesystem_bytes = ''%s''', v_min_fs),
+        format('pg_flashback.local_safety_reserve_bytes = ''%s''', v_safety)
+    ];
+
+    IF v_slot_keep IS NULL OR v_slot_keep IN ('-1', '') THEN
+        v_notes := v_notes || ARRAY[
+            'max_slot_wal_keep_size is unlimited (-1); prefer a finite cap so slot loss + open coverage gap fails closed before the filesystem fills'
+        ];
+        v_lines := v_lines || ARRAY['max_slot_wal_keep_size = ''4GB''  # suggested finite cap; tune to disk'];
+    END IF;
+
+    IF v_missing <> ARRAY[]::text[] THEN
+        v_notes := v_notes || ARRAY[
+            'capacity GUCs are unset; protect/restore fail closed until they are configured and PostgreSQL is restarted (postmaster GUCs) or reloaded where Userset applies'
+        ];
+    END IF;
+
+    RETURN jsonb_build_object(
+        'schema_version', 1,
+        'profile', 'local_delta',
+        'database', v_db,
+        'sample_relation', p_rel::text,
+        'filesystem_available_bytes', v_fs,
+        'projected_base_snapshot_bytes', v_base,
+        'projected_restore_peak_bytes', v_peak,
+        'missing_capacity_gucs', to_jsonb(v_missing),
+        'current', jsonb_build_object(
+            'local_max_snapshot_bytes', v_cur_snap,
+            'local_max_restore_peak_bytes', v_cur_peak,
+            'local_min_filesystem_bytes', v_cur_min,
+            'target_databases', v_targets,
+            'max_worker_processes', v_max_workers,
+            'max_replication_slots', v_slots,
+            'max_wal_senders', v_senders,
+            'max_slot_wal_keep_size', v_slot_keep
+        ),
+        'recommended_postgresql_conf_lines', to_jsonb(v_lines),
+        'apply', jsonb_build_object(
+            'automatic', false,
+            'privileged_opt_in', false,
+            'note', 'pg_flashback never edits postgresql.conf silently; copy the lines below, then restart PostgreSQL because shared_preload_libraries / wal_level / worker and slot limits require a postmaster restart'
+        ),
+        'restart_required', true,
+        'reload_sufficient', false,
+        'notes', to_jsonb(v_notes),
+        'operator_role_sql', format($sql$
+-- After CREATE EXTENSION, grant a login operator (not superuser) the admin API:
+CREATE ROLE pgfb_operator LOGIN PASSWORD '...';  -- use your secret management
+GRANT flashback_admin TO pgfb_operator;
+-- Connect as pgfb_operator for protect/status/recover/unprotect/cleanup.
+$sql$)
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION flashback_config_recommend(regclass, text) IS
+    'Read-only local_delta configuration recommendation. Returns postgresql.conf lines and operator-role SQL; never mutates cluster configuration.';

@@ -146,7 +146,7 @@ BEGIN
     expected := 'all three mandatory budgets configured (>0)';
     IF COALESCE(v_snap, 0) <= 0 OR COALESCE(v_peak, 0) <= 0 OR COALESCE(v_min_fs, 0) <= 0 THEN
         status := 'error';
-        action := 'set pg_flashback.local_max_snapshot_bytes, local_max_restore_peak_bytes and local_min_filesystem_bytes';
+        action := 'run SELECT flashback_config_recommend(); or pg_flashback config recommend, copy the capacity GUC lines into postgresql.conf, then restart PostgreSQL';
     ELSE
         status := 'ok'; action := 'none';
     END IF;

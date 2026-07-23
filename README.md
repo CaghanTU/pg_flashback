@@ -25,8 +25,11 @@ Recover public.orders? [y/N]
 ```
 
 > pg_flashback is under active development. The primary product is local
-> recovery for small and medium ordinary PostgreSQL tables. Test it in a
-> staging environment before production use.
+> recovery (`local_delta` + WAL) for small and medium ordinary PostgreSQL
+> tables. Capacity is sized by protected table size, change rate, and free
+> disk — not by whole-database size. Backup/pgBackRest paths are experimental
+> and are not required for the local product. Test in staging before
+> production use.
 
 ## Why pg_flashback?
 
@@ -69,9 +72,19 @@ See [the support matrix](docs/SUPPORT.md) for the precise contract.
 - A supported PostgreSQL server and matching development/package files
 - `wal_level = logical`
 - `shared_preload_libraries = 'pg_flashback'`
+- Explicit capacity budgets:
+  `pg_flashback.local_max_snapshot_bytes`,
+  `pg_flashback.local_max_restore_peak_bytes`,
+  `pg_flashback.local_min_filesystem_bytes`
 - Enough `max_worker_processes` capacity for one capture worker and one
   maintenance worker per configured database
 - `psql` and `jq` for the `pg_flashback` command
+
+See [Quickstart](docs/QUICKSTART.md) and
+[`docs/samples/postgresql.pg_flashback.conf`](docs/samples/postgresql.pg_flashback.conf).
+Use `pg_flashback config recommend` for read-only conf line suggestions.
+Day-to-day operations should use a login role granted `flashback_admin`
+(`pgfb_operator` in the Quickstart), not a standing superuser session.
 
 ## Installation
 

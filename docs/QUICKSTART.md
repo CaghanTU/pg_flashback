@@ -1,37 +1,80 @@
 # Quickstart
 
-This guide creates a disposable protected table and recovers it after an
-accidental DROP.
+This guide configures the local_delta product profile, protects an ordinary
+table, and recovers it after an accidental DROP. It does not install or
+configure pgBackRest.
+
+## Product boundary
+
+Protection cost is driven by **table size**, **change rate**, and **free disk**,
+not by total database size. The supported path is local base image + logical
+WAL capture. Backup/pgBackRest helpers that may exist in the tree are
+experimental and are not part of this quickstart.
 
 ## Prerequisites
 
-- PostgreSQL 15–18
-- `shared_preload_libraries = 'pg_flashback'`
-- `wal_level = logical`
-- the current database listed in `pg_flashback.target_databases`
-- `pg_flashback` installed in that database and the CLI available on `PATH`
+- PostgreSQL 15–18 on Linux
+- `psql` and `jq` on `PATH`
+- Enough free disk for a protected base image, retained deltas, and restore peak
 
-For a database named `appdb`, a minimal configuration is:
+## 1. Configure PostgreSQL (restart required)
+
+Ask the extension for a read-only recommendation after it is installed, or start
+from the sample fragment in
+[`docs/samples/postgresql.pg_flashback.conf`](samples/postgresql.pg_flashback.conf).
+
+Minimal fragment for database `appdb`:
 
 ```conf
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical
+max_worker_processes = 16
+max_replication_slots = 8
+max_wal_senders = 8
+max_slot_wal_keep_size = '4GB'
+pg_flashback.enabled = on
+pg_flashback.capture_mode = wal
 pg_flashback.target_databases = 'appdb'
 pg_flashback.max_workers = 4
+pg_flashback.local_max_snapshot_bytes = '2GB'
+pg_flashback.local_max_restore_peak_bytes = '4GB'
+pg_flashback.local_min_filesystem_bytes = '5GB'
+pg_flashback.local_safety_reserve_bytes = '64MB'
 ```
 
-Restart PostgreSQL, then:
+`local_max_snapshot_bytes`, `local_max_restore_peak_bytes`, and
+`local_min_filesystem_bytes` are mandatory. When unset, `protect` and restore
+fail closed.
+
+pg_flashback does **not** edit `postgresql.conf` for you. Copy the lines,
+restart PostgreSQL, then continue.
+
+## 2. Install extension and operator role
+
+Superuser is typically required for install. Day-to-day operations should use a
+login role that holds `flashback_admin` only.
 
 ```bash
 export PGDATABASE=appdb
+# Use libpq env / .pgpass — never put passwords on the CLI argv.
 psql -c "CREATE EXTENSION pg_flashback;"
+
+psql <<'SQL'
+CREATE ROLE pgfb_operator LOGIN PASSWORD /* use your secret management */ 'CHANGE_ME';
+GRANT flashback_admin TO pgfb_operator;
+SQL
+
+export PGUSER=pgfb_operator
+pg_flashback config recommend
 pg_flashback doctor
 ```
 
-Do not continue until `doctor` reports that the capture and maintenance
-workers are ready.
+Do not continue until `doctor` reports that capacity budgets are configured and
+the capture/maintenance workers are ready. Re-run
+`pg_flashback config recommend public.your_largest_table` after you know the
+target table size and tighten the budgets if needed.
 
-## Create and protect a table
+## 3. Create and protect a table
 
 ```bash
 psql <<'SQL'
@@ -54,7 +97,7 @@ pg_flashback status public.orders
 Protection is healthy only after the worker has consumed the boundary
 transaction. The CLI waits for that state.
 
-## Simulate an incident
+## 4. Simulate an incident
 
 Commit a normal change and then DROP the table in a separate transaction:
 
@@ -63,7 +106,7 @@ psql -c "UPDATE public.orders SET total = 130.00 WHERE customer = 'Ada';"
 psql -c "DROP TABLE public.orders;"
 ```
 
-## Preview and recover
+## 5. Preview and recover
 
 Previewing is read-only:
 
@@ -71,54 +114,32 @@ Previewing is read-only:
 pg_flashback recover public.orders --dry-run
 ```
 
-The plan identifies the exact DROP event, coverage generation, target
-COMMIT LSN, storage estimate, and any unsupported dependencies.
+The plan identifies the exact DROP event, the exact event-bound dependency
+manifest, coverage generation, target COMMIT LSN, and any unsupported
+dependencies. Recovery refuses when the exact manifest is missing.
 
-Recover interactively:
+Recover interactively (or with `--yes` in automation):
 
 ```bash
 pg_flashback recover public.orders
+# or:
+pg_flashback recover public.orders --yes --latest-drop
 ```
 
-Or confirm explicitly for automation:
+Default lookback follows the table's retained horizon (not a fixed 24 hours).
+Override with `--lookback '14 days'` when needed.
+
+## 6. Verify and clean up
 
 ```bash
-pg_flashback recover public.orders --latest-drop --yes
-```
-
-Verify the result:
-
-```bash
-psql -c "TABLE public.orders;"
-pg_flashback status public.orders
+psql -c "SELECT * FROM public.orders ORDER BY id;"
 pg_flashback history public.orders
-```
-
-## Stop protection
-
-Stopping and deleting evidence are deliberately separate:
-
-```bash
 pg_flashback unprotect public.orders --yes
-pg_flashback list
-
-# Inspect first, then remove the inactive lifecycle by its tracking ID.
-pg_flashback cleanup --tracking-id 1 --dry-run
-pg_flashback cleanup --tracking-id 1 --yes
+pg_flashback cleanup --tracking-id <id> --yes
 ```
 
-Never infer a tracking ID in automation; read it from `pg_flashback list
---json`.
+## Next reading
 
-## Expected refusals
-
-The command exits non-zero without changing the table when:
-
-- no unambiguous recoverable DROP exists;
-- the logical slot or required WAL continuity was lost;
-- a different live table now owns the same name;
-- the table topology or CASCADE dependency graph is unsupported;
-- capacity, worker, or coverage checks are unhealthy.
-
-Use `pg_flashback doctor`, `pg_flashback status`, and `--verbose` for the
-recommended action.
+- [SUPPORT.md](SUPPORT.md) — supported table features and fail-closed rejects
+- [ARCHITECTURE.md](ARCHITECTURE.md) — local_delta design
+- [DEVELOPMENT.md](DEVELOPMENT.md) — build and test

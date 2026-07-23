@@ -1,7 +1,15 @@
 # Support matrix
 
-This document defines the current local DROP-recovery contract. Code may exist
-outside this matrix; that does not make it a supported product path.
+This document defines the current local DROP-recovery contract (`local_delta`
++ logical WAL). Code may exist outside this matrix; that does not make it a
+supported product path. Backup/pgBackRest helpers are experimental and are not
+part of the primary local product.
+
+Capacity is sized by **protected table size**, **change rate**, and **free
+disk**, not by total database size. The three capacity GUCs
+(`local_max_snapshot_bytes`, `local_max_restore_peak_bytes`,
+`local_min_filesystem_bytes`) must be set explicitly; otherwise protect/restore
+fail closed. Use `pg_flashback config recommend` for read-only advice.
 
 ## Platforms
 
@@ -9,9 +17,10 @@ outside this matrix; that does not make it a supported product path.
 |---|---|
 | PostgreSQL | 15, 16, 17, 18 |
 | Operating system | Linux |
-| Capture | Logical WAL |
+| Capture | Logical WAL (`local_delta`) |
 | Topology | Writable primary with one local logical slot per configured database |
 | CLI dependencies | `psql`, `jq`, libpq connection settings |
+| Operator role | Login role with `flashback_admin` (superuser only for install) |
 
 Native macOS is not supported. Linux/aarch64 development under Lima and
 Linux/x86_64 builds are separate environments; evidence from one architecture
@@ -46,6 +55,8 @@ is not silently generalized to the other.
 | `DROP ... CASCADE` | Planned from the pre-DROP manifest; rejected if any dependency is unsupported |
 | `TRUNCATE` or destructive DML | Captured by the engine; advanced LSN recovery remains available |
 | DDL across an unproven schema epoch | Rejected |
+| Maintenance / reanchor | Opt-in via `pg_flashback maintain`; never silent auto-maintain |
+| Uninstall | `pg_flashback prepare-uninstall` refuses active lifecycles/pending restores |
 
 ## Transaction semantics
 
