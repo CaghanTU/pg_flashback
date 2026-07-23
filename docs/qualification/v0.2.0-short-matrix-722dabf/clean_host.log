@@ -1,0 +1,43 @@
+pg_flashback-candidate-722dabfe3d40-pg17-aarch64-linux.tar.gz: OK
+./pg_flashback-candidate-722dabfe3d40-pg17-aarch64-linux.tar.gz: OK
+./pg_flashback-candidate-722dabfe3d40-src.tar.gz: OK
+./pg-flashback-recovery-candidate-722dabfe3d40-aarch64-linux.tar.gz: OK
+[clean-host-smoke] 21:51:47 extracting candidate archives (source_commit=722dabfe3d40a152a0308148f0fe12c794f6f49d package_sha=0d703c299b1dce6162a6ebde96eab1c57ae9b288ee590ccfa32d68e580313e51)
+[clean-host-smoke] 21:51:47 PASS[1]: detected PATH collision when older pg_flashback precedes candidate
+[clean-host-smoke] 21:51:47 PASS[2]: installed extension+helper+CLI from candidate archives only (PATH/hash verified)
+2026-07-23 21:51:47.888 P00   INFO: stanza-create command begin 2.53.1: --config=/tmp/pgfb-clean-host-20260723T185147Z-86987/pgbackrest.conf --exec-id=87073-d4bdc6b8 --log-level-console=info --log-level-file=detail --log-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/log --pg1-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/primary --pg1-port=42987 --pg1-socket-path=/tmp/pgfb-ch-20260723T185147Z-86987 --repo1-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/repo --stanza=clean_host
+2026-07-23 21:51:48.498 P00   INFO: stanza-create for stanza 'clean_host' on repo1
+2026-07-23 21:51:48.506 P00   INFO: stanza-create command end: completed successfully (619ms)
+[clean-host-smoke] 21:51:48 PASS[3]: CREATE EXTENSION from candidate archive
+[clean-host-smoke] 21:51:48 PASS[4]: pg_flashback doctor
+NOTICE:  pg_flashback: created logical replication slot pg_flashback_cleandb
+[clean-host-smoke] 21:51:49 PASS[5]: pg_flashback protect
+NOTICE:  table "__fb_lsn_shadow_1" does not exist, skipping
+NOTICE:  table "__fb_lsn_shadow_1" does not exist, skipping
+NOTICE:  table "orders" does not exist, skipping
+NOTICE:  pg_flashback: restore applied at target LSN 0/1C0D260; successor coverage is pending until this transaction COMMIT is consumed. Check flashback_health() before another historical operation.
+[clean-host-smoke] 21:51:50 PASS[6]: pg_flashback protect/DROP/recover fingerprint
+[clean-host-smoke] 21:51:50 PASS[7]: local SQL track activation
+2026-07-23 21:51:50.962 P00   INFO: backup command begin 2.53.1: --compress-type=none --config=/tmp/pgfb-clean-host-20260723T185147Z-86987/pgbackrest.conf --exec-id=87337-159c6657 --no-expire-auto --log-level-console=info --log-level-file=detail --log-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/log --pg1-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/primary --pg1-port=42987 --pg1-socket-path=/tmp/pgfb-ch-20260723T185147Z-86987 --no-repo1-block --no-repo1-bundle --repo1-hardlink --repo1-path=/tmp/pgfb-clean-host-20260723T185147Z-86987/repo --repo1-retention-full=99 --stanza=clean_host --start-fast --type=full
+2026-07-23 21:51:51.679 P00   INFO: execute non-exclusive backup start: backup begins after the requested immediate checkpoint completes
+2026-07-23 21:51:52.084 P00   INFO: backup start archive = 000000010000000000000003, lsn = 0/3000028
+2026-07-23 21:51:52.084 P00   INFO: check archive for prior segment 000000010000000000000002
+2026-07-23 21:51:53.972 P00   INFO: execute non-exclusive backup stop and wait for all WAL segments to archive
+2026-07-23 21:51:54.175 P00   INFO: backup stop archive = 000000010000000000000005, lsn = 0/5000638
+2026-07-23 21:51:54.177 P00   INFO: check archive for segment(s) 000000010000000000000003:000000010000000000000005
+2026-07-23 21:51:54.186 P00   INFO: new backup label = 20260723-215151F
+2026-07-23 21:51:54.202 P00   INFO: full backup size = 32.8MB, file total = 1451
+2026-07-23 21:51:54.202 P00   INFO: backup command end: completed successfully (3240ms)
+[clean-host-smoke] 21:51:54 PASS[8]: operator FULL0 created: 20260723-215151F
+NOTICE:  schema "pg_temp" does not exist, skipping
+NOTICE:  table "_fb_wal_lock_ids" does not exist, skipping
+NOTICE:  table "_fb_wal_batch" does not exist, skipping
+NOTICE:  table "_fb_wal_commits" does not exist, skipping
+NOTICE:  table "_fb_wal_events" does not exist, skipping
+NOTICE:  table "_fb_wal_relevant_commits" does not exist, skipping
+[clean-host-smoke] 21:51:56 PASS[9]: retained FULL+WAL activation
+[clean-host-smoke] 21:51:56 PASS[10]: anchor reconcile dry-run and live (no FULL created)
+[clean-host-smoke] 21:51:59 PASS[11]: real pgBackRest table restore
+[clean-host-smoke] 21:51:59 PASS[12]: health checks (health=healthy)
+[clean-host-smoke] 21:51:59 PASS[13]: uninstall/cleanup
+[clean-host-smoke] 21:51:59 COMPLETE: 13 assertions; /tmp/pgfb-clean-host-20260723T185147Z-86987/result.json

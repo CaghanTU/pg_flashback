@@ -1,0 +1,2 @@
+NOTICE:  pg_flashback: created logical replication slot pg_flashback_postgres
+Fault injection smoke: PASS (/home/caghan.linux/table-restore/pg_flashback/target/qualification/fault-injection-smoke-20260723T185254Z-87910.json)

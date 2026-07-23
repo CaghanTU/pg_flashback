@@ -1,0 +1,10 @@
+━━━ 0. Ortam hazırlığı (GUC kaydet, DB + slot temizle, restart) ━━━
+psql: error: connection to server on socket "/home/caghan.linux/.pgrx/.s.PGSQL.28817" failed: No such file or directory
+	Is the server running locally and accepting connections on that socket?
+FAIL: hata (satır 190)
+━━━ Temizlik: GUC'ları geri al, restart, test DB/slot'larını düşür ━━━
+  ok: temizlik tamamlandı (target_databases=)
+
+╔══════════════════════════════════════════╗
+║   WAL E2E: BAŞARISIZ ✘ (ortam geri alındı)║
+╚══════════════════════════════════════════╝

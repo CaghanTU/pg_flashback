@@ -1,0 +1,41 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running unittests src/lib.rs (tools/pg_flashback_recovery/target/debug/deps/pg_flashback_recovery-f02fed226f1dd868)
+
+running 22 tests
+test capacity::tests::request_directory_names_reject_hidden_and_path_components ... ok
+test executor::tests::quotes_pg_dump_identifier_pattern ... ok
+test capacity::tests::tree_and_aggregate_quota_count_request_directories_only ... ok
+test executor::tests::quotes_shell_and_postgresql_config_values ... ok
+test pgbackrest::tests::backup_label_cannot_escape_repository_root ... ok
+test pgbackrest::tests::parses_postgresql_lsn ... ok
+test pgbackrest::tests::selects_latest_full_backup_not_after_target ... ok
+test pgbackrest::tests::target_before_oldest_backup_fails_closed ... ok
+test gc::tests::remove_now_holds_request_lock_through_delete ... ok
+test provider::tests::only_pgbackrest_is_qualified ... ok
+test provider::tests::dependency_kinds_are_extensible_without_selecting_them ... ok
+test tests::configuration_file_must_not_be_writable_or_a_symlink ... ok
+test tests::request_id_cannot_escape_work_root ... ok
+test tests::request_requires_positive_target_time_and_schema_version ... ok
+test provider::tests::pin_and_release_dependencies_are_durable ... ok
+test gc::tests::gc_keeps_ancient_pins_until_explicit_unpin ... ok
+test verify::tests::archive_frontier_rejects_a_newer_timeline ... ok
+test verify::tests::archive_frontier_requires_the_anchor_timeline ... ok
+test verify::tests::verification_request_binds_safe_id_and_positive_tracking_id ... ok
+test verify::tests::wal_segment_and_lsn_conversion_round_trip ... ok
+test verify::tests::large_manifest_is_streamed_instead_of_rejected_by_contract_limit ... ok
+test verify::tests::archive_parser_rejects_history_files_and_verifies_wal_checksum ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src/main.rs (tools/pg_flashback_recovery/target/debug/deps/pg_flashback_recovery-02f6a0e220e6efab)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pg_flashback_recovery
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

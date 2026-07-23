@@ -1,30 +1,19 @@
 {
-  "qualification_kind": "local_product_hardening_freeze",
-  "extension_version": "0.2.0",
-  "status": "READY_TO_START",
+  "freeze_kind": "local_product_hardening_short_matrix",
+  "branch": "work/v0.1.0-overnight-sanitized",
+  "product_commit": "722dabfe3d40a152a0308148f0fe12c794f6f49d",
+  "candidate_dir": "target/candidate/722dabfe3d40a152a0308148f0fe12c794f6f49d",
+  "readiness": "READY_TO_START",
   "staging_verdict": "HAYIR",
-  "candidate_source_commit": "b3b8ba5d8730dd80595f7c51764dd0e4e0641b03",
-  "source_tree": "4539f1d90791cd12028eb5418a0744633a7fae46",
-  "candidate_dir": "target/candidate/b3b8ba5d8730dd80595f7c51764dd0e4e0641b03",
+  "exact_rc_24h_soak": "not_started",
+  "invalidates_candidate": "b3b8ba5d8730dd80595f7c51764dd0e4e0641b03",
+  "evidence_dir": "docs/qualification/v0.2.0-short-matrix-722dabf",
   "digests": {
-    "package_sha256": "556711323dd2cfc30c76075c45e086f8cf5f19db05460766a9c04b7c766a29f0",
-    "extension_binary_sha256": "f6c29e6c05b46149c01aff8a0ce623888484edc852b90049e1e2bf2b1f032a50",
-    "cli_binary_sha256": "19bd2bc21729c5ff52c0ebf6ec993f34c187ca8526122afb124584b0547ac175",
-    "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
-  },
-  "historical_soaks_not_claimed": [
-    "3b392ff",
-    "0e65604",
-    "86ab5a8"
-  ],
-  "supersedes_candidate": "86ab5a8c7a1cc9db4584eadfa8a67bddf1a9b93b",
-  "evidence_dir": "docs/qualification/v0.2.0-short-matrix-b3b8ba5",
-  "gates": {
-    "exact_wal_matrix": "passed",
-    "short_matrix": "passed",
-    "ha_promotion_e2e": "passed",
-    "gate_c_24h": "not_started"
-  },
-  "ready_to_start_24h_command": "PG_FLASHBACK_STABILITY_MODE=exact CANDIDATE_DIR=target/candidate/b3b8ba5d8730dd80595f7c51764dd0e4e0641b03 ./scripts/run_exact_rc_24h_stability_soak.sh",
-  "note": "Short matrix and exact-WAL candidate-archive matrix green on tip digests. HA promotion E2E passed. Tip Gate C not started; staging remains HAYIR until tip Gate C. Historical soaks do not qualify tip binaries."
+  "candidate_source_commit": "722dabfe3d40a152a0308148f0fe12c794f6f49d",
+  "package_sha256": "0d703c299b1dce6162a6ebde96eab1c57ae9b288ee590ccfa32d68e580313e51",
+  "extension_binary_sha256": "61a21338d8ccbd72a0ad61df641d67e887ede38610298d3722fc2dbcba11c900",
+  "cli_binary_sha256": "7d09d3165c3008b0bf81505a1121fbcfff25ec89b64efeb4ba107cebd02d2908",
+  "helper_binary_sha256": "a17cfb25b1cacb6400da3420d62171bc939a6a501b5735fce17764a0ac6c93b6"
+},
+  "claim_host": "PostgreSQL 17 on Linux/aarch64 under Lima on an Apple Silicon host"
 }

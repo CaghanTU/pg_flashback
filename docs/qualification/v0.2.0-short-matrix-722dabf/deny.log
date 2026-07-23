@@ -1,0 +1,447 @@
+warning[duplicate]: found 2 duplicate entries for crate 'block-buffer'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:13:1
+   │  
+13 │ ╭ block-buffer 0.10.4 registry+https://github.com/rust-lang/crates.io-index
+14 │ │ block-buffer 0.12.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ block-buffer v0.10.4
+     └── digest v0.10.7
+         ├── hmac v0.12.1
+         │   └── pg_flashback v0.2.0
+         └── sha2 v0.10.9
+             └── pg_flashback v0.2.0 (*)
+   ├ block-buffer v0.12.0
+     └── digest v0.11.2
+         ├── hmac v0.13.0
+         │   └── postgres-protocol v0.6.12
+         │       ├── postgres-types v0.2.14
+         │       │   └── tokio-postgres v0.7.18
+         │       │       └── postgres v0.19.13
+         │       │           └── pgrx-tests v0.16.1
+         │       │               └── pg_flashback v0.2.0
+         │       └── tokio-postgres v0.7.18 (*)
+         ├── md-5 v0.11.0
+         │   └── postgres-protocol v0.6.12 (*)
+         └── sha2 v0.11.0
+             └── postgres-protocol v0.6.12 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'cpufeatures'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:37:1
+   │  
+37 │ ╭ cpufeatures 0.2.17 registry+https://github.com/rust-lang/crates.io-index
+38 │ │ cpufeatures 0.3.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰───────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ cpufeatures v0.2.17
+     └── sha2 v0.10.9
+         └── pg_flashback v0.2.0
+   ├ cpufeatures v0.3.0
+     ├── chacha20 v0.10.0
+     │   └── rand v0.10.2
+     │       ├── postgres-protocol v0.6.12
+     │       │   ├── postgres-types v0.2.14
+     │       │   │   └── tokio-postgres v0.7.18
+     │       │   │       └── postgres v0.19.13
+     │       │   │           └── pgrx-tests v0.16.1
+     │       │   │               └── pg_flashback v0.2.0
+     │       │   └── tokio-postgres v0.7.18 (*)
+     │       └── tokio-postgres v0.7.18 (*)
+     └── sha2 v0.11.0
+         └── postgres-protocol v0.6.12 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'crypto-common'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:39:1
+   │  
+39 │ ╭ crypto-common 0.1.7 registry+https://github.com/rust-lang/crates.io-index
+40 │ │ crypto-common 0.2.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ crypto-common v0.1.7
+     └── digest v0.10.7
+         ├── hmac v0.12.1
+         │   └── pg_flashback v0.2.0
+         └── sha2 v0.10.9
+             └── pg_flashback v0.2.0 (*)
+   ├ crypto-common v0.2.1
+     └── digest v0.11.2
+         ├── hmac v0.13.0
+         │   └── postgres-protocol v0.6.12
+         │       ├── postgres-types v0.2.14
+         │       │   └── tokio-postgres v0.7.18
+         │       │       └── postgres v0.19.13
+         │       │           └── pgrx-tests v0.16.1
+         │       │               └── pg_flashback v0.2.0
+         │       └── tokio-postgres v0.7.18 (*)
+         ├── md-5 v0.11.0
+         │   └── postgres-protocol v0.6.12 (*)
+         └── sha2 v0.11.0
+             └── postgres-protocol v0.6.12 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'digest'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:42:1
+   │  
+42 │ ╭ digest 0.10.7 registry+https://github.com/rust-lang/crates.io-index
+43 │ │ digest 0.11.2 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰───────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ digest v0.10.7
+     ├── hmac v0.12.1
+     │   └── pg_flashback v0.2.0
+     └── sha2 v0.10.9
+         └── pg_flashback v0.2.0 (*)
+   ├ digest v0.11.2
+     ├── hmac v0.13.0
+     │   └── postgres-protocol v0.6.12
+     │       ├── postgres-types v0.2.14
+     │       │   └── tokio-postgres v0.7.18
+     │       │       └── postgres v0.19.13
+     │       │           └── pgrx-tests v0.16.1
+     │       │               └── pg_flashback v0.2.0
+     │       └── tokio-postgres v0.7.18 (*)
+     ├── md-5 v0.11.0
+     │   └── postgres-protocol v0.6.12 (*)
+     └── sha2 v0.11.0
+         └── postgres-protocol v0.6.12 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'getrandom'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:67:1
+   │  
+67 │ ╭ getrandom 0.3.4 registry+https://github.com/rust-lang/crates.io-index
+68 │ │ getrandom 0.4.2 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ getrandom v0.3.4
+     └── rand_core v0.9.5
+         ├── rand v0.9.5
+         │   ├── pgrx-tests v0.16.1
+         │   │   └── pg_flashback v0.2.0
+         │   └── proptest v1.11.0
+         │       └── pgrx-tests v0.16.1 (*)
+         ├── rand_chacha v0.9.0
+         │   ├── proptest v1.11.0 (*)
+         │   └── rand v0.9.5 (*)
+         └── rand_xorshift v0.4.0
+             └── proptest v1.11.0 (*)
+   ├ getrandom v0.4.2
+     ├── rand v0.10.2
+     │   ├── postgres-protocol v0.6.12
+     │   │   ├── postgres-types v0.2.14
+     │   │   │   └── tokio-postgres v0.7.18
+     │   │   │       └── postgres v0.19.13
+     │   │   │           └── pgrx-tests v0.16.1
+     │   │   │               └── pg_flashback v0.2.0
+     │   │   └── tokio-postgres v0.7.18 (*)
+     │   └── tokio-postgres v0.7.18 (*)
+     ├── tempfile v3.27.0
+     │   ├── pgrx-tests v0.16.1 (*)
+     │   ├── proptest v1.11.0
+     │   │   └── pgrx-tests v0.16.1 (*)
+     │   └── rusty-fork v0.3.1
+     │       └── proptest v1.11.0 (*)
+     └── uuid v1.23.0
+         └── pgrx v0.16.1
+             ├── pg_flashback v0.2.0 (*)
+             └── pgrx-tests v0.16.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'hashbrown'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:71:1
+   │  
+71 │ ╭ hashbrown 0.15.5 registry+https://github.com/rust-lang/crates.io-index
+72 │ │ hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ hashbrown v0.15.5
+     └── petgraph v0.8.3
+         └── pgrx-sql-entity-graph v0.16.1
+             ├── pgrx v0.16.1
+             │   ├── pg_flashback v0.2.0
+             │   └── pgrx-tests v0.16.1
+             │       └── pg_flashback v0.2.0 (*)
+             ├── pgrx-macros v0.16.1
+             │   ├── pgrx v0.16.1 (*)
+             │   ├── pgrx-pg-sys v0.16.1
+             │   │   └── pgrx v0.16.1 (*)
+             │   └── pgrx-tests v0.16.1 (*)
+             └── pgrx-pg-sys v0.16.1 (*)
+   ├ hashbrown v0.16.1
+     └── indexmap v2.13.0
+         └── petgraph v0.8.3
+             └── pgrx-sql-entity-graph v0.16.1
+                 ├── pgrx v0.16.1
+                 │   ├── pg_flashback v0.2.0
+                 │   └── pgrx-tests v0.16.1
+                 │       └── pg_flashback v0.2.0 (*)
+                 ├── pgrx-macros v0.16.1
+                 │   ├── pgrx v0.16.1 (*)
+                 │   ├── pgrx-pg-sys v0.16.1
+                 │   │   └── pgrx v0.16.1 (*)
+                 │   └── pgrx-tests v0.16.1 (*)
+                 └── pgrx-pg-sys v0.16.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'hmac'
+   ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:74:1
+   │  
+74 │ ╭ hmac 0.12.1 registry+https://github.com/rust-lang/crates.io-index
+75 │ │ hmac 0.13.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ hmac v0.12.1
+     └── pg_flashback v0.2.0
+   ├ hmac v0.13.0
+     └── postgres-protocol v0.6.12
+         ├── postgres-types v0.2.14
+         │   └── tokio-postgres v0.7.18
+         │       └── postgres v0.19.13
+         │           └── pgrx-tests v0.16.1
+         │               └── pg_flashback v0.2.0
+         └── tokio-postgres v0.7.18 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'r-efi'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:136:1
+    │  
+136 │ ╭ r-efi 5.3.0 registry+https://github.com/rust-lang/crates.io-index
+137 │ │ r-efi 6.0.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ r-efi v5.3.0
+      └── getrandom v0.3.4
+          └── rand_core v0.9.5
+              ├── rand v0.9.5
+              │   ├── pgrx-tests v0.16.1
+              │   │   └── pg_flashback v0.2.0
+              │   └── proptest v1.11.0
+              │       └── pgrx-tests v0.16.1 (*)
+              ├── rand_chacha v0.9.0
+              │   ├── proptest v1.11.0 (*)
+              │   └── rand v0.9.5 (*)
+              └── rand_xorshift v0.4.0
+                  └── proptest v1.11.0 (*)
+    ├ r-efi v6.0.0
+      └── getrandom v0.4.2
+          ├── rand v0.10.2
+          │   ├── postgres-protocol v0.6.12
+          │   │   ├── postgres-types v0.2.14
+          │   │   │   └── tokio-postgres v0.7.18
+          │   │   │       └── postgres v0.19.13
+          │   │   │           └── pgrx-tests v0.16.1
+          │   │   │               └── pg_flashback v0.2.0
+          │   │   └── tokio-postgres v0.7.18 (*)
+          │   └── tokio-postgres v0.7.18 (*)
+          ├── tempfile v3.27.0
+          │   ├── pgrx-tests v0.16.1 (*)
+          │   ├── proptest v1.11.0
+          │   │   └── pgrx-tests v0.16.1 (*)
+          │   └── rusty-fork v0.3.1
+          │       └── proptest v1.11.0 (*)
+          └── uuid v1.23.0
+              └── pgrx v0.16.1
+                  ├── pg_flashback v0.2.0 (*)
+                  └── pgrx-tests v0.16.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'rand'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:139:1
+    │  
+139 │ ╭ rand 0.9.5 registry+https://github.com/rust-lang/crates.io-index
+140 │ │ rand 0.10.2 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand v0.9.5
+      ├── pgrx-tests v0.16.1
+      │   └── pg_flashback v0.2.0
+      └── proptest v1.11.0
+          └── pgrx-tests v0.16.1 (*)
+    ├ rand v0.10.2
+      ├── postgres-protocol v0.6.12
+      │   ├── postgres-types v0.2.14
+      │   │   └── tokio-postgres v0.7.18
+      │   │       └── postgres v0.19.13
+      │   │           └── pgrx-tests v0.16.1
+      │   │               └── pg_flashback v0.2.0
+      │   └── tokio-postgres v0.7.18 (*)
+      └── tokio-postgres v0.7.18 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'rand_core'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:142:1
+    │  
+142 │ ╭ rand_core 0.9.5 registry+https://github.com/rust-lang/crates.io-index
+143 │ │ rand_core 0.10.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand_core v0.9.5
+      ├── rand v0.9.5
+      │   ├── pgrx-tests v0.16.1
+      │   │   └── pg_flashback v0.2.0
+      │   └── proptest v1.11.0
+      │       └── pgrx-tests v0.16.1 (*)
+      ├── rand_chacha v0.9.0
+      │   ├── proptest v1.11.0 (*)
+      │   └── rand v0.9.5 (*)
+      └── rand_xorshift v0.4.0
+          └── proptest v1.11.0 (*)
+    ├ rand_core v0.10.0
+      ├── chacha20 v0.10.0
+      │   └── rand v0.10.2
+      │       ├── postgres-protocol v0.6.12
+      │       │   ├── postgres-types v0.2.14
+      │       │   │   └── tokio-postgres v0.7.18
+      │       │   │       └── postgres v0.19.13
+      │       │   │           └── pgrx-tests v0.16.1
+      │       │   │               └── pg_flashback v0.2.0
+      │       │   └── tokio-postgres v0.7.18 (*)
+      │       └── tokio-postgres v0.7.18 (*)
+      ├── getrandom v0.4.2
+      │   ├── rand v0.10.2 (*)
+      │   ├── tempfile v3.27.0
+      │   │   ├── pgrx-tests v0.16.1 (*)
+      │   │   ├── proptest v1.11.0
+      │   │   │   └── pgrx-tests v0.16.1 (*)
+      │   │   └── rusty-fork v0.3.1
+      │   │       └── proptest v1.11.0 (*)
+      │   └── uuid v1.23.0
+      │       └── pgrx v0.16.1
+      │           ├── pg_flashback v0.2.0 (*)
+      │           └── pgrx-tests v0.16.1 (*)
+      └── rand v0.10.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'sha2'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:163:1
+    │  
+163 │ ╭ sha2 0.10.9 registry+https://github.com/rust-lang/crates.io-index
+164 │ │ sha2 0.11.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ sha2 v0.10.9
+      └── pg_flashback v0.2.0
+    ├ sha2 v0.11.0
+      └── postgres-protocol v0.6.12
+          ├── postgres-types v0.2.14
+          │   └── tokio-postgres v0.7.18
+          │       └── postgres v0.19.13
+          │           └── pgrx-tests v0.16.1
+          │               └── pg_flashback v0.2.0
+          └── tokio-postgres v0.7.18 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'thiserror'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:178:1
+    │  
+178 │ ╭ thiserror 1.0.69 registry+https://github.com/rust-lang/crates.io-index
+179 │ │ thiserror 2.0.18 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ thiserror v1.0.69
+      └── cargo_metadata v0.18.1
+          └── clap-cargo v0.14.1
+              └── pgrx-tests v0.16.1
+                  └── pg_flashback v0.2.0
+    ├ thiserror v2.0.18
+      ├── pgrx v0.16.1
+      │   ├── pg_flashback v0.2.0
+      │   └── pgrx-tests v0.16.1
+      │       └── pg_flashback v0.2.0 (*)
+      ├── pgrx-pg-config v0.16.1
+      │   ├── pgrx-bindgen v0.16.1
+      │   │   └── (build) pgrx-pg-sys v0.16.1
+      │   │       └── pgrx v0.16.1 (*)
+      │   └── pgrx-tests v0.16.1 (*)
+      ├── pgrx-sql-entity-graph v0.16.1
+      │   ├── pgrx v0.16.1 (*)
+      │   ├── pgrx-macros v0.16.1
+      │   │   ├── pgrx v0.16.1 (*)
+      │   │   ├── pgrx-pg-sys v0.16.1 (*)
+      │   │   └── pgrx-tests v0.16.1 (*)
+      │   └── pgrx-pg-sys v0.16.1 (*)
+      └── pgrx-tests v0.16.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'thiserror-impl'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:180:1
+    │  
+180 │ ╭ thiserror-impl 1.0.69 registry+https://github.com/rust-lang/crates.io-index
+181 │ │ thiserror-impl 2.0.18 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰───────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ thiserror-impl v1.0.69
+      └── thiserror v1.0.69
+          └── cargo_metadata v0.18.1
+              └── clap-cargo v0.14.1
+                  └── pgrx-tests v0.16.1
+                      └── pg_flashback v0.2.0
+    ├ thiserror-impl v2.0.18
+      └── thiserror v2.0.18
+          ├── pgrx v0.16.1
+          │   ├── pg_flashback v0.2.0
+          │   └── pgrx-tests v0.16.1
+          │       └── pg_flashback v0.2.0 (*)
+          ├── pgrx-pg-config v0.16.1
+          │   ├── pgrx-bindgen v0.16.1
+          │   │   └── (build) pgrx-pg-sys v0.16.1
+          │   │       └── pgrx v0.16.1 (*)
+          │   └── pgrx-tests v0.16.1 (*)
+          ├── pgrx-sql-entity-graph v0.16.1
+          │   ├── pgrx v0.16.1 (*)
+          │   ├── pgrx-macros v0.16.1
+          │   │   ├── pgrx v0.16.1 (*)
+          │   │   ├── pgrx-pg-sys v0.16.1 (*)
+          │   │   └── pgrx-tests v0.16.1 (*)
+          │   └── pgrx-pg-sys v0.16.1 (*)
+          └── pgrx-tests v0.16.1 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'wasi'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:207:1
+    │  
+207 │ ╭ wasi 0.11.1+wasi-snapshot-preview1 registry+https://github.com/rust-lang/crates.io-index
+208 │ │ wasi 0.14.7+wasi-0.2.4 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰────────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ wasi v0.11.1+wasi-snapshot-preview1
+      └── mio v1.2.0
+          └── tokio v1.50.0
+              ├── postgres v0.19.13
+              │   └── pgrx-tests v0.16.1
+              │       └── pg_flashback v0.2.0
+              ├── tokio-postgres v0.7.18
+              │   └── postgres v0.19.13 (*)
+              └── tokio-util v0.7.18
+                  └── tokio-postgres v0.7.18 (*)
+    ├ wasi v0.14.7+wasi-0.2.4
+      └── wasite v1.0.2
+          └── whoami v2.1.1
+              └── tokio-postgres v0.7.18
+                  └── postgres v0.19.13
+                      └── pgrx-tests v0.16.1
+                          └── pg_flashback v0.2.0
+
+warning[duplicate]: found 2 duplicate entries for crate 'winnow'
+    ┌─ /home/caghan.linux/table-restore/pg_flashback/Cargo.lock:238:1
+    │  
+238 │ ╭ winnow 0.7.15 registry+https://github.com/rust-lang/crates.io-index
+239 │ │ winnow 1.0.1 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ winnow v0.7.15
+      └── toml v0.9.12+spec-1.1.0
+          ├── cargo_toml v0.22.3
+          │   └── pgrx-pg-config v0.16.1
+          │       ├── pgrx-bindgen v0.16.1
+          │       │   └── (build) pgrx-pg-sys v0.16.1
+          │       │       └── pgrx v0.16.1
+          │       │           ├── pg_flashback v0.2.0
+          │       │           └── pgrx-tests v0.16.1
+          │       │               └── pg_flashback v0.2.0 (*)
+          │       └── pgrx-tests v0.16.1 (*)
+          └── pgrx-pg-config v0.16.1 (*)
+    ├ winnow v1.0.1
+      └── toml_parser v1.1.0+spec-1.1.0
+          └── toml v0.9.12+spec-1.1.0
+              ├── cargo_toml v0.22.3
+              │   └── pgrx-pg-config v0.16.1
+              │       ├── pgrx-bindgen v0.16.1
+              │       │   └── (build) pgrx-pg-sys v0.16.1
+              │       │       └── pgrx v0.16.1
+              │       │           ├── pg_flashback v0.2.0
+              │       │           └── pgrx-tests v0.16.1
+              │       │               └── pg_flashback v0.2.0 (*)
+              │       └── pgrx-tests v0.16.1 (*)
+              └── pgrx-pg-config v0.16.1 (*)
+
+advisories ok, bans ok, licenses ok, sources ok

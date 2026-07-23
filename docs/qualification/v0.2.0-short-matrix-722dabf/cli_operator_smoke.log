@@ -1,0 +1,13 @@
+psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  role "caghan" does not exist
+{
+  "schema_version": 1,
+  "command": "version",
+  "status": "ok",
+  "code": "ok",
+  "data": {
+    "cli_version": "0.2.0",
+    "extension_version": "unreachable"
+  },
+  "error": null
+}
+psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  role "caghan" does not exist

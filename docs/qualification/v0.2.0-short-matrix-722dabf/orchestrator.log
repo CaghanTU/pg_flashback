@@ -1,0 +1,54 @@
+=== START dba_acceptance 18:45:41 ===
+=== PASS dba_acceptance ===
+=== START drop_adversarial 18:45:53 ===
+=== PASS drop_adversarial ===
+=== START drop_qualification 18:46:35 ===
+=== PASS drop_qualification ===
+=== START git_diff_check 18:47:45 ===
+=== PASS git_diff_check ===
+=== START fmt 18:47:45 ===
+=== PASS fmt ===
+=== START fmt_helper 18:47:45 ===
+=== PASS fmt_helper ===
+=== START clippy 18:47:45 ===
+=== PASS clippy ===
+=== START clippy_helper 18:47:45 ===
+=== PASS clippy_helper ===
+=== START helper_tests 18:47:45 ===
+=== PASS helper_tests ===
+=== START audit 18:47:46 ===
+=== PASS audit ===
+=== START deny 18:47:48 ===
+=== PASS deny ===
+=== START deny_helper 18:47:48 ===
+=== PASS deny_helper ===
+=== START package_sbom 18:47:49 ===
+=== PASS package_sbom ===
+=== START pgrx_test_pg15 18:47:49 ===
+=== PASS pgrx_test_pg15 ===
+=== START pgrx_test_pg16 18:48:09 ===
+=== PASS pgrx_test_pg16 ===
+=== START pgrx_test_pg17 18:48:28 ===
+=== PASS pgrx_test_pg17 ===
+=== START pgrx_test_pg18 18:48:37 ===
+=== PASS pgrx_test_pg18 ===
+=== START exact_wal_matrix 18:49:03 ===
+=== PASS exact_wal_matrix ===
+=== START upgrade_e2e 18:51:36 ===
+=== PASS upgrade_e2e ===
+=== START restore_benchmark 18:51:41 ===
+=== PASS restore_benchmark ===
+=== START wal_overhead 18:51:46 ===
+=== PASS wal_overhead ===
+=== START clean_host 18:51:47 ===
+=== PASS clean_host ===
+=== START ha_promotion 18:51:59 ===
+=== PASS ha_promotion ===
+=== START wal_e2e 18:52:39 ===
+=== FAIL wal_e2e rc=2 ===
+=== START fault_injection_smoke 18:52:54 ===
+=== PASS fault_injection_smoke ===
+=== START worker_admission_isolation 18:52:56 ===
+=== PASS worker_admission_isolation ===
+=== START cli_operator_smoke 18:53:00 ===
+=== PASS cli_operator_smoke ===
