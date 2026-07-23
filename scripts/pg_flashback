@@ -26,6 +26,7 @@ ALL_DATABASES=0
 AT_TIMESTAMP=""
 AT_LSN=""
 DISASTER_EVENT_ID=""
+LOOKBACK=""
 CLI_VERSION="0.2.0"
 
 usage() {
@@ -35,19 +36,23 @@ Usage: pg_flashback [options] <command> [args]
 Commands:
   version
   doctor [--reconcile] [--all-databases]
+  config recommend [TABLE]
   protect TABLE
   list
   status [TABLE] [--all-databases]
   history [TABLE]
   changes [TABLE]          # optional row-change history (sensitive)
-  recover TABLE [--latest-drop] [--yes] [--dry-run]
+  recover TABLE [--latest-drop] [--yes] [--dry-run] [--lookback INTERVAL]
                 [--event-id ID] [--at TIMESTAMP] [--lsn LSN]
   unprotect TABLE [--yes]
   cleanup --tracking-id ID [--dry-run] [--yes]
+  maintain TABLE|--all [--dry-run|--yes] [--if-needed]
+  prepare-uninstall [--yes]
 
 Options:
   --json       Machine-readable JSON envelope on stdout (before or after command)
   --verbose    Include technical details in human output (before or after command)
+  --lookback   Recover lookback window (default: retained horizon for the table)
   -h, --help   Show this help
 
 Exit codes:
@@ -56,16 +61,18 @@ Exit codes:
   2  usage / configuration error
 
 Environment (libpq):
-  PGHOST, PGPORT, PGDATABASE, PGUSER, ...
+  PGHOST, PGPORT, PGDATABASE, PGUSER, .pgpass
+  Never pass passwords on the CLI argv.
 
 Environment (pg_flashback):
   PG_FLASHBACK_STATEMENT_TIMEOUT_MS      default 120000
   PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S  default 60
   PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S  default 120
-  PG_FLASHBACK_DISCOVERY_TIMEOUT_S       default 30 (post-DROP plan catch-up poll)
+  PG_FLASHBACK_DISCOVERY_TIMEOUT_S       default 30 (post-DROP / manifest bind poll)
 
 Typical recovery after an accidental DROP:
   pg_flashback doctor
+  pg_flashback config recommend
   pg_flashback protect public.orders
   # ... later, after DROP TABLE public.orders;
   pg_flashback --json recover public.orders
@@ -172,26 +179,7 @@ for_each_database() {
 canonical_table_name() {
     local table=$1
     psql_tuples -v "table=$table" <<'SQL'
-SELECT COALESCE(
-    (
-        SELECT format('%I.%I', n.nspname, c.relname)
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.oid = to_regclass(:'table')
-    ),
-    (
-        SELECT format('%I.%I', tt.schema_name, tt.table_name)
-        FROM flashback.tracked_tables tt
-        WHERE tt.recovery_profile = 'local_delta'
-          AND (
-              format('%I.%I', tt.schema_name, tt.table_name) = :'table'
-              OR (position('.' IN :'table') = 0 AND tt.table_name = :'table')
-          )
-        ORDER BY tt.is_active DESC, tt.tracked_since DESC
-        LIMIT 1
-    ),
-    :'table'
-);
+SELECT flashback_resolve_lifecycle_name(:'table');
 SQL
 }
 
@@ -201,35 +189,7 @@ wait_health() {
     deadline=$(( $(date +%s) + timeout_s ))
     while (( $(date +%s) <= deadline )); do
         health=$(psql_tuples -v "table=$table" <<'SQL'
-SELECT COALESCE(
-    (
-        SELECT h.health
-        FROM flashback_health() h
-        WHERE h.table_name = (
-                SELECT format('%I.%I', n.nspname, c.relname)
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.oid = to_regclass(:'table')
-              )
-           OR h.table_name = :'table'
-        ORDER BY CASE h.health WHEN 'healthy' THEN 0 ELSE 1 END
-        LIMIT 1
-    ),
-    (
-        SELECT h.health
-        FROM flashback_health() h
-        JOIN flashback.tracked_tables tt
-          ON format('%I.%I', tt.schema_name, tt.table_name) = h.table_name
-        WHERE tt.recovery_profile = 'local_delta'
-          AND (
-              format('%I.%I', tt.schema_name, tt.table_name) = :'table'
-              OR (position('.' IN :'table') = 0 AND tt.table_name = :'table')
-          )
-        ORDER BY tt.is_active DESC, tt.tracked_since DESC
-        LIMIT 1
-    ),
-    'missing'
-);
+SELECT flashback_lifecycle_health(:'table');
 SQL
 )
         if [[ "$health" == "healthy" ]]; then
@@ -359,6 +319,78 @@ SQL
     [[ "$errors" == "0" ]]
 }
 
+cmd_config() {
+    local sub=${1:-}
+    shift || true
+    case "$sub" in
+        recommend) cmd_config_recommend "$@" ;;
+        ""|-h|--help) die "config requires a subcommand (recommend)" ;;
+        *) die "unknown config subcommand: $sub" ;;
+    esac
+}
+
+cmd_config_recommend() {
+    local table=${1:-} payload
+    if [[ -n "$table" ]]; then
+        reject_controls table "$table"
+        payload="$(psql_tuples -v "table=$table" <<'SQL'
+SELECT flashback_config_recommend(:'table'::regclass, NULL);
+SQL
+)" || fail "flashback_config_recommend failed"
+    else
+        payload="$(psql_tuples <<'SQL'
+SELECT flashback_config_recommend(NULL::regclass, NULL);
+SQL
+)" || fail "flashback_config_recommend failed"
+    fi
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope config_recommend ok ok "$payload" null
+        return 0
+    fi
+    echo "pg_flashback config recommend (local_delta)"
+    echo "=========================================="
+    echo "Read-only advice. pg_flashback does not edit postgresql.conf."
+    echo
+    echo "Copy these lines into postgresql.conf (restart required):"
+    printf '%s' "$payload" | jq -r '.recommended_postgresql_conf_lines[]?'
+    echo
+    echo "Operator role (after CREATE EXTENSION):"
+    printf '%s' "$payload" | jq -r '.operator_role_sql // empty'
+    if [[ "$(printf '%s' "$payload" | jq -r '.missing_capacity_gucs | length')" != "0" ]]; then
+        echo
+        echo "Missing capacity GUCs (protect fails closed until set):"
+        printf '%s' "$payload" | jq -r '.missing_capacity_gucs[]?'
+    fi
+    notes="$(printf '%s' "$payload" | jq -r '.notes[]?' 2>/dev/null || true)"
+    if [[ -n "$notes" ]]; then
+        echo
+        echo "Notes:"
+        printf '%s\n' "$notes" | sed 's/^/  - /'
+    fi
+}
+
+default_recover_lookback() {
+    local table=$1
+    local horizon
+    horizon="$(psql_tuples -v "table=$table" <<'SQL'
+SELECT COALESCE(
+    (
+        SELECT GREATEST(rs.retention_interval, interval '1 hour')::text
+        FROM flashback_retention_status() rs
+        WHERE rs.table_name = :'table'
+           OR rs.table_name = format('%I.%I',
+                split_part(:'table', '.', 1),
+                split_part(:'table', '.', 2))
+        ORDER BY 1
+        LIMIT 1
+    ),
+    '7 days'
+);
+SQL
+)" || horizon="7 days"
+    printf '%s' "${horizon:-7 days}"
+}
+
 cmd_doctor() {
     if [[ "$ALL_DATABASES" == 1 ]]; then
         local db payloads=() fail=0 chunk
@@ -406,19 +438,33 @@ SQL
     fi
 }
 
+require_version_match() {
+    local ext
+    ext=$(psql_tuples <<'SQL'
+SELECT COALESCE(
+    (SELECT extversion FROM pg_extension WHERE extname = 'pg_flashback'),
+    'missing'
+);
+SQL
+) || ext=missing
+    if [[ "$ext" != "$CLI_VERSION" ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            emit_envelope version_guard error version_mismatch \
+                "$(jq -n --arg cli "$CLI_VERSION" --arg ext "$ext" '{cli_version:$cli,extension_version:$ext}')" \
+                "$(jq -n --arg cli "$CLI_VERSION" --arg ext "$ext" '{message:"CLI/extension version mismatch",action:"install matching package binaries",cli:$cli,extension:$ext}')"
+        else
+            echo "Problem: CLI version $CLI_VERSION does not match extension $ext"
+            echo "Impact: refusing mutating command"
+            echo "Action: install matching pg_flashback package (CLI + .so + SQL)"
+        fi
+        exit 1
+    fi
+}
+
 cmd_list() {
     local payload
     payload=$(psql_tuples <<'SQL'
-SELECT COALESCE(jsonb_agg(jsonb_build_object(
-    'table_name', format('%I.%I', tt.schema_name, tt.table_name),
-    'tracking_id', tt.tracking_id,
-    'is_active', tt.is_active,
-    'protection_state', COALESCE(tt.protection_state, 'active'),
-    'tracked_since', tt.tracked_since,
-    'retention_interval', tt.retention_interval
-) ORDER BY tt.schema_name, tt.table_name), '[]'::jsonb)
-FROM flashback.tracked_tables tt
-WHERE tt.recovery_profile = 'local_delta';
+SELECT flashback_list_lifecycles();
 SQL
 )
     if [[ "$JSON_OUT" == 1 ]]; then
@@ -479,22 +525,12 @@ SQL
 cmd_protect() {
     local table=$1
     local canon already health rec advise_json
+    require_version_match
     reject_controls table "$table"
     canon="$(canonical_table_name "$table")"
 
     already=$(psql_tuples -v "table=$table" <<'SQL'
-SELECT CASE
-    WHEN EXISTS (
-        SELECT 1
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND (
-              (to_regclass(:'table') IS NOT NULL AND tt.rel_oid = to_regclass(:'table'))
-              OR format('%I.%I', tt.schema_name, tt.table_name) = :'table'
-          )
-    ) THEN 'yes' ELSE 'no'
-END;
+SELECT CASE WHEN flashback_is_actively_protected(:'table') THEN 'yes' ELSE 'no' END;
 SQL
 )
 
@@ -556,89 +592,7 @@ cmd_status() {
     fi
 
     payload=$(psql_tuples -v "table=${table:-}" <<'SQL'
-WITH target AS (
-    SELECT NULLIF(:'table', '') AS requested
-),
-workers AS (
-    SELECT * FROM flashback_worker_readiness()
-),
-slot AS (
-    SELECT * FROM flashback_slot_status_snapshot() LIMIT 1
-),
-rows AS (
-    SELECT h.*
-    FROM flashback_health() h, target t
-    WHERE t.requested IS NULL
-       OR h.table_name = t.requested
-       OR h.table_name = (
-            SELECT format('%I.%I', n.nspname, c.relname)
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.oid = to_regclass(t.requested)
-       )
-       OR h.table_name IN (
-            SELECT format('%I.%I', tt.schema_name, tt.table_name)
-            FROM flashback.tracked_tables tt
-            WHERE tt.recovery_profile = 'local_delta'
-              AND (
-                  format('%I.%I', tt.schema_name, tt.table_name) = t.requested
-                  OR (position('.' IN coalesce(t.requested,'')) = 0
-                      AND tt.table_name = t.requested)
-              )
-       )
-),
-disk AS (
-    SELECT COALESCE(sum(pg_total_relation_size(c.oid)), 0) AS flashback_bytes
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'flashback'
-)
-SELECT jsonb_build_object(
-    'workers', jsonb_build_object(
-        'admission_state', w.admission_state,
-        'capture_running', w.capture_running,
-        'maintenance_running', w.maintenance_running,
-        'reason', w.reason
-    ),
-    'slot', CASE WHEN s.slot_name IS NULL THEN null ELSE jsonb_build_object(
-        'name', s.slot_name,
-        'wal_status', s.wal_status,
-        'retained_bytes', s.retained_wal_bytes,
-        'safe_wal_size', s.safe_wal_size
-    ) END,
-    'flashback_disk_bytes', d.flashback_bytes,
-    'disk_retention', flashback_disk_retention_status(),
-    'tables', COALESCE((
-        SELECT jsonb_agg(jsonb_build_object(
-            'table_name', r.table_name,
-            'protected', true,
-            'health', r.health,
-            'recommended_action', r.recommended_action,
-            'open_gap_count', r.open_gap_count,
-            'reason', r.reason,
-            'valid_through_lsn', r.valid_through_lsn,
-            'recovery_profile', r.recovery_profile,
-            'retention_interval', (
-                SELECT tt.retention_interval::text
-                FROM flashback.tracked_tables tt
-                WHERE format('%I.%I', tt.schema_name, tt.table_name) = r.table_name
-                ORDER BY tt.is_active DESC
-                LIMIT 1
-            ),
-            'coverage_since', (
-                SELECT tt.tracked_since
-                FROM flashback.tracked_tables tt
-                WHERE format('%I.%I', tt.schema_name, tt.table_name) = r.table_name
-                ORDER BY tt.is_active DESC
-                LIMIT 1
-            )
-        ) ORDER BY r.table_name)
-        FROM rows r
-    ), '[]'::jsonb)
-)
-FROM workers w
-CROSS JOIN disk d
-LEFT JOIN slot s ON true;
+SELECT flashback_status_snapshot(NULLIF(:'table', ''));
 SQL
 )
 
@@ -686,24 +640,26 @@ SQL
         return 0
     fi
 
-    printf '%s' "$payload" | jq -r --arg verbose "$VERBOSE" '
-      .tables[] |
-      (if (.health == "healthy" and ((.open_gap_count // 0) == 0)) then "yes" else "no / limited" end) as $restorable |
-      "Table: \(.table_name)\n" +
-      "  Protected: yes\n" +
-      "  Restorable: \($restorable)\n" +
-      "  Coverage since: \(.coverage_since // "unknown")\n" +
-      "  Gap: \(if ((.open_gap_count // 0) == 0) then "none" else "yes (\(.open_gap_count) open)" end)\n" +
-      "  Retention window: \(.retention_interval // "unknown")\n" +
-      (if ((.recommended_action // "none") != "none" and (.recommended_action // "none") != "null")
-        then "  Action needed: \(.recommended_action)\n"
-        else "  Action needed: none\n" end) +
-      (if $verbose == "1" then
-        "  Technical health: \(.health)\n" +
-        "  Technical valid_through_lsn: \(.valid_through_lsn // "")\n" +
-        "  Technical profile: \(.recovery_profile // "")\n"
-       else "" end)
-    '
+    printf '%s' "$payload" | jq -r --arg verbose "$VERBOSE" \
+      '.tables[] as $t
+      | (($t.health == "healthy") and (($t.open_gap_count // 0) == 0)) as $healthy
+      | ((.latest_drop_recoverability // []) | map(select(.table_name == $t.table_name)) | .[0]) as $drop
+      | [
+          "Table: \($t.table_name)",
+          "  Protected: yes",
+          "  Coverage health: \(if $healthy then "healthy" else ($t.health // "degraded") end)",
+          "  Latest DROP restorable: \(
+              if $drop == null then "no DROP in lookback"
+              elif ($drop.restorable == true) then "yes"
+              else "no (\($drop.status // "non_restorable"))" end)",
+          "  Gap: \(if (($t.open_gap_count // 0) == 0) then "none" else "yes (\($t.open_gap_count) open)" end)",
+          (if (($t.recommended_action // "none") != "none" and ($t.recommended_action // "none") != "null")
+            then "  Action needed: \($t.recommended_action)"
+            else "  Action needed: none" end),
+          (if $verbose == "1" then
+            "  Technical health: \($t.health)\n  Technical valid_through_lsn: \($t.valid_through_lsn // "")\n  Technical profile: \($t.recovery_profile // "")\n  Latest DROP reason: \($drop.reason // "")"
+           else empty end)
+        ] | join("\n")'
 }
 
 
@@ -789,7 +745,8 @@ SQL
 cmd_recover() {
     local table=$1
     local canon plan status reason lsn disaster_time selection token op_id health code
-    local begin_json exec_json deadline now
+    local begin_json exec_json deadline now lookback
+    require_version_match
     reject_controls table "$table"
     canon="$(canonical_table_name "$table")"
 
@@ -798,10 +755,16 @@ cmd_recover() {
     fi
     : "${LATEST_DROP:=1}"
 
-    # Bounded discovery: poll while capture frontier has not observed the DROP.
+    if [[ -z "$LOOKBACK" ]]; then
+        LOOKBACK="$(default_recover_lookback "$table")"
+    fi
+    lookback="$LOOKBACK"
+    reject_controls lookback "$lookback"
+
+    # Bounded discovery: poll while capture frontier lags or exact manifest bind pending.
     deadline=$(( $(date +%s) + DISCOVERY_TIMEOUT_S ))
     while true; do
-        plan="$(psql_tuples -v "table=$table" -v "lookback=${LOOKBACK:-24 hours}" \
+        plan="$(psql_tuples -v "table=$table" -v "lookback=$lookback" \
             -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
 SELECT flashback_recover_plan(
     :'table',
@@ -814,11 +777,15 @@ SQL
 )"
         status=$(printf '%s' "$plan" | jq -r '.status // empty')
         code=$(printf '%s' "$plan" | jq -r '.code // empty')
-        if [[ "$code" != "capture_catchup_pending" ]]; then
+        if [[ "$code" != "capture_catchup_pending" && "$code" != "exact_manifest_pending" ]]; then
             break
         fi
         now=$(date +%s)
         if (( now >= deadline )); then
+            if [[ "$code" == "exact_manifest_pending" ]]; then
+                plan="$(printf '%s' "$plan" | jq '.code="exact_manifest_missing" | .status="error" | .reason=("exact pre-DROP dependency manifest was not bound within discovery timeout")')"
+                code=exact_manifest_missing
+            fi
             break
         fi
         sleep 0.5
@@ -835,16 +802,17 @@ SQL
             jq -n --argjson plan "$plan" \
                 '{schema_version:1, command:"recover", status:"error",
                   code:($plan.code // "non_restorable"), data:{plan:$plan},
-                  error:{message:($plan.reason // $plan.code // "not restorable")}}'
+                  error:{message:($plan.reason // $plan.code // "not restorable"),
+                         action:($plan.action // "run pg_flashback doctor and status")}}'
         else
             echo "Cannot recover $canon"
-            echo "  Status: ${status:-missing}"
-            echo "  Reason: ${reason:-no recoverable DROP found}"
+            echo "  Problem: ${reason:-no recoverable DROP found}"
+            echo "  Impact: no mutation was performed"
             if [[ "$code" == "capture_catchup_pending" ]]; then
-                echo "  Meaning: capture has not yet observed the latest DROP (frontier lag)."
                 echo "  Action: wait for worker catch-up, then retry; inspect: pg_flashback doctor / status $canon"
+            elif [[ "$code" == "exact_manifest_pending" || "$code" == "exact_manifest_missing" ]]; then
+                echo "  Action: wait for exact event-bound dependency manifest bind, then retry; refuse recovery without it"
             else
-                echo "  Meaning: pg_flashback will not guess a recovery point when coverage is incomplete or ambiguous."
                 echo "  Action: run pg_flashback doctor and pg_flashback status $canon"
             fi
         fi
@@ -935,7 +903,7 @@ SQL
     local state=""
     for _ in $(seq 1 "$RECOVER_HEALTH_TIMEOUT_S"); do
         state=$(psql_tuples -v "opid=$op_id" <<'SQL'
-SELECT state FROM flashback.operation_current_state WHERE operation_id = :'opid'::bigint;
+SELECT COALESCE(flashback_operation_state(:'opid'::bigint), 'missing');
 SQL
 )
         [[ "$state" == "verified" || "$state" == "failed" ]] && break
@@ -1005,6 +973,7 @@ SQL
 }
 
 cmd_unprotect() {
+    require_version_match
     local table=$1
     local canon out status
     reject_controls table "$table"
@@ -1034,6 +1003,7 @@ SQL
 cmd_cleanup() {
     local tid=$1
     local out status
+    require_version_match
     reject_controls tracking_id "$tid"
     [[ "$tid" =~ ^[0-9]+$ ]] || die "cleanup --tracking-id requires a numeric id"
     if [[ "$DRY_RUN" != 1 ]]; then
@@ -1055,6 +1025,140 @@ SQL
         if [[ "$VERBOSE" == 1 || "$DRY_RUN" == 1 ]]; then
             echo "  Details: $out"
         fi
+    fi
+}
+
+cmd_maintain() {
+    local target=${1:-}
+    local if_needed=0
+    local plan out
+    require_version_match
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --if-needed) if_needed=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --yes) YES=1; shift ;;
+            --json) JSON_OUT=1; shift ;;
+            --verbose|-v) VERBOSE=1; shift ;;
+            *) die "unknown maintain option: $1" ;;
+        esac
+    done
+    [[ -n "$target" ]] || die "maintain requires TABLE or --all"
+    if [[ "$target" == "--all" ]]; then
+        local tables
+        tables="$(psql_tuples <<'SQL'
+SELECT COALESCE(jsonb_agg(x->>'table_name'), '[]'::jsonb)
+FROM jsonb_array_elements(flashback_list_lifecycles()) x
+WHERE (x->>'is_active')::boolean;
+SQL
+)"
+        if [[ "$JSON_OUT" == 1 ]]; then
+            local maintain_all_payload
+            maintain_all_payload="$(jq -n --argjson tables "$tables" '{mode:"all",tables:$tables,note:"invoke per-table maintain"}')"
+            emit_envelope maintain ok ok "$maintain_all_payload" null
+            return 0
+        fi
+        printf '%s' "$tables" | jq -r '.[]' | while read -r t; do
+            [[ -n "$t" ]] || continue
+            if [[ "$if_needed" == 1 ]]; then
+                plan="$(psql_tuples -v "table=$t" <<'SQL'
+SELECT flashback_maintain_plan(:'table');
+SQL
+)"
+                if [[ "$(printf '%s' "$plan" | jq -r '.recommended')" != "true" ]]; then
+                    echo "maintain skip $t (not recommended)"
+                    continue
+                fi
+            fi
+            if [[ "$DRY_RUN" == 1 ]]; then
+                cmd_maintain "$t" --dry-run
+            else
+                [[ "$YES" == 1 ]] || die "maintain --all requires --yes"
+                cmd_maintain "$t" --yes
+            fi
+        done
+        return 0
+    fi
+
+    reject_controls table "$target"
+    plan="$(psql_tuples -v "table=$target" <<'SQL'
+SELECT flashback_maintain_plan(:'table');
+SQL
+)" || fail "maintain plan failed"
+    if [[ "$(printf '%s' "$plan" | jq -r '.status')" != "ok" ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            emit_envelope maintain error "$(printf '%s' "$plan" | jq -r '.code')" "$plan" \
+                "$(jq -n --argjson plan "$plan" '{message:($plan.code // "refused"), action:($plan.action // "")}')"
+        else
+            echo "Problem: maintain refused for $target ($(printf '%s' "$plan" | jq -r '.code'))"
+            echo "Impact: no generation change"
+            echo "Action: $(printf '%s' "$plan" | jq -r '.action // "resolve pending restore/building generation"')"
+        fi
+        exit 1
+    fi
+    if [[ "$if_needed" == 1 && "$(printf '%s' "$plan" | jq -r '.recommended')" != "true" ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            emit_envelope maintain ok skipped "$plan" null
+        else
+            echo "maintain not needed for $target"
+        fi
+        return 0
+    fi
+    if [[ "$DRY_RUN" == 1 ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            emit_envelope maintain ok dry_run "$plan" null
+        else
+            echo "Maintain dry-run for $(printf '%s' "$plan" | jq -r '.table_name')"
+            echo "  Would create a new WAL-aligned base/generation via reanchor"
+            echo "  Peak disk estimate available in capacity projection when relation exists"
+        fi
+        return 0
+    fi
+    [[ "$YES" == 1 ]] || die "maintain requires --yes (or --dry-run)"
+    # Fresh transaction: reanchor must be the first write.
+    out="$(psql_tuples -v "table=$target" <<'SQL'
+SELECT flashback_maintain_execute(:'table');
+SQL
+)" || fail "maintain execute failed"
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope maintain ok ok "$out" null
+    else
+        echo "Maintain started for $(printf '%s' "$out" | jq -r '.table_name') generation=$(printf '%s' "$out" | jq -r '.new_generation_id')"
+        echo "Wait for successor coverage healthy before cleanup of older generations."
+    fi
+}
+
+cmd_prepare_uninstall() {
+    local out execute=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes) YES=1; execute=true; shift ;;
+            --json) JSON_OUT=1; shift ;;
+            --verbose|-v) VERBOSE=1; shift ;;
+            *) die "unknown prepare-uninstall option: $1" ;;
+        esac
+    done
+    out="$(psql_tuples -v "exec=$execute" <<'SQL'
+SELECT flashback_prepare_uninstall((:'exec'::text IN ('true','t','1','yes')));
+SQL
+)" || fail "prepare-uninstall failed"
+    if [[ "$(printf '%s' "$out" | jq -r '.status')" != "ok" ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            emit_envelope prepare_uninstall error "$(printf '%s' "$out" | jq -r '.code')" "$out" \
+                "$(jq -n --argjson o "$out" '{message:($o.code // "refused"), action:($o.action // "")}')"
+        else
+            echo "Problem: uninstall not safe ($(printf '%s' "$out" | jq -r '.code'))"
+            echo "Impact: extension/slots left unchanged"
+            echo "Action: $(printf '%s' "$out" | jq -r '.action')"
+        fi
+        exit 1
+    fi
+    if [[ "$JSON_OUT" == 1 ]]; then
+        emit_envelope prepare_uninstall ok "$(printf '%s' "$out" | jq -r '.code')" "$out" null
+    else
+        echo "prepare-uninstall: $(printf '%s' "$out" | jq -r '.code')"
+        printf '%s\n' "$out" | jq -r '.next_steps[]?' | sed 's/^/  - /'
     fi
 }
 
@@ -1080,6 +1184,11 @@ while [[ $# -gt 0 ]]; do
         --event-id)
             [[ $# -ge 2 ]] || die "--event-id requires ID"
             DISASTER_EVENT_ID=$2
+            shift 2
+            ;;
+        --lookback)
+            [[ $# -ge 2 ]] || die "--lookback requires INTERVAL"
+            LOOKBACK=$2
             shift 2
             ;;
         --at)
@@ -1117,6 +1226,11 @@ case "$cmd" in
                 --event-id)
                     [[ $# -ge 2 ]] || die "--event-id requires ID"
                     DISASTER_EVENT_ID=$2
+                    shift 2
+                    ;;
+                --lookback)
+                    [[ $# -ge 2 ]] || die "--lookback requires INTERVAL"
+                    LOOKBACK=$2
                     shift 2
                     ;;
                 --at)
@@ -1159,6 +1273,20 @@ case "$cmd" in
         done
         command -v jq >/dev/null || die "jq is required"
         cmd_doctor
+        ;;
+    config)
+        carg=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown config option: $1" ;;
+                *) carg+=("$1"); shift ;;
+            esac
+        done
+        set -- "${carg[@]+"${carg[@]}"}"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_config "$@"
         ;;
     version)
         while [[ $# -gt 0 ]]; do
@@ -1311,6 +1439,28 @@ case "$cmd" in
         else
             cmd_restore_compat "$1" "$2" "$3"
         fi
+        ;;
+    maintain)
+        margs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                --yes) YES=1; shift ;;
+                --dry-run) DRY_RUN=1; shift ;;
+                --if-needed|--all) margs+=("$1"); shift ;;
+                -*) die "unknown maintain option: $1" ;;
+                *) margs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${margs[@]+"${margs[@]}"}"
+        [[ $# -ge 1 ]] || die "maintain requires TABLE or --all"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_maintain "$@"
+        ;;
+    prepare-uninstall)
+        command -v jq >/dev/null || die "jq is required"
+        cmd_prepare_uninstall "$@"
         ;;
     advise|disasters|resolve)
         die "command '$cmd' moved out of the primary CLI; use SQL APIs or --verbose recover/protect flows"

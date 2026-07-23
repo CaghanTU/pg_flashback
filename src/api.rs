@@ -80,11 +80,42 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/monitoring_cache.sql",
+    name = "flashback_monitoring_cache",
+    requires = ["flashback_storage_schema_bootstrap"],
+);
+
+extension_sql_file!(
+    "../sql/functions/operator_projections.sql",
+    name = "flashback_operator_projections",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_operator_diagnosis",
+        "flashback_health_runtime",
+        "flashback_worker_admission",
+        "flashback_monitoring_cache"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/operation_journal.sql",
     name = "flashback_operation_journal",
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_health_runtime",
+        "flashback_worker_admission"
+    ],
+);
+
+extension_sql_file!(
+    "../sql/functions/maintain_uninstall.sql",
+    name = "flashback_maintain_uninstall",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_operator_projections",
+        "flashback_coverage_runtime",
+        "flashback_operation_journal",
+        "flashback_local_capacity",
         "flashback_worker_admission"
     ],
 );
@@ -97,6 +128,7 @@ extension_sql_file!(
         "flashback_operator_diagnosis",
         "flashback_operation_journal",
         "flashback_restore_lsn_api",
+        "flashback_restore_verify_helpers",
         "flashback_drop_dependency_manifest",
         "flashback_worker_admission",
         flashback_sha256
@@ -113,12 +145,6 @@ extension_sql_file!(
         "flashback_worker_admission",
         "flashback_payload_ownership_helpers"
     ],
-);
-
-extension_sql_file!(
-    "../sql/functions/monitoring_cache.sql",
-    name = "flashback_monitoring_cache",
-    requires = ["flashback_storage_schema_bootstrap"],
 );
 
 extension_sql_file!(

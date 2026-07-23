@@ -89,6 +89,7 @@ GRANT EXECUTE ON FUNCTION flashback_local_restore_preflight(regclass) TO flashba
 GRANT EXECUTE ON FUNCTION flashback_measure_local_capacity(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_admit_local_capacity(regclass, text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_advise(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_config_recommend(regclass, text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_relation_filesystem_available_bytes(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_tablespace_filesystem_available_bytes(oid) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
@@ -104,6 +105,15 @@ GRANT EXECUTE ON FUNCTION flashback_query_lsn(text, pg_lsn, text)     TO flashba
 GRANT EXECUTE ON FUNCTION flashback_resolve_target(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_health()                          TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_doctor()                          TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_resolve_lifecycle_name(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_list_lifecycles() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_is_actively_protected(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_lifecycle_health(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_operation_state(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_status_snapshot(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_plan(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_execute(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_prepare_uninstall(boolean) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_disaster_points(text, interval)   TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_plan(text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_begin(text, text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
