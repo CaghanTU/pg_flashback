@@ -1,0 +1,5 @@
+NOTICE:  table "__fb_lsn_shadow_2" does not exist, skipping
+NOTICE:  table "__fb_lsn_shadow_2" does not exist, skipping
+NOTICE:  table "cli_disk" does not exist, skipping
+NOTICE:  pg_flashback: restore applied at target LSN 0/1918160; successor coverage is pending until this transaction COMMIT is consumed. Check flashback_health() before another historical operation.
+pg_flashback: recover timed out waiting for healthy coverage (last=local_budget_exhausted)

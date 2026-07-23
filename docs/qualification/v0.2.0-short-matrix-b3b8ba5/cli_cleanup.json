@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "command": "cleanup",
+  "status": "ok",
+  "code": "ok",
+  "data": {
+    "code": "ok",
+    "status": "cleaned",
+    "table_name": "public.cli_ops",
+    "tracking_id": 1,
+    "operation_id": 3,
+    "schema_version": 1,
+    "retired_snapshots": 2,
+    "deleted_delta_rows": 4
+  },
+  "error": null
+}

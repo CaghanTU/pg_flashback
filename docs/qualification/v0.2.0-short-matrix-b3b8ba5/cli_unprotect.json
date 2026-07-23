@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "command": "unprotect",
+  "status": "ok",
+  "code": "ok",
+  "data": {
+    "code": "ok",
+    "note": "sealed unprotected state is written by worker/finalizer after marker COMMIT",
+    "status": "stopping",
+    "table_name": "public.cli_ops",
+    "tracking_id": 1,
+    "operation_id": 2,
+    "schema_version": 1,
+    "stop_marker_xid": 912
+  },
+  "error": null
+}

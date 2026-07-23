@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "command": "list",
+  "status": "ok",
+  "code": "ok",
+  "data": [
+    {
+      "is_active": true,
+      "table_name": "public.cli_ops",
+      "tracking_id": 1,
+      "tracked_since": "2026-07-23T03:38:26.615982+03:00",
+      "protection_state": "active",
+      "retention_interval": "7 days"
+    }
+  ],
+  "error": null
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "command": "history",
+  "status": "ok",
+  "code": "ok",
+  "data": [
+    {
+      "state": "verified",
+      "command": "recover",
+      "message": "successor coverage healthy",
+      "state_at": "2026-07-23T03:38:29.651146+03:00",
+      "created_at": "2026-07-23T03:38:29.478964+03:00",
+      "error_code": null,
+      "plan_token": "f0f0bc637618cf00d45b2c855e99aa66b801fa0e9c74b8ec1cecfc748637742f",
+      "table_name": "public.cli_ops",
+      "target_lsn": "0/1844788",
+      "operation_id": 1,
+      "session_user_name": "caghan"
+    }
+  ],
+  "error": null
+}

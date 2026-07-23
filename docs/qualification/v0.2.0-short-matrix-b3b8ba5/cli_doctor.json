@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "command": "doctor",
+  "status": "ok",
+  "code": "ok",
+  "data": [
+    {
+      "scope": "database",
+      "check_name": "backup_profile_prerequisites",
+      "status": "ok",
+      "observed": "active_backup_lifecycles=0",
+      "expected": "backup helper prerequisites only required when backup lifecycles exist",
+      "action": "none"
+    },
+    {
+      "scope": "cluster",
+      "check_name": "effective_capture_mode",
+      "status": "ok",
+      "observed": "wal",
+      "expected": "wal",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "local_capacity_budgets",
+      "status": "ok",
+      "observed": "max_snapshot=8589934592 max_restore_peak=17179869184 min_filesystem=67108864 safety_reserve=16777216",
+      "expected": "all three mandatory budgets configured (>0)",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "local_capacity_override",
+      "status": "ok",
+      "observed": "false",
+      "expected": "false",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "logical_slot",
+      "status": "ok",
+      "observed": "name=pg_flashback_postgres wal_status=reserved retained_bytes=267960 safe_wal_size=null",
+      "expected": "slot present for current database with wal_status not lost/missing when tracking is active",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "recover_verification_pending",
+      "status": "ok",
+      "observed": "applied_coverage_pending=0",
+      "expected": "0 pending recover finalizations",
+      "action": "none"
+    },
+    {
+      "scope": "cluster",
+      "check_name": "shared_preload_libraries",
+      "status": "ok",
+      "observed": "pg_flashback",
+      "expected": "contains pg_flashback",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "tracked_lifecycle_health",
+      "status": "ok",
+      "observed": "active=1 unhealthy=0 open_gaps=0 pending_boundaries=0",
+      "expected": "active lifecycles healthy with no open gaps or pending boundaries",
+      "action": "none"
+    },
+    {
+      "scope": "cluster",
+      "check_name": "wal_level",
+      "status": "ok",
+      "observed": "logical",
+      "expected": "logical",
+      "action": "none"
+    },
+    {
+      "scope": "database",
+      "check_name": "worker_admission",
+      "status": "ok",
+      "observed": "ready; capture_pid=2146744; maintenance_pid=2146743",
+      "expected": "ready",
+      "action": "none"
+    },
+    {
+      "scope": "cluster",
+      "check_name": "worker_pair_capacity",
+      "status": "ok",
+      "observed": "admitted_pairs=1 slots_required=2 max_workers=3 max_worker_processes=16 configured_demand=1",
+      "expected": "slots_required <= max_worker_processes AND configured_demand <= max_workers",
+      "action": "none"
+    }
+  ],
+  "error": null
+}

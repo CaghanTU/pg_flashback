@@ -20,16 +20,16 @@ remain historical only and must not qualify new binaries.
 | Phase | Title | Status | Notes |
 |---|---|---|---|
 | 0 | Audit docs | COMPLETE | This file + support matrix |
-| 1 | Correctness + security | PARTIAL | HA promotion E2E not yet proven on tip candidate |
+| 1 | Correctness + security | COMPLETE | HA promotion E2E green on tip candidate `b3b8ba5` |
 | 2 | Recover plan / dry-run | COMPLETE | Combined with Phase 3 milestone |
 | 3 | Journal + validation + execute grants | COMPLETE | Immutable header + append-only events |
 | 4 | Two-phase unprotect + cleanup | COMPLETE | Stopping marker protocol |
-| 5 | Unified exact-WAL matrix | PENDING | Harness present; candidate matrix not green yet |
-| 6 | CLI / multi-DB / disk UX | COMPLETE | Implementation landed; short-matrix proof pending |
+| 5 | Unified exact-WAL matrix | COMPLETE | Exact-WAL matrix green on `b3b8ba5` package digests |
+| 6 | CLI / multi-DB / disk UX | COMPLETE | CLI/multi-DB/disk UX proven in short matrix on `b3b8ba5` |
 | 7 | Upgrade ADR | COMPLETE | ADR 0001 → `0.2.0` from `0.1.0` |
-| 8 | Package / SBOM | COMPLETE | Candidate `86ab5a8` archives + SBOM published |
-| 9 | Exact benchmarks | PENDING | Scripts require CANDIDATE_DIR; claim run pending |
-| 10 | Qualify freeze | PENDING | Not READY_TO_START until short matrix green |
+| 8 | Package / SBOM | COMPLETE | Final candidate `b3b8ba5` archives + SBOM published |
+| 9 | Exact benchmarks | COMPLETE | Restore + WAL overhead claim runs bound to `b3b8ba5` |
+| 10 | Qualify freeze | COMPLETE | Freeze READY_TO_START; tip Gate C not started |
 
 ## Exit criteria (summary)
 
