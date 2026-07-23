@@ -1106,6 +1106,17 @@ case "$cmd" in
         cmd_recover "$1"
         ;;
     unprotect)
+        uargs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                --yes) YES=1; shift ;;
+                -*) die "unknown unprotect option: $1" ;;
+                *) uargs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${uargs[@]+"${uargs[@]}"}"
         [[ $# -eq 1 ]] || die "unprotect requires TABLE"
         command -v jq >/dev/null || die "jq is required"
         cmd_unprotect "$1"
