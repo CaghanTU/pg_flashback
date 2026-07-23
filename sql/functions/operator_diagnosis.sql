@@ -272,6 +272,7 @@ DECLARE
     v_status text;
     v_reason text;
     v_gen record;
+    v_gen_id bigint;
     v_admit_ok boolean;
 BEGIN
     IF lookback IS NULL OR lookback <= interval '0' THEN
@@ -313,6 +314,7 @@ BEGIN
         v_status := 'non_restorable';
         v_reason := NULL;
         v_gen := NULL;
+        v_gen_id := NULL;
         v_admit_ok := false;
 
         IF rec.commit_lsn IS NULL THEN
@@ -367,8 +369,13 @@ BEGIN
                   )
                 ORDER BY g.generation_no DESC
                 LIMIT 1;
+                IF FOUND THEN
+                    v_gen_id := v_gen.generation_id;
+                ELSE
+                    v_gen_id := NULL;
+                END IF;
 
-            IF v_gen.generation_id IS NULL THEN
+            IF v_gen_id IS NULL THEN
                 IF v_reason IS NULL THEN
                     v_reason := 'ambiguous or missing coverage generation for the disaster event';
                 END IF;
@@ -448,7 +455,7 @@ BEGIN
         disaster_time := COALESCE(rec.committed_at, rec.event_time);
         safe_target_lsn := v_safe_lsn;
         safe_target_time := v_safe_time;
-        generation_id := COALESCE(rec.generation_id, v_gen.generation_id);
+        generation_id := COALESCE(rec.generation_id, v_gen_id);
         status := v_status;
         reason := v_reason;
         RETURN NEXT;

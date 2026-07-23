@@ -487,20 +487,25 @@ BEGIN
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
     -- Conservative CASCADE: bind to the audited recover selection when present.
-    PERFORM flashback_require_supported_drop_manifest(
-        admission.tracking_id,
-        CASE
-            WHEN NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '')
-                 IS NOT NULL
-            THEN (
-                SELECT o.disaster_event_id
-                FROM flashback.operations o
-                WHERE o.operation_id =
-                    current_setting('pg_flashback.audited_recover_operation_id')::bigint
-            )
-            ELSE NULL
-        END
-    );
+    DECLARE
+        v_audited text;
+        v_disaster_event_id bigint := NULL;
+    BEGIN
+        v_audited := NULLIF(
+            btrim(COALESCE(current_setting('pg_flashback.audited_recover_operation_id', true), '')),
+            ''
+        );
+        IF v_audited IS NOT NULL AND v_audited ~ '^[0-9]+$' THEN
+            SELECT o.disaster_event_id
+              INTO v_disaster_event_id
+            FROM flashback.operations o
+            WHERE o.operation_id = v_audited::bigint;
+        END IF;
+        PERFORM flashback_require_supported_drop_manifest(
+            admission.tracking_id,
+            v_disaster_event_id
+        );
+    END;
 
     v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
     IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
