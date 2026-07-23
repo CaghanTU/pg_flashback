@@ -121,6 +121,21 @@ SQL
         --arg rps "$RPS" --argjson ok "$ok" \
         '$acc + [{rows:$n, elapsed_ms:$ms, rows_per_sec:$rps, fingerprint_ok:$ok}]')
     log "scale=$n elapsed_ms=$ELAPSED_MS rps=$RPS fp_ok=$ok"
+
+    # Retire the lifecycle so the next scale can create a fresh tracking generation.
+    "${PSQL[@]}" -c "SELECT flashback_unprotect('public.bench_t');" >/dev/null
+    for _ in $(seq 1 120); do
+        "${PSQL[@]}" -c "SELECT flashback_consume_wal(8192); SELECT flashback_finalize_unprotect_operations();" >/dev/null || true
+        active=$("${PSQL[@]}" -c "SELECT count(*) FROM flashback.tracked_tables WHERE table_name='bench_t' AND is_active;")
+        [[ "$active" == "0" ]] && break
+        sleep 0.25
+    done
+    [[ "$active" == "0" ]] || die "unprotect did not seal before next scale"
+    tid=$("${PSQL[@]}" -c "SELECT tracking_id FROM flashback.tracked_tables WHERE table_name='bench_t' ORDER BY tracking_id DESC LIMIT 1;")
+    if [[ -n "$tid" ]]; then
+        "${PSQL[@]}" -c "SELECT flashback_cleanup($tid, false);" >/dev/null
+    fi
+    "${PSQL[@]}" -c "DROP TABLE IF EXISTS public.bench_t CASCADE;" >/dev/null
 done
 
 STATUS=failed
