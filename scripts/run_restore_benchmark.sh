@@ -74,40 +74,43 @@ RESULTS='[]'
 CORRECTNESS=1
 for n in $SCALES; do
     log "scale=$n"
+    # Unique relation per scale so multi-scale claims do not fight pending
+    # successor generations from a prior recover on the same name.
+    rel="public.bench_t_${n}"
     "${PSQL[@]}" <<SQL
-DROP TABLE IF EXISTS public.bench_t CASCADE;
-CREATE TABLE public.bench_t (id int PRIMARY KEY, payload text);
-SELECT flashback_track('public.bench_t');
+DROP TABLE IF EXISTS ${rel} CASCADE;
+CREATE TABLE ${rel} (id int PRIMARY KEY, payload text);
+SELECT flashback_track('${rel}');
 SQL
     h=""
     for _ in $(seq 1 120); do
-        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='public.bench_t' LIMIT 1;")
+        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='${rel}' LIMIT 1;")
         [[ "$h" == "healthy" ]] && break
         sleep 0.25
     done
     [[ "$h" == "healthy" ]] || die "not healthy before load"
 
-    "${PSQL[@]}" -c "INSERT INTO public.bench_t SELECT g, 'x' FROM generate_series(1,$n) g;"
+    "${PSQL[@]}" -c "INSERT INTO ${rel} SELECT g, 'x' FROM generate_series(1,$n) g;"
     for _ in $(seq 1 120); do
-        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='public.bench_t' LIMIT 1;")
+        h=$("${PSQL[@]}" -c "SELECT health FROM flashback_health() WHERE table_name='${rel}' LIMIT 1;")
         [[ "$h" == "healthy" ]] && break
         sleep 0.25
     done
 
-    FP=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.bench_t;")
-    "${PSQL[@]}" -c "DROP TABLE public.bench_t;"
+    FP=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM ${rel};")
+    "${PSQL[@]}" -c "DROP TABLE ${rel};"
     st=""
     for _ in $(seq 1 180); do
-        st=$("${PSQL[@]}" -c "SELECT status FROM flashback_disaster_points('public.bench_t', interval '1 hour') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
+        st=$("${PSQL[@]}" -c "SELECT status FROM flashback_disaster_points('${rel}', interval '1 hour') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
         [[ "$st" == "restorable" ]] && break
         sleep 0.25
     done
 
     START_NS=$(date +%s%N)
-    "${PSQL[@]}" -c "SELECT flashback_recover_execute('public.bench_t', (flashback_recover_plan('public.bench_t'))->>'plan_token');" >/dev/null
+    "${PSQL[@]}" -c "SELECT flashback_recover_execute('${rel}', (flashback_recover_plan('${rel}'))->>'plan_token');" >/dev/null
     END_NS=$(date +%s%N)
     ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
-    FP2=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.bench_t;")
+    FP2=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM ${rel};")
     ok=true
     if [[ "$FP" != "$FP2" ]]; then
         ok=false
@@ -121,21 +124,6 @@ SQL
         --arg rps "$RPS" --argjson ok "$ok" \
         '$acc + [{rows:$n, elapsed_ms:$ms, rows_per_sec:$rps, fingerprint_ok:$ok}]')
     log "scale=$n elapsed_ms=$ELAPSED_MS rps=$RPS fp_ok=$ok"
-
-    # Retire the lifecycle so the next scale can create a fresh tracking generation.
-    "${PSQL[@]}" -c "SELECT flashback_unprotect('public.bench_t');" >/dev/null
-    for _ in $(seq 1 120); do
-        "${PSQL[@]}" -c "SELECT flashback_consume_wal(8192); SELECT flashback_finalize_unprotect_operations();" >/dev/null || true
-        active=$("${PSQL[@]}" -c "SELECT count(*) FROM flashback.tracked_tables WHERE table_name='bench_t' AND is_active;")
-        [[ "$active" == "0" ]] && break
-        sleep 0.25
-    done
-    [[ "$active" == "0" ]] || die "unprotect did not seal before next scale"
-    tid=$("${PSQL[@]}" -c "SELECT tracking_id FROM flashback.tracked_tables WHERE table_name='bench_t' ORDER BY tracking_id DESC LIMIT 1;")
-    if [[ -n "$tid" ]]; then
-        "${PSQL[@]}" -c "SELECT flashback_cleanup($tid, false);" >/dev/null
-    fi
-    "${PSQL[@]}" -c "DROP TABLE IF EXISTS public.bench_t CASCADE;" >/dev/null
 done
 
 STATUS=failed
