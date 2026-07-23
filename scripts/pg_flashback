@@ -16,6 +16,7 @@ PSQL_BIN="${PSQL_BIN:-psql}"
 STATEMENT_TIMEOUT_MS="${PG_FLASHBACK_STATEMENT_TIMEOUT_MS:-${PG_FLASHBACKCTL_STATEMENT_TIMEOUT_MS:-120000}}"
 PROTECT_HEALTH_TIMEOUT_S="${PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S:-${PG_FLASHBACKCTL_TRACK_HEALTH_TIMEOUT_S:-60}}"
 RECOVER_HEALTH_TIMEOUT_S="${PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S:-${PG_FLASHBACKCTL_RESTORE_HEALTH_TIMEOUT_S:-120}}"
+DISCOVERY_TIMEOUT_S="${PG_FLASHBACK_DISCOVERY_TIMEOUT_S:-30}"
 JSON_OUT=0
 VERBOSE=0
 YES=0
@@ -45,13 +46,13 @@ Commands:
   cleanup --tracking-id ID [--dry-run] [--yes]
 
 Options:
-  --json       Machine-readable JSON envelope on stdout
-  --verbose    Include technical details in human output
+  --json       Machine-readable JSON envelope on stdout (before or after command)
+  --verbose    Include technical details in human output (before or after command)
   -h, --help   Show this help
 
 Exit codes:
   0  success
-  1  operational failure
+  1  operational failure / partial multi-DB failure
   2  usage / configuration error
 
 Environment (libpq):
@@ -61,12 +62,19 @@ Environment (pg_flashback):
   PG_FLASHBACK_STATEMENT_TIMEOUT_MS      default 120000
   PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S  default 60
   PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S  default 120
+  PG_FLASHBACK_DISCOVERY_TIMEOUT_S       default 30 (post-DROP plan catch-up poll)
 
 Typical recovery after an accidental DROP:
   pg_flashback doctor
   pg_flashback protect public.orders
   # ... later, after DROP TABLE public.orders;
-  pg_flashback recover public.orders
+  pg_flashback --json recover public.orders
+  # equivalent:
+  pg_flashback recover public.orders --json
+
+After install, verify the CLI on PATH matches the candidate package:
+  command -v pg_flashback
+  pg_flashback version
 EOF
 }
 
@@ -125,11 +133,25 @@ emit_envelope() {
 }
 
 list_target_databases() {
+    # Enumerate configured flashback target databases from GUCs — not every
+    # connectable pg_database. postgres is included only when configured.
     psql_tuples <<'SQL'
-SELECT datname
-FROM pg_database
-WHERE datallowconn
-  AND NOT datistemplate
+WITH raw AS (
+    SELECT COALESCE(
+        NULLIF(current_setting('pg_flashback.target_databases', true), ''),
+        NULLIF(current_setting('pg_flashback.target_database', true), ''),
+        current_database()
+    ) AS csv
+),
+names AS (
+    SELECT DISTINCT trim(both FROM x) AS datname
+    FROM raw, unnest(string_to_array(raw.csv, ',')) AS x
+    WHERE trim(both FROM x) <> ''
+)
+SELECT n.datname
+FROM names n
+JOIN pg_database d ON d.datname = n.datname
+WHERE d.datallowconn AND NOT d.datistemplate
 ORDER BY 1;
 SQL
 }
@@ -257,21 +279,43 @@ doctor_action_for_humans() {
 
 doctor_one_db() {
     local db=${1:-}
-    local errors n
+    local errors n installed
     local psql_cmd=(psql_tuples)
     if [[ -n "$db" ]]; then
         psql_cmd=(psql_tuples_db "$db")
     fi
+
+    installed=$("${psql_cmd[@]}" <<'SQL'
+SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_flashback');
+SQL
+) || installed="f"
+    if [[ "$installed" != "t" ]]; then
+        if [[ "$JSON_OUT" == 1 ]]; then
+            if [[ -n "$db" ]]; then
+                jq -n --arg db "$db" \
+                    '{database:$db, checks:null, error:{code:"extension_missing", message:"pg_flashback extension is not installed in this database"}}'
+            else
+                emit_envelope doctor error extension_missing \
+                    '{"checks":null}' \
+                    '{"code":"extension_missing","message":"pg_flashback extension is not installed"}'
+            fi
+        else
+            echo "pg_flashback doctor${db:+ ($db)}: extension_missing"
+        fi
+        return 1
+    fi
+
     if [[ "${DOCTOR_RECONCILE:-0}" == 1 ]]; then
         n=$("${psql_cmd[@]}" <<'SQL'
 SELECT flashback_finalize_recover_operations()
-     + flashback_finalize_unprotect_operations();
+     + flashback_finalize_unprotect_operations()
+     + flashback_reconcile_recover_operations(interval '5 minutes');
 SQL
 )
         if [[ -n "$db" ]]; then
-            echo "Reconciled($db): finalized=$n"
+            echo "Reconciled($db): finalized=$n" >&2
         else
-            echo "Reconciled recover/unprotect operations: finalized=$n"
+            echo "Reconciled recover/unprotect operations: finalized=$n" >&2
         fi
     fi
     if [[ "$JSON_OUT" == 1 ]]; then
@@ -283,7 +327,7 @@ SQL
 )
         if [[ -n "$db" ]]; then
             jq -n --arg db "$db" --argjson checks "$checks" \
-                '{database:$db, checks:$checks}'
+                '{database:$db, checks:$checks, error:null}'
         else
             emit_envelope doctor ok ok "$checks" null
         fi
@@ -744,7 +788,8 @@ SQL
 
 cmd_recover() {
     local table=$1
-    local canon plan status reason lsn disaster_time selection token op_id health
+    local canon plan status reason lsn disaster_time selection token op_id health code
+    local begin_json exec_json deadline now
     reject_controls table "$table"
     canon="$(canonical_table_name "$table")"
 
@@ -753,9 +798,11 @@ cmd_recover() {
     fi
     : "${LATEST_DROP:=1}"
 
-    # Server-side authority: do not assemble selection from raceable shell queries.
-    plan="$(psql_tuples -v "table=$table" -v "lookback=${LOOKBACK:-24 hours}" \
-        -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
+    # Bounded discovery: poll while capture frontier has not observed the DROP.
+    deadline=$(( $(date +%s) + DISCOVERY_TIMEOUT_S ))
+    while true; do
+        plan="$(psql_tuples -v "table=$table" -v "lookback=${LOOKBACK:-24 hours}" \
+            -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
 SELECT flashback_recover_plan(
     :'table',
     :'lookback'::interval,
@@ -765,7 +812,18 @@ SELECT flashback_recover_plan(
 );
 SQL
 )"
-    status=$(printf '%s' "$plan" | jq -r '.status // empty')
+        status=$(printf '%s' "$plan" | jq -r '.status // empty')
+        code=$(printf '%s' "$plan" | jq -r '.code // empty')
+        if [[ "$code" != "capture_catchup_pending" ]]; then
+            break
+        fi
+        now=$(date +%s)
+        if (( now >= deadline )); then
+            break
+        fi
+        sleep 0.5
+    done
+
     reason=$(printf '%s' "$plan" | jq -r '.reason // .code // empty')
     lsn=$(printf '%s' "$plan" | jq -r '.target_lsn // empty')
     disaster_time=$(printf '%s' "$plan" | jq -r '.disaster_time // empty')
@@ -782,8 +840,13 @@ SQL
             echo "Cannot recover $canon"
             echo "  Status: ${status:-missing}"
             echo "  Reason: ${reason:-no recoverable DROP found}"
-            echo "  Meaning: pg_flashback will not guess a recovery point when coverage is incomplete or ambiguous."
-            echo "  Action: run pg_flashback doctor and pg_flashback status $canon"
+            if [[ "$code" == "capture_catchup_pending" ]]; then
+                echo "  Meaning: capture has not yet observed the latest DROP (frontier lag)."
+                echo "  Action: wait for worker catch-up, then retry; inspect: pg_flashback doctor / status $canon"
+            else
+                echo "  Meaning: pg_flashback will not guess a recovery point when coverage is incomplete or ambiguous."
+                echo "  Action: run pg_flashback doctor and pg_flashback status $canon"
+            fi
         fi
         exit 1
     fi
@@ -820,11 +883,11 @@ SQL
         exit 1
     fi
 
-    local exec_json
-    exec_json="$(psql_tuples -v "table=$table" -v "token=$token" \
+    # TX A: durable begin (autocommit). TX B: execute. TX C on failure: mark_failed.
+    begin_json="$(psql_tuples -v "table=$table" -v "token=$token" \
         -v "lookback=${LOOKBACK:-24 hours}" \
         -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
-SELECT flashback_recover_execute(
+SELECT flashback_recover_begin(
     :'table',
     :'token',
     :'lookback'::interval,
@@ -834,7 +897,38 @@ SELECT flashback_recover_execute(
 );
 SQL
 )"
-    op_id=$(printf '%s' "$exec_json" | jq -r '.operation_id // empty')
+    op_id=$(printf '%s' "$begin_json" | jq -r '.operation_id // empty')
+    [[ -n "$op_id" && "$op_id" != "null" ]] || fail "recover begin did not return operation_id"
+
+    set +e
+    exec_json="$(psql_tuples -v "table=$table" -v "token=$token" -v "opid=$op_id" \
+        -v "lookback=${LOOKBACK:-24 hours}" \
+        -v "event_id=${DISASTER_EVENT_ID:-}" -v "ts=${AT_TIMESTAMP:-}" -v "lsn=${AT_LSN:-}" <<'SQL'
+SELECT flashback_recover_execute(
+    :'table',
+    :'token',
+    :'lookback'::interval,
+    NULLIF(:'event_id', '')::bigint,
+    NULLIF(:'ts', '')::timestamptz,
+    NULLIF(:'lsn', '')::pg_lsn,
+    :'opid'::bigint
+);
+SQL
+)"
+    local exec_rc=$?
+    set -e
+    if [[ "$exec_rc" -ne 0 ]]; then
+        psql_tuples -v "opid=$op_id" -v "msg=${exec_json:-execute failed}" <<'SQL' >/dev/null || true
+SELECT flashback_recover_mark_failed(
+    :'opid'::bigint,
+    NULL,
+    'restore_failed',
+    left(:'msg', 500),
+    jsonb_build_object('cli', 'pg_flashback')
+);
+SQL
+        fail "recover execute failed for operation_id=$op_id (durable failed event recorded)"
+    fi
 
     health="$(wait_health "$table" "$RECOVER_HEALTH_TIMEOUT_S" "recover")"
     # Worker/finalizer owns verified; CLI only observes the projection.
@@ -851,9 +945,9 @@ SQL
 
     if [[ "$JSON_OUT" == 1 ]]; then
         jq -n --arg table "$canon" --arg health "$health" --arg state "$state" \
-            --argjson plan "$plan" --argjson exec "$exec_json" \
+            --argjson plan "$plan" --argjson begin "$begin_json" --argjson exec "$exec_json" \
             '{schema_version:1, command:"recover", status:"ok", code:"verified",
-              data:{table:$table, health:$health, state:$state, plan:$plan, execute:$exec}, error:null}'
+              data:{table:$table, health:$health, state:$state, plan:$plan, begin:$begin, execute:$exec}, error:null}'
     else
         echo "Recovered: $canon"
         echo "Coverage is healthy again (operation verified)."
@@ -870,10 +964,20 @@ cmd_status_dispatch() {
         cmd_status "$table"
         return
     fi
-    local db fail=0 chunk arr
+    local db fail=0 chunk arr installed
     local -a payloads=()
     while IFS= read -r db; do
         [[ -n "$db" ]] || continue
+        installed=$(PGDATABASE="$db" psql_tuples <<'SQL'
+SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='pg_flashback');
+SQL
+) || installed="f"
+        if [[ "$installed" != "t" ]]; then
+            fail=1
+            payloads+=("$(jq -n --arg db "$db" \
+                '{database:$db, status:null, error:{code:"extension_missing", message:"pg_flashback extension is not installed in this database"}}')")
+            continue
+        fi
         if chunk=$(
             JSON_OUT=1
             PGDATABASE="$db" cmd_status "$table"
@@ -881,8 +985,9 @@ cmd_status_dispatch() {
             payloads+=("$(jq -n --arg db "$db" --argjson data "$chunk" '{database:$db, status:$data, error:null}')")
         else
             fail=1
-            echo "pg_flashback: status failed for database $db" >&2
-            payloads+=("$(jq -n --arg db "$db" '{database:$db, status:null, error:"status failed"}')")
+            # Keep aggregate JSON valid even when a single DB fails.
+            payloads+=("$(jq -n --arg db "$db" --arg raw "${chunk:-}" \
+                '{database:$db, status:null, error:{code:"status_failed", message:($raw | if . == "" then "status failed" else . end)}}')")
         fi
     done < <(list_target_databases)
     arr=$(printf '%s\n' "${payloads[@]+"${payloads[@]}"}" | jq -s '.')
@@ -1056,31 +1161,85 @@ case "$cmd" in
         cmd_doctor
         ;;
     version)
-        [[ $# -eq 0 ]] || die "version takes no arguments"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown version option: $1" ;;
+                *) die "version takes no positional arguments" ;;
+            esac
+        done
         command -v jq >/dev/null || die "jq is required"
         cmd_version
         ;;
     list)
-        [[ $# -eq 0 ]] || die "list takes no arguments"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown list option: $1" ;;
+                *) die "list takes no positional arguments" ;;
+            esac
+        done
         command -v jq >/dev/null || die "jq is required"
         cmd_list
         ;;
     history)
+        hargs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown history option: $1" ;;
+                *) hargs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${hargs[@]+"${hargs[@]}"}"
         [[ $# -le 1 ]] || die "history accepts optional TABLE"
         command -v jq >/dev/null || die "jq is required"
         cmd_history "${1:-}"
         ;;
     changes)
+        cargs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown changes option: $1" ;;
+                *) cargs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${cargs[@]+"${cargs[@]}"}"
         [[ $# -eq 1 ]] || die "changes requires TABLE"
         command -v jq >/dev/null || die "jq is required"
         cmd_changes "$1"
         ;;
     protect)
+        pargs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown protect option: $1" ;;
+                *) pargs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${pargs[@]+"${pargs[@]}"}"
         [[ $# -eq 1 ]] || die "protect requires TABLE"
         command -v jq >/dev/null || die "jq is required"
         cmd_protect "$1"
         ;;
     track)
+        targs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                -*) die "unknown track option: $1" ;;
+                *) targs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${targs[@]+"${targs[@]}"}"
         [[ $# -eq 1 ]] || die "track requires TABLE"
         command -v jq >/dev/null || die "jq is required"
         echo "pg_flashback: 'track' is deprecated; use 'protect'" >&2

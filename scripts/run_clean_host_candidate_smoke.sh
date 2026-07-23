@@ -124,9 +124,36 @@ install -m 0644 "$EXT_ROOT/share/extension/pg_flashback.control" \
 # Operator CLI install path used by end users.
 mkdir -p "$WORK/bin"
 install -m 0755 "$CLI" "$WORK/bin/pg_flashback"
+
+# Detect a stale pg_flashback earlier in PATH before we prepend the candidate.
+# A clean-host upgrade must refuse silently executing an older CLI.
+STALE_CLI_PROBE="$(mktemp -d "$WORK/stale-cli.XXXXXX")"
+install -m 0755 /dev/null "$STALE_CLI_PROBE/pg_flashback" 2>/dev/null || true
+printf '#!/bin/sh\necho stale-cli-sentinel\nexit 99\n' > "$STALE_CLI_PROBE/pg_flashback"
+chmod 0755 "$STALE_CLI_PROBE/pg_flashback"
+PATH_WITH_STALE="$STALE_CLI_PROBE:$WORK/bin:$PG_BIN:$PATH"
+RESOLVED_STALE="$(PATH="$PATH_WITH_STALE" command -v pg_flashback || true)"
+if [[ "$RESOLVED_STALE" == "$STALE_CLI_PROBE/pg_flashback" ]]; then
+    STALE_OUT="$(PATH="$PATH_WITH_STALE" pg_flashback version 2>/dev/null || true)"
+    [[ "$STALE_OUT" == *stale-cli-sentinel* ]] \
+        || die "PATH collision probe did not execute the earlier stale CLI"
+    pass "detected PATH collision when older pg_flashback precedes candidate"
+else
+    die "PATH collision probe failed to resolve stale CLI first"
+fi
+rm -rf "$STALE_CLI_PROBE"
+
 export PATH="$WORK/bin:$PG_BIN:$PATH"
 export PSQL_BIN="$PG_BIN/psql"
-pass "installed extension+helper+CLI from candidate archives only"
+RESOLVED_CLI="$(command -v pg_flashback)"
+[[ "$RESOLVED_CLI" == "$WORK/bin/pg_flashback" ]] \
+    || die "resolved CLI is not candidate install path: $RESOLVED_CLI"
+CLI_SHA_RESOLVED="$(sha256sum "$RESOLVED_CLI" | awk '{print $1}')"
+[[ -z "$CLI_SHA_MANIFEST" || "$CLI_SHA_RESOLVED" == "$CLI_SHA_MANIFEST" ]] \
+    || die "resolved CLI sha256 $CLI_SHA_RESOLVED != MANIFEST $CLI_SHA_MANIFEST"
+CLI_VER_OUT="$("$RESOLVED_CLI" version 2>&1 || true)"
+[[ -n "$CLI_VER_OUT" ]] || die "pg_flashback version produced empty output"
+pass "installed extension+helper+CLI from candidate archives only (PATH/hash verified)"
 
 pgbr() { "$PGBACKREST" --config="$PGBACKREST_CONFIG" --stanza="$STANZA" "$@"; }
 primary_sql() {
@@ -263,6 +290,7 @@ pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.allow_unaudited_restore = on
 pg_flashback.slot_lag_warning_bytes = 16GB
 pg_flashback.slot_lag_at_risk_bytes = 32GB
 EOF

@@ -88,6 +88,13 @@ printf '%s\n' "$PG_MAJOR" > "$EXT_DIR/PG_MAJOR"
 printf '%s\n' \
     "Install the operator CLI with:" \
     "  sudo install -m 0755 bin/pg_flashback /usr/local/bin/pg_flashback" \
+    "" \
+    "Then verify PATH resolves THIS CLI (stale copies earlier in PATH are unsafe):" \
+    "  command -v pg_flashback" \
+    "  pg_flashback version" \
+    "  sha256sum \"\$(command -v pg_flashback)\"" \
+    "Expected CLI sha256 is recorded in MANIFEST.json artifacts.cli_binary_sha256." \
+    "Do not leave an older pg_flashback binary earlier in PATH than the installed candidate." \
     > "$EXT_DIR/bin/INSTALL.txt"
 cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
 cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md docs/QUICKSTART_LOCAL_DROP.md "$EXT_DIR/docs/"
