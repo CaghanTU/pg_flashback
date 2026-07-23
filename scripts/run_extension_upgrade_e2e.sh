@@ -49,6 +49,7 @@ pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.allow_unaudited_restore = on
 EOF
 
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK/pg.log" start -w
@@ -84,7 +85,9 @@ for _ in $(seq 1 180); do
     [[ "$st" == "restorable" ]] && break
     sleep 0.2
 done
-"${PSQL[@]}" -c "SELECT flashback_recover_execute('public.upg_t', (flashback_recover_plan('public.upg_t'))->>'plan_token');" >/dev/null
+TOKEN=$("${PSQL[@]}" -c "SELECT flashback_recover_plan('public.upg_t')->>'plan_token';")
+OP=$("${PSQL[@]}" -c "SELECT flashback_recover_begin('public.upg_t', '$TOKEN')->>'operation_id';")
+"${PSQL[@]}" -c "SELECT flashback_recover_execute('public.upg_t', '$TOKEN', interval '24 hours', NULL, NULL, NULL, $OP);" >/dev/null
 FP2=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||v, ',' ORDER BY id)) FROM public.upg_t;")
 [[ "$FP" == "$FP2" ]] || die "fingerprint mismatch after recover"
 

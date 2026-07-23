@@ -64,6 +64,7 @@ pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.allow_unaudited_restore = on
 EOF
 
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK/pg.log" start -w
@@ -107,7 +108,9 @@ SQL
     done
 
     START_NS=$(date +%s%N)
-    "${PSQL[@]}" -c "SELECT flashback_recover_execute('${rel}', (flashback_recover_plan('${rel}'))->>'plan_token');" >/dev/null
+    TOKEN=$("${PSQL[@]}" -c "SELECT flashback_recover_plan('${rel}')->>'plan_token';")
+    OP=$("${PSQL[@]}" -c "SELECT flashback_recover_begin('${rel}', '$TOKEN')->>'operation_id';")
+    "${PSQL[@]}" -c "SELECT flashback_recover_execute('${rel}', '$TOKEN', interval '24 hours', NULL, NULL, NULL, $OP);" >/dev/null
     END_NS=$(date +%s%N)
     ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
     FP2=$("${PSQL[@]}" -c "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM ${rel};")

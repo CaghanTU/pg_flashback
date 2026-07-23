@@ -25,12 +25,16 @@ DECLARE
     v_tracked_oid oid;
     v_identity_conflict boolean := false;
     v_manifest jsonb;
+    v_manifest_row record;
     v_status text;
     v_code text;
     v_token text;
     v_canonical text;
     v_selection text;
     v_resolved pg_lsn;
+    v_slot record;
+    v_frontier pg_lsn;
+    v_pending_wal boolean := false;
 BEGIN
     -- Resolve tracking identity
     SELECT tt.tracking_id, tt.rel_oid, format('%I.%I', tt.schema_name, tt.table_name)
@@ -158,6 +162,32 @@ BEGIN
     END IF;
 
     IF v_row IS NULL OR v_row.table_name IS NULL THEN
+        -- Distinguish true absence of DROP from capture frontier lag.
+        SELECT * INTO v_slot FROM flashback_slot_status_snapshot() LIMIT 1;
+        v_frontier := COALESCE(v_slot.confirmed_flush_lsn, v_slot.restart_lsn);
+        v_pending_wal := COALESCE(
+            pg_wal_lsn_diff(pg_current_wal_lsn(), COALESCE(v_frontier, '0/0'::pg_lsn)) > 0,
+            true
+        );
+        IF v_pending_wal THEN
+            RETURN jsonb_build_object(
+                'schema_version', v_plan_version,
+                'plan_version', v_plan_version,
+                'selection', v_selection,
+                'table_name', v_canonical,
+                'tracking_id', v_tracking_id,
+                'status', 'error',
+                'code', 'capture_catchup_pending',
+                'identity_conflict', v_identity_conflict,
+                'capture_frontier_lsn', v_frontier,
+                'current_wal_lsn', pg_current_wal_lsn(),
+                'duration_estimate', 'unknown',
+                'blockers', jsonb_build_array(
+                    'no DROP event observed yet; capture worker has not reached the current WAL frontier'
+                ),
+                'action', 'wait for flashback capture/slot catch-up then replan; run flashback_doctor()/status'
+            );
+        END IF;
         RETURN jsonb_build_object(
             'schema_version', v_plan_version,
             'plan_version', v_plan_version,
@@ -167,20 +197,52 @@ BEGIN
             'status', 'error',
             'code', 'no_drop_event',
             'identity_conflict', v_identity_conflict,
+            'capture_frontier_lsn', v_frontier,
+            'current_wal_lsn', pg_current_wal_lsn(),
             'duration_estimate', 'unknown',
-            'blockers', jsonb_build_array('no DROP event for selection')
+            'blockers', jsonb_build_array('no DROP event for selection after capture frontier caught up')
         );
     END IF;
 
-    SELECT m.manifest INTO v_manifest
+    SELECT m.manifest, m.manifest_id, m.has_unsupported, m.cascade_requested,
+           m.source_xid, flashback_sha256(m.manifest::text) AS manifest_hash
+      INTO v_manifest_row
     FROM flashback.drop_dependency_manifests m
     WHERE m.tracking_id = v_tracking_id
-    ORDER BY m.captured_at DESC
+      AND (
+          (v_row.disaster_event_id IS NOT NULL AND m.disaster_event_id = v_row.disaster_event_id)
+          OR (m.source_xid IS NOT NULL AND m.source_xid = (
+                SELECT dl.source_xid FROM flashback.delta_log dl
+                WHERE dl.event_id = v_row.disaster_event_id
+                LIMIT 1
+             ))
+          OR (m.disaster_commit_lsn IS NOT NULL
+              AND m.disaster_commit_lsn IS NOT DISTINCT FROM v_row.disaster_commit_lsn)
+      )
+    ORDER BY
+        CASE WHEN m.disaster_event_id = v_row.disaster_event_id THEN 0 ELSE 1 END,
+        m.captured_at DESC, m.manifest_id DESC
     LIMIT 1;
+
+    -- Fallback only when no event-bound row exists (legacy manifests).
+    IF v_manifest_row.manifest_id IS NULL THEN
+        SELECT m.manifest, m.manifest_id, m.has_unsupported, m.cascade_requested,
+               m.source_xid, flashback_sha256(m.manifest::text) AS manifest_hash
+          INTO v_manifest_row
+        FROM flashback.drop_dependency_manifests m
+        WHERE m.tracking_id = v_tracking_id
+        ORDER BY m.captured_at DESC, m.manifest_id DESC
+        LIMIT 1;
+    END IF;
+
+    v_manifest := v_manifest_row.manifest;
 
     v_status := v_row.status;
     v_code := CASE
         WHEN v_identity_conflict THEN 'identity_conflict'
+        WHEN COALESCE(v_manifest_row.has_unsupported, false)
+             OR COALESCE((v_manifest->>'has_unsupported')::boolean, false)
+             THEN 'unsupported_dependencies'
         WHEN v_status = 'restorable' THEN 'ok'
         WHEN v_row.reason ILIKE '%ambiguous%' THEN 'ambiguous_coverage_generation'
         WHEN v_row.reason ILIKE '%gap%' THEN 'coverage_gap'
@@ -194,15 +256,20 @@ BEGIN
             'identity conflict: live relation OID differs from tracked lifecycle OID for %s',
             v_canonical
         );
+    ELSIF v_code = 'unsupported_dependencies' THEN
+        v_status := 'non_restorable';
+        v_row.reason := 'pre-DROP dependency manifest reports unsupported or unqualified dependencies';
     END IF;
 
-    v_token := flashback_sha256(format('%s|%s|%s|%s|%s|%s',
+    v_token := flashback_sha256(format('%s|%s|%s|%s|%s|%s|%s|%s',
         v_plan_version,
         v_tracking_id,
         COALESCE(v_row.disaster_event_id::text, ''),
         COALESCE(v_row.generation_id::text, ''),
         COALESCE(v_row.safe_target_lsn::text, ''),
-        v_canonical));
+        v_canonical,
+        COALESCE(v_manifest_row.manifest_id::text, ''),
+        COALESCE(v_manifest_row.manifest_hash, '')));
 
     RETURN jsonb_build_object(
         'schema_version', v_plan_version,
@@ -221,14 +288,25 @@ BEGIN
         'reason', v_row.reason,
         'identity_conflict', v_identity_conflict,
         'dependency_manifest', v_manifest,
+        'dependency_manifest_id', v_manifest_row.manifest_id,
+        'dependency_manifest_hash', v_manifest_row.manifest_hash,
+        'blockers', CASE
+            WHEN v_code = 'unsupported_dependencies' THEN
+                COALESCE(v_manifest->'views', '[]'::jsonb)
+                || COALESCE(v_manifest->'matviews', '[]'::jsonb)
+                || COALESCE(v_manifest->'incoming_fk', '[]'::jsonb)
+                || COALESCE(v_manifest->'inheritance_children', '[]'::jsonb)
+                || COALESCE(v_manifest->'inheritance_parents', '[]'::jsonb)
+            ELSE '[]'::jsonb
+        END,
         'duration_estimate', 'unknown',
         'note', 'plan_token is identity/stale guard only; RBAC authorizes execute; dry-run does not authorize'
     );
 END;
 $$;
 
--- Mutating execute: recompute plan under lock and compare token.
-CREATE OR REPLACE FUNCTION flashback_recover_execute(
+-- TX A: durable recover attempt header. Commit before destructive restore.
+CREATE OR REPLACE FUNCTION flashback_recover_begin(
     p_table text,
     p_plan_token text,
     p_lookback interval DEFAULT interval '24 hours',
@@ -244,15 +322,12 @@ AS $$
 DECLARE
     v_plan jsonb;
     v_op bigint;
-    v_rows bigint;
     v_token text;
-    v_lsn pg_lsn;
     v_tracking_id bigint;
     v_table text;
 BEGIN
-    PERFORM flashback_require_primary('flashback_recover_execute');
+    PERFORM flashback_require_primary('flashback_recover_begin');
 
-    -- Serialize against concurrent recover/replan for the same lifecycle.
     SELECT tt.tracking_id INTO v_tracking_id
     FROM flashback.tracked_tables tt
     WHERE tt.recovery_profile = 'local_delta'
@@ -270,13 +345,12 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    -- Fully recompute under lock; plan_token is stale-selection guard only.
     v_plan := flashback_recover_plan(p_table, p_lookback, p_disaster_event_id, p_at, p_lsn);
     v_token := v_plan->>'plan_token';
     IF v_token IS NULL OR v_token IS DISTINCT FROM p_plan_token THEN
         RAISE EXCEPTION 'pg_flashback: recover plan_token mismatch (stale selection); replan required'
             USING ERRCODE = 'serialization_failure',
-                  HINT = 'Call flashback_recover_plan again and retry execute with the new plan_token.';
+                  HINT = 'Call flashback_recover_plan again and retry begin with the new plan_token.';
     END IF;
     IF COALESCE(v_plan->>'status', '') <> 'restorable' THEN
         RAISE EXCEPTION 'pg_flashback: recover plan is not restorable (%)',
@@ -284,34 +358,154 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    v_lsn := (v_plan->>'target_lsn')::pg_lsn;
     v_tracking_id := (v_plan->>'tracking_id')::bigint;
     v_table := v_plan->>'table_name';
 
-    -- Attempt header in this transaction; verified is appended later by finalizer.
     v_op := flashback_operation_begin(
         'recover', v_table, v_tracking_id,
         (v_plan->>'plan_version')::integer, v_token,
         (v_plan->>'disaster_event_id')::bigint,
         (v_plan->>'generation_id')::bigint,
-        v_lsn,
-        jsonb_build_object('plan', v_plan)
+        (v_plan->>'target_lsn')::pg_lsn,
+        jsonb_build_object(
+            'plan', v_plan,
+            'protocol', 'begin_then_execute',
+            'note', 'Commit this transaction before flashback_recover_execute'
+        )
     );
 
-    BEGIN
-        v_rows := flashback_restore_lsn(v_table, v_lsn);
-        PERFORM flashback_operation_append_event(
-            v_op, 'applied_coverage_pending', NULL, NULL,
-            'restore applied; waiting for successor coverage',
-            jsonb_build_object('rows_affected', v_rows)
-        );
-    EXCEPTION WHEN OTHERS THEN
-        PERFORM flashback_operation_append_event(
-            v_op, 'failed', SQLSTATE, 'restore_failed', SQLERRM,
-            jsonb_build_object('sqlerrm', SQLERRM)
-        );
-        RAISE;
-    END;
+    RETURN jsonb_build_object(
+        'schema_version', 1,
+        'status', 'started',
+        'code', 'ok',
+        'operation_id', v_op,
+        'table_name', v_table,
+        'plan_token', v_token,
+        'tracking_id', v_tracking_id,
+        'target_lsn', v_plan->>'target_lsn',
+        'note', 'Commit before calling flashback_recover_execute(operation_id, plan_token, ...). On execute failure call flashback_recover_mark_failed in a new transaction.'
+    );
+END;
+$$;
+
+-- TX B: destructive restore against a committed operation_id from begin.
+-- Does NOT create the operation header. On failure, RAISE without appending
+-- failed (that append must happen in TX C via flashback_recover_mark_failed).
+CREATE OR REPLACE FUNCTION flashback_recover_execute(
+    p_table text,
+    p_plan_token text,
+    p_lookback interval DEFAULT interval '24 hours',
+    p_disaster_event_id bigint DEFAULT NULL,
+    p_at timestamptz DEFAULT NULL,
+    p_lsn pg_lsn DEFAULT NULL,
+    p_operation_id bigint DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_plan jsonb;
+    v_op bigint := p_operation_id;
+    v_rows bigint;
+    v_token text;
+    v_lsn pg_lsn;
+    v_tracking_id bigint;
+    v_table text;
+    v_header_command text;
+    v_header_token text;
+    v_header_tracking bigint;
+    v_header_state text;
+    v_binding jsonb;
+BEGIN
+    PERFORM flashback_require_primary('flashback_recover_execute');
+
+    IF v_op IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_recover_execute requires operation_id from flashback_recover_begin'
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Call flashback_recover_begin, COMMIT, then flashback_recover_execute(..., p_operation_id => ...).';
+    END IF;
+
+    SELECT o.command, o.plan_token, o.tracking_id, s.state
+      INTO v_header_command, v_header_token, v_header_tracking, v_header_state
+    FROM flashback.operations o
+    JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
+    WHERE o.operation_id = v_op
+    FOR UPDATE OF o;
+
+    IF v_header_command IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: unknown recover operation_id %', v_op
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_header_command IS DISTINCT FROM 'recover' THEN
+        RAISE EXCEPTION 'pg_flashback: operation % is not a recover attempt', v_op
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_header_state IS DISTINCT FROM 'started' THEN
+        RAISE EXCEPTION 'pg_flashback: operation % is not in started state (got %)',
+            v_op, v_header_state
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_header_token IS DISTINCT FROM p_plan_token THEN
+        RAISE EXCEPTION 'pg_flashback: operation plan_token mismatch'
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    SELECT tt.tracking_id INTO v_tracking_id
+    FROM flashback.tracked_tables tt
+    WHERE tt.recovery_profile = 'local_delta'
+      AND (
+          (to_regclass(p_table) IS NOT NULL AND tt.rel_oid = to_regclass(p_table))
+          OR format('%I.%I', tt.schema_name, tt.table_name) = p_table
+          OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
+      )
+    ORDER BY tt.is_active DESC, tt.tracked_since DESC
+    LIMIT 1
+    FOR UPDATE OF tt;
+
+    IF v_tracking_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: no local_delta lifecycle for %', p_table
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    v_plan := flashback_recover_plan(p_table, p_lookback, p_disaster_event_id, p_at, p_lsn);
+    v_token := v_plan->>'plan_token';
+    IF v_token IS NULL OR v_token IS DISTINCT FROM p_plan_token THEN
+        RAISE EXCEPTION 'pg_flashback: recover plan_token mismatch (stale selection); replan required'
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'Call flashback_recover_plan again, begin a new operation, and retry.';
+    END IF;
+    IF COALESCE(v_plan->>'status', '') <> 'restorable' THEN
+        RAISE EXCEPTION 'pg_flashback: recover plan is not restorable (%)',
+            COALESCE(v_plan->>'code', 'unknown')
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF (v_plan->>'tracking_id')::bigint IS DISTINCT FROM v_header_tracking THEN
+        RAISE EXCEPTION 'pg_flashback: operation tracking_id drift versus recomputed plan'
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    v_lsn := (v_plan->>'target_lsn')::pg_lsn;
+    v_tracking_id := (v_plan->>'tracking_id')::bigint;
+    v_table := v_plan->>'table_name';
+
+    PERFORM set_config('pg_flashback.audited_recover_operation_id', v_op::text, true);
+
+    v_rows := flashback_restore_lsn(v_table, v_lsn);
+
+    SELECT COALESCE(o.details->'successor', '{}'::jsonb) INTO v_binding
+    FROM flashback.operations o
+    WHERE o.operation_id = v_op;
+
+    PERFORM flashback_operation_append_event(
+        v_op, 'applied_coverage_pending', NULL, NULL,
+        'restore applied; waiting for exact successor coverage',
+        jsonb_build_object(
+            'rows_affected', v_rows,
+            'successor', v_binding
+        )
+    );
 
     RETURN jsonb_build_object(
         'schema_version', 1,
@@ -321,7 +515,8 @@ BEGIN
         'table_name', v_table,
         'rows_affected', v_rows,
         'plan_token', v_token,
-        'note', 'verified is written by worker/finalizer after healthy successor coverage'
+        'successor', v_binding,
+        'note', 'verified is written by worker/finalizer after the exact successor boundary is healthy'
     );
 END;
 $$;

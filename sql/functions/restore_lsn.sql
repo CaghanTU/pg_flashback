@@ -449,8 +449,25 @@ DECLARE
     v_identity_edge bigint;
     v_identity_start bigint;
     v_identity_increment bigint;
+    v_cur_schema text;
+    v_cur_name text;
+    v_want_schema text;
+    v_want_name text;
 BEGIN
     PERFORM flashback_require_primary('flashback_restore_lsn');
+
+    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NULL
+       AND NOT COALESCE(
+            NULLIF(current_setting('pg_flashback.allow_unaudited_restore', true), '')::boolean,
+            false
+       )
+    THEN
+        RAISE EXCEPTION
+            'pg_flashback: flashback_restore_lsn requires audited recover context'
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Use flashback_recover_begin + flashback_recover_execute, or set pg_flashback.allow_unaudited_restore=on for emergency/lab use only.';
+    END IF;
+
     PERFORM flashback_set_restore_in_progress(true);
 
     -- Stream serialization is the outermost lock in every WAL lifecycle
@@ -469,8 +486,21 @@ BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
-    -- Conservative CASCADE: use pre-DROP ProcessUtility manifest, not live catalog.
-    PERFORM flashback_require_supported_drop_manifest(admission.tracking_id);
+    -- Conservative CASCADE: bind to the audited recover selection when present.
+    PERFORM flashback_require_supported_drop_manifest(
+        admission.tracking_id,
+        CASE
+            WHEN NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '')
+                 IS NOT NULL
+            THEN (
+                SELECT o.disaster_event_id
+                FROM flashback.operations o
+                WHERE o.operation_id =
+                    current_setting('pg_flashback.audited_recover_operation_id')::bigint
+            )
+            ELSE NULL
+        END
+    );
 
     v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
     IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
@@ -671,6 +701,43 @@ BEGIN
         ELSE
             PERFORM setval(to_regclass(v_seq_name), v_identity_edge, true);
         END IF;
+
+        -- Restore the original qualified identity sequence name when captured.
+        v_want_schema := COALESCE(
+            def_rec.identity_options->>'sequence_schema',
+            materialized.source_schema_name
+        );
+        v_want_name := def_rec.identity_options->>'sequence_name';
+        IF v_want_name IS NOT NULL AND v_want_name <> '' THEN
+            IF to_regclass(format('%I.%I', v_want_schema, v_want_name)) IS NOT NULL
+               AND to_regclass(format('%I.%I', v_want_schema, v_want_name))
+                   IS DISTINCT FROM to_regclass(v_seq_name)
+            THEN
+                RAISE EXCEPTION
+                    'pg_flashback: cannot restore identity sequence name %.%; name is occupied by an unrelated object',
+                    v_want_schema, v_want_name
+                    USING ERRCODE = 'duplicate_table';
+            END IF;
+
+            SELECT n.nspname, c.relname INTO v_cur_schema, v_cur_name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(v_seq_name);
+
+            IF v_cur_schema IS DISTINCT FROM v_want_schema THEN
+                EXECUTE format(
+                    'ALTER SEQUENCE %I.%I SET SCHEMA %I',
+                    v_cur_schema, v_cur_name, v_want_schema
+                );
+                v_cur_schema := v_want_schema;
+            END IF;
+            IF v_cur_name IS DISTINCT FROM v_want_name THEN
+                EXECUTE format(
+                    'ALTER SEQUENCE %I.%I RENAME TO %I',
+                    v_cur_schema, v_cur_name, v_want_name
+                );
+            END IF;
+        END IF;
     END LOOP;
 
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
@@ -772,6 +839,27 @@ BEGIN
 
     RAISE NOTICE 'pg_flashback: restore applied at target LSN %; successor coverage is pending until this transaction COMMIT is consumed. Check flashback_health() before another historical operation.',
         p_target_lsn;
+
+    -- Attach exact successor binding to the durable recover operation when present.
+    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NOT NULL THEN
+        UPDATE flashback.operations
+           SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+                'successor', jsonb_build_object(
+                    'tracking_id', admission.tracking_id,
+                    'generation_id', v_new_generation_id,
+                    'stream_id', v_new_stream_id,
+                    'boundary_xid', v_boundary_xid,
+                    'boundary_marker', format(
+                        'post-restore:%s:%s:%s',
+                        admission.tracking_id, v_boundary_xid, v_generation_no
+                    ),
+                    'restored_target_lsn', p_target_lsn,
+                    'rel_oid_at_boundary', v_new_rel_oid
+                )
+           )
+         WHERE operation_id = current_setting('pg_flashback.audited_recover_operation_id')::bigint;
+    END IF;
+
     PERFORM flashback_set_restore_in_progress(false);
     RETURN materialized.events_applied;
 EXCEPTION WHEN OTHERS THEN

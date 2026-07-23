@@ -188,7 +188,89 @@ $$;
 COMMENT ON FUNCTION flashback_operation_history(text, interval) IS
     'Operator operation history (not row-change payloads). Source of truth is append-only operation_events.';
 
--- Worker/finalizer: mark recover ops verified after successor coverage is healthy.
+-- Client/reconciler: durable failure after a failed or abandoned execute TX.
+-- Must be called in a NEW transaction (PostgreSQL cannot keep the failed
+-- append if it shares the aborted restore transaction).
+CREATE OR REPLACE FUNCTION flashback_recover_mark_failed(
+    p_operation_id bigint,
+    p_sqlstate text DEFAULT NULL,
+    p_error_code text DEFAULT 'restore_failed',
+    p_message text DEFAULT NULL,
+    p_payload jsonb DEFAULT '{}'::jsonb
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_state text;
+BEGIN
+    SELECT state INTO v_state
+    FROM flashback.operation_current_state
+    WHERE operation_id = p_operation_id;
+
+    IF v_state IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: unknown recover operation_id %', p_operation_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_state IN ('verified', 'failed', 'abandoned') THEN
+        RETURN;
+    END IF;
+    IF v_state NOT IN ('started', 'applied_coverage_pending') THEN
+        RAISE EXCEPTION 'pg_flashback: refuse mark_failed for operation % in state %',
+            p_operation_id, v_state
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM flashback_operation_append_event(
+        p_operation_id,
+        'failed',
+        p_sqlstate,
+        COALESCE(p_error_code, 'restore_failed'),
+        COALESCE(p_message, 'recover execute failed'),
+        COALESCE(p_payload, '{}'::jsonb) || jsonb_build_object('phase', 'mark_failed')
+    );
+END;
+$$;
+
+-- Reconciler: classify durable `started` ops that never reached applied/failed.
+-- Never guesses success — only marks abandoned/failed after an explicit window.
+CREATE OR REPLACE FUNCTION flashback_reconcile_recover_operations(
+    p_stale_after interval DEFAULT interval '5 minutes'
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    r record;
+    v_n integer := 0;
+BEGIN
+    FOR r IN
+        SELECT s.*
+        FROM flashback.operation_current_state s
+        WHERE s.command IN ('recover', 'restore_lsn')
+          AND s.state = 'started'
+          AND s.state_at < clock_timestamp() - p_stale_after
+    LOOP
+        PERFORM flashback_operation_append_event(
+            r.operation_id, 'abandoned', NULL, 'recover_abandoned',
+            'recover begin committed but execute never reached applied_coverage_pending',
+            jsonb_build_object(
+                'finalizer', 'flashback_reconcile_recover_operations',
+                'stale_after', p_stale_after::text
+            )
+        );
+        v_n := v_n + 1;
+    END LOOP;
+    RETURN v_n;
+END;
+$$;
+
+-- Worker/finalizer: mark recover ops verified only when the exact successor
+-- generation bound at apply time is healthy/active with resolved boundary.
 CREATE OR REPLACE FUNCTION flashback_finalize_recover_operations()
 RETURNS integer
 LANGUAGE plpgsql
@@ -197,7 +279,16 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     r record;
-    v_health text;
+    v_payload jsonb;
+    v_succ jsonb;
+    v_tracking_id bigint;
+    v_generation_id bigint;
+    v_stream_id bigint;
+    v_boundary_xid bigint;
+    v_boundary_marker text;
+    v_cg record;
+    v_health record;
+    v_gap boolean;
     v_n integer := 0;
 BEGIN
     FOR r IN
@@ -206,19 +297,97 @@ BEGIN
         WHERE s.command IN ('recover', 'restore_lsn')
           AND s.state = 'applied_coverage_pending'
     LOOP
-        SELECT h.health INTO v_health
-        FROM flashback_health() h
-        WHERE h.table_name = r.table_name
+        SELECT e.payload INTO v_payload
+        FROM flashback.operation_events e
+        WHERE e.operation_id = r.operation_id
+          AND e.event_type = 'applied_coverage_pending'
+        ORDER BY e.event_id DESC
         LIMIT 1;
 
-        IF v_health = 'healthy' THEN
-            PERFORM flashback_operation_append_event(
-                r.operation_id, 'verified', NULL, NULL,
-                'successor coverage healthy',
-                jsonb_build_object('finalizer', 'flashback_finalize_recover_operations')
-            );
-            v_n := v_n + 1;
+        SELECT COALESCE(v_payload->'successor', o.details->'successor', '{}'::jsonb)
+          INTO v_succ
+        FROM flashback.operations o
+        WHERE o.operation_id = r.operation_id;
+        v_tracking_id := NULLIF(v_succ->>'tracking_id', '')::bigint;
+        v_generation_id := NULLIF(v_succ->>'generation_id', '')::bigint;
+        v_stream_id := NULLIF(v_succ->>'stream_id', '')::bigint;
+        v_boundary_xid := NULLIF(v_succ->>'boundary_xid', '')::bigint;
+        v_boundary_marker := NULLIF(v_succ->>'boundary_marker', '');
+
+        IF v_tracking_id IS NULL OR v_generation_id IS NULL THEN
+            -- Incomplete binding: never verify by table_name alone.
+            CONTINUE;
         END IF;
+        IF r.tracking_id IS NOT NULL AND r.tracking_id IS DISTINCT FROM v_tracking_id THEN
+            CONTINUE;
+        END IF;
+
+        SELECT cg.* INTO v_cg
+        FROM flashback.coverage_generations cg
+        WHERE cg.generation_id = v_generation_id
+          AND cg.tracking_id = v_tracking_id
+        LIMIT 1;
+
+        IF v_cg.generation_id IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF v_cg.state IS DISTINCT FROM 'active' THEN
+            CONTINUE;
+        END IF;
+        IF v_cg.boundary_lsn IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF v_stream_id IS NOT NULL AND v_cg.stream_id IS DISTINCT FROM v_stream_id THEN
+            CONTINUE;
+        END IF;
+        IF v_boundary_xid IS NOT NULL
+           AND v_cg.boundary_xid IS DISTINCT FROM v_boundary_xid THEN
+            CONTINUE;
+        END IF;
+        IF v_boundary_marker IS NOT NULL
+           AND v_cg.boundary_marker IS DISTINCT FROM v_boundary_marker THEN
+            CONTINUE;
+        END IF;
+
+        SELECT EXISTS (
+            SELECT 1
+            FROM flashback.coverage_gaps gap
+            WHERE gap.tracking_id = v_tracking_id
+              AND gap.reanchored_by_generation_id IS NULL
+              AND gap.gap_start_lsn IS NOT NULL
+              AND gap.gap_start_lsn <= v_cg.boundary_lsn
+              AND (gap.gap_end_lsn IS NULL OR gap.gap_end_lsn > v_cg.boundary_lsn)
+        ) INTO v_gap;
+        IF v_gap THEN
+            CONTINUE;
+        END IF;
+
+        SELECT h.* INTO v_health
+        FROM flashback_health() h
+        WHERE h.tracking_id = v_tracking_id
+          AND h.generation_id = v_generation_id
+        LIMIT 1;
+
+        IF v_health.tracking_id IS NULL OR v_health.health IS DISTINCT FROM 'healthy' THEN
+            CONTINUE;
+        END IF;
+        IF v_health.valid_through_lsn IS NULL
+           OR v_health.valid_through_lsn < v_cg.boundary_lsn THEN
+            CONTINUE;
+        END IF;
+
+        PERFORM flashback_operation_append_event(
+            r.operation_id, 'verified', NULL, NULL,
+            'exact successor coverage healthy',
+            jsonb_build_object(
+                'finalizer', 'flashback_finalize_recover_operations',
+                'tracking_id', v_tracking_id,
+                'generation_id', v_generation_id,
+                'boundary_lsn', v_cg.boundary_lsn,
+                'stream_id', v_cg.stream_id
+            )
+        );
+        v_n := v_n + 1;
     END LOOP;
     RETURN v_n;
 END;

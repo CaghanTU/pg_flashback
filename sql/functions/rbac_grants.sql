@@ -106,9 +106,12 @@ GRANT EXECUTE ON FUNCTION flashback_health()                          TO flashba
 GRANT EXECUTE ON FUNCTION flashback_doctor()                          TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_disaster_points(text, interval)   TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_plan(text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_recover_execute(text, text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_operation_history(text, interval) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_recover_begin(text, text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_recover_execute(text, text, interval, bigint, timestamptz, pg_lsn, bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_recover_mark_failed(bigint, text, text, text, jsonb) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_reconcile_recover_operations(interval) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_finalize_recover_operations() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_operation_history(text, interval) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_unprotect(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_finalize_unprotect_operations() TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_cleanup(bigint, boolean) TO flashback_admin;
