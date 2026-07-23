@@ -342,10 +342,11 @@ wait_drop_restorable public.adv_fallback || die "first DROP not restorable"
 # that is non_restorable by opening a coverage gap intersecting the prefix.
 TID=$(q "SELECT tracking_id FROM flashback.tracked_tables WHERE format('%I.%I',schema_name,table_name)='public.adv_fallback' ORDER BY tracked_since DESC LIMIT 1;")
 GID=$(q "SELECT generation_id FROM flashback.coverage_generations WHERE tracking_id=$TID AND state IN ('active','sealed') ORDER BY generation_no DESC LIMIT 1;")
+# Gap must cover the pre-DROP safe target. A gap that starts after the DROP COMMIT
+# LSN does not invalidate that DROP and would falsely allow recover.
 q "INSERT INTO flashback.coverage_gaps(tracking_id, source_generation_id, gap_start_lsn, gap_end_lsn, lower_bound_inclusive, reason)
-   VALUES ($TID, $GID, pg_current_wal_lsn(), NULL, true, 'adversarial_gap');"
-# Ensure disaster_points still lists the older DROP; CLI must evaluate latest by LSN.
-# With an open gap, latest DROP becomes non_restorable; older must NOT be chosen.
+   VALUES ($TID, $GID, '0/0'::pg_lsn, NULL, true, 'adversarial_gap');"
+# With an open gap covering the prefix, latest DROP is non_restorable; recover must refuse.
 rc=0
 "$CLI" recover public.adv_fallback --latest-drop --yes >/tmp/pgfb-adv-fallback.out 2>&1 || rc=$?
 [[ "$rc" != 0 ]] || fail_case "latest_drop_no_silent_fallback" "CLI fell back to older restorable DROP"
