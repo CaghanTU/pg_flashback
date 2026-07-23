@@ -72,12 +72,18 @@ pg_flashback.local_safety_reserve_bytes = '16MB'
 EOF
 "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/postgresql.log" \
     -o "-p $PORT -k $SOCKET" start -w >/dev/null
-export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE=postgres PGUSER="$(whoami)"
+export PGHOST="$SOCKET"
+export PGPORT="$PORT"
+export PGDATABASE=postgres
+PGUSER="$(whoami)"
+export PGUSER
 
 psql -v ON_ERROR_STOP=1 -qAtc "CREATE EXTENSION pg_flashback;"
+# Create app tables as a role that can CREATE in public (PG15+ revoke).
 psql -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE pgfb_operator LOGIN;
 GRANT flashback_admin TO pgfb_operator;
+GRANT CREATE, USAGE ON SCHEMA public TO pgfb_operator;
 SQL
 export PGUSER=pgfb_operator
 
@@ -108,7 +114,9 @@ if [[ -n "$tid" && "$tid" != "null" ]]; then
 fi
 pg_flashback prepare-uninstall --yes
 
-export PGUSER="$(whoami)"
+export PGUSER
+PGUSER="$(whoami)"
+export PGUSER
 psql -v ON_ERROR_STOP=1 -c "DROP EXTENSION pg_flashback;"
 slots="$(psql -v ON_ERROR_STOP=1 -qAtc "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_flashback%';")"
 test "$slots" = "0"

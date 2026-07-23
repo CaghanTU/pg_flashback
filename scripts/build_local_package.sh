@@ -25,7 +25,6 @@ esac
 cd "$ROOT"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 SOURCE_COMMIT="$(git rev-parse HEAD)"
-SHORT="$(git rev-parse --short=12 HEAD)"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct HEAD)}"
 export TZ=UTC
 
@@ -43,7 +42,7 @@ fi
 
 STAGE="$OUT_DIR/stage"
 ARCHIVE_ROOT="pg_flashback-${VERSION}-pg${PG_MAJOR}-${ARCH_LABEL}-linux"
-rm -rf "$STAGE/$ARCHIVE_ROOT"
+rm -rf "${STAGE:?}/${ARCHIVE_ROOT:?}"
 mkdir -p "$STAGE/$ARCHIVE_ROOT"/{lib,bin,share/extension,docs/samples,scripts} "$OUT_DIR"
 
 echo "Building local package version=$VERSION pg=$PG_MAJOR commit=$SOURCE_COMMIT"

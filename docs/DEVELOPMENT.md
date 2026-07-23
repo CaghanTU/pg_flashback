@@ -17,6 +17,28 @@ cargo install --locked cargo-pgrx --version 0.16.1
 cargo pgrx init --pg17 /path/to/pg_config
 ```
 
+## Local package
+
+```bash
+PG_MAJOR=17 ./scripts/build_local_package.sh
+ARCHIVE=target/local-package/pg_flashback-*-pg17-*-linux.tar.gz \
+  PG_CONFIG="$(cargo pgrx info pg-config 17)" \
+  ./scripts/run_local_package_smoke.sh
+```
+
+The local archive is fresh-install-only for 0.2.0 and does not include the
+experimental recovery helper. Helper packaging remains separate.
+
+## Byte support envelope
+
+```bash
+# Against a live installed cluster with capacity GUCs set:
+PG_FLASHBACK_BENCH_SIZES="10MiB 100MiB" \
+  ./scripts/run_byte_support_envelope_bench.sh
+```
+
+Results are written under `target/bench/` and are host/config specific.
+
 ## Fast checks
 
 ```bash
