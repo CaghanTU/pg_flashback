@@ -204,35 +204,60 @@ BEGIN
         );
     END IF;
 
+    -- Exact event-bound manifest only: disaster_event_id must equal the
+    -- selected DROP. Never fall back to another generation's latest row.
     SELECT m.manifest, m.manifest_id, m.has_unsupported, m.cascade_requested,
            m.source_xid, flashback_sha256(m.manifest::text) AS manifest_hash
       INTO v_manifest_row
     FROM flashback.drop_dependency_manifests m
     WHERE m.tracking_id = v_tracking_id
-      AND (
-          (v_row.disaster_event_id IS NOT NULL AND m.disaster_event_id = v_row.disaster_event_id)
-          OR (m.source_xid IS NOT NULL AND m.source_xid = (
-                SELECT dl.source_xid FROM flashback.delta_log dl
-                WHERE dl.event_id = v_row.disaster_event_id
-                LIMIT 1
-             ))
-          OR (m.disaster_commit_lsn IS NOT NULL
-              AND m.disaster_commit_lsn IS NOT DISTINCT FROM v_row.disaster_commit_lsn)
-      )
-    ORDER BY
-        CASE WHEN m.disaster_event_id = v_row.disaster_event_id THEN 0 ELSE 1 END,
-        m.captured_at DESC, m.manifest_id DESC
+      AND v_row.disaster_event_id IS NOT NULL
+      AND m.disaster_event_id = v_row.disaster_event_id
+    ORDER BY m.captured_at DESC, m.manifest_id DESC
     LIMIT 1;
 
-    -- Fallback only when no event-bound row exists (legacy manifests).
     IF v_manifest_row.manifest_id IS NULL THEN
+        -- Worker may still be binding disaster_event_id onto a freshly captured
+        -- pre-DROP manifest; try bind once, then ask callers to poll.
+        PERFORM flashback_bind_drop_dependency_manifests();
         SELECT m.manifest, m.manifest_id, m.has_unsupported, m.cascade_requested,
                m.source_xid, flashback_sha256(m.manifest::text) AS manifest_hash
           INTO v_manifest_row
         FROM flashback.drop_dependency_manifests m
         WHERE m.tracking_id = v_tracking_id
+          AND v_row.disaster_event_id IS NOT NULL
+          AND m.disaster_event_id = v_row.disaster_event_id
         ORDER BY m.captured_at DESC, m.manifest_id DESC
         LIMIT 1;
+    END IF;
+
+    IF v_manifest_row.manifest_id IS NULL THEN
+        RETURN jsonb_build_object(
+            'schema_version', v_plan_version,
+            'plan_version', v_plan_version,
+            'selection', v_selection,
+            'table_name', v_canonical,
+            'tracking_id', v_tracking_id,
+            'disaster_event_id', v_row.disaster_event_id,
+            'generation_id', v_row.generation_id,
+            'target_lsn', v_row.safe_target_lsn,
+            'disaster_commit_lsn', v_row.disaster_commit_lsn,
+            'disaster_time', v_row.disaster_time,
+            'status', 'error',
+            'code', 'exact_manifest_pending',
+            'reason', format(
+                'exact pre-DROP dependency manifest for disaster_event_id=%s is not bound yet',
+                v_row.disaster_event_id
+            ),
+            'identity_conflict', v_identity_conflict,
+            'dependency_manifest', NULL,
+            'dependency_manifest_id', NULL,
+            'blockers', jsonb_build_array(
+                'exact event-bound dependency manifest missing; waiting for ProcessUtility capture + worker bind'
+            ),
+            'action', 'wait briefly for worker bind then replan; recovery refuses without the exact manifest',
+            'duration_estimate', 'unknown'
+        );
     END IF;
 
     v_manifest := v_manifest_row.manifest;
@@ -383,7 +408,7 @@ BEGIN
         'plan_token', v_token,
         'tracking_id', v_tracking_id,
         'target_lsn', v_plan->>'target_lsn',
-        'note', 'Commit before calling flashback_recover_execute(operation_id, plan_token, ...). On execute failure call flashback_recover_mark_failed in a new transaction.'
+        'note', 'Commit before calling flashback_recover_execute(operation_id, plan_token, ...). On execute failure call flashback_recover_mark_failed in a new transaction. verified requires restore_verification.status=passed on the operation header.'
     );
 END;
 $$;
@@ -516,7 +541,7 @@ BEGIN
         'rows_affected', v_rows,
         'plan_token', v_token,
         'successor', v_binding,
-        'note', 'verified is written by worker/finalizer after the exact successor boundary is healthy'
+        'note', 'verified is written by worker/finalizer after restore_verification passes and the exact successor boundary is healthy'
     );
 END;
 $$;
