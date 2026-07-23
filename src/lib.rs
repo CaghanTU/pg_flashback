@@ -358,6 +358,10 @@ mod tests {
         it_slot_health_actions,
         "../tests/sql/integration/slot_health_actions.sql"
     );
+    sql_test!(
+        it_restore_verify_regression,
+        "../tests/sql/integration/restore_verify_regression.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

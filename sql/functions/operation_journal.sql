@@ -289,6 +289,8 @@ DECLARE
     v_cg record;
     v_health record;
     v_gap boolean;
+    v_restore_verification jsonb;
+    v_verification_status text;
     v_n integer := 0;
 BEGIN
     FOR r IN
@@ -297,6 +299,26 @@ BEGIN
         WHERE s.command IN ('recover', 'restore_lsn')
           AND s.state = 'applied_coverage_pending'
     LOOP
+        SELECT o.details INTO v_restore_verification
+        FROM flashback.operations o
+        WHERE o.operation_id = r.operation_id;
+
+        v_verification_status := v_restore_verification->'restore_verification'->>'status';
+        IF v_verification_status IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF v_verification_status = 'failed' THEN
+            PERFORM flashback_operation_append_event(
+                r.operation_id, 'failed', NULL, 'restore_verification_failed',
+                'restore verification proof marked failed',
+                COALESCE(v_restore_verification->'restore_verification', '{}'::jsonb)
+            );
+            CONTINUE;
+        END IF;
+        IF v_verification_status IS DISTINCT FROM 'passed' THEN
+            CONTINUE;
+        END IF;
+
         SELECT e.payload INTO v_payload
         FROM flashback.operation_events e
         WHERE e.operation_id = r.operation_id

@@ -453,6 +453,9 @@ DECLARE
     v_cur_name text;
     v_want_schema text;
     v_want_name text;
+    v_restored_rel regclass;
+    v_expected_proof jsonb;
+    v_restore_verification jsonb;
 BEGIN
     PERFORM flashback_require_primary('flashback_restore_lsn');
 
@@ -745,6 +748,27 @@ BEGIN
         END IF;
     END LOOP;
 
+    v_restored_rel := to_regclass(format('%I.%I',
+        materialized.source_schema_name, materialized.source_table_name));
+    IF v_restored_rel IS NULL THEN
+        RAISE EXCEPTION 'flashback_restore_lsn: restored relation missing after swap for %',
+            p_target_table;
+    END IF;
+
+    v_expected_proof := public.flashback_capture_restore_expected_proof(
+        v_restored_rel,
+        jsonb_build_object(
+            'tracking_id', admission.tracking_id,
+            'restored_target_lsn', p_target_lsn,
+            'source_generation_id', admission.generation_id
+        )
+    );
+    v_restore_verification := public.flashback_verify_restored_relation(
+        v_restored_rel,
+        v_expected_proof,
+        materialized.target_schema_def
+    );
+
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
     v_provisional_lsn := pg_current_wal_insert_lsn();
 
@@ -849,6 +873,7 @@ BEGIN
     IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NOT NULL THEN
         UPDATE flashback.operations
            SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+                'restore_verification', v_restore_verification,
                 'successor', jsonb_build_object(
                     'tracking_id', admission.tracking_id,
                     'generation_id', v_new_generation_id,
