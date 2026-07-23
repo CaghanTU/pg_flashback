@@ -456,6 +456,10 @@ DECLARE
     v_restored_rel regclass;
     v_expected_proof jsonb;
     v_restore_verification jsonb;
+    v_disaster_event_id bigint := NULL;
+    v_disaster_commit_lsn pg_lsn := NULL;
+    v_source_xid bigint := NULL;
+    v_audited text;
 BEGIN
     PERFORM flashback_require_primary('flashback_restore_lsn');
 
@@ -492,62 +496,50 @@ BEGIN
     -- Conservative CASCADE: exact event-bound manifest is mandatory.
     -- Resolve disaster_event_id from the audited recover operation, else from
     -- the first DROP after the admitted target LSN for this lifecycle.
-    DECLARE
-        v_audited text;
-        v_disaster_event_id bigint := NULL;
-        v_disaster_commit_lsn pg_lsn := NULL;
-        v_source_xid bigint := NULL;
-    BEGIN
-        v_audited := NULLIF(
-            btrim(COALESCE(current_setting('pg_flashback.audited_recover_operation_id', true), '')),
-            ''
-        );
-        IF v_audited IS NOT NULL AND v_audited ~ '^[0-9]+$' THEN
-            SELECT o.disaster_event_id
-              INTO v_disaster_event_id
-            FROM flashback.operations o
-            WHERE o.operation_id = v_audited::bigint;
-        END IF;
+    v_audited := NULLIF(
+        btrim(COALESCE(current_setting('pg_flashback.audited_recover_operation_id', true), '')),
+        ''
+    );
+    IF v_audited IS NOT NULL AND v_audited ~ '^[0-9]+$' THEN
+        SELECT o.disaster_event_id
+          INTO v_disaster_event_id
+        FROM flashback.operations o
+        WHERE o.operation_id = v_audited::bigint;
+    END IF;
 
-        IF v_disaster_event_id IS NULL THEN
-            SELECT dl.event_id, dl.commit_lsn, dl.source_xid
-              INTO v_disaster_event_id, v_disaster_commit_lsn, v_source_xid
-            FROM flashback.delta_log dl
-            WHERE dl.tracking_id = admission.tracking_id
-              AND dl.event_type = 'DROP'
-              AND dl.commit_lsn IS NOT NULL
-              AND dl.commit_lsn > p_target_lsn
-            ORDER BY dl.commit_lsn ASC, dl.event_id ASC
-            LIMIT 1;
-        ELSE
-            SELECT dl.commit_lsn, dl.source_xid
-              INTO v_disaster_commit_lsn, v_source_xid
-            FROM flashback.delta_log dl
-            WHERE dl.event_id = v_disaster_event_id
-            LIMIT 1;
-        END IF;
+    IF v_disaster_event_id IS NULL THEN
+        SELECT dl.event_id, dl.commit_lsn, dl.source_xid
+          INTO v_disaster_event_id, v_disaster_commit_lsn, v_source_xid
+        FROM flashback.delta_log dl
+        WHERE dl.tracking_id = admission.tracking_id
+          AND dl.event_type = 'DROP'
+          AND dl.commit_lsn IS NOT NULL
+          AND dl.commit_lsn > p_target_lsn
+        ORDER BY dl.commit_lsn ASC, dl.event_id ASC
+        LIMIT 1;
+    ELSE
+        SELECT dl.commit_lsn, dl.source_xid
+          INTO v_disaster_commit_lsn, v_source_xid
+        FROM flashback.delta_log dl
+        WHERE dl.event_id = v_disaster_event_id
+        LIMIT 1;
+    END IF;
 
-        IF v_disaster_event_id IS NULL
-           AND v_disaster_commit_lsn IS NULL
-           AND v_source_xid IS NULL
-        THEN
-            RAISE EXCEPTION
-                'pg_flashback: restore refused: cannot resolve exact DROP identity for dependency manifest (tracking_id %, target_lsn %)',
-                admission.tracking_id, p_target_lsn
-                USING ERRCODE = 'invalid_parameter_value',
-                      HINT = 'Use flashback_recover_begin/execute so the selected disaster_event_id is audited, or ensure the DROP is captured in delta_log.';
-        END IF;
+    IF v_disaster_event_id IS NULL THEN
+        RAISE EXCEPTION
+            'pg_flashback: restore refused: cannot resolve exact DROP identity for dependency manifest (tracking_id %, target_lsn %)',
+            admission.tracking_id, p_target_lsn
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Use flashback_recover_begin/execute so the selected disaster_event_id is audited, or ensure the DROP is captured in delta_log.';
+    END IF;
 
-        -- Best-effort bind before the hard gate (idempotent).
-        PERFORM flashback_bind_drop_dependency_manifests();
+    -- Best-effort bind before the hard gate (idempotent).
+    PERFORM flashback_bind_drop_dependency_manifests();
 
-        PERFORM flashback_require_supported_drop_manifest(
-            admission.tracking_id,
-            v_disaster_event_id,
-            v_disaster_commit_lsn,
-            v_source_xid
-        );
-    END;
+    PERFORM flashback_require_supported_drop_manifest(
+        admission.tracking_id,
+        v_disaster_event_id
+    );
 
     v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
     IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
@@ -635,6 +627,34 @@ BEGIN
     FROM flashback_materialize_lsn(
         p_target_table, p_target_lsn, 'flashback', v_shadow_name, true
     );
+
+    -- Independent expected proof from pre-swap shadow + target schema_def.
+    v_expected_proof := public.flashback_build_expected_restore_proof(
+        to_regclass(format('flashback.%I', v_shadow_name)),
+        materialized.target_schema_def,
+        COALESCE((
+            SELECT to_jsonb(m) - 'raw_ddl'
+            FROM flashback.drop_dependency_manifests m
+            WHERE m.tracking_id = admission.tracking_id
+              AND m.disaster_event_id IS NOT DISTINCT FROM v_disaster_event_id
+            LIMIT 1
+        ), '{}'::jsonb),
+        jsonb_build_object(
+            'tracking_id', admission.tracking_id,
+            'generation_id', admission.generation_id,
+            'stream_id', admission.stream_id,
+            'boundary_snapshot_id', admission.boundary_snapshot_id,
+            'boundary_lsn', admission.boundary_lsn,
+            'target_lsn', p_target_lsn,
+            'disaster_event_id', v_disaster_event_id
+        )
+    );
+
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_expected_proof_before_swap' THEN
+        RAISE EXCEPTION 'pg_flashback: test_restore_failpoint=after_expected_proof_before_swap'
+            USING ERRCODE = 'query_canceled';
+    END IF;
 
     IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
          = 'after_materialize_before_swap' THEN
@@ -794,14 +814,16 @@ BEGIN
             p_target_table;
     END IF;
 
-    v_expected_proof := public.flashback_capture_restore_expected_proof(
-        v_restored_rel,
-        jsonb_build_object(
-            'tracking_id', admission.tracking_id,
-            'restored_target_lsn', p_target_lsn,
-            'source_generation_id', admission.generation_id
-        )
-    );
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_mutate_row' THEN
+        -- Deterministic post-swap corruption for adversarial verification tests.
+        EXECUTE format(
+            'DELETE FROM %I.%I WHERE ctid = (SELECT ctid FROM %I.%I LIMIT 1)',
+            materialized.source_schema_name, materialized.source_table_name,
+            materialized.source_schema_name, materialized.source_table_name
+        );
+    END IF;
+
     v_restore_verification := public.flashback_verify_restored_relation(
         v_restored_rel,
         v_expected_proof,
@@ -912,6 +934,7 @@ BEGIN
     IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NOT NULL THEN
         UPDATE flashback.operations
            SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+                'expected_proof', v_expected_proof,
                 'restore_verification', v_restore_verification,
                 'successor', jsonb_build_object(
                     'tracking_id', admission.tracking_id,

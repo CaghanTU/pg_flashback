@@ -17,6 +17,9 @@ extension_sql_file!(
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_payload_ownership_helpers",
+        flashback_fingerprint_order_spec,
+        flashback_relation_full_data_fingerprint,
+        flashback_sha256,
     ],
 );
 
