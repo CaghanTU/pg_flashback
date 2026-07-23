@@ -559,7 +559,7 @@ SELECT jsonb_build_object(
     'slot', CASE WHEN s.slot_name IS NULL THEN null ELSE jsonb_build_object(
         'name', s.slot_name,
         'wal_status', s.wal_status,
-        'retained_bytes', s.retained_bytes,
+        'retained_bytes', s.retained_wal_bytes,
         'safe_wal_size', s.safe_wal_size
     ) END,
     'flashback_disk_bytes', d.flashback_bytes,
@@ -599,6 +599,8 @@ SQL
 )
 
     if [[ "$JSON_OUT" == 1 ]]; then
+        # Single-DB --json returns the status payload object. --all-databases wraps
+        # each database payload and emits the outer envelope in cmd_status_dispatch.
         printf '%s\n' "$payload"
         return 0
     fi
