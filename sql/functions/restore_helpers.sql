@@ -678,7 +678,7 @@ BEGIN
                 v_tgt_schema, v_tgt_table, v_con.name, v_con.def
             );
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: constraint % skipped: %', v_con.name, SQLERRM;
+            RAISE EXCEPTION 'flashback: constraint % failed: %', v_con.name, SQLERRM;
         END;
     END LOOP;
 
@@ -804,7 +804,7 @@ BEGIN
                     p_shadow_schema, p_shadow_table, v_con.name, v_con.def
                 );
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: deferred constraint % skipped: %', v_con.name, SQLERRM;
+                RAISE EXCEPTION 'flashback: deferred constraint % failed: %', v_con.name, SQLERRM;
             END;
         END LOOP;
     END;
@@ -848,7 +848,7 @@ BEGIN
                 format(' ON %I.%I ', p_shadow_schema, p_shadow_table));
             EXECUTE v_idx_def;
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: deferred index skipped: %', SQLERRM;
+            RAISE EXCEPTION 'flashback: deferred index failed: %', SQLERRM;
         END;
     END LOOP;
 END;
@@ -1047,7 +1047,7 @@ BEGIN
                 v_heir.cschema, v_heir.ctable,
                 p_orig_schema, p_orig_table);
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: could not detach INHERITS child %.% from parent %.%: %',
+            RAISE EXCEPTION 'flashback: could not detach INHERITS child %.% from parent %.%: %',
                 v_heir.cschema, v_heir.ctable, p_orig_schema, p_orig_table, SQLERRM;
         END;
     END LOOP;
@@ -1074,7 +1074,7 @@ BEGIN
                 v_heir.cschema, v_heir.ctable,
                 p_orig_schema, p_orig_table);
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: could not re-attach INHERITS child %.% to parent %.%: %',
+            RAISE EXCEPTION 'flashback: could not re-attach INHERITS child %.% to parent %.%: %',
                 v_heir.cschema, v_heir.ctable, p_orig_schema, p_orig_table, SQLERRM;
         END;
     END LOOP;
@@ -1091,7 +1091,7 @@ BEGIN
                 p_orig_schema, p_orig_table,
                 v_partition_bound);
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: could not re-attach % to partition tree (%): %',
+            RAISE EXCEPTION 'flashback: could not re-attach % to partition tree (%): %',
                 p_orig_table, v_partition_parent, SQLERRM;
         END;
     END IF;
@@ -1114,7 +1114,7 @@ BEGIN
                 EXECUTE format('ALTER TABLE %I.%I RENAME CONSTRAINT %I TO %I',
                     p_orig_schema, p_orig_table, v_shadow_con.conname, v_new_conname);
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: constraint rename % → % failed: %',
+                RAISE EXCEPTION 'flashback: constraint rename % → % failed: %',
                     v_shadow_con.conname, v_new_conname, SQLERRM;
             END;
         END LOOP;
@@ -1137,7 +1137,7 @@ BEGIN
                 EXECUTE format('ALTER INDEX %I.%I RENAME TO %I',
                     p_orig_schema, v_shadow_idx.indexname, v_new_idxname);
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: index rename % → % failed: %',
+                RAISE EXCEPTION 'flashback: index rename % → % failed: %',
                     v_shadow_idx.indexname, v_new_idxname, SQLERRM;
             END;
         END LOOP;
@@ -1162,7 +1162,7 @@ BEGIN
                 EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
                     v_part.sch, v_shadow_part, v_part.name);
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: partition rename % failed: %', v_part.name, SQLERRM;
+                RAISE EXCEPTION 'flashback: partition rename % failed: %', v_part.name, SQLERRM;
             END;
         END LOOP;
     END IF;
@@ -1213,7 +1213,7 @@ BEGIN
                             CASE WHEN v_dep.knd = 'm' THEN 'MATERIALIZED VIEW' ELSE 'VIEW' END,
                             v_dep.sch, v_dep.nm, v_dep.owner);
                     EXCEPTION WHEN OTHERS THEN
-                        RAISE WARNING 'flashback: could not restore owner % for %.%: %',
+                        RAISE EXCEPTION 'flashback: could not restore owner % for %.%: %',
                             v_dep.owner, v_dep.sch, v_dep.nm, SQLERRM;
                     END;
                 END IF;
@@ -1230,7 +1230,7 @@ BEGIN
                                 EXECUTE format('ALTER VIEW %I.%I SET (%s)',
                                     v_dep.sch, v_dep.nm, v_opt);
                             EXCEPTION WHEN OTHERS THEN
-                                RAISE WARNING 'flashback: view option % on %.% failed: %',
+                                RAISE EXCEPTION 'flashback: view option % on %.% failed: %',
                                     v_opt, v_dep.sch, v_dep.nm, SQLERRM;
                             END;
                         END LOOP;
@@ -1262,7 +1262,7 @@ BEGIN
                                              THEN ' WITH GRANT OPTION' ELSE '' END);
                                 END IF;
                             EXCEPTION WHEN OTHERS THEN
-                                RAISE WARNING 'flashback: GRANT % on %.% to % failed: %',
+                                RAISE EXCEPTION 'flashback: GRANT % on %.% to % failed: %',
                                     v_acl_rec.privilege, v_dep.sch, v_dep.nm,
                                     v_acl_rec.grantee, SQLERRM;
                             END;
@@ -1285,7 +1285,7 @@ BEGIN
                             BEGIN
                                 EXECUTE v_idx_rec.def;
                             EXCEPTION WHEN OTHERS THEN
-                                RAISE WARNING 'flashback: matview index recreate for %.% failed: %',
+                                RAISE EXCEPTION 'flashback: matview index recreate for %.% failed: %',
                                     v_dep.sch, v_dep.nm, SQLERRM;
                             END;
                         END LOOP;
@@ -1298,13 +1298,13 @@ BEGIN
                         EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I',
                             v_dep.sch, v_dep.nm);
                     EXCEPTION WHEN OTHERS THEN
-                        RAISE WARNING 'flashback: REFRESH MATERIALIZED VIEW %.% failed: %',
+                        RAISE EXCEPTION 'flashback: REFRESH MATERIALIZED VIEW %.% failed: %',
                             v_dep.sch, v_dep.nm, SQLERRM;
                     END;
                 END IF;
 
             EXCEPTION WHEN OTHERS THEN
-                RAISE WARNING 'flashback: could not recreate % %.% after restore (%): recreate manually. Definition: %',
+                RAISE EXCEPTION 'flashback: could not recreate % %.% after restore (%): recreate manually. Definition: %',
                     CASE WHEN v_dep.knd = 'm' THEN 'materialized view' ELSE 'view' END,
                     v_dep.sch, v_dep.nm, SQLERRM, v_dep.def;
             END;
@@ -1321,7 +1321,7 @@ BEGIN
             EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
                 p_orig_schema, p_orig_table, v_con.name, v_con.def);
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: FK constraint % deferred: %', v_con.name, SQLERRM;
+            RAISE EXCEPTION 'flashback: FK constraint % deferred: %', v_con.name, SQLERRM;
         END;
     END LOOP;
 
@@ -1333,7 +1333,7 @@ BEGIN
         BEGIN
             EXECUTE v_trig.def;
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: trigger restore failed: %', SQLERRM;
+            RAISE EXCEPTION 'flashback: trigger restore failed: %', SQLERRM;
         END;
     END LOOP;
 
@@ -1368,7 +1368,7 @@ BEGIN
                      THEN format(' WITH CHECK (%s)', v_pol.with_check) ELSE '' END
             );
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: RLS policy % failed: %', v_pol.name, SQLERRM;
+            RAISE EXCEPTION 'flashback: RLS policy % failed: %', v_pol.name, SQLERRM;
         END;
     END LOOP;
 
@@ -1379,7 +1379,7 @@ BEGIN
             EXECUTE format('ALTER TABLE %I.%I OWNER TO %I',
                 p_orig_schema, p_orig_table, ddl_info->>'owner');
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: could not restore owner % for %.% from schema_def: %',
+            RAISE EXCEPTION 'flashback: could not restore owner % for %.% from schema_def: %',
                 ddl_info->>'owner', p_orig_schema, p_orig_table, SQLERRM;
         END;
     ELSIF v_owner IS NOT NULL THEN
@@ -1429,7 +1429,7 @@ BEGIN
                                  THEN ' WITH GRANT OPTION' ELSE '' END);
                     END IF;
                 EXCEPTION WHEN OTHERS THEN
-                    RAISE WARNING 'flashback: GRANT % on %.% to % from schema_def failed: %',
+                    RAISE EXCEPTION 'flashback: GRANT % on %.% to % from schema_def failed: %',
                         v_acl_json.privilege, p_orig_schema, p_orig_table,
                         v_acl_json.grantee, SQLERRM;
                 END;
@@ -1437,24 +1437,16 @@ BEGIN
         END;
     END IF;
 
-    -- ── Restore incoming FK constraints from other tables ──────────
-    -- These were silently dropped by DROP TABLE ... CASCADE above.
-    -- Re-adding them here restores referential integrity for dependent tables.
-    FOR v_ifk IN
-        SELECT ifk->>'conname' AS conname,
-               ifk->>'schema'  AS sch,
-               ifk->>'table'   AS tbl,
-               ifk->>'def'     AS def
-        FROM jsonb_array_elements(v_incoming_fks) ifk
-    LOOP
-        BEGIN
-            EXECUTE format('ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
-                v_ifk.sch, v_ifk.tbl, v_ifk.conname, v_ifk.def);
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'flashback: incoming FK %.% on %.% could not be restored: %',
-                v_ifk.sch, v_ifk.conname, v_ifk.sch, v_ifk.tbl, SQLERRM;
-        END;
-    END LOOP;
+    -- ── Incoming FK constraints from other tables ──────────────────
+    -- Staging contract: peer-table ALTER during restore is not proven for
+    -- lock/RBAC/concurrency. Fail closed rather than mutate other relations.
+    IF jsonb_array_length(COALESCE(v_incoming_fks, '[]'::jsonb)) > 0 THEN
+        RAISE EXCEPTION
+            'pg_flashback: incoming foreign keys are not supported in local_delta staging restore (% refs)',
+            jsonb_array_length(v_incoming_fks)
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Drop or defer incoming FKs before protect, or unprotect peers first.';
+    END IF;
 
     RETURN v_new_oid;
 END;
