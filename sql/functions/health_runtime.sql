@@ -314,6 +314,19 @@ BEGIN
             v_health := 'repository_anchor_missing';
             v_action := 'restore_repository_anchor_or_reanchor';
             v_reason := 'backup repository proof is unavailable; restore admission is frozen';
+        ELSIF COALESCE(rec.generation_state_reason, '') = 'coverage_frozen_storage_exhausted'
+        THEN
+            -- Outranks slot_lost/capture_worker_missing/local_budget_exhausted:
+            -- a permanent storage-exhaustion gap (flashback_storage_freeze_lifecycle)
+            -- means this lifecycle can never silently report healthy again on its
+            -- own; it is durably capped at its frozen valid_through_lsn until an
+            -- operator raises budgets/frees disk and reanchors a fresh lifecycle.
+            v_health := 'coverage_frozen_storage_exhausted';
+            v_action := 'raise_storage_budget_or_free_disk_then_reanchor';
+            v_reason := COALESCE(
+                rec.generation_state_reason,
+                'local retained-payload storage budget was exhausted; coverage beyond the frozen watermark is a permanent gap'
+            );
         ELSIF v_post_restore_gap
            OR (
                rec.recovery_profile = 'backup'

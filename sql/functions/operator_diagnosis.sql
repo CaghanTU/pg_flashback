@@ -34,6 +34,7 @@ DECLARE
     v_pending bigint;
     v_pending_verify bigint;
     v_backup_lifecycles bigint;
+    v_slot_keep text;
 BEGIN
     v_mode := flashback_effective_capture_mode();
     v_wal_level := current_setting('wal_level');
@@ -48,6 +49,7 @@ BEGIN
         flashback_local_guc_bytes('pg_flashback.local_safety_reserve_bytes', '0'),
         0
     );
+    v_slot_keep := current_setting('max_slot_wal_keep_size', true);
 
     -- preload / capture mode
     scope := 'cluster'; check_name := 'shared_preload_libraries';
@@ -147,6 +149,17 @@ BEGIN
     IF COALESCE(v_snap, 0) <= 0 OR COALESCE(v_peak, 0) <= 0 OR COALESCE(v_min_fs, 0) <= 0 THEN
         status := 'error';
         action := 'run SELECT flashback_config_recommend(); or pg_flashback config recommend, copy the capacity GUC lines into postgresql.conf, then restart PostgreSQL';
+    ELSE
+        status := 'ok'; action := 'none';
+    END IF;
+    RETURN NEXT;
+
+    scope := 'cluster'; check_name := 'max_slot_wal_keep_size';
+    observed := COALESCE(v_slot_keep, 'unset');
+    expected := 'finite value (not -1/unbounded)';
+    IF v_slot_keep IS NULL OR v_slot_keep IN ('-1', '') THEN
+        status := 'warning';
+        action := 'max_slot_wal_keep_size is unlimited; a stalled/lost consumer can grow WAL retention without bound. This is a cluster-wide fuse across every logical slot, not a per-lifecycle storage budget — set a finite cap (see: pg_flashback config recommend) and pair it with pg_flashback.local_max_retained_payload_bytes for the local_delta retained-payload budget.';
     ELSE
         status := 'ok'; action := 'none';
     END IF;

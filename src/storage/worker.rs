@@ -774,14 +774,26 @@ fn consume_wal_changes() -> Option<i32> {
         return None;
     };
 
-    let result: Result<i32, SpiError> =
-        BackgroundWorker::transaction(|| {
-            Ok(Spi::get_one_with_args::<i32>(
-                "SELECT flashback_consume_wal($1)",
-                &[batch_size.into()],
-            )?
-            .unwrap_or(0))
-        });
+    let result: Result<i32, SpiError> = BackgroundWorker::transaction(|| {
+        let inserted = Spi::get_one_with_args::<i32>(
+            "SELECT flashback_consume_wal($1)",
+            &[batch_size.into()],
+        )?
+        .unwrap_or(0);
+        // Storage-exhaustion freeze/gap recording happens in the SAME
+        // transaction as slot consumption: a lifecycle can never advance its
+        // consumed watermark past the point a permanent gap is recorded for
+        // it, and the gap can never be recorded without the consume that
+        // observed the exhaustion also committing.
+        let freeze_exists = Spi::get_one::<bool>(
+            "SELECT to_regprocedure('flashback_storage_freeze_scan()') IS NOT NULL",
+        )?
+        .unwrap_or(false);
+        if freeze_exists {
+            Spi::run("SELECT flashback_storage_freeze_scan()")?;
+        }
+        Ok(inserted)
+    });
 
     let unlock_result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
         Spi::run(
