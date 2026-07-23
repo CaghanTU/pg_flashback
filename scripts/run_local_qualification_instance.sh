@@ -27,9 +27,13 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 
 port_is_free() {
     local p=$1
+    # Return 0 when nothing is listening on TCP port $p.
     if command -v ss >/dev/null 2>&1; then
-        if ss -ltn 2>/dev/null | awk -v p=":$p" '$4 ~ p {found=1} END {exit found}'; then
-            return 1
+        if ss -ltnH 2>/dev/null | awk -v p=":$p" '
+            $4 ~ p"$" || $4 ~ p"]$" { found=1; exit }
+            END { exit found ? 0 : 1 }
+        '; then
+            return 1 # listener present → not free
         fi
         return 0
     fi
