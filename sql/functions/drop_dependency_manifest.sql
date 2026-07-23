@@ -17,11 +17,36 @@ BEGIN
                 captured_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 cascade_requested BOOLEAN NOT NULL DEFAULT false,
                 manifest         JSONB NOT NULL,
-                has_unsupported  BOOLEAN NOT NULL DEFAULT false
+                has_unsupported  BOOLEAN NOT NULL DEFAULT false,
+                source_xid       BIGINT,
+                disaster_commit_lsn PG_LSN,
+                disaster_event_id BIGINT
             )
         $ddl$;
         EXECUTE 'CREATE INDEX drop_dependency_manifests_tracking_idx
                  ON flashback.drop_dependency_manifests (tracking_id, captured_at DESC)';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'drop_dependency_manifests'
+          AND column_name = 'source_xid'
+    ) THEN
+        ALTER TABLE flashback.drop_dependency_manifests ADD COLUMN source_xid BIGINT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'drop_dependency_manifests'
+          AND column_name = 'disaster_commit_lsn'
+    ) THEN
+        ALTER TABLE flashback.drop_dependency_manifests ADD COLUMN disaster_commit_lsn PG_LSN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'drop_dependency_manifests'
+          AND column_name = 'disaster_event_id'
+    ) THEN
+        ALTER TABLE flashback.drop_dependency_manifests ADD COLUMN disaster_event_id BIGINT;
     END IF;
 END
 $$;
@@ -75,35 +100,43 @@ BEGIN
     JOIN pg_namespace n ON n.oid = rel.relnamespace
     WHERE c.conrelid = v_oid AND c.contype = 'f';
 
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    SELECT COALESCE(jsonb_agg(obj ORDER BY obj->>'name'), '[]'::jsonb)
+      INTO v_views
+    FROM (
+        SELECT DISTINCT ON (c.oid) jsonb_build_object(
                'name', format('%I.%I', n.nspname, c.relname),
                'class', 'view',
                'reconstruct', false,
                'reason', 'view_reconstruction_not_qualified'
-           ) ORDER BY n.nspname, c.relname), '[]'::jsonb)
-      INTO v_views
-    FROM pg_depend d
-    JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
-    JOIN pg_class c ON c.oid = r.ev_class AND c.relkind = 'v'
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE d.refclassid = 'pg_class'::regclass
-      AND d.refobjid = v_oid
-      AND d.deptype = 'n';
+           ) AS obj
+        FROM pg_depend d
+        JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+        JOIN pg_class c ON c.oid = r.ev_class AND c.relkind = 'v'
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE d.refclassid = 'pg_class'::regclass
+          AND d.refobjid = v_oid
+          AND d.deptype = 'n'
+        ORDER BY c.oid, n.nspname, c.relname
+    ) uniq_views;
 
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    SELECT COALESCE(jsonb_agg(obj ORDER BY obj->>'name'), '[]'::jsonb)
+      INTO v_matviews
+    FROM (
+        SELECT DISTINCT ON (c.oid) jsonb_build_object(
                'name', format('%I.%I', n.nspname, c.relname),
                'class', 'matview',
                'reconstruct', false,
                'reason', 'matview_reconstruction_not_qualified'
-           ) ORDER BY n.nspname, c.relname), '[]'::jsonb)
-      INTO v_matviews
-    FROM pg_depend d
-    JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
-    JOIN pg_class c ON c.oid = r.ev_class AND c.relkind = 'm'
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE d.refclassid = 'pg_class'::regclass
-      AND d.refobjid = v_oid
-      AND d.deptype = 'n';
+           ) AS obj
+        FROM pg_depend d
+        JOIN pg_rewrite r ON r.oid = d.objid AND d.classid = 'pg_rewrite'::regclass
+        JOIN pg_class c ON c.oid = r.ev_class AND c.relkind = 'm'
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE d.refclassid = 'pg_class'::regclass
+          AND d.refobjid = v_oid
+          AND d.deptype = 'n'
+        ORDER BY c.oid, n.nspname, c.relname
+    ) uniq_matviews;
 
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'name', t.tgname,
@@ -233,18 +266,50 @@ BEGIN
 
     INSERT INTO flashback.drop_dependency_manifests (
         tracking_id, rel_oid, schema_name, table_name,
-        cascade_requested, manifest, has_unsupported
+        cascade_requested, manifest, has_unsupported, source_xid
     ) VALUES (
         tracked.tracking_id, tracked.rel_oid, tracked.schema_name, tracked.table_name,
         COALESCE(cascade_requested, false), v_manifest,
-        COALESCE((v_manifest->>'has_unsupported')::boolean, false)
+        COALESCE((v_manifest->>'has_unsupported')::boolean, false),
+        (txid_current() % 4294967296)::bigint
     );
 END;
 $$;
 
--- Restore preflight: refuse swap when the latest committed manifest for this
--- lifecycle reports unsupported dependencies (conservative CASCADE).
-CREATE OR REPLACE FUNCTION flashback_require_supported_drop_manifest(p_tracking_id bigint)
+-- Bind committed DROP events to pre-DROP manifests captured in the same TX.
+-- Called after delta_log insert so plan/execute can select by event identity.
+CREATE OR REPLACE FUNCTION flashback_bind_drop_dependency_manifests()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_n integer := 0;
+BEGIN
+    UPDATE flashback.drop_dependency_manifests m
+       SET disaster_event_id = dl.event_id,
+           disaster_commit_lsn = dl.commit_lsn
+      FROM flashback.delta_log dl
+     WHERE dl.event_type = 'DROP'
+       AND dl.tracking_id = m.tracking_id
+       AND dl.source_xid IS NOT DISTINCT FROM m.source_xid
+       AND m.disaster_event_id IS NULL
+       AND dl.commit_lsn IS NOT NULL;
+
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
+END;
+$$;
+
+-- Restore preflight: refuse swap when the selected DROP's manifest reports
+-- unsupported dependencies. Prefer exact event binding over "latest for tracking".
+CREATE OR REPLACE FUNCTION flashback_require_supported_drop_manifest(
+    p_tracking_id bigint,
+    p_disaster_event_id bigint DEFAULT NULL,
+    p_disaster_commit_lsn pg_lsn DEFAULT NULL,
+    p_source_xid bigint DEFAULT NULL
+)
 RETURNS void
 LANGUAGE plpgsql
 STABLE
@@ -258,14 +323,52 @@ BEGIN
       INTO v_row
     FROM flashback.drop_dependency_manifests m
     WHERE m.tracking_id = p_tracking_id
-    ORDER BY m.captured_at DESC, m.manifest_id DESC
+      AND (
+          (
+              p_disaster_event_id IS NULL
+              AND p_disaster_commit_lsn IS NULL
+              AND p_source_xid IS NULL
+          )
+          OR (
+              p_disaster_event_id IS NOT NULL
+              AND (
+                  m.disaster_event_id = p_disaster_event_id
+                  OR (
+                      m.source_xid IS NOT NULL
+                      AND m.source_xid = (
+                          SELECT dl.source_xid
+                          FROM flashback.delta_log dl
+                          WHERE dl.event_id = p_disaster_event_id
+                          LIMIT 1
+                      )
+                  )
+              )
+          )
+          OR (
+              p_disaster_commit_lsn IS NOT NULL
+              AND m.disaster_commit_lsn IS NOT DISTINCT FROM p_disaster_commit_lsn
+          )
+          OR (
+              p_source_xid IS NOT NULL
+              AND m.source_xid = p_source_xid
+          )
+      )
+    ORDER BY
+        CASE
+            WHEN p_disaster_event_id IS NOT NULL
+                 AND m.disaster_event_id = p_disaster_event_id THEN 0
+            WHEN p_disaster_commit_lsn IS NOT NULL
+                 AND m.disaster_commit_lsn IS NOT DISTINCT FROM p_disaster_commit_lsn THEN 1
+            WHEN p_source_xid IS NOT NULL AND m.source_xid = p_source_xid THEN 2
+            ELSE 3
+        END,
+        m.captured_at DESC,
+        m.manifest_id DESC
     LIMIT 1;
 
     IF v_row.manifest_id IS NULL THEN
-        -- Older coverage without a manifest: fail closed for CASCADE safety
-        -- only when we cannot prove absence of unsupported deps. Ordinary
-        -- DROP without dependents still proceeds (no manifest row is OK when
-        -- the table had no tracked DROP capture yet — rare). Prefer presence.
+        -- Older coverage without a manifest: ordinary DROP without dependents
+        -- still proceeds. Prefer presence when a DROP was captured.
         RETURN;
     END IF;
 
