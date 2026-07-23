@@ -68,9 +68,14 @@ AS $$
                                 'min', s.seqmin,
                                 'max', s.seqmax,
                                 'cache', s.seqcache,
-                                'cycle', s.seqcycle
+                                'cycle', s.seqcycle,
+                                'sequence_schema', nsp.nspname,
+                                'sequence_name', seqc.relname,
+                                'sequence_qualified', format('%I.%I', nsp.nspname, seqc.relname)
                             )
                             FROM pg_depend dep
+                            JOIN pg_class seqc ON seqc.oid = dep.objid AND seqc.relkind = 'S'
+                            JOIN pg_namespace nsp ON nsp.oid = seqc.relnamespace
                             JOIN pg_sequence s ON s.seqrelid = dep.objid
                             WHERE dep.classid = 'pg_class'::regclass
                               AND dep.refclassid = 'pg_class'::regclass
@@ -896,7 +901,12 @@ BEGIN
         END IF;
     END IF;
 
-    v_snapshot_name := format('base_snapshot_%s', v_rel_oid::text);
+    IF v_tracking_id IS NULL THEN
+        v_tracking_id := nextval('flashback.tracking_id_seq');
+    END IF;
+    -- Snapshot payload is keyed by tracking_id so reprotect of the same live
+    -- OID never clobbers an inactive lifecycle's base snapshot.
+    v_snapshot_name := format('base_snapshot_t%s', v_tracking_id::text);
 
     -- Clean up any stale checkpoint snapshots for this OID (handles OID recycling)
     DECLARE
@@ -909,6 +919,7 @@ BEGIN
         FROM flashback.tracked_tables
         WHERE schema_name = v_schema_name AND table_name = v_table_name
           AND rel_oid <> v_rel_oid
+          AND is_active
         LIMIT 1;
 
         IF old_oid IS NOT NULL THEN
@@ -949,14 +960,23 @@ BEGIN
                     RAISE EXCEPTION 'flashback_track: invalid snapshot ref: %',
                         stale_snap.snapshot_table;
                 END IF;
-                PERFORM public.flashback_drop_payload_table(
-                    to_regclass(stale_snap.snapshot_table)
-                );
+                -- Only drop orphan snapshot payloads not owned by a retained lifecycle.
+                IF NOT EXISTS (
+                    SELECT 1 FROM flashback.tracked_tables tt
+                    WHERE tt.rel_oid = v_rel_oid
+                      AND tt.base_snapshot_table = stale_snap.snapshot_table
+                ) THEN
+                    PERFORM public.flashback_drop_payload_table(
+                        to_regclass(stale_snap.snapshot_table)
+                    );
+                    DELETE FROM flashback.snapshots
+                    WHERE rel_oid = v_rel_oid
+                      AND snapshot_table = stale_snap.snapshot_table;
+                END IF;
             END IF;
         END LOOP;
-        DELETE FROM flashback.snapshots WHERE rel_oid = v_rel_oid;
-        DELETE FROM flashback.delta_log WHERE rel_oid = v_rel_oid;
-        DELETE FROM flashback.staging_events WHERE rel_oid = v_rel_oid;
+        -- Do NOT delete delta_log/staging by rel_oid: inactive lifecycles for the
+        -- same live OID must retain their evidence after unprotect/reprotect.
     END;
 
     PERFORM public.flashback_drop_payload_table(
@@ -967,6 +987,10 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
 
+    IF v_tracking_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: internal error: tracking_id unset before insert';
+    END IF;
+
     INSERT INTO flashback.tracked_tables (
         tracking_id, rel_oid, schema_name, table_name, base_snapshot_table,
         schema_version, recovery_profile, helper_profile,
@@ -975,41 +999,17 @@ BEGIN
         replica_identity_was, replica_identity_index
     )
     VALUES (
-        COALESCE(v_tracking_id, nextval('flashback.tracking_id_seq')),
+        v_tracking_id,
         v_rel_oid, v_schema_name, v_table_name,
         format('flashback.%I', v_snapshot_name),
         1, 'local_delta', NULL, NULL, NULL,
         now(), interval '15 minutes', interval '7 days', true,
         v_replica_identity_was, v_replica_identity_index
-    )
-    ON CONFLICT (rel_oid)
-    DO UPDATE SET
-        schema_name = EXCLUDED.schema_name,
-        table_name = EXCLUDED.table_name,
-        base_snapshot_table = EXCLUDED.base_snapshot_table,
-        schema_version = 1,
-        recovery_profile = 'local_delta',
-        helper_profile = NULL,
-        coverage_start_lsn = NULL,
-        coverage_end_lsn = NULL,
-        tracked_since = now(),
-        is_active = true,
-        replica_identity_was = EXCLUDED.replica_identity_was,
-        replica_identity_index = EXCLUDED.replica_identity_index;
+    );
 
     SELECT tracked_since INTO v_tracked_since
-    FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
-
-    SELECT tracking_id INTO v_bound_tracking_id
-    FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
-
-    IF v_tracking_id IS NOT NULL
-       AND v_bound_tracking_id IS DISTINCT FROM v_tracking_id
-    THEN
-        RAISE EXCEPTION 'pg_flashback: concurrent first-track bound table % to lifecycle %, expected %',
-            target_table, v_bound_tracking_id, v_tracking_id;
-    END IF;
-    v_tracking_id := v_bound_tracking_id;
+    FROM flashback.tracked_tables WHERE tracking_id = v_tracking_id;
+    v_bound_tracking_id := v_tracking_id;
 
     IF flashback_effective_capture_mode() = 'wal' THEN
         -- Logical decoding exposes PostgreSQL's 32-bit TransactionId. Keep
@@ -1977,6 +1977,13 @@ BEGIN
     )
     SELECT count(*) INTO v_inserted FROM ins;
 
+    -- Bind pre-DROP manifests (captured with source_xid in the DROP TX) to the
+    -- exact committed DROP event so plan/execute never use a newer unrelated
+    -- manifest for the same tracking_id.
+    IF to_regprocedure('public.flashback_bind_drop_dependency_manifests()') IS NOT NULL THEN
+        PERFORM flashback_bind_drop_dependency_manifests();
+    END IF;
+
     DELETE FROM flashback.pending_wal_events p
     USING _fb_wal_commits c
     WHERE p.stream_id = v_stream_id
@@ -2529,12 +2536,15 @@ BEGIN
           INTO tracked
         FROM flashback.tracked_tables tt
         WHERE tt.table_name = input_table
-        ORDER BY tt.is_active DESC, tt.tracked_since DESC LIMIT 1;
+          AND tt.is_active
+        ORDER BY tt.tracked_since DESC LIMIT 1;
     ELSE
         SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
           INTO tracked
         FROM flashback.tracked_tables tt
         WHERE tt.schema_name = input_schema AND tt.table_name = input_table
+          AND tt.is_active
+        ORDER BY tt.tracked_since DESC
         LIMIT 1;
     END IF;
 
@@ -2553,7 +2563,8 @@ BEGIN
                   INTO tracked
                 FROM flashback.tracked_tables tt
                 WHERE tt.rel_oid = v_oid
-                ORDER BY tt.is_active DESC LIMIT 1;
+                  AND tt.is_active
+                ORDER BY tt.tracked_since DESC LIMIT 1;
             END IF;
         END;
     END IF;

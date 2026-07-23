@@ -37,7 +37,7 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    IF v_schema = 'flashback' AND v_name ~ '^base_snapshot_[0-9]+$' THEN
+    IF v_schema = 'flashback' AND v_name ~ '^base_snapshot_([0-9]+|t[0-9]+)$' THEN
         RETURN 'base_snapshot';
     END IF;
     IF v_schema = 'flashback' AND v_name ~ '^snap_[0-9]+_[0-9]+$' THEN
@@ -362,7 +362,7 @@ BEGIN
         WHERE c.relkind = 'r'
           AND (
               (n.nspname = 'flashback' AND (
-                   c.relname ~ '^base_snapshot_[0-9]+$'
+                   c.relname ~ '^base_snapshot_([0-9]+|t[0-9]+)$'
                 OR c.relname ~ '^snap_[0-9]+_[0-9]+$'
                 OR (
                     c.relname <> 'delta_log_default'

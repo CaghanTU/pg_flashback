@@ -65,6 +65,41 @@ BEGIN
                 WHERE is_active
         $idx$;
     END IF;
+
+    -- Replace global rel_oid primary key with tracking_id PK + active-only
+    -- uniqueness on rel_oid so inactive historical rows can coexist.
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.conrelid = 'flashback.tracked_tables'::regclass
+          AND c.contype = 'p'
+          AND a.attname = 'rel_oid'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables DROP CONSTRAINT tracked_tables_pkey;
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'flashback.tracked_tables'::regclass
+              AND conname = 'tracked_tables_tracking_id_key'
+        ) THEN
+            ALTER TABLE flashback.tracked_tables
+                DROP CONSTRAINT tracked_tables_tracking_id_key;
+        END IF;
+        ALTER TABLE flashback.tracked_tables
+            ADD CONSTRAINT tracked_tables_pkey PRIMARY KEY (tracking_id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'flashback'
+          AND indexname = 'tracked_tables_active_rel_oid_key'
+    ) THEN
+        EXECUTE $idx$
+            CREATE UNIQUE INDEX tracked_tables_active_rel_oid_key
+                ON flashback.tracked_tables (rel_oid)
+                WHERE is_active
+        $idx$;
+    END IF;
 END
 $$;
 

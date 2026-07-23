@@ -276,8 +276,8 @@ DO $$
 BEGIN
     IF to_regclass('flashback.tracked_tables') IS NULL THEN
         EXECUTE 'CREATE TABLE flashback.tracked_tables (
-            tracking_id          BIGINT NOT NULL DEFAULT nextval(''flashback.tracking_id_seq''),
-            rel_oid              OID PRIMARY KEY,
+            tracking_id          BIGINT NOT NULL DEFAULT nextval(''flashback.tracking_id_seq'') PRIMARY KEY,
+            rel_oid              OID NOT NULL,
             schema_name          TEXT NOT NULL,
             table_name           TEXT NOT NULL,
             base_snapshot_table  TEXT,
@@ -290,11 +290,13 @@ BEGIN
             checkpoint_interval  INTERVAL NOT NULL DEFAULT interval ''15 minutes'',
             retention_interval   INTERVAL NOT NULL DEFAULT interval ''7 days'',
             is_active            BOOLEAN NOT NULL DEFAULT true,
-            CONSTRAINT tracked_tables_tracking_id_key UNIQUE (tracking_id),
             CONSTRAINT tracked_tables_tracking_profile_key
-                UNIQUE (tracking_id, recovery_profile),
-            UNIQUE(schema_name, table_name)
+                UNIQUE (tracking_id, recovery_profile)
         )';
+        EXECUTE 'CREATE UNIQUE INDEX tracked_tables_active_name_key
+                 ON flashback.tracked_tables (schema_name, table_name) WHERE is_active';
+        EXECUTE 'CREATE UNIQUE INDEX tracked_tables_active_rel_oid_key
+                 ON flashback.tracked_tables (rel_oid) WHERE is_active';
     END IF;
 END
 $$;
@@ -341,6 +343,46 @@ BEGIN
             GREATEST(v_max_tracking_id, v_sequence_last),
             true
         );
+    END IF;
+
+    -- Replace global rel_oid primary key with tracking_id PK + active-only
+    -- uniqueness so inactive historical rows can coexist with reprotect.
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.conrelid = 'flashback.tracked_tables'::regclass
+          AND c.contype = 'p'
+          AND a.attname = 'rel_oid'
+    ) THEN
+        ALTER TABLE flashback.tracked_tables DROP CONSTRAINT tracked_tables_pkey;
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'flashback.tracked_tables'::regclass
+              AND conname = 'tracked_tables_tracking_id_key'
+        ) THEN
+            ALTER TABLE flashback.tracked_tables
+                DROP CONSTRAINT tracked_tables_tracking_id_key;
+        END IF;
+        ALTER TABLE flashback.tracked_tables
+            ADD CONSTRAINT tracked_tables_pkey PRIMARY KEY (tracking_id);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'flashback'
+          AND indexname = 'tracked_tables_active_rel_oid_key'
+    ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX tracked_tables_active_rel_oid_key
+                 ON flashback.tracked_tables (rel_oid) WHERE is_active';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'flashback'
+          AND indexname = 'tracked_tables_active_name_key'
+    ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX tracked_tables_active_name_key
+                 ON flashback.tracked_tables (schema_name, table_name) WHERE is_active';
     END IF;
 END
 $$;
