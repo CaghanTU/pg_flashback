@@ -23,8 +23,7 @@ jobs:
       - name: Match tag to package version
         run: |
           package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          helper_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' tools/pg_flashback_recovery/Cargo.toml | head -1)"
-          test "$helper_version" = "$package_version"
+          # Local product version is independent of the experimental recovery helper.
           if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
             test "${GITHUB_REF_NAME%-rc.*}" = "v${package_version}"
           else
@@ -71,65 +70,48 @@ jobs:
           archive_root="pg_flashback-${version}-pg${{ matrix.pg }}-x86_64-linux"
           package_so="$(find dist/package -type f -name pg_flashback.so -print -quit)"
           package_control="$(find dist/package -type f -name pg_flashback.control -print -quit)"
-          package_sql="$(find dist/package -type f -name 'pg_flashback--*.sql' -print -quit)"
-          test -n "$package_so" && test -n "$package_control" && test -n "$package_sql"
+          mapfile -t package_sql < <(find dist/package -type f -name 'pg_flashback--*.sql' | sort)
+          test -n "$package_so" && test -n "$package_control" && test "${#package_sql[@]}" -gt 0
           mkdir -p "dist/${archive_root}/lib" "dist/${archive_root}/bin" \
-            "dist/${archive_root}/share/extension" "dist/${archive_root}/docs"
+            "dist/${archive_root}/share/extension" "dist/${archive_root}/docs/samples" \
+            "dist/${archive_root}/scripts"
           install -m 0755 "$package_so" "dist/${archive_root}/lib/pg_flashback.so"
           install -m 0755 scripts/pg_flashback \
             "dist/${archive_root}/bin/pg_flashback"
-          install -m 0644 "$package_control" "$package_sql" \
+          install -m 0644 "$package_control" "${package_sql[@]}" \
             "dist/${archive_root}/share/extension/"
           printf '%s\n' "${{ matrix.pg }}" > "dist/${archive_root}/PG_MAJOR"
+          printf '%s\n' "fresh-install-only" > "dist/${archive_root}/INSTALL_CONTRACT"
           cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
             "dist/${archive_root}/"
           cp docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
-            docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md \
+            docs/DEVELOPMENT.md \
             "dist/${archive_root}/docs/"
+          cp docs/samples/postgresql.pg_flashback.conf \
+            "dist/${archive_root}/docs/samples/"
+          install -m 0755 scripts/run_local_package_smoke.sh \
+            "dist/${archive_root}/scripts/"
+          (
+            cd "dist/${archive_root}"
+            sha256sum lib/pg_flashback.so bin/pg_flashback share/extension/* > SHA256SUMS
+          )
+          jq -n \
+            --arg version "$version" \
+            --arg pg "${{ matrix.pg }}" \
+            --arg so "$(sha256sum dist/${archive_root}/lib/pg_flashback.so | awk '{print $1}')" \
+            --arg cli "$(sha256sum dist/${archive_root}/bin/pg_flashback | awk '{print $1}')" \
+            '{schema_version:1,product:"pg_flashback",profile:"local_delta",version:$version,postgresql_major:$pg,install_contract:"fresh-install-only",artifacts:{shared_object_sha256:$so,cli_binary_sha256:$cli}}' \
+            > "dist/${archive_root}/MANIFEST.json"
+          printf '%s\n' '{"spdxVersion":"SPDX-2.3","name":"pg_flashback","packages":[{"name":"pg_flashback"}]}' \
+            > "dist/${archive_root}/SBOM.spdx.json"
           tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
 
       - name: Smoke-install the portable archive layout
         run: |
           pg_config="$(cargo pgrx info pg-config ${{ matrix.pg }})"
-          pg_bin="$(dirname "$pg_config")"
-          archive_root="$(find dist -maxdepth 1 -type d \
-            -name 'pg_flashback-*-pg${{ matrix.pg }}-x86_64-linux' -print -quit)"
-          test -n "$archive_root"
-          test "$(cat "$archive_root/PG_MAJOR")" = "${{ matrix.pg }}"
-          port=$((55400 + ${{ matrix.pg }}))
-          install -m 0755 "$archive_root/lib/pg_flashback.so" \
-            "$($pg_config --pkglibdir)/pg_flashback.so"
-          install -m 0644 "$archive_root/share/extension/pg_flashback.control" \
-            "$archive_root"/share/extension/pg_flashback--*.sql \
-            "$($pg_config --sharedir)/extension/"
-          data="$(mktemp -d)"
-          socket="$(mktemp -d)"
-          cleanup() {
-            "$pg_bin/pg_ctl" -D "$data" stop -m immediate -w >/dev/null 2>&1 || true
-            rm -rf "$data" "$socket"
-          }
-          trap cleanup EXIT
-          "$pg_bin/initdb" -D "$data" --locale=C.UTF-8 -A trust >/dev/null
-          "$pg_bin/pg_ctl" -D "$data" -l "$data/postgresql.log" \
-            -o "-p $port -k $socket -c shared_preload_libraries=pg_flashback -c wal_level=logical" \
-            start -w >/dev/null
-          result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "CREATE EXTENSION pg_flashback;")
-          "$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "CREATE TABLE package_smoke(id integer PRIMARY KEY);" >/dev/null
-          track_result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "SELECT flashback_track_backup('public.package_smoke', 'default');")"
-          test "$track_result" = "t"
-          result="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "SELECT extversion || ':' ||
-                (SELECT recovery_profile FROM flashback.tracked_tables
-                 WHERE table_name = 'package_smoke')
-              FROM pg_extension WHERE extname = 'pg_flashback';")"
-          test "$result" = "0.1.0:backup"
-          gen_state="$("$pg_bin/psql" -h "$socket" -p "$port" -d postgres -v ON_ERROR_STOP=1 \
-            -qAtc "SELECT state FROM flashback.coverage_generations
-                   WHERE recovery_profile = 'backup' ORDER BY generation_id LIMIT 1;")"
-          test "$gen_state" = "building"
+          archive="$(find dist -maxdepth 1 -type f -name 'pg_flashback-*-pg${{ matrix.pg }}-x86_64-linux.tar.gz' -print -quit)"
+          test -n "$archive"
+          ARCHIVE="$archive" PG_CONFIG="$pg_config" ./scripts/run_local_package_smoke.sh
 
       - name: Upload extension archive
         uses: actions/upload-artifact@v4
@@ -139,9 +121,10 @@ jobs:
           if-no-files-found: error
 
   helper-package:
-    name: Recovery helper package
+    name: Experimental recovery helper package
     needs: verify-version
     runs-on: ubuntu-22.04
+    # Experimental backup helper is intentionally separate from the local product.
 
     steps:
       - uses: actions/checkout@v4
