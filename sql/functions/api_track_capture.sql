@@ -730,6 +730,10 @@ BEGIN
     END IF;
 
     PERFORM flashback_require_supported_local_table(v_rel_oid);
+    -- Machine-checked preserve/reject gate (docs/SUPPORT.md is generated from
+    -- this contract). Narrower topology checks above stay in place; this is
+    -- the broader feature-by-feature compatibility surface.
+    PERFORM flashback_require_local_compatibility(v_rel_oid);
 
     IF EXISTS (
         SELECT 1 FROM flashback.tracked_tables

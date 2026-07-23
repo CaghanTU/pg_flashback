@@ -35,6 +35,8 @@ DECLARE
     v_slot record;
     v_frontier pg_lsn;
     v_pending_wal boolean := false;
+    v_epoch_schema_def jsonb;
+    v_epoch_compat jsonb;
 BEGIN
     -- Resolve tracking identity
     SELECT tt.tracking_id, tt.rel_oid, format('%I.%I', tt.schema_name, tt.table_name)
@@ -262,12 +264,57 @@ BEGIN
 
     v_manifest := v_manifest_row.manifest;
 
+    -- Target schema epoch compatibility: never promise a recovery that the
+    -- restore engine cannot reconstruct/verify. Prefer the exact
+    -- schema_versions row at/under the DROP's safe target LSN; fall back to
+    -- the generation's boundary snapshot schema_def.
+    IF v_row.generation_id IS NOT NULL THEN
+        SELECT jsonb_build_object(
+                   'schema', split_part(v_canonical, '.', 1),
+                   'table', split_part(v_canonical, '.', 2),
+                   'columns', COALESCE(sv.columns, '[]'::jsonb),
+                   'primary_key', COALESCE(sv.primary_key, '[]'::jsonb),
+                   'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
+                   'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
+                   'partition_by', sv.constraints -> 'partition_by',
+                   'partitions', sv.constraints -> 'partitions',
+                   'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
+                   'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
+                   'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false)
+               )
+          INTO v_epoch_schema_def
+        FROM flashback.schema_versions sv
+        WHERE sv.tracking_id = v_tracking_id
+          AND sv.generation_id = v_row.generation_id
+          AND sv.commit_lsn IS NOT NULL
+          AND sv.commit_lsn <= COALESCE(v_row.safe_target_lsn, v_row.disaster_commit_lsn)
+        ORDER BY sv.commit_lsn DESC, sv.schema_version DESC
+        LIMIT 1;
+
+        IF v_epoch_schema_def IS NULL THEN
+            SELECT snap.schema_def INTO v_epoch_schema_def
+            FROM flashback.coverage_generations cg
+            JOIN flashback.snapshots snap
+              ON snap.snapshot_id = cg.boundary_snapshot_id
+             AND snap.tracking_id = cg.tracking_id
+            WHERE cg.generation_id = v_row.generation_id
+              AND cg.tracking_id = v_tracking_id;
+        END IF;
+
+        IF v_epoch_schema_def IS NOT NULL THEN
+            v_epoch_compat := flashback_local_compatibility_schema_def(v_epoch_schema_def);
+        END IF;
+    END IF;
+
     v_status := v_row.status;
     v_code := CASE
         WHEN v_identity_conflict THEN 'identity_conflict'
         WHEN COALESCE(v_manifest_row.has_unsupported, false)
              OR COALESCE((v_manifest->>'has_unsupported')::boolean, false)
              THEN 'unsupported_dependencies'
+        WHEN v_epoch_compat IS NOT NULL
+             AND NOT COALESCE((v_epoch_compat->>'supported')::boolean, true)
+             THEN 'unsupported_schema_epoch'
         WHEN v_status = 'restorable' THEN 'ok'
         WHEN v_row.reason ILIKE '%ambiguous%' THEN 'ambiguous_coverage_generation'
         WHEN v_row.reason ILIKE '%gap%' THEN 'coverage_gap'
@@ -284,6 +331,12 @@ BEGIN
     ELSIF v_code = 'unsupported_dependencies' THEN
         v_status := 'non_restorable';
         v_row.reason := 'pre-DROP dependency manifest reports unsupported or unqualified dependencies';
+    ELSIF v_code = 'unsupported_schema_epoch' THEN
+        v_status := 'non_restorable';
+        v_row.reason := format(
+            'target schema epoch is not supported by the local DROP recovery product: %s',
+            COALESCE(v_epoch_compat->>'reason', 'unknown')
+        );
     END IF;
 
     v_token := flashback_sha256(format('%s|%s|%s|%s|%s|%s|%s|%s',
@@ -315,6 +368,7 @@ BEGIN
         'dependency_manifest', v_manifest,
         'dependency_manifest_id', v_manifest_row.manifest_id,
         'dependency_manifest_hash', v_manifest_row.manifest_hash,
+        'schema_epoch_compatibility', v_epoch_compat,
         'blockers', CASE
             WHEN v_code = 'unsupported_dependencies' THEN
                 COALESCE(v_manifest->'views', '[]'::jsonb)
@@ -322,6 +376,8 @@ BEGIN
                 || COALESCE(v_manifest->'incoming_fk', '[]'::jsonb)
                 || COALESCE(v_manifest->'inheritance_children', '[]'::jsonb)
                 || COALESCE(v_manifest->'inheritance_parents', '[]'::jsonb)
+            WHEN v_code = 'unsupported_schema_epoch' THEN
+                COALESCE(v_epoch_compat->'rejected_features', '[]'::jsonb)
             ELSE '[]'::jsonb
         END,
         'duration_estimate', 'unknown',

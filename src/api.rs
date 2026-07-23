@@ -33,6 +33,12 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/local_compatibility.sql",
+    name = "flashback_local_compatibility",
+    requires = ["flashback_storage_schema_bootstrap"],
+);
+
+extension_sql_file!(
     "../sql/functions/api_track_capture.sql",
     name = "flashback_api_track_capture",
     requires = [
@@ -40,7 +46,8 @@ extension_sql_file!(
         "flashback_payload_ownership_helpers",
         "flashback_local_capacity",
         "flashback_worker_admission",
-        "flashback_drop_dependency_manifest"
+        "flashback_drop_dependency_manifest",
+        "flashback_local_compatibility"
     ],
 );
 
@@ -130,6 +137,7 @@ extension_sql_file!(
         "flashback_restore_lsn_api",
         "flashback_restore_verify_helpers",
         "flashback_drop_dependency_manifest",
+        "flashback_local_compatibility",
         "flashback_worker_admission",
         flashback_sha256
     ],

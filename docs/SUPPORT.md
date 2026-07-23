@@ -28,21 +28,50 @@ is not silently generalized to the other.
 
 ## Tables
 
-| Table property | Behavior |
+This matrix is generated from the machine-checked gate in
+`sql/functions/local_compatibility.sql` (`flashback_local_compatibility` /
+`flashback_local_compatibility_schema_def`). `flashback_track()` calls
+`flashback_require_local_compatibility()` and refuses to protect a table
+outside this contract; `flashback_recover_plan()` runs the same check against
+the target schema epoch and refuses (`unsupported_schema_epoch`) if the
+epoch being recovered to is outside it.
+
+### Preserved (supported)
+
+| Feature | Behavior |
 |---|---|
-| Ordinary permanent `LOGGED` table | Supported |
-| Primary/secondary indexes | Preserved |
-| Unique and check constraints | Preserved |
-| Identity and serial sequences | Preserved; original names restored |
-| TOAST / large values | Supported |
+| Ordinary columns | Preserved |
+| Identity and serial columns | Preserved; original names restored |
+| Primary key, `UNIQUE`, `CHECK` constraints | Preserved |
+| Outgoing foreign keys | Preserved |
+| Plain btree indexes | Preserved |
+| Owner and table/column ACL | Preserved |
+| TOAST / large values | Preserved |
+| Replica identity | Preserved |
+| Basic row-level security policies | Preserved |
+| Ordinary (non-internal) triggers | Preserved |
+| Comments | Preserved |
+| Tablespace and storage `reloptions` | Preserved |
+| Owned sequences | Preserved |
 | Quoted names and non-`public` schemas | Supported |
-| Owner and ACL | Preserved |
-| Row-level security metadata | Preserved when the complete policy contract can be reconstructed |
+
+### Rejected (fail closed)
+
+| Feature | Behavior |
+|---|---|
 | Partitioned table or partition | Rejected |
+| Classical inheritance (parent or child) | Rejected |
 | Foreign table | Rejected |
-| Materialized view | Rejected |
 | TEMP or `UNLOGGED` table | Rejected |
-| Classical inheritance topology | Rejected unless the exact topology is proven by the recovery plan |
+| Materialized view | Rejected |
+| Extension-owned relation | Rejected |
+| Exclusion constraints | Rejected |
+| Rules | Rejected |
+| Security labels | Rejected |
+| Publications | Rejected |
+| Incoming foreign keys | Rejected |
+| Non-btree, expression, or partial indexes | Rejected |
+| Generated columns | Rejected (reconstruction is not proven; rejected even for "simple" cases) |
 
 ## Incidents
 

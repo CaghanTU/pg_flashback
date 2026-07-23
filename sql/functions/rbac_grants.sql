@@ -77,8 +77,12 @@ GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_recovery_agent;
 
 -- Public API (for flashback_admin only)
 GRANT EXECUTE ON FUNCTION flashback_track(text)                       TO flashback_admin;
--- flashback_require_supported_local_table remains owner-only (deny-by-default
--- revoke above); flashback_track() calls it under SECURITY DEFINER.
+-- flashback_require_supported_local_table / flashback_require_local_compatibility
+-- remain owner-only (deny-by-default revoke above); flashback_track() calls
+-- them under SECURITY DEFINER. The underlying reports are still useful
+-- operator-facing pre-checks, so those are granted explicitly below.
+GRANT EXECUTE ON FUNCTION flashback_local_compatibility(regclass)      TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_local_compatibility_schema_def(jsonb) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_untrack(text)                     TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text, timestamptz)        TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore(text[], timestamptz)      TO flashback_admin;
@@ -113,6 +117,14 @@ GRANT EXECUTE ON FUNCTION flashback_operation_state(bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_status_snapshot(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_plan(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_execute(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_begin(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_finalize(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_storage_budget_policy() TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_lifecycle_storage_metrics(text) TO flashback_admin;
+-- flashback_storage_freeze_lifecycle/flashback_storage_freeze_scan remain
+-- owner-only (deny-by-default revoke above): they are called from the WAL
+-- consume path (src/storage/worker.rs) in the same transaction as slot
+-- consumption, never directly by an operator.
 GRANT EXECUTE ON FUNCTION flashback_prepare_uninstall(boolean) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_disaster_points(text, interval)   TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_plan(text, interval, bigint, timestamptz, pg_lsn) TO flashback_admin;
