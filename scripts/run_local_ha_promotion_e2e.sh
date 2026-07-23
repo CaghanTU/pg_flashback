@@ -71,8 +71,9 @@ PSQL_S="$PG_BIN/psql -h $SOCK -p $PORT_STANDBY -v ON_ERROR_STOP=1 -qAt"
 [[ "$($PSQL_S -d postgres -c 'SELECT pg_is_in_recovery();')" == t ]] \
     || die "standby not in recovery"
 
-$PSQL_P -d postgres -c "CREATE TABLE public.ha_orders(id int PRIMARY KEY, v text);
-                         SELECT flashback_track('public.ha_orders');" >/dev/null
+$PSQL_P -d postgres -c "CREATE TABLE public.ha_orders(id int PRIMARY KEY, v text);" >/dev/null
+# flashback_track must be the first write in its own transaction.
+$PSQL_P -d postgres -c "SELECT flashback_track('public.ha_orders');" >/dev/null
 
 # Standby mutating APIs must fail closed.
 rc=0
