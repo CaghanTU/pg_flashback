@@ -84,12 +84,14 @@ SQL
     printf '%s\n' "$delta"
 }
 
-D_DEFAULT=$(run_workload default)
-D_FULL=$(run_workload ri_full)
-D_TRACKED=$(run_workload tracked)
+D_DEFAULT=$(run_workload default | tail -n1 | tr -dc '0-9')
+D_FULL=$(run_workload ri_full | tail -n1 | tr -dc '0-9')
+D_TRACKED=$(run_workload tracked | tail -n1 | tr -dc '0-9')
+[[ -n "$D_DEFAULT" && -n "$D_FULL" && -n "$D_TRACKED" ]] || die "workload did not return WAL byte deltas"
+printf '%s' "$IDENTITY" | jq -e . >/dev/null || die "candidate identity JSON invalid"
 
 jq -n \
-  --argjson identity "$IDENTITY" \
+  --arg identity "$IDENTITY" \
   --argjson rows "$ROWS" \
   --argjson default_bytes "$D_DEFAULT" \
   --argjson ri_full_bytes "$D_FULL" \
@@ -97,7 +99,7 @@ jq -n \
   '{
      qualification_kind: "exact_wal_overhead",
      status: "passed",
-     identity: $identity,
+     identity: ($identity | fromjson),
      rows: $rows,
      wal_bytes_delta: {
        default: $default_bytes,

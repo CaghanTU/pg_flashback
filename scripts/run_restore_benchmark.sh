@@ -28,7 +28,8 @@ mkdir -p "$RESULT_DIR" "$WORK"
 log() { printf '[exact-wal-bench] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { log "FAIL: $*"; exit 1; }
 
-if grep -Eq '_fb_bench_capture_trigger' "$0"; then
+# Detect the legacy fake-trigger helper definition, not this checker line.
+if grep -Eq 'CREATE[[:space:]]+OR[[:space:]]+REPLACE[[:space:]]+FUNCTION[[:space:]]+_fb_bench_capture_trigger' "$0"; then
     die "benchmark harness embeds forbidden fake-trigger technique"
 fi
 

@@ -11,7 +11,8 @@ PORT_STANDBY="${PG_FLASHBACK_HA_STANDBY_PORT:-28972}"
 WORK="${PG_FLASHBACK_HA_WORK:-$ROOT/target/local-ha-e2e/$$}"
 PRIMARY="$WORK/primary"
 STANDBY="$WORK/standby"
-SOCK="$WORK/sock"
+# Keep unix socket path short (kernel ~107 byte limit).
+SOCK="/tmp/pgfb-ha-$$"
 mkdir -p "$SOCK" "$WORK"
 
 cleanup() {
