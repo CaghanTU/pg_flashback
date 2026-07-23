@@ -15,7 +15,12 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EVIDENCE="${1:-$ROOT/docs/qualification/v0.1.0-overnight-retained-full-evidence.json}"
+EVIDENCE="${1:-}"
+
+if [[ -z "$EVIDENCE" ]]; then
+    echo "usage: $0 <qualification-evidence.json>" >&2
+    exit 2
+fi
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "OK: $*"; }
@@ -61,7 +66,7 @@ fi
 # only purpose was to rewrite tested_commit inside the same file.
 if [[ -n "$EVIDENCE_COMMIT" ]]; then
     if git -C "$ROOT" show --name-only --pretty=format: "$EVIDENCE_COMMIT" \
-        | grep -q 'docs/qualification/.*evidence'; then
+        | grep -q 'qualification/.*evidence'; then
         BODY="$(git -C "$ROOT" show -s --format=%B "$EVIDENCE_COMMIT")"
         if grep -qiE 'stamp(ed)? (tested_commit|HEAD)|embed(s|ded)? (its )?own (commit )?hash|self-?hash churn|tested_commit.*=.*HEAD' <<<"$BODY"; then
             die "evidence commit message suggests self-hash stamping; use source_commit + separate artifact instead"

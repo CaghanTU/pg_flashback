@@ -1,4 +1,4 @@
-name: Release candidate
+name: Release
 
 on:
   push:
@@ -73,15 +73,18 @@ jobs:
           package_control="$(find dist/package -type f -name pg_flashback.control -print -quit)"
           package_sql="$(find dist/package -type f -name 'pg_flashback--*.sql' -print -quit)"
           test -n "$package_so" && test -n "$package_control" && test -n "$package_sql"
-          mkdir -p "dist/${archive_root}/lib" \
+          mkdir -p "dist/${archive_root}/lib" "dist/${archive_root}/bin" \
             "dist/${archive_root}/share/extension" "dist/${archive_root}/docs"
           install -m 0755 "$package_so" "dist/${archive_root}/lib/pg_flashback.so"
+          install -m 0755 scripts/pg_flashback \
+            "dist/${archive_root}/bin/pg_flashback"
           install -m 0644 "$package_control" "$package_sql" \
             "dist/${archive_root}/share/extension/"
           printf '%s\n' "${{ matrix.pg }}" > "dist/${archive_root}/PG_MAJOR"
           cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
             "dist/${archive_root}/"
-          cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md \
+          cp docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
+            docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md \
             "dist/${archive_root}/docs/"
           tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
 
@@ -163,8 +166,8 @@ jobs:
           cp tools/pg_flashback_recovery/README.md "dist/${archive_root}/README.md"
           cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
             "dist/${archive_root}/"
-          cp docs/RECOVERY_HELPER_DESIGN.md docs/BACKUP_RESTORE_RUNBOOK.md \
-            docs/RELEASE_SCOPE.md "dist/${archive_root}/docs/"
+          cp docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md \
+            docs/SUPPORT.md "dist/${archive_root}/docs/"
           tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
 
       - name: Upload helper archive

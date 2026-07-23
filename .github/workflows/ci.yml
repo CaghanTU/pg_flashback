@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, work/v0.1.0-overnight, work/v0.1.0-overnight-sanitized]
+    branches: [main, develop]
   pull_request:
     branches: [main]
   workflow_dispatch:

@@ -43,9 +43,8 @@ All success output is JSON on stdout. Errors are JSON on stderr:
 {"status":"error","code":"repository_busy","message":"..."}
 ```
 
-See the checked-in [example configuration](examples/helper.json), the
-[architecture contract](../../docs/RECOVERY_HELPER_DESIGN.md), and the
-[operator runbook](../../docs/BACKUP_RESTORE_RUNBOOK.md).
+See the checked-in [example configuration](examples/helper.json) and the
+[experimental subsystem overview](../../docs/EXPERIMENTAL_BACKUP.md).
 
 ## Service rules
 
@@ -61,5 +60,5 @@ See the checked-in [example configuration](examples/helper.json), the
   request JSON.
 - Treat `request_id` as an immutable idempotency key bound to one profile.
 
-First-release support and rejected topologies are defined in
-[`docs/RELEASE_SCOPE.md`](../../docs/RELEASE_SCOPE.md).
+This helper is experimental and is not part of the supported local DROP
+recovery contract in [`docs/SUPPORT.md`](../../docs/SUPPORT.md).

@@ -77,7 +77,6 @@ package_sql="$(find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' -p
 [[ -n "$package_so" && -n "$package_control" && -n "$package_sql" ]]
 install -m 0755 "$package_so" "$EXT_DIR/lib/pg_flashback.so"
 install -m 0755 "$ROOT/scripts/pg_flashback" "$EXT_DIR/bin/pg_flashback"
-install -m 0755 "$ROOT/scripts/pg_flashbackctl" "$EXT_DIR/bin/pg_flashbackctl"
 install -m 0644 "$package_control" "$package_sql" "$EXT_DIR/share/extension/"
 if [[ -f "$ROOT/sql/upgrades/pg_flashback--0.1.0--0.2.0.sql" ]]; then
     install -m 0644 \
@@ -97,7 +96,8 @@ printf '%s\n' \
     "Do not leave an older pg_flashback binary earlier in PATH than the installed candidate." \
     > "$EXT_DIR/bin/INSTALL.txt"
 cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
-cp docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md docs/QUICKSTART_LOCAL_DROP.md "$EXT_DIR/docs/"
+cp docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
+    docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md "$EXT_DIR/docs/"
 mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
@@ -134,8 +134,8 @@ install -m 0755 \
 cp "$ROOT/tools/pg_flashback_recovery/examples/"*.json "$HELPER_DIR/examples/" 2>/dev/null || true
 cp "$ROOT/tools/pg_flashback_recovery/README.md" "$HELPER_DIR/README.md"
 cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$HELPER_DIR/"
-cp docs/RECOVERY_HELPER_DESIGN.md docs/BACKUP_RESTORE_RUNBOOK.md \
-    docs/RELEASE_SCOPE.md "$HELPER_DIR/docs/"
+cp docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md \
+    docs/SUPPORT.md "$HELPER_DIR/docs/"
 mkdir -p "$HELPER_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \

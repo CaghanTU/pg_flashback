@@ -1,8 +1,6 @@
-name: Qualification (overnight)
+name: Qualification
 
 on:
-  push:
-    branches: [work/v0.1.0-overnight, work/v0.1.0-overnight-sanitized]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -38,7 +36,7 @@ jobs:
           shellcheck -S warning scripts/*.sh
 
   build-candidate:
-    name: Build exact candidate archive
+    name: Build package archive
     runs-on: ubuntu-22.04
     outputs:
       source_commit: ${{ steps.manifest.outputs.source_commit }}
@@ -69,7 +67,7 @@ jobs:
           key: ${{ runner.os }}-candidate-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-candidate-
 
-      - name: Drop cached candidate archives
+      - name: Drop cached package archives
         run: rm -rf target/candidate
 
       - name: Install cargo-pgrx and PostgreSQL 17
@@ -77,7 +75,7 @@ jobs:
           cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
           cargo pgrx init --pg17 download
 
-      - name: Build candidate archives
+      - name: Build package archives
         run: |
           chmod +x scripts/build_candidate_archive.sh scripts/run_clean_host_candidate_smoke.sh
           PG_MAJOR=17 ./scripts/build_candidate_archive.sh
@@ -91,7 +89,7 @@ jobs:
           echo "CANDIDATE_DIR=$(dirname "$manifest")" >> "$GITHUB_ENV"
           jq . "$manifest"
 
-      - name: Upload candidate archives
+      - name: Upload package archives
         uses: actions/upload-artifact@v4
         with:
           name: pg-flashback-candidate-${{ steps.manifest.outputs.source_commit }}

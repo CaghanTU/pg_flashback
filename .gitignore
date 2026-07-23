@@ -1,10 +1,58 @@
-.DS_Store
-.idea/
-/target
+# Build and package output
+/target/
 /tools/pg_flashback_recovery/target/
-*.iml
-**/*.rs.bk
+/dist/
+/artifacts/
+*.tar.gz
+*.tgz
+*.zip
+*.rpm
+*.deb
+
+# Generated test and qualification output
+/docs/qualification/
 tests/pg_regress/results
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out
+*.log
+*.pid
+*.tmp
+*.temp
+*.out
+core
+core.*
+
+# Coverage and profiling
+/.coverage
+/coverage/
+/htmlcov/
+/lcov.info
+*.profraw
+*.profdata
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+.direnv/
+.envrc
+*.iml
+*.code-workspace
+*.swp
+*.swo
+*~
+**/*.rs.bk
+compile_commands.json
+
+# Personal planning notes
 ROADMAP.md

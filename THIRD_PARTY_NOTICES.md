@@ -49,5 +49,6 @@ change. They must be re-evaluated on every pgrx upgrade; vulnerability findings
 remain a release blocker.
 
 Before publishing a release, run the dependency and license gates in
-[`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md). If a dependency or
+the release checks described in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+If a dependency or
 license changes, update this notice in the same pull request.

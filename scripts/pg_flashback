@@ -72,7 +72,7 @@ Typical recovery after an accidental DROP:
   # equivalent:
   pg_flashback recover public.orders --json
 
-After install, verify the CLI on PATH matches the candidate package:
+After install, verify the CLI on PATH matches the installed package:
   command -v pg_flashback
   pg_flashback version
 EOF
@@ -158,7 +158,7 @@ SQL
 
 for_each_database() {
     local fn=$1
-    local db rc=0 any_fail=0
+    local db any_fail=0
     while IFS= read -r db; do
         [[ -n "$db" ]] || continue
         if ! "$fn" "$db"; then
@@ -932,8 +932,8 @@ SQL
 
     health="$(wait_health "$table" "$RECOVER_HEALTH_TIMEOUT_S" "recover")"
     # Worker/finalizer owns verified; CLI only observes the projection.
-    local state="" i
-    for i in $(seq 1 "$RECOVER_HEALTH_TIMEOUT_S"); do
+    local state=""
+    for _ in $(seq 1 "$RECOVER_HEALTH_TIMEOUT_S"); do
         state=$(psql_tuples -v "opid=$op_id" <<'SQL'
 SELECT state FROM flashback.operation_current_state WHERE operation_id = :'opid'::bigint;
 SQL
@@ -1302,7 +1302,7 @@ case "$cmd" in
         die "untrack is deprecated; use: pg_flashback unprotect TABLE && pg_flashback cleanup --tracking-id ID"
         ;;
     restore)
-        # Compatibility with older pg_flashbackctl restore TABLE LSN --yes
+        # Compatibility with the older restore TABLE LSN --yes command.
         [[ $# -eq 2 || $# -eq 3 ]] || die "legacy restore requires TABLE LSN --yes"
         command -v jq >/dev/null || die "jq is required"
         echo "pg_flashback: 'restore TABLE LSN' is deprecated; prefer 'recover TABLE --latest-drop --yes'" >&2

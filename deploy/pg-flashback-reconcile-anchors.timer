@@ -1,6 +1,6 @@
 [Unit]
 Description=Periodic pg_flashback backup-anchor reconciliation
-Documentation=file:///usr/share/doc/pg_flashback/BACKUP_RESTORE_RUNBOOK.md
+Documentation=file:///usr/share/doc/pg_flashback/EXPERIMENTAL_BACKUP.md
 
 [Timer]
 # Conservative default: verify/advance only; does not initiate backups.

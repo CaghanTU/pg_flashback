@@ -1,6 +1,6 @@
 [Unit]
 Description=pg_flashback reconcile backup anchors (never creates FULL backups)
-Documentation=file:///usr/share/doc/pg_flashback/BACKUP_RESTORE_RUNBOOK.md
+Documentation=file:///usr/share/doc/pg_flashback/EXPERIMENTAL_BACKUP.md
 After=network-online.target postgresql.service
 Wants=network-online.target
 

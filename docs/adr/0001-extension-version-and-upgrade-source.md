@@ -1,8 +1,7 @@
 # ADR 0001 — Extension version and supported upgrade source
 
 Status: Accepted  
-Date: 2026-07-23  
-Branch: `work/v0.1.0-overnight-sanitized`
+Date: 2026-07-23
 
 ## Context
 
@@ -10,12 +9,10 @@ Audit of distributed identities:
 
 | Identity | Observed | Notes |
 |---|---|---|
-| Cargo / control `default_version` | `0.1.0` (pre-ADR tip) | Source of truth for CREATE EXTENSION |
+| Cargo / control `default_version` | `0.1.0` before this decision | Source of truth for CREATE EXTENSION |
 | Git tag | `v0.4.0` only | Historical packaging tag; **not** equal to extension `default_version` |
 | GitHub releases | none beyond tag audit at ADR time | Do not treat tag as upgrade source |
 | Schema compatibility | additive catalog for hardening phases 1–6 | Needs versioned upgrade SQL |
-
-The hardening plan forbids pre-fixing `0.1.1`. Upgrade must be chosen from evidence.
 
 ## Decision
 
@@ -28,7 +25,8 @@ The hardening plan forbids pre-fixing `0.1.1`. Upgrade must be chosen from evide
 
 ## Consequences
 
-- Tip Cargo version becomes `0.2.0` after this ADR lands.
-- Phase 8 candidate archives bind to `0.2.0` binaries.
-- Historical Gate C / short-matrix soaks remain historical and do not qualify the new version.
+- Cargo and extension package versions become `0.2.0`.
+- Package archives bind their manifests to the exact source commit and binary
+  digests.
+- Test evidence applies to the source commit that was actually tested.
 - Clean-host path: install `0.2.0` OR install `0.1.0` then `ALTER EXTENSION pg_flashback UPDATE TO '0.2.0'`.

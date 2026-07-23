@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Deprecated compatibility shim. Use `pg_flashback` instead.
-set -Eeuo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "WARNING: pg_flashbackctl is deprecated; use pg_flashback" >&2
-exec "$ROOT/pg_flashback" "$@"

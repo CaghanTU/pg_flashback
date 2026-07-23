@@ -1,2 +1,0 @@
-NOTICE:  pg_flashback: created logical replication slot pg_flashback_wadm_a
-Worker admission isolation: PASS (/home/caghan.linux/table-restore/pg_flashback/target/qualification/worker-admission-isolation-20260723T185256Z-88053.json)

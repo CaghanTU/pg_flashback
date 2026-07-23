@@ -18,8 +18,14 @@ and remediation timing depend on severity and reproducibility.
 
 ## Trust assumptions
 
-The extension is superuser-installed. The backup recovery helper and reference
-controller must run as a dedicated, non-root operating-system account with
-private configuration and work directories. The first-release trust boundary
-and rejected topologies are defined in
-[`docs/RELEASE_SCOPE.md`](docs/RELEASE_SCOPE.md).
+The extension is superuser-installed. Its supported and rejected local
+topologies are defined in [`docs/SUPPORT.md`](docs/SUPPORT.md).
+
+Snapshot and WAL-derived row data are as sensitive as the protected source
+table. Monitoring access does not imply permission to read those payloads.
+
+The experimental backup recovery helper and reference controller must run as a
+dedicated, non-root operating-system account with private configuration and
+work directories. That subsystem is outside the current local-product support
+contract; see
+[`docs/EXPERIMENTAL_BACKUP.md`](docs/EXPERIMENTAL_BACKUP.md).

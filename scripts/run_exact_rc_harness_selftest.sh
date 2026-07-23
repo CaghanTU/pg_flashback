@@ -169,12 +169,12 @@ tar -tzf "$ORIG_CANDIDATE_DIR/$EXT_ARCHIVE" > "$EXT_LIST"
 tar -tzf "$ORIG_CANDIDATE_DIR/$HELPER_ARCHIVE" > "$HELPER_LIST"
 ARCHIVE_CONTENT_OK=1
 for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
-    docs/RELEASE_SCOPE.md docs/BACKUP_RESTORE_RUNBOOK.md; do
+    docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
+    docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md; do
     rg -F "/$required" "$EXT_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
 done
 for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
-    docs/RECOVERY_HELPER_DESIGN.md docs/RELEASE_SCOPE.md \
-    docs/BACKUP_RESTORE_RUNBOOK.md; do
+    docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md docs/SUPPORT.md; do
     rg -F "/$required" "$HELPER_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
 done
 rm -f "$EXT_LIST" "$HELPER_LIST"
