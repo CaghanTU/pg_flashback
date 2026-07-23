@@ -302,8 +302,10 @@ BEGIN
 END;
 $$;
 
--- Restore preflight: refuse swap when the selected DROP's manifest reports
--- unsupported dependencies. Prefer exact event binding over "latest for tracking".
+-- Restore preflight: refuse swap unless an exact event-bound dependency
+-- manifesto is present and reports only supported dependencies.
+-- Never fall back to "latest for tracking_id" and never treat a missing
+-- binding as "no dependents".
 CREATE OR REPLACE FUNCTION flashback_require_supported_drop_manifest(
     p_tracking_id bigint,
     p_disaster_event_id bigint DEFAULT NULL,
@@ -318,30 +320,36 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_row record;
+    v_any_manifest boolean;
 BEGIN
+    IF p_disaster_event_id IS NULL
+       AND p_disaster_commit_lsn IS NULL
+       AND p_source_xid IS NULL
+    THEN
+        RAISE EXCEPTION
+            'pg_flashback: restore refused: exact DROP identity required for dependency manifest check (tracking_id %)',
+            p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Pass disaster_event_id (preferred), disaster_commit_lsn, or source_xid from the selected DROP.';
+    END IF;
+
+    -- Prefer an exact disaster_event_id bind; allow xid/lsn only as
+    -- transitional bind keys for freshly captured rows awaiting worker bind.
     SELECT *
       INTO v_row
     FROM flashback.drop_dependency_manifests m
     WHERE m.tracking_id = p_tracking_id
       AND (
-          (
-              p_disaster_event_id IS NULL
-              AND p_disaster_commit_lsn IS NULL
-              AND p_source_xid IS NULL
-          )
+          (p_disaster_event_id IS NOT NULL AND m.disaster_event_id = p_disaster_event_id)
           OR (
               p_disaster_event_id IS NOT NULL
-              AND (
-                  m.disaster_event_id = p_disaster_event_id
-                  OR (
-                      m.source_xid IS NOT NULL
-                      AND m.source_xid = (
-                          SELECT dl.source_xid
-                          FROM flashback.delta_log dl
-                          WHERE dl.event_id = p_disaster_event_id
-                          LIMIT 1
-                      )
-                  )
+              AND m.disaster_event_id IS NULL
+              AND m.source_xid IS NOT NULL
+              AND m.source_xid = (
+                    SELECT dl.source_xid
+                    FROM flashback.delta_log dl
+                    WHERE dl.event_id = p_disaster_event_id
+                    LIMIT 1
               )
           )
           OR (
@@ -367,9 +375,25 @@ BEGIN
     LIMIT 1;
 
     IF v_row.manifest_id IS NULL THEN
-        -- Older coverage without a manifest: ordinary DROP without dependents
-        -- still proceeds. Prefer presence when a DROP was captured.
-        RETURN;
+        SELECT EXISTS (
+            SELECT 1
+            FROM flashback.drop_dependency_manifests m
+            WHERE m.tracking_id = p_tracking_id
+        ) INTO v_any_manifest;
+
+        IF v_any_manifest THEN
+            RAISE EXCEPTION
+                'pg_flashback: restore refused: no exact pre-DROP dependency manifest bound to the selected DROP (tracking_id %, disaster_event_id %, commit_lsn %, xid %)',
+                p_tracking_id, p_disaster_event_id, p_disaster_commit_lsn, p_source_xid
+                USING ERRCODE = 'feature_not_supported',
+                      HINT = 'Wait for worker bind (flashback_bind_drop_dependency_manifests) or replan; never recovers from another DROP generation''s manifest.';
+        END IF;
+
+        RAISE EXCEPTION
+            'pg_flashback: restore refused: pre-DROP dependency manifest is missing for tracking_id %',
+            p_tracking_id
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'ProcessUtility must capture a dependency manifest in the DROP transaction; recovery refuses without it.';
     END IF;
 
     IF v_row.has_unsupported OR COALESCE((v_row.manifest->>'has_unsupported')::boolean, false) THEN

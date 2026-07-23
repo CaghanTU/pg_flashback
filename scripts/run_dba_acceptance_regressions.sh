@@ -430,10 +430,18 @@ VIEW_N=$(printf '%s' "$PLAN5" | jq '[.dependency_manifest.views[]?.name] | uniqu
 # mark manifest unsupported then try restore_lsn path / require
 set +e
 ERR5=$(qe "SELECT flashback_require_supported_drop_manifest(
-    (SELECT tracking_id FROM flashback.tracked_tables WHERE table_name='dba_casc' ORDER BY tracked_since DESC LIMIT 1));")
+    (SELECT tracking_id FROM flashback.tracked_tables WHERE table_name='dba_casc' ORDER BY tracked_since DESC LIMIT 1),
+    ($(printf '%s' "$PLAN5" | jq -r '.disaster_event_id'))::bigint);")
 RC5=$?
 set -e
 [[ $RC5 -ne 0 ]] || die "f5 require_supported did not refuse"
+# Identity-less call must also fail closed (no latest-manifest fallback).
+set +e
+ERR5b=$(qe "SELECT flashback_require_supported_drop_manifest(
+    (SELECT tracking_id FROM flashback.tracked_tables WHERE table_name='dba_casc' ORDER BY tracked_since DESC LIMIT 1));")
+RC5b=$?
+set -e
+[[ $RC5b -ne 0 ]] || die "f5 identity-less require_supported unexpectedly succeeded"
 pass "f5 CASCADE plan=execute non_restorable"
 
 echo "== Finding 6: multi-database CLI =="
