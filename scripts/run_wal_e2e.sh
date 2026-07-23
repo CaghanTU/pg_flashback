@@ -206,6 +206,7 @@ qp "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '8GB'" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '16GB'" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.local_min_filesystem_bytes = '64MB'" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.local_safety_reserve_bytes = '16MB'" > /dev/null
+pg_flashback.allow_unaudited_restore = on
 qp "ALTER SYSTEM SET pg_flashback.local_boundary_write_stall_ms = 60000" > /dev/null
 restart_pg || { echo "FAIL: PostgreSQL yeniden başlatılamadı"; exit 1; }
 echo "  ok: instance yeniden başladı (target_databases=$DB, capture_mode=wal)"

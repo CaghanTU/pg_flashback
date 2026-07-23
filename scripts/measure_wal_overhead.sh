@@ -47,6 +47,7 @@ pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.allow_unaudited_restore = on
 EOF
 
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK_ROOT/pg.log" start -w
