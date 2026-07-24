@@ -204,7 +204,12 @@ BEGIN
 
     v_database_oid := (SELECT oid FROM pg_database WHERE datname = current_database());
     v_enabled := COALESCE(current_setting('pg_flashback.enabled', true), 'on') <> 'off';
-    v_mode := flashback_effective_capture_mode();
+    -- Read configured GUC without calling flashback_effective_capture_mode(),
+    -- which raises for illegal values; reconcile must still break the stream.
+    v_mode := NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), '');
+    IF v_mode IS NULL THEN
+        v_mode := 'wal';
+    END IF;
 
     PERFORM pg_advisory_xact_lock(358945::integer, v_database_oid::integer);
     SELECT * INTO v_stream
@@ -237,7 +242,8 @@ BEGIN
             'configured_enabled', v_enabled,
             'configured_effective_mode', v_mode,
             'configured_capture_mode', COALESCE(
-                current_setting('pg_flashback.capture_mode', true), 'auto'
+                NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), ''),
+                'wal'
             )
         )
     );
@@ -275,7 +281,10 @@ BEGIN
     END IF;
 
     v_enabled := COALESCE(current_setting('pg_flashback.enabled', true), 'on') <> 'off';
-    v_mode := flashback_effective_capture_mode();
+    v_mode := NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), '');
+    IF v_mode IS NULL THEN
+        v_mode := 'wal';
+    END IF;
 
     SELECT EXISTS (
         SELECT 1
@@ -351,7 +360,13 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: wal_level must be logical for release-qualified local tracking'
             USING HINT = 'Set wal_level=logical in postgresql.conf and restart PostgreSQL.';
     END IF;
-    IF flashback_effective_capture_mode() IS DISTINCT FROM 'wal' THEN
+    -- Do not call flashback_effective_capture_mode() here: it raises for illegal
+    -- values, but we must still reconcile/break any active stream first.
+    IF COALESCE(
+           NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), ''),
+           'wal'
+       ) IS DISTINCT FROM 'wal'
+    THEN
         PERFORM flashback_reconcile_capture_configuration();
         RETURN NULL;
     END IF;
@@ -477,9 +492,8 @@ DECLARE
     v_row_count bigint;
 BEGIN
     PERFORM flashback_require_primary('flashback_reanchor');
-    IF flashback_effective_capture_mode() IS DISTINCT FROM 'wal' THEN
-        RAISE EXCEPTION 'pg_flashback: local re-anchor requires WAL capture';
-    END IF;
+    -- Fail closed: only wal is legal (raises for trigger/auto).
+    PERFORM flashback_effective_capture_mode();
     IF txid_current_if_assigned() IS NOT NULL THEN
         RAISE EXCEPTION 'pg_flashback: flashback_reanchor() must run before any write in a dedicated transaction'
             USING HINT = 'COMMIT or ROLLBACK, then call flashback_reanchor() as the first write in a new READ COMMITTED transaction.';

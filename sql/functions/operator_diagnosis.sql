@@ -35,7 +35,12 @@ DECLARE
     v_pending_verify bigint;
     v_slot_keep text;
 BEGIN
-    v_mode := flashback_effective_capture_mode();
+    -- Read the configured GUC directly so doctor can report an actionable error
+    -- row when capture_mode is illegal (effective_capture_mode() raises).
+    v_mode := NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), '');
+    IF v_mode IS NULL THEN
+        v_mode := 'wal';
+    END IF;
     v_wal_level := current_setting('wal_level');
     v_preload := current_setting('shared_preload_libraries');
     SELECT * INTO STRICT v_workers FROM flashback_worker_readiness();
@@ -65,10 +70,9 @@ BEGIN
     observed := v_mode; expected := 'wal';
     IF v_mode = 'wal' THEN
         status := 'ok'; action := 'none';
-    ELSIF v_mode = 'trigger' THEN
-        status := 'warning'; action := 'trigger mode is legacy/experimental; use wal for the qualified local profile';
     ELSE
-        status := 'error'; action := 'set wal_level=logical and pg_flashback.capture_mode=wal|auto';
+        status := 'error';
+        action := 'set pg_flashback.capture_mode=wal and wal_level=logical; trigger and auto are not supported';
     END IF;
     RETURN NEXT;
 

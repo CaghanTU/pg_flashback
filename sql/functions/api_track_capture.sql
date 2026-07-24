@@ -1,25 +1,26 @@
 -- =================================================================
--- Public API: schema def collection, capture triggers, track/untrack,
+-- Public API: schema def collection, WAL track/untrack,
 -- checkpoint, retention, history, DDL capture.
 -- =================================================================
 
--- Returns the effective capture mode: 'wal' or 'trigger'.
--- 'auto' resolves based on wal_level.
+-- Returns 'wal' when capture_mode is unset/empty/wal.
+-- Explicit trigger or auto (and any other value) fails closed — never silently
+-- treat auto as wal.
 CREATE OR REPLACE FUNCTION flashback_effective_capture_mode()
 RETURNS text
 LANGUAGE plpgsql
+STABLE
 AS $$
 DECLARE
     v_mode text;
-    v_wal_level text;
 BEGIN
-    v_mode := COALESCE(current_setting('pg_flashback.capture_mode', true), 'auto');
-    IF v_mode = 'wal' THEN RETURN 'wal'; END IF;
-    IF v_mode = 'trigger' THEN RETURN 'trigger'; END IF;
-    -- auto: detect wal_level
-    v_wal_level := current_setting('wal_level');
-    IF v_wal_level = 'logical' THEN RETURN 'wal'; END IF;
-    RETURN 'trigger';
+    v_mode := NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), '');
+    IF v_mode IS NULL OR v_mode = 'wal' THEN
+        RETURN 'wal';
+    END IF;
+    RAISE EXCEPTION 'pg_flashback: capture_mode=% is not supported; only wal is operational',
+        v_mode
+        USING HINT = 'Set pg_flashback.capture_mode=wal and wal_level=logical. Values trigger and auto are rejected fail-closed.';
 END;
 $$;
 
@@ -219,375 +220,6 @@ AS $$
     WHERE c.oid = input_rel_oid;
 $$;
 
--- Statement-level trigger for INSERT (regular / non-partitioned tables only)
--- Uses REFERENCING NEW TABLE transition table for efficiency.
--- NOT compatible with partitioned tables — use flashback_capture_insert_row_trigger instead.
-CREATE OR REPLACE FUNCTION flashback_capture_insert_trigger()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_table_name text;
-    v_max_size   integer;
-    v_skipped    bigint;
-BEGIN
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        RETURN NULL;
-    END IF;
-
-    IF TG_NARGS > 0 THEN
-        v_table_name := TG_ARGV[0];
-    ELSE
-        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
-    END IF;
-    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-
-    INSERT INTO flashback.staging_events
-           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
-    SELECT  clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID),
-            (txid_current() % 4294967296)::bigint,
-            'INSERT', v_table_name, NULL, to_jsonb(r.*)
-    FROM    _fb_new r
-    WHERE   pg_column_size(r.*) <= v_max_size;
-
-    SELECT count(*) INTO v_skipped FROM _fb_new r WHERE pg_column_size(r.*) > v_max_size;
-    IF v_skipped > 0 THEN
-        RAISE WARNING 'pg_flashback: % rows skipped (exceed max_row_size %) for %', v_skipped, v_max_size, v_table_name;
-    END IF;
-
-    RETURN NULL;
-END;
-$$;
-
--- Per-row trigger for INSERT (partitioned tables)
--- PostgreSQL does not support REFERENCING NEW TABLE (transition tables) on
--- partitioned tables. This per-row variant is used automatically when
--- flashback_attach_capture_trigger detects a partitioned parent.
-CREATE OR REPLACE FUNCTION flashback_capture_insert_row_trigger()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_table_name text;
-    v_max_size   integer;
-    v_rel_oid    oid;
-BEGIN
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        RETURN NULL;
-    END IF;
-
-    IF TG_NARGS > 0 THEN
-        v_table_name := TG_ARGV[0];
-    ELSE
-        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
-    END IF;
-    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-
-    IF pg_column_size(NEW.*) > v_max_size THEN
-        RAISE WARNING 'pg_flashback: row too large (% bytes), skipping INSERT capture for %',
-            pg_column_size(NEW.*), v_table_name;
-        RETURN NULL;
-    END IF;
-
-    -- Resolve parent OID (partitioned parent, not the individual partition)
-    v_rel_oid := COALESCE(to_regclass(v_table_name), TG_RELID);
-
-    INSERT INTO flashback.staging_events
-           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
-    VALUES (clock_timestamp(), v_rel_oid,
-            (txid_current() % 4294967296)::bigint,
-            'INSERT', v_table_name, NULL, to_jsonb(NEW));
-
-    RETURN NULL;
-END;
-$$;
-
--- Per-row trigger for DELETE (partitioned tables)
--- PostgreSQL does not support REFERENCING OLD TABLE (transition tables) on
--- partitioned tables. This per-row variant is used automatically when
--- flashback_attach_capture_trigger detects a partitioned parent.
-CREATE OR REPLACE FUNCTION flashback_capture_delete_row_trigger()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_table_name text;
-    v_max_size   integer;
-    v_rel_oid    oid;
-BEGIN
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        RETURN NULL;
-    END IF;
-
-    IF TG_NARGS > 0 THEN
-        v_table_name := TG_ARGV[0];
-    ELSE
-        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
-    END IF;
-    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-
-    IF pg_column_size(OLD.*) > v_max_size THEN
-        RAISE WARNING 'pg_flashback: row too large (% bytes), skipping DELETE capture for %',
-            pg_column_size(OLD.*), v_table_name;
-        RETURN NULL;
-    END IF;
-
-    -- Resolve parent OID (partitioned parent, not the individual partition)
-    v_rel_oid := COALESCE(to_regclass(v_table_name), TG_RELID);
-
-    INSERT INTO flashback.staging_events
-           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
-    VALUES (clock_timestamp(), v_rel_oid,
-            (txid_current() % 4294967296)::bigint,
-            'DELETE', v_table_name, to_jsonb(OLD), NULL);
-
-    RETURN NULL;
-END;
-$$;
-
--- Per-row trigger for UPDATE (diff-only capture)
--- For tables WITH a primary key: stores only PK columns + changed columns.
--- For tables WITHOUT a primary key: stores full OLD and NEW rows (fallback).
--- Skips capture entirely if no columns actually changed.
-CREATE OR REPLACE FUNCTION flashback_capture_update_trigger()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_table_name text;
-    v_max_size integer;
-    v_old_json jsonb;
-    v_new_json jsonb;
-    v_pk_cols text[];
-    v_old_diff jsonb;
-    v_new_diff jsonb;
-BEGIN
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        RETURN NULL;
-    END IF;
-
-    IF TG_NARGS > 0 THEN
-        v_table_name := TG_ARGV[0];
-    ELSE
-        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
-    END IF;
-
-    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-
-    v_old_json := to_jsonb(OLD);
-    v_new_json := to_jsonb(NEW);
-
-    -- Skip capture if no columns actually changed (no-op UPDATE)
-    IF v_old_json = v_new_json THEN
-        RETURN NULL;
-    END IF;
-
-    -- Get primary key columns for this table
-    SELECT array_agg(a.attname ORDER BY k.ord)
-      INTO v_pk_cols
-    FROM pg_index i
-    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-    WHERE i.indrelid = TG_RELID AND i.indisprimary;
-
-    IF v_pk_cols IS NOT NULL AND array_length(v_pk_cols, 1) > 0 THEN
-        -- Diff-only: PK columns + changed columns only
-        SELECT jsonb_object_agg(kv.key, kv.value)
-          INTO v_old_diff
-        FROM jsonb_each(v_old_json) kv
-        WHERE kv.key = ANY(v_pk_cols)
-           OR v_old_json->kv.key IS DISTINCT FROM v_new_json->kv.key;
-
-        SELECT jsonb_object_agg(kv.key, kv.value)
-          INTO v_new_diff
-        FROM jsonb_each(v_new_json) kv
-        WHERE kv.key = ANY(v_pk_cols)
-           OR v_old_json->kv.key IS DISTINCT FROM v_new_json->kv.key;
-    ELSE
-        -- No PK: store full rows for reliable matching during restore
-        v_old_diff := v_old_json;
-        v_new_diff := v_new_json;
-    END IF;
-
-    IF pg_column_size(v_old_diff) > v_max_size OR pg_column_size(v_new_diff) > v_max_size THEN
-        RAISE WARNING 'pg_flashback: row too large, skipping capture for %', v_table_name;
-        RETURN NULL;
-    END IF;
-
-    INSERT INTO flashback.staging_events
-           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
-    VALUES (clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID),
-            (txid_current() % 4294967296)::bigint, 'UPDATE',
-            v_table_name, v_old_diff, v_new_diff);
-    RETURN NULL;
-END;
-$$;
-
--- Statement-level trigger for DELETE
-CREATE OR REPLACE FUNCTION flashback_capture_delete_trigger()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_table_name text;
-    v_max_size   integer;
-    v_skipped    bigint;
-BEGIN
-    IF flashback_is_restore_in_progress(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF NOT flashback_capture_configuration_guard(TG_RELID) THEN
-        RETURN NULL;
-    END IF;
-    IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        RETURN NULL;
-    END IF;
-
-    IF TG_NARGS > 0 THEN
-        v_table_name := TG_ARGV[0];
-    ELSE
-        v_table_name := format('%I.%I', TG_TABLE_SCHEMA, TG_TABLE_NAME);
-    END IF;
-    v_max_size := COALESCE(pg_size_bytes(current_setting('pg_flashback.max_row_size', true)), 65536);
-
-    INSERT INTO flashback.staging_events
-           (event_time, rel_oid, source_xid, event_type, table_name, old_data, new_data)
-    SELECT  clock_timestamp(), COALESCE(to_regclass(v_table_name), TG_RELID),
-            (txid_current() % 4294967296)::bigint,
-            'DELETE', v_table_name, to_jsonb(r.*), NULL
-    FROM    _fb_old r
-    WHERE   pg_column_size(r.*) <= v_max_size;
-
-    SELECT count(*) INTO v_skipped FROM _fb_old r WHERE pg_column_size(r.*) > v_max_size;
-    IF v_skipped > 0 THEN
-        RAISE WARNING 'pg_flashback: % rows skipped (exceed max_row_size %) for %', v_skipped, v_max_size, v_table_name;
-    END IF;
-
-    RETURN NULL;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION flashback_attach_capture_trigger(input_schema text, input_table text)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_relkind char;
-    v_qualified text := format('%I.%I', input_schema, input_table);
-BEGIN
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_row ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_ins ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_upd ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_del ON %I.%I', input_schema, input_table);
-
-    -- Detect partitioned table (parent 'p') OR leaf partition ('r' with partition parent).
-    -- Transition tables (REFERENCING NEW/OLD TABLE) are not supported on either.
-    SELECT c.relkind INTO v_relkind
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = input_schema AND c.relname = input_table;
-
-    -- Treat a leaf partition the same as a partitioned parent: use FOR EACH ROW.
-    IF v_relkind = 'r' THEN
-        SELECT relkind INTO v_relkind
-        FROM pg_class
-        WHERE oid = (
-            SELECT i.inhparent FROM pg_inherits i
-            JOIN pg_class c ON c.oid = i.inhrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = input_schema AND c.relname = input_table
-            LIMIT 1
-        );
-        -- if parent is 'p' (partitioned), use 'p' path; otherwise revert to 'r'
-        IF v_relkind IS DISTINCT FROM 'p' THEN
-            v_relkind := 'r';
-        END IF;
-    END IF;
-
-    IF v_relkind = 'p' THEN
-        -- Partitioned table: PostgreSQL does NOT support REFERENCING NEW/OLD TABLE
-        -- (transition tables) on partitioned tables. Use per-row triggers instead.
-        -- PostgreSQL automatically propagates FOR EACH ROW triggers to all current
-        -- and future partitions.
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_ins AFTER INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_insert_row_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_upd AFTER UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_update_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_del AFTER DELETE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_delete_row_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-    ELSE
-        -- Regular (non-partitioned) table: use statement-level triggers with
-        -- transition tables for efficient bulk-insert / bulk-delete capture.
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_ins AFTER INSERT ON %I.%I REFERENCING NEW TABLE AS _fb_new FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_insert_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_upd AFTER UPDATE ON %I.%I FOR EACH ROW EXECUTE FUNCTION flashback_capture_update_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-        EXECUTE format(
-            'CREATE TRIGGER flashback_capture_del AFTER DELETE ON %I.%I REFERENCING OLD TABLE AS _fb_old FOR EACH STATEMENT EXECUTE FUNCTION flashback_capture_delete_trigger(%L)',
-            input_schema, input_table, v_qualified
-        );
-    END IF;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION flashback_detach_capture_trigger(input_schema text, input_table text)
-RETURNS void
-LANGUAGE plpgsql
-SET search_path = pg_catalog, flashback, public
-AS $$
-BEGIN
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_row ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_ins ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_upd ON %I.%I', input_schema, input_table);
-    EXECUTE format('DROP TRIGGER IF EXISTS flashback_capture_del ON %I.%I', input_schema, input_table);
-END;
-$$;
-
 -- Fail-closed topology gate for the local DROP product profile.
 -- Ordinary permanent LOGGED tables only; partitioned/foreign/matview/temp/unlogged rejected.
 CREATE OR REPLACE FUNCTION flashback_require_supported_local_table(p_rel regclass)
@@ -681,43 +313,18 @@ DECLARE
     v_rel_oid oid;
     v_schema_name text;
     v_table_name text;
-    v_snapshot_name text;
-    v_tracked_since timestamptz;
     v_replica_identity_was "char" := 'd';
     v_replica_identity_index text := NULL;
-    v_requested_mode text;
     v_stream_id bigint;
     v_tracking_id bigint;
-    v_bound_tracking_id bigint;
     v_snapshot_id bigint;
     v_generation_id bigint;
     v_boundary_xid bigint;
     v_provisional_lsn pg_lsn;
-    v_schema_def jsonb;
-    v_row_count bigint;
 BEGIN
     PERFORM flashback_require_primary('flashback_track');
-    v_requested_mode := COALESCE(current_setting('pg_flashback.capture_mode', true), 'auto');
-
-    -- The release-qualified local profile is WAL-only. Explicit trigger mode
-    -- remains available solely as the named legacy/experimental path used by
-    -- the legacy timestamp test matrix; auto never silently downgrades.
-    IF flashback_effective_capture_mode() <> 'wal' THEN
-        IF v_requested_mode = 'trigger' THEN
-            RAISE WARNING 'pg_flashback: explicit trigger capture is legacy/experimental and creates no correctness-qualified coverage generation';
-        ELSE
-            RAISE EXCEPTION 'pg_flashback: local_delta requires WAL capture; auto mode will not fall back to trigger capture'
-                USING HINT = 'Set wal_level=logical in postgresql.conf, restart PostgreSQL, and use pg_flashback.capture_mode=wal or auto.';
-        END IF;
-    ELSE
-        IF txid_current_if_assigned() IS NOT NULL THEN
-            RAISE EXCEPTION 'pg_flashback: flashback_track() must run before any write in a dedicated transaction'
-                USING HINT = 'COMMIT or ROLLBACK, then call flashback_track() as the first write in a new READ COMMITTED transaction.';
-        END IF;
-        IF current_setting('transaction_isolation') <> 'read committed' THEN
-            RAISE EXCEPTION 'pg_flashback: flashback_track() requires READ COMMITTED isolation for a fresh post-lock snapshot';
-        END IF;
-    END IF;
+    -- Fail closed before any metadata: only wal is legal (raises for trigger/auto).
+    PERFORM flashback_effective_capture_mode();
 
     SELECT c.oid, n.nspname, c.relname
       INTO v_rel_oid, v_schema_name, v_table_name
@@ -735,326 +342,117 @@ BEGIN
     -- the broader feature-by-feature compatibility surface.
     PERFORM flashback_require_local_compatibility(v_rel_oid);
 
+    -- Clean-txn / isolation gates apply only after the table is known to be
+    -- supportable. Callers probing unsupported topologies may already have
+    -- created the relation in this transaction; they must still receive the
+    -- topology/compatibility error rather than a dedicated-txn diagnostic.
+    IF txid_current_if_assigned() IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track() must run before any write in a dedicated transaction'
+            USING HINT = 'COMMIT or ROLLBACK, then call flashback_track() as the first write in a new READ COMMITTED transaction.';
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track() requires READ COMMITTED isolation for a fresh post-lock snapshot';
+    END IF;
+
     -- Fail closed when this database has no admitted, running capture worker.
     -- Membership in target_databases is not enough: max_workers truncation or a
     -- missing process would otherwise create a lifecycle that never consumes WAL.
-    IF flashback_effective_capture_mode() = 'wal' THEN
-        PERFORM flashback_require_admitted_capture_worker('flashback_track()');
-    ELSE
-        DECLARE
-            v_ready record;
+    PERFORM flashback_require_admitted_capture_worker('flashback_track()');
+
+    -- Ensure the replication slot exists. The slot is created HERE and only
+    -- here — the background worker merely checks for it — so a creation
+    -- failure must abort tracking (fail-closed): returning success without a
+    -- slot would mean silently capturing nothing.
+    -- pg_create_logical_replication_slot requires a transaction that has
+    -- not performed writes yet.
+    -- Lock order for every qualified lifecycle operation is database
+    -- stream -> canonical pre-identity key -> stable tracking ID ->
+    -- relation.  Take the database key before slot creation so two first
+    -- trackers cannot race while creating the same per-database slot.
+    PERFORM pg_advisory_xact_lock(
+        358945::integer,
+        (SELECT oid::integer
+         FROM pg_database
+         WHERE datname = current_database())
+    );
+
+    -- Capture the current replica identity BEFORE we change it so that
+    -- flashback_untrack() can restore the table to its original setting.
+    SELECT c.relreplident INTO v_replica_identity_was
+    FROM pg_class c WHERE c.oid = v_rel_oid;
+
+    -- If the table uses REPLICA IDENTITY USING INDEX, remember which index
+    -- so untrack can restore it exactly.
+    IF v_replica_identity_was = 'i' THEN
+        SELECT ic.relname INTO v_replica_identity_index
+        FROM pg_index i
+        JOIN pg_class ic ON ic.oid = i.indexrelid
+        WHERE i.indrelid = v_rel_oid
+          AND i.indisreplident;
+    END IF;
+
+    -- Logical slots are database-specific: a slot with our name that
+    -- belongs to ANOTHER database cannot decode this database's changes,
+    -- so the existence check must be scoped to current_database().
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_replication_slots
+        WHERE slot_name = flashback_effective_slot_name()
+          AND database = current_database()
+    ) THEN
+        IF EXISTS (
+            SELECT 1 FROM pg_replication_slots
+            WHERE slot_name = flashback_effective_slot_name()
+        ) THEN
+            RAISE EXCEPTION 'pg_flashback: replication slot % already exists but belongs to another database. WAL capture cannot work for %. Set pg_flashback.slot_name to a database-unique name.',
+                flashback_effective_slot_name(), current_database();
+        END IF;
         BEGIN
-            SELECT * INTO STRICT v_ready FROM flashback_worker_readiness();
-            IF NOT v_ready.admitted OR NOT v_ready.capture_running THEN
-                RAISE WARNING 'pg_flashback: % — captured events will not be processed until admission and capture worker are healthy',
-                    v_ready.reason;
-            END IF;
+            PERFORM pg_create_logical_replication_slot(
+                flashback_effective_slot_name(),
+                'pg_flashback'
+            );
+            RAISE NOTICE 'pg_flashback: created logical replication slot %',
+                flashback_effective_slot_name();
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'pg_flashback: could not create replication slot % (%). Without a slot, WAL capture would silently miss every change, so tracking is aborted.',
+                flashback_effective_slot_name(), SQLERRM
+                USING HINT = format(
+                    'Run flashback_track in a fresh transaction with no prior writes, or create the slot manually first: SELECT pg_create_logical_replication_slot(%L, %L);',
+                    flashback_effective_slot_name(), 'pg_flashback');
         END;
     END IF;
 
-    -- In WAL mode, ensure the replication slot exists. The slot is created
-    -- HERE and only here — the background worker merely checks for it — so
-    -- a creation failure must abort tracking (fail-closed): returning
-    -- success without a slot would mean silently capturing nothing.
-    -- pg_create_logical_replication_slot requires a transaction that has
-    -- not performed writes yet.
-    IF flashback_effective_capture_mode() = 'wal' THEN
-        -- Lock order for every qualified lifecycle operation is database
-        -- stream -> canonical pre-identity key -> stable tracking ID ->
-        -- relation.  Take the database key before slot creation so two first
-        -- trackers cannot race while creating the same per-database slot.
-        PERFORM pg_advisory_xact_lock(
-            358945::integer,
-            (SELECT oid::integer
-             FROM pg_database
-             WHERE datname = current_database())
-        );
-
-        -- Capture the current replica identity BEFORE we change it so that
-        -- flashback_untrack() can restore the table to its original setting.
-        SELECT c.relreplident INTO v_replica_identity_was
-        FROM pg_class c WHERE c.oid = v_rel_oid;
-
-        -- If the table uses REPLICA IDENTITY USING INDEX, remember which index
-        -- so untrack can restore it exactly.
-        IF v_replica_identity_was = 'i' THEN
-            SELECT ic.relname INTO v_replica_identity_index
-            FROM pg_index i
-            JOIN pg_class ic ON ic.oid = i.indexrelid
-            WHERE i.indrelid = v_rel_oid
-              AND i.indisreplident;
-        END IF;
-
-        -- Logical slots are database-specific: a slot with our name that
-        -- belongs to ANOTHER database cannot decode this database's changes,
-        -- so the existence check must be scoped to current_database().
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_replication_slots
-            WHERE slot_name = flashback_effective_slot_name()
-              AND database = current_database()
-        ) THEN
-            IF EXISTS (
-                SELECT 1 FROM pg_replication_slots
-                WHERE slot_name = flashback_effective_slot_name()
-            ) THEN
-                RAISE EXCEPTION 'pg_flashback: replication slot % already exists but belongs to another database. WAL capture cannot work for %. Set pg_flashback.slot_name to a database-unique name.',
-                    flashback_effective_slot_name(), current_database();
-            END IF;
-            BEGIN
-                PERFORM pg_create_logical_replication_slot(
-                    flashback_effective_slot_name(),
-                    'pg_flashback'
-                );
-                RAISE NOTICE 'pg_flashback: created logical replication slot %',
-                    flashback_effective_slot_name();
-            EXCEPTION WHEN OTHERS THEN
-                RAISE EXCEPTION 'pg_flashback: could not create replication slot % (%). Without a slot, WAL capture would silently miss every change, so tracking is aborted.',
-                    flashback_effective_slot_name(), SQLERRM
-                    USING HINT = format(
-                        'Run flashback_track in a fresh transaction with no prior writes, or create the slot manually first: SELECT pg_create_logical_replication_slot(%L, %L);',
-                        flashback_effective_slot_name(), 'pg_flashback');
-            END;
-        END IF;
-
-        v_stream_id := flashback_ensure_active_wal_stream();
-        IF v_stream_id IS NULL THEN
-            RAISE EXCEPTION 'pg_flashback: WAL stream could not be activated for slot %',
-                flashback_effective_slot_name();
-        END IF;
-
-        SELECT b.out_tracking_id, b.out_generation_id, b.out_boundary_xid,
-               b.out_snapshot_id, b.out_provisional_lsn
-          INTO v_tracking_id, v_generation_id, v_boundary_xid, v_snapshot_id, v_provisional_lsn
-        FROM flashback_bootstrap_local_delta_lifecycle_core(
-            v_rel_oid,
-            v_stream_id,
-            v_replica_identity_was,
-            v_replica_identity_index
-        ) AS b;
-
-        -- Tracking itself only mutates flashback.* metadata, which the output
-        -- plugin deliberately filters to avoid a worker feedback loop.  Emit one
-        -- transactional marker so the decoder publishes this transaction's real
-        -- COMMIT record and the building generation can acquire an exact
-        -- COMMIT-LSN boundary.
-        PERFORM pg_logical_emit_message(
-            true,
-            'pg_flashback',
-            jsonb_build_object(
-                'op', 'BOUNDARY',
-                'kind', 'initial_track',
-                'tracking_id', v_tracking_id,
-                'generation_id', v_generation_id
-            )::text
-        );
-        RETURN true;
-    ELSE
-        PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
-
-        -- Warn if track_commit_timestamp is off. In trigger mode, event_time is the
-        -- trigger's clock_timestamp() at statement execution, NOT the transaction
-        -- commit time. A long-running transaction can therefore appear in the PITR
-        -- window before it actually committed. Enable track_commit_timestamp = on
-        -- in postgresql.conf for commit-time-correct PITR in trigger mode.
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_settings
-            WHERE name = 'track_commit_timestamp' AND setting = 'on'
-        ) THEN
-            RAISE NOTICE 'pg_flashback (%): track_commit_timestamp is off. In trigger mode, event_time is statement-level clock_timestamp(), not transaction commit time. Long-running transactions may appear in the PITR window before they committed. Set track_commit_timestamp = on for commit-time-correct PITR.',
-                target_table;
-        END IF;
+    v_stream_id := flashback_ensure_active_wal_stream();
+    IF v_stream_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: WAL stream could not be activated for slot %',
+            flashback_effective_slot_name();
     END IF;
 
-    IF v_tracking_id IS NULL THEN
-        v_tracking_id := nextval('flashback.tracking_id_seq');
-    END IF;
-    -- Snapshot payload is keyed by tracking_id so reprotect of the same live
-    -- OID never clobbers an inactive lifecycle's base snapshot.
-    v_snapshot_name := format('base_snapshot_t%s', v_tracking_id::text);
-
-    -- Clean up any stale checkpoint snapshots for this OID (handles OID recycling)
-    DECLARE
-        stale_snap record;
-        old_oid    oid;
-    BEGIN
-        -- Handle DROP+recreate without flashback_untrack: table has same name but new OID.
-        -- Remove the old tracked_tables row (and its data) so the INSERT below succeeds.
-        SELECT rel_oid INTO old_oid
-        FROM flashback.tracked_tables
-        WHERE schema_name = v_schema_name AND table_name = v_table_name
-          AND rel_oid <> v_rel_oid
-          AND is_active
-        LIMIT 1;
-
-        IF old_oid IS NOT NULL THEN
-            -- Drop checkpoint snapshot tables for the old OID
-            FOR stale_snap IN
-                SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = old_oid
-            LOOP
-                IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
-                    IF stale_snap.snapshot_table !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
-                        RAISE EXCEPTION 'flashback_track: invalid stale snapshot ref: %',
-                            stale_snap.snapshot_table;
-                    END IF;
-                    PERFORM public.flashback_drop_payload_table(
-                        to_regclass(stale_snap.snapshot_table)
-                    );
-                END IF;
-            END LOOP;
-            DECLARE old_snap_name text := format('base_snapshot_%s', old_oid::text);
-            BEGIN
-                PERFORM public.flashback_drop_payload_table(
-                    to_regclass(format('flashback.%I', old_snap_name))
-                );
-            END;
-            DELETE FROM flashback.snapshots         WHERE rel_oid = old_oid;
-            DELETE FROM flashback.delta_log         WHERE rel_oid = old_oid;
-            DELETE FROM flashback.staging_events    WHERE rel_oid = old_oid;
-            DELETE FROM flashback.schema_versions   WHERE rel_oid = old_oid;
-            DELETE FROM flashback.tracked_tables    WHERE rel_oid = old_oid;
-            RAISE NOTICE 'pg_flashback (%): stale tracking entry for old OID % removed (table was dropped+recreated without flashback_untrack)',
-                target_table, old_oid;
-        END IF;
-
-        FOR stale_snap IN
-            SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = v_rel_oid
-        LOOP
-            IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
-                IF stale_snap.snapshot_table !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
-                    RAISE EXCEPTION 'flashback_track: invalid snapshot ref: %',
-                        stale_snap.snapshot_table;
-                END IF;
-                -- Only drop orphan snapshot payloads not owned by a retained lifecycle.
-                IF NOT EXISTS (
-                    SELECT 1 FROM flashback.tracked_tables tt
-                    WHERE tt.rel_oid = v_rel_oid
-                      AND tt.base_snapshot_table = stale_snap.snapshot_table
-                ) THEN
-                    PERFORM public.flashback_drop_payload_table(
-                        to_regclass(stale_snap.snapshot_table)
-                    );
-                    DELETE FROM flashback.snapshots
-                    WHERE rel_oid = v_rel_oid
-                      AND snapshot_table = stale_snap.snapshot_table;
-                END IF;
-            END IF;
-        END LOOP;
-        -- Do NOT delete delta_log/staging by rel_oid: inactive lifecycles for the
-        -- same live OID must retain their evidence after unprotect/reprotect.
-    END;
-
-    PERFORM public.flashback_drop_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_name))
-    );
-    EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I', v_snapshot_name, v_schema_name, v_table_name);
-    PERFORM public.flashback_own_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_name))
-    );
-
-    IF v_tracking_id IS NULL THEN
-        RAISE EXCEPTION 'pg_flashback: internal error: tracking_id unset before insert';
-    END IF;
-
-    INSERT INTO flashback.tracked_tables (
-        tracking_id, rel_oid, schema_name, table_name, base_snapshot_table,
-        schema_version, recovery_profile, helper_profile,
-        coverage_start_lsn, coverage_end_lsn,
-        tracked_since, checkpoint_interval, retention_interval, is_active,
-        replica_identity_was, replica_identity_index
-    )
-    VALUES (
-        v_tracking_id,
-        v_rel_oid, v_schema_name, v_table_name,
-        format('flashback.%I', v_snapshot_name),
-        1, 'local_delta', NULL, NULL, NULL,
-        now(), interval '15 minutes', interval '7 days', true,
-        v_replica_identity_was, v_replica_identity_index
-    );
-
-    SELECT tracked_since INTO v_tracked_since
-    FROM flashback.tracked_tables WHERE tracking_id = v_tracking_id;
-    v_bound_tracking_id := v_tracking_id;
-
-    IF flashback_effective_capture_mode() = 'wal' THEN
-        -- Logical decoding exposes PostgreSQL's 32-bit TransactionId. Keep
-        -- every SQL-side correlation key in that same domain; txid_current()
-        -- is epoch-expanded and would stop matching after the first wrap.
-        v_boundary_xid := (txid_current() % 4294967296)::bigint;
-        v_provisional_lsn := pg_current_wal_insert_lsn();
-        v_schema_def := COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
-        EXECUTE format('SELECT count(*) FROM flashback.%I', v_snapshot_name)
-          INTO v_row_count;
-
-        INSERT INTO flashback.snapshots (
-            rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-            schema_def, row_count, captured_at
-        ) VALUES (
-            v_rel_oid, v_tracking_id, format('flashback.%I', v_snapshot_name),
-            v_provisional_lsn, v_schema_def, v_row_count, clock_timestamp()
-        ) RETURNING snapshot_id INTO v_snapshot_id;
-
-        INSERT INTO flashback.coverage_generations (
-            tracking_id, generation_no, stream_id, recovery_profile, state,
-            boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
-            boundary_xid, boundary_marker, details
-        ) VALUES (
-            v_tracking_id, 1, v_stream_id, 'local_delta', 'building',
-            'initial_track', v_rel_oid, v_snapshot_id,
-            v_boundary_xid, format('initial-track:%s:%s', v_tracking_id, v_boundary_xid),
-            jsonb_build_object('provisional_snapshot_lsn', v_provisional_lsn)
-        ) RETURNING generation_id INTO v_generation_id;
-    END IF;
-
-    DELETE FROM flashback.schema_versions WHERE rel_oid = v_rel_oid;
-
-    INSERT INTO flashback.schema_versions (
-        rel_oid, tracking_id, generation_id, stream_id, source_xid,
-        schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
-        columns, primary_key, constraints, helper_schema_sha256
-    )
-    SELECT
-        v_rel_oid, v_tracking_id, v_generation_id, v_stream_id,
-        CASE WHEN v_generation_id IS NOT NULL THEN v_boundary_xid ELSE NULL END,
-        1,
-        COALESCE(v_tracked_since, clock_timestamp()),
-        COALESCE(v_provisional_lsn, pg_current_wal_lsn()),
-        CASE WHEN v_generation_id IS NULL THEN COALESCE(v_tracked_since, clock_timestamp()) ELSE NULL END,
-        NULL,
-        COALESCE(schema_def -> 'columns', '[]'::jsonb),
-        COALESCE(schema_def -> 'primary_key', '[]'::jsonb),
-        jsonb_build_object(
-            'check_unique_fk', COALESCE(schema_def -> 'constraints', '[]'::jsonb),
-            'indexes', COALESCE(schema_def -> 'indexes', '[]'::jsonb),
-            'partition_by', schema_def -> 'partition_by',
-            'partitions', schema_def -> 'partitions',
-            'triggers', COALESCE(schema_def -> 'triggers', '[]'::jsonb),
-            'rls_policies', COALESCE(schema_def -> 'rls_policies', '[]'::jsonb),
-            'rls_enabled', COALESCE((schema_def -> 'rls_enabled')::boolean, false)
-        ),
-        flashback_helper_schema_sha256(v_rel_oid)
-    FROM (
-        SELECT COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb) AS schema_def
-    ) s;
+    SELECT b.out_tracking_id, b.out_generation_id, b.out_boundary_xid,
+           b.out_snapshot_id, b.out_provisional_lsn
+      INTO v_tracking_id, v_generation_id, v_boundary_xid, v_snapshot_id, v_provisional_lsn
+    FROM flashback_bootstrap_local_delta_lifecycle_core(
+        v_rel_oid,
+        v_stream_id,
+        v_replica_identity_was,
+        v_replica_identity_index
+    ) AS b;
 
     -- Tracking itself only mutates flashback.* metadata, which the output
     -- plugin deliberately filters to avoid a worker feedback loop.  Emit one
     -- transactional marker so the decoder publishes this transaction's real
     -- COMMIT record and the building generation can acquire an exact
-    -- COMMIT-LSN boundary.  The marker is metadata-only; it is never replayed
-    -- as a table event.
-    IF v_generation_id IS NOT NULL THEN
-        PERFORM pg_logical_emit_message(
-            true,
-            'pg_flashback',
-            jsonb_build_object(
-                'op', 'BOUNDARY',
-                'kind', 'initial_track',
-                'tracking_id', v_tracking_id,
-                'generation_id', v_generation_id
-            )::text
-        );
-    END IF;
-
+    -- COMMIT-LSN boundary.
+    PERFORM pg_logical_emit_message(
+        true,
+        'pg_flashback',
+        jsonb_build_object(
+            'op', 'BOUNDARY',
+            'kind', 'initial_track',
+            'tracking_id', v_tracking_id,
+            'generation_id', v_generation_id
+        )::text
+    );
     RETURN true;
 END;
 $$;
@@ -1183,82 +581,6 @@ BEGIN
     END LOOP;
 
     RETURN v_taken;
-END;
-$$;
-
--- Manually flush staging_events -> delta_log.
--- Normally done by the background worker. Call this if the worker is not
--- running (e.g. in testing environments or after worker downtime) to make
--- trigger-captured events visible to flashback_restore/flashback_query.
--- Returns the total number of events promoted.
-CREATE OR REPLACE FUNCTION flashback_flush_staging(batch_size integer DEFAULT 1000)
-RETURNS integer
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_total   integer := 0;
-    v_moved   integer;
-BEGIN
-    LOOP
-        WITH moved AS (
-            DELETE FROM flashback.staging_events
-            WHERE staging_id IN (
-                SELECT staging_id
-                FROM flashback.staging_events
-                ORDER BY staging_id
-                LIMIT batch_size
-            )
-            RETURNING *
-        )
-        INSERT INTO flashback.delta_log (
-            event_time, event_type, table_name, rel_oid, source_xid,
-            committed_at, schema_version, old_data, new_data
-        )
-        SELECT
-            COALESCE(
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM pg_settings
-                    WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
-                m.event_time
-            ),
-            m.event_type, m.table_name, m.rel_oid, m.source_xid,
-            COALESCE(
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM pg_settings
-                    WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
-                clock_timestamp()
-            ),
-            COALESCE((
-                SELECT sv.schema_version
-                FROM flashback.schema_versions sv
-                WHERE sv.rel_oid = m.rel_oid
-                  AND sv.applied_at <= m.event_time
-                ORDER BY sv.schema_version DESC
-                LIMIT 1
-            ), 1),
-            m.old_data, m.new_data
-        FROM moved m
-        WHERE EXISTS (
-            SELECT 1 FROM flashback.tracked_tables tt
-            WHERE tt.rel_oid = m.rel_oid
-              AND tt.is_active
-              AND tt.recovery_profile = 'local_delta'
-              AND m.event_time >= tt.tracked_since
-        )
-        -- event_id assignment must follow capture order: replay's net-effect
-        -- computation orders events by event_id.
-        ORDER BY m.staging_id;
-
-        GET DIAGNOSTICS v_moved = ROW_COUNT;
-        v_total := v_total + v_moved;
-        EXIT WHEN v_moved < batch_size;
-    END LOOP;
-
-    RETURN v_total;
 END;
 $$;
 
@@ -1757,12 +1079,10 @@ BEGIN
         -- tracking order. Untrack consumes the slot before retiring the
         -- binding, so taking only the tracking key first would deadlock
         -- against the worker (which takes the database key first).
-        IF flashback_effective_capture_mode() = 'wal' THEN
-            PERFORM pg_advisory_xact_lock(
-                358945::integer,
-                (SELECT oid::integer FROM pg_database WHERE datname = current_database())
-            );
-        END IF;
+        PERFORM pg_advisory_xact_lock(
+            358945::integer,
+            (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+        );
         PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
         IF EXISTS (
             SELECT 1 FROM flashback.coverage_generations cg
@@ -1785,46 +1105,37 @@ BEGIN
             EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE',
                            v_schema_name, v_table_name);
         END IF;
-        IF flashback_effective_capture_mode() = 'wal' THEN
-            PERFORM flashback_consume_wal(50000);
-        END IF;
+        PERFORM flashback_consume_wal(50000);
     END IF;
 
-    -- Only a local_delta lifecycle installs capture (replica identity or a DML
-    -- trigger), so only it needs capture teardown here.
-    IF v_recovery_profile = 'local_delta' AND flashback_effective_capture_mode() = 'trigger' THEN
-        IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
-            PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
-        END IF;
-    ELSIF v_recovery_profile = 'local_delta' THEN
-        -- WAL mode: restore the table's original REPLICA IDENTITY.
-        -- flashback_track() forced it to FULL; leaving it there permanently
-        -- causes write amplification and changes logical decoding behaviour
-        -- for the application after the table is untracked.
-        IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
-            DECLARE
-                v_original_ri    "char";
-                v_original_ri_idx text;
-                v_ri_clause      text;
-            BEGIN
-                SELECT tt.replica_identity_was, tt.replica_identity_index
-                  INTO v_original_ri, v_original_ri_idx
-                FROM flashback.tracked_tables tt WHERE tt.rel_oid = v_rel_oid;
+    -- Restore the table's original REPLICA IDENTITY. flashback_track() forced
+    -- it to FULL; leaving it there permanently causes write amplification and
+    -- changes logical decoding behaviour for the application after untrack.
+    IF v_recovery_profile = 'local_delta'
+       AND to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL
+    THEN
+        DECLARE
+            v_original_ri    "char";
+            v_original_ri_idx text;
+            v_ri_clause      text;
+        BEGIN
+            SELECT tt.replica_identity_was, tt.replica_identity_index
+              INTO v_original_ri, v_original_ri_idx
+            FROM flashback.tracked_tables tt WHERE tt.rel_oid = v_rel_oid;
 
-                v_ri_clause := CASE COALESCE(v_original_ri, 'd')
-                    WHEN 'f' THEN 'FULL'
-                    WHEN 'n' THEN 'NOTHING'
-                    WHEN 'i' THEN
-                        CASE WHEN v_original_ri_idx IS NOT NULL
-                             THEN 'USING INDEX ' || quote_ident(v_original_ri_idx)
-                             ELSE 'DEFAULT'   -- index name unknown; fall back
-                        END
-                    ELSE 'DEFAULT'
-                END;
-                EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
-                    v_schema_name, v_table_name, v_ri_clause);
+            v_ri_clause := CASE COALESCE(v_original_ri, 'd')
+                WHEN 'f' THEN 'FULL'
+                WHEN 'n' THEN 'NOTHING'
+                WHEN 'i' THEN
+                    CASE WHEN v_original_ri_idx IS NOT NULL
+                         THEN 'USING INDEX ' || quote_ident(v_original_ri_idx)
+                         ELSE 'DEFAULT'   -- index name unknown; fall back
+                    END
+                ELSE 'DEFAULT'
             END;
-        END IF;
+            EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
+                v_schema_name, v_table_name, v_ri_clause);
+        END;
     END IF;
 
     IF v_base_snapshot IS NOT NULL AND v_base_snapshot <> '' THEN
@@ -1861,7 +1172,6 @@ BEGIN
     DELETE FROM flashback.delta_log
     WHERE (v_has_generations AND tracking_id = v_tracking_id)
        OR (NOT v_has_generations AND rel_oid = v_rel_oid);
-    DELETE FROM flashback.staging_events WHERE rel_oid = v_rel_oid;
     DELETE FROM flashback.schema_versions
     WHERE (v_has_generations AND tracking_id = v_tracking_id)
        OR (NOT v_has_generations AND rel_oid = v_rel_oid);
@@ -1989,7 +1299,10 @@ BEGIN
                 SELECT 1 FROM flashback.coverage_generations cg
                 WHERE cg.tracking_id = tracked.tracking_id
             )
-            OR flashback_effective_capture_mode() = 'wal'
+            OR COALESCE(
+                   NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), ''),
+                   'wal'
+               ) = 'wal'
         ) THEN
             RAISE EXCEPTION 'pg_flashback: DDL capture refused because tracking lifecycle % has no active WAL generation',
                 tracked.tracking_id;
@@ -2034,14 +1347,6 @@ BEGIN
 
         RAISE NOTICE 'pg_flashback: table renamed/moved from %.% to %.% — tracking updated',
             tracked.schema_name, tracked.table_name, v_actual_schema, v_actual_table;
-
-        -- Recreate triggers with updated table-name argument
-        IF tracked.recovery_profile = 'local_delta'
-           AND flashback_effective_capture_mode() = 'trigger'
-        THEN
-            PERFORM flashback_detach_capture_trigger(v_actual_schema, v_actual_table);
-            PERFORM flashback_attach_capture_trigger(v_actual_schema, v_actual_table);
-        END IF;
 
         tracked.schema_name := v_actual_schema;
         tracked.table_name  := v_actual_table;

@@ -17,6 +17,7 @@ extension_sql_file!(
     name = "flashback_rbac_grants",
     requires = [
         "flashback_api_track_capture",
+        "flashback_wal_only_migration",
         "flashback_coverage_runtime",
         "flashback_health_runtime",
         "flashback_operator_diagnosis",

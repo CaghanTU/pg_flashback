@@ -94,7 +94,6 @@ GRANT EXECUTE ON FUNCTION flashback_recover_deleted(text, timestamptz) TO flashb
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted_lsn(text, pg_lsn) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_checkpoint(text)                  TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_reanchor(text)                    TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_flush_staging(integer)            TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_consume_wal(integer)              TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_apply_retention()                 TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_query(text, timestamptz, text)    TO flashback_admin;
@@ -231,14 +230,8 @@ COMMENT ON FUNCTION flashback_set_restore_in_progress(bool)
     IS '[Internal] Set the process-local restore-in-progress flag. Extension-owner execution chain only.';
 COMMENT ON FUNCTION flashback_is_restore_in_progress(oid)
     IS 'Return whether the current backend has a restore in progress. Safe to call from triggers or monitoring.';
-COMMENT ON FUNCTION flashback_attach_capture_trigger(text, text)
-    IS '[Internal] Attach INSERT/UPDATE/DELETE capture triggers to a table. Called only by guarded lifecycle APIs.';
-COMMENT ON FUNCTION flashback_detach_capture_trigger(text, text)
-    IS '[Internal] Remove capture triggers from a table. Called only by guarded lifecycle APIs.';
 COMMENT ON FUNCTION flashback_take_due_checkpoints()
     IS 'Auto-checkpoint all tracked tables whose checkpoint_interval has elapsed. Called by the background worker.';
-COMMENT ON FUNCTION flashback_flush_staging(integer)
-    IS 'Manually flush staging_events to delta_log. Normally done by the background worker. Useful when the worker is not running (e.g. testing or recovery). Returns number of events promoted.';
 COMMENT ON FUNCTION flashback_consume_wal(integer)
     IS 'Consume decoded changes from this database''s logical replication slot into delta_log, stamped with real commit time and LSN. Normally called by the background worker. Returns number of events inserted.';
 COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)
@@ -259,16 +252,6 @@ COMMENT ON FUNCTION flashback_recreate_table_from_ddl(jsonb, text, text)
     IS '[Internal] Recreate table from DDL definition. Supports shadow-table mode for crash-safe restore.';
 COMMENT ON FUNCTION flashback_finalize_shadow_swap(text, text, text, text, jsonb)
     IS '[Internal] Atomic swap: DROP original → RENAME shadow. Restores FK, triggers, RLS, ACL. Returns new OID.';
-COMMENT ON FUNCTION flashback_capture_insert_trigger()
-    IS 'Statement-level AFTER INSERT trigger — bulk-captures new rows via transition table into staging_events. Not used on partitioned tables.';
-COMMENT ON FUNCTION flashback_capture_insert_row_trigger()
-    IS '[Internal] Per-row AFTER INSERT trigger for partitioned tables — transition tables are not supported on partitioned tables.';
-COMMENT ON FUNCTION flashback_capture_update_trigger()
-    IS 'Row-level AFTER UPDATE trigger — diff-only capture for PK tables (PK + changed columns), full-row for non-PK. Skips no-op updates.';
-COMMENT ON FUNCTION flashback_capture_delete_trigger()
-    IS 'Statement-level AFTER DELETE trigger — bulk-captures deleted rows via transition table into staging_events. Not used on partitioned tables.';
-COMMENT ON FUNCTION flashback_capture_delete_row_trigger()
-    IS '[Internal] Per-row AFTER DELETE trigger for partitioned tables — transition tables are not supported on partitioned tables.';
 COMMENT ON FUNCTION flashback_restore_parallel(text, timestamptz, int)
     IS 'Restore a table with parallel-worker hints (max_parallel_workers_per_gather). Also emits per-partition guidance for partitioned tables.';
 COMMENT ON FUNCTION flashback_ensure_delta_partition(date)

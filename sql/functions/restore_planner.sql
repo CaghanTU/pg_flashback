@@ -464,17 +464,9 @@ BEGIN
         END LOOP;
     END IF;
 
-    -- Re-attach capture after the swap
-    -- In trigger mode: install the statement-level triggers on the restored table.
-    -- In WAL mode: do NOT attach triggers (staging_events is skipped by the worker
-    -- in WAL mode, so any trigger-captured rows would accumulate and never reach
-    -- delta_log). Instead, re-assert REPLICA IDENTITY FULL because the shadow swap
-    -- creates a new OID and the table relation is fresh.
-    IF flashback_effective_capture_mode() = 'trigger' THEN
-        PERFORM flashback_attach_capture_trigger(v_schema_name, v_table_name);
-    ELSE
-        EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
-    END IF;
+    -- Re-assert REPLICA IDENTITY FULL after the shadow swap. The swap creates a
+    -- new OID and a fresh relation; WAL capture requires FULL identity.
+    EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
 
     -- Post-restore checkpoint
     DECLARE

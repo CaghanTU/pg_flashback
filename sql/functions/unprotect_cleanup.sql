@@ -268,7 +268,6 @@ BEGIN
         -- Restore replica identity while relation still exists; keep payload.
         IF to_regclass(format('%I.%I', r.schema_name, r.table_name)) IS NOT NULL
            AND r.recovery_profile = 'local_delta'
-           AND flashback_effective_capture_mode() <> 'trigger'
         THEN
             SELECT tt.replica_identity_was, tt.replica_identity_index
               INTO v_original_ri, v_original_ri_idx
@@ -291,11 +290,6 @@ BEGIN
             EXCEPTION WHEN OTHERS THEN
                 NULL; -- seal still proceeds; RI restore is best-effort
             END;
-        ELSIF r.recovery_profile = 'local_delta'
-              AND flashback_effective_capture_mode() = 'trigger'
-              AND to_regclass(format('%I.%I', r.schema_name, r.table_name)) IS NOT NULL
-        THEN
-            PERFORM flashback_detach_capture_trigger(r.schema_name, r.table_name);
         END IF;
 
         UPDATE flashback.coverage_generations

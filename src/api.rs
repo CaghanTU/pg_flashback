@@ -85,6 +85,12 @@ extension_sql_file!(
     ],
 );
 
+extension_sql_file!(
+    "../sql/functions/wal_only_migration.sql",
+    name = "flashback_wal_only_migration",
+    requires = ["flashback_api_track_capture"],
+);
+
 #[cfg(any(test, feature = "pg_test"))]
 extension_sql_file!(
     "../sql/functions/test_wal_seam.sql",
@@ -94,6 +100,7 @@ extension_sql_file!(
         "flashback_lifecycle_bootstrap_core",
         "flashback_ddl_staging_core",
         "flashback_api_track_capture",
+        "flashback_wal_only_migration",
         "flashback_restore_lsn_api"
     ],
 );
@@ -104,6 +111,7 @@ extension_sql_file!(
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_api_track_capture",
+        "flashback_wal_only_migration",
         "flashback_local_capacity"
     ],
 );

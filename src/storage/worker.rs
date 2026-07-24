@@ -19,9 +19,10 @@ static TARGET_DATABASE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CS
 static TARGET_DATABASES_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 /// Maximum database worker pairs to register (capture + maintenance per DB).
 static MAX_WORKERS_GUC: GucSetting<i32> = GucSetting::<i32>::new(4);
-/// Capture mode: 'wal' (WAL-based via logical decoding), 'trigger' (legacy trigger-based),
-/// or 'auto' (use WAL if wal_level=logical, otherwise fallback to triggers).
-static CAPTURE_MODE_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+/// Capture mode: only 'wal' is operational. 'trigger' and 'auto' remain as
+/// deprecated compatibility inputs and fail closed (no capture).
+static CAPTURE_MODE_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"wal"));
 /// Logical replication slot name override. Default is per-database
 /// (pg_flashback_<dbname>) because logical slots are database-specific.
 static SLOT_NAME_GUC: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
@@ -86,7 +87,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.worker_interval_ms",
         c"pg_flashback delta worker flush interval",
-        c"Base capture interval in milliseconds. WAL mode backs off to at most one second while idle and resets immediately after captured activity; trigger mode keeps this fixed interval.",
+        c"Base capture interval in milliseconds. WAL mode backs off to at most one second while idle and resets immediately after captured activity.",
         &WORKER_INTERVAL_MS,
         50,
         10_000,
@@ -97,7 +98,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.worker_batch_size",
         c"pg_flashback delta worker batch size",
-        c"How many events the background worker moves from staging_events to delta_log per cycle.",
+        c"How many WAL changes the background worker consumes into delta_log per cycle.",
         &WORKER_BATCH_SIZE_GUC,
         128,
         50_000,
@@ -141,7 +142,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_bool_guc(
         c"pg_flashback.enabled",
         c"Enable or disable pg_flashback capture",
-        c"When OFF, triggers skip capture and worker idles. Emergency kill switch.",
+        c"When OFF, the capture worker idles after recording a durable discontinuity. Emergency kill switch.",
         &ENABLED_GUC,
         GucContext::Suset,
         GucFlags::default(),
@@ -161,7 +162,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_string_guc(
         c"pg_flashback.target_database",
         c"Database the pg_flashback worker connects to",
-        c"The background worker flushes staging_events in this database. Set to the database where the extension is installed. Default: postgres. Overridden by target_databases if set.",
+        c"The background worker runs WAL capture in this database. Set to the database where the extension is installed. Default: postgres. Overridden by target_databases if set.",
         &TARGET_DATABASE_GUC,
         GucContext::Postmaster,
         GucFlags::default(),
@@ -189,8 +190,8 @@ pub fn register_worker_and_guc() {
 
     GucRegistry::define_string_guc(
         c"pg_flashback.capture_mode",
-        c"pg_flashback capture mode: auto, wal, or trigger",
-        c"'wal' = WAL-based logical decoding (requires wal_level=logical), 'trigger' = legacy trigger-based capture, 'auto' = detect wal_level and choose (default: auto).",
+        c"pg_flashback capture mode (wal only; trigger/auto rejected)",
+        c"Only 'wal' is operational (default). Deprecated values 'trigger' and 'auto' fail closed: no DML capture and reconcile breaks any active stream. Set wal_level=logical.",
         &CAPTURE_MODE_GUC,
         GucContext::Suset,
         GucFlags::default(),
@@ -467,15 +468,14 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
     let db_name = &db_list[worker_index];
     BackgroundWorker::connect_worker_to_spi(Some(db_name), None);
 
-    // Detect capture mode once at startup
-    // Note: for 'auto', the mode is re-evaluated each cycle in the loop.
-    // At startup we just log the initial mode without SPI to avoid
-    // polluting the transaction state before slot creation.
+    // Log the configured capture_mode GUC at startup. Only 'wal' is
+    // operational; illegal values are reconciled fail-closed each cycle.
     let mode_setting = CAPTURE_MODE_GUC.get();
     let initial_mode_str = mode_setting
         .as_deref()
         .and_then(|cs| cs.to_str().ok())
-        .unwrap_or("auto");
+        .filter(|s| !s.is_empty())
+        .unwrap_or("wal");
     log!(
         "pg_flashback delta worker {worker_index} started (database: {db_name}, capture_mode_guc: {initial_mode_str}, {total} total database(s))",
         total = db_list.len()
@@ -520,7 +520,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
 
             let t0 = std::time::Instant::now();
             if mode == "wal" {
-                // Lazily ensure slot exists (handles upgrade from trigger-only versions)
+                // Lazily ensure slot exists (created by flashback_track)
                 if !slot_ready {
                     slot_ready = ensure_replication_slot();
                     if !slot_ready && !slot_warned {
@@ -536,11 +536,11 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
                     }
                 }
             } else {
-                slot_ready = false; // reset if mode changes away from WAL
+                // trigger/auto/other: never capture. Reconcile above breaks the
+                // stream; keep slot_ready false and idle until mode is wal.
+                slot_ready = false;
                 wal_idle_cycles = 0;
             }
-            // Always flush staging_events (DDL events go through staging even in WAL mode)
-            flush_staging_to_delta_log();
             let flush_ms = t0.elapsed().as_millis();
 
             let cycle_ms = cycle_start.elapsed().as_millis();
@@ -558,7 +558,7 @@ pub extern "C-unwind" fn pg_flashback_delta_worker_main(arg: pg_sys::Datum) {
         // amplification without improving correctness. WAL slots retain
         // unconsumed changes across crashes, so bounded idle backoff affects
         // only visibility latency. Any captured event or consume error resets
-        // the delay; trigger mode keeps its fixed crash-window cadence.
+        // the delay.
         let interval_ms = if enabled && mode == "wal" {
             let multiplier = 1_u64 << wal_idle_cycles.min(5);
             base_interval_ms
@@ -655,41 +655,24 @@ fn reconcile_capture_configuration() -> bool {
     }
 }
 
-/// Determine the effective capture mode based on GUC and wal_level.
-/// Returns "wal" or "trigger".
+/// Determine the operational capture mode from the GUC.
+/// Returns "wal" only when the GUC is unset/empty/`wal`.
+/// Returns the raw illegal value (`trigger`, `auto`, …) otherwise so the
+/// worker never runs the WAL consume path and reconcile can break the stream.
 ///
-/// Does NOT use SPI — reads wal_level directly via GetConfigOption
-/// to avoid polluting transaction state in the background worker.
+/// Does NOT use SPI.
 fn effective_capture_mode() -> &'static str {
     let mode_setting = CAPTURE_MODE_GUC.get();
     let mode = mode_setting
         .as_deref()
         .and_then(|cs| cs.to_str().ok())
-        .unwrap_or("auto");
+        .unwrap_or("");
 
     match mode {
-        "wal" => "wal",
+        "" | "wal" => "wal",
         "trigger" => "trigger",
-        _ => {
-            // auto: check wal_level via C API (no SPI needed)
-            let wal_level = unsafe {
-                let opt_name = std::ffi::CString::new("wal_level").unwrap();
-                let val = pg_sys::GetConfigOption(opt_name.as_ptr(), true, false);
-                if val.is_null() {
-                    "replica".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(val)
-                        .to_str()
-                        .unwrap_or("replica")
-                        .to_string()
-                }
-            };
-            if wal_level == "logical" {
-                "wal"
-            } else {
-                "trigger"
-            }
-        }
+        "auto" => "auto",
+        _ => "invalid",
     }
 }
 
@@ -798,84 +781,6 @@ fn consume_wal_changes() -> Option<i32> {
         return None;
     }
     inserted
-}
-
-fn flush_staging_to_delta_log() {
-    let batch_size = effective_worker_batch_size() as i64;
-    let result: Result<(), SpiError> = BackgroundWorker::transaction(|| {
-        // Skip if staging_events table doesn't exist yet (extension not fully installed)
-        let table_exists =
-            Spi::get_one::<bool>("SELECT to_regclass('flashback.staging_events') IS NOT NULL")?
-                .unwrap_or(false);
-        if !table_exists {
-            return Ok(());
-        }
-
-        // In WAL mode staging_events is normally empty (DML comes from the
-        // slot, DDL from WAL messages), but flushing unconditionally is cheap
-        // and drains any events left behind by a trigger→wal mode switch.
-        let query = "WITH moved AS (
-                DELETE FROM flashback.staging_events
-                WHERE staging_id IN (
-                    SELECT staging_id
-                    FROM flashback.staging_events
-                    ORDER BY staging_id
-                    LIMIT $1
-                )
-                RETURNING *
-            )
-            INSERT INTO flashback.delta_log (
-                event_time, event_type, table_name, rel_oid, source_xid,
-                committed_at, schema_version, old_data, new_data
-            )
-            SELECT
-                -- Use the actual transaction commit timestamp when track_commit_timestamp
-                -- is enabled. This makes event_time commit-time-correct for PITR accuracy.
-                -- Without it, event_time is the trigger's clock_timestamp() at statement
-                -- execution, which can precede the actual commit for long-running transactions.
-                COALESCE(
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM pg_settings
-                        WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                    ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
-                    m.event_time
-                ) AS event_time,
-                m.event_type, m.table_name, m.rel_oid, m.source_xid,
-                COALESCE(
-                    CASE WHEN EXISTS (
-                        SELECT 1 FROM pg_settings
-                        WHERE name = 'track_commit_timestamp' AND setting = 'on'
-                    ) THEN pg_xact_commit_timestamp(m.source_xid::text::xid) END,
-                    clock_timestamp()
-                ) AS committed_at,
-                COALESCE((
-                    SELECT sv.schema_version
-                    FROM flashback.schema_versions sv
-                    WHERE sv.rel_oid = m.rel_oid
-                      AND sv.applied_at <= m.event_time
-                    ORDER BY sv.schema_version DESC
-                    LIMIT 1
-                ), 1),
-                m.old_data, m.new_data
-            FROM moved m
-            WHERE EXISTS (
-                SELECT 1 FROM flashback.tracked_tables tt
-                WHERE tt.rel_oid = m.rel_oid
-                  AND tt.is_active
-                  AND tt.recovery_profile = 'local_delta'
-                  AND m.event_time >= tt.tracked_since
-            )
-            -- event_id assignment must follow capture order: replay's
-            -- net-effect computation orders events by event_id.
-            ORDER BY m.staging_id";
-
-        Spi::run_with_args(query, &[batch_size.into()])?;
-        Ok(())
-    });
-
-    if let Err(err) = result {
-        log!("pg_flashback STAGING_FLUSH_ERROR error={err:?}");
-    }
 }
 
 fn run_periodic_checkpoints() {

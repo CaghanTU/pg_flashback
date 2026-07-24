@@ -211,7 +211,6 @@ BEGIN
         );
         DELETE FROM flashback.snapshots WHERE rel_oid = old_oid;
         DELETE FROM flashback.delta_log WHERE rel_oid = old_oid;
-        DELETE FROM flashback.staging_events WHERE rel_oid = old_oid;
         DELETE FROM flashback.schema_versions WHERE rel_oid = old_oid;
         DELETE FROM flashback.tracked_tables WHERE rel_oid = old_oid;
     END IF;

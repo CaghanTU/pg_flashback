@@ -862,7 +862,7 @@ CREATE TABLE IF NOT EXISTS flashback.capture_streams (
     database_oid           OID NOT NULL,
     database_name          NAME NOT NULL,
     epoch_no               BIGINT NOT NULL CHECK (epoch_no > 0),
-    capture_mode           TEXT NOT NULL CHECK (capture_mode IN ('trigger', 'wal')),
+    capture_mode           TEXT NOT NULL CHECK (capture_mode IN ('wal')),
     timeline_id            BIGINT CHECK (timeline_id IS NULL OR timeline_id > 0),
     slot_name              TEXT,
     plugin_name            TEXT,
@@ -880,17 +880,10 @@ CREATE TABLE IF NOT EXISTS flashback.capture_streams (
     details                JSONB NOT NULL DEFAULT '{}'::jsonb,
     CONSTRAINT capture_streams_database_epoch_key UNIQUE (database_oid, epoch_no),
     CONSTRAINT capture_streams_slot_shape_check CHECK (
-        (
-            capture_mode = 'wal'
-            AND timeline_id IS NOT NULL
-            AND slot_name IS NOT NULL AND btrim(slot_name) <> ''
-            AND plugin_name IS NOT NULL AND btrim(plugin_name) <> ''
-        ) OR (
-            capture_mode = 'trigger'
-            AND timeline_id IS NULL
-            AND slot_name IS NULL
-            AND plugin_name IS NULL
-        )
+        capture_mode = 'wal'
+        AND timeline_id IS NOT NULL
+        AND slot_name IS NOT NULL AND btrim(slot_name) <> ''
+        AND plugin_name IS NOT NULL AND btrim(plugin_name) <> ''
     ),
     CONSTRAINT capture_streams_state_shape_check CHECK (
         (state = 'initializing' AND invalidated_at IS NULL AND retired_at IS NULL)
@@ -940,21 +933,35 @@ BEGIN
     ) THEN
         ALTER TABLE flashback.capture_streams ADD COLUMN timeline_id BIGINT;
     END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.capture_streams WHERE capture_mode IS DISTINCT FROM 'wal'
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: capture_streams still contains non-wal capture_mode rows; WAL-only upgrade cannot continue'
+            USING HINT = 'Retire or unprotect trigger-mode streams, then reload/upgrade. Only capture_mode=wal is supported.';
+    END IF;
+
+    ALTER TABLE flashback.capture_streams
+        DROP CONSTRAINT IF EXISTS capture_streams_capture_mode_check;
+    -- Recreate the named check from CREATE TABLE (PostgreSQL auto-names inline CHECKs).
+    ALTER TABLE flashback.capture_streams
+        DROP CONSTRAINT IF EXISTS capture_streams_capture_mode_check1;
+    BEGIN
+        ALTER TABLE flashback.capture_streams
+            ADD CONSTRAINT capture_streams_capture_mode_check
+            CHECK (capture_mode IN ('wal'));
+    EXCEPTION WHEN duplicate_object THEN
+        NULL;
+    END;
+
     ALTER TABLE flashback.capture_streams
         DROP CONSTRAINT IF EXISTS capture_streams_slot_shape_check;
     ALTER TABLE flashback.capture_streams
         ADD CONSTRAINT capture_streams_slot_shape_check CHECK (
-            (
-                capture_mode = 'wal'
-                AND timeline_id IS NOT NULL AND timeline_id > 0
-                AND slot_name IS NOT NULL AND btrim(slot_name) <> ''
-                AND plugin_name IS NOT NULL AND btrim(plugin_name) <> ''
-            ) OR (
-                capture_mode = 'trigger'
-                AND timeline_id IS NULL
-                AND slot_name IS NULL
-                AND plugin_name IS NULL
-            )
+            capture_mode = 'wal'
+            AND timeline_id IS NOT NULL AND timeline_id > 0
+            AND slot_name IS NOT NULL AND btrim(slot_name) <> ''
+            AND plugin_name IS NOT NULL AND btrim(plugin_name) <> ''
         );
 END
 $$;
@@ -1817,64 +1824,49 @@ CREATE INDEX IF NOT EXISTS schema_versions_generation_commit_idx
     ON flashback.schema_versions (generation_id, committed_at, version_id)
     WHERE generation_id IS NOT NULL;
 
+-- WAL-only: do not create staging_events on fresh install. On upgrade, refuse
+-- non-empty leftover rows (fail-closed, never delete), otherwise detach legacy
+-- flashback_capture_* triggers and drop the empty table + capture functions.
 DO $$
+DECLARE
+    v_count bigint;
+    r record;
 BEGIN
     IF to_regclass('flashback.staging_events') IS NULL THEN
-        EXECUTE 'CREATE TABLE flashback.staging_events (
-            staging_id  BIGSERIAL PRIMARY KEY,
-            event_time  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            rel_oid     OID NOT NULL,
-            tracking_id BIGINT,
-            generation_id BIGINT,
-            stream_id   BIGINT,
-            source_xid  BIGINT NOT NULL
-                        DEFAULT ((txid_current() % 4294967296)::bigint),
-            event_type  TEXT NOT NULL,
-            table_name  TEXT NOT NULL,
-            old_data    JSONB,
-            new_data    JSONB
-        )';
+        RETURN;
     END IF;
-END
-$$;
 
--- Upgrade old installations that predate the LOGGED staging fix. This takes
--- an ACCESS EXCLUSIVE lock and may rewrite the relation, but leaving it
--- UNLOGGED would silently lose committed capture on crash.
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_class c
+    EXECUTE 'SELECT count(*) FROM flashback.staging_events' INTO v_count;
+    IF v_count > 0 THEN
+        RAISE EXCEPTION
+            'pg_flashback: flashback.staging_events still contains % row(s); WAL-only upgrade cannot discard them',
+            v_count
+            USING HINT =
+                'Flush with the previous pg_flashback binary (flashback_flush_staging), or unprotect/re-anchor after draining capture, then reload/upgrade. Do not DELETE staging rows manually.';
+    END IF;
+
+    FOR r IN
+        SELECT n.nspname AS sch, c.relname AS tbl, t.tgname
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'flashback'
-          AND c.relname = 'staging_events'
-          AND c.relpersistence = 'u'
-    ) THEN
-        ALTER TABLE flashback.staging_events SET LOGGED;
-        RAISE NOTICE 'pg_flashback: converted legacy staging_events to LOGGED';
-    END IF;
+        WHERE NOT t.tgisinternal
+          AND t.tgname LIKE 'flashback_capture_%'
+    LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', r.tgname, r.sch, r.tbl);
+    END LOOP;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'flashback' AND table_name = 'staging_events'
-          AND column_name = 'tracking_id'
-    ) THEN
-        ALTER TABLE flashback.staging_events ADD COLUMN tracking_id BIGINT;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'flashback' AND table_name = 'staging_events'
-          AND column_name = 'generation_id'
-    ) THEN
-        ALTER TABLE flashback.staging_events ADD COLUMN generation_id BIGINT;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'flashback' AND table_name = 'staging_events'
-          AND column_name = 'stream_id'
-    ) THEN
-        ALTER TABLE flashback.staging_events ADD COLUMN stream_id BIGINT;
-    END IF;
+    DROP FUNCTION IF EXISTS flashback_flush_staging(integer) CASCADE;
+    DROP FUNCTION IF EXISTS flashback_attach_capture_trigger(text, text) CASCADE;
+    DROP FUNCTION IF EXISTS flashback_detach_capture_trigger(text, text) CASCADE;
+    DROP FUNCTION IF EXISTS flashback_capture_insert_trigger() CASCADE;
+    DROP FUNCTION IF EXISTS flashback_capture_insert_row_trigger() CASCADE;
+    DROP FUNCTION IF EXISTS flashback_capture_delete_row_trigger() CASCADE;
+    DROP FUNCTION IF EXISTS flashback_capture_update_trigger() CASCADE;
+    DROP FUNCTION IF EXISTS flashback_capture_delete_trigger() CASCADE;
+
+    DROP TABLE flashback.staging_events;
+    RAISE NOTICE 'pg_flashback: dropped empty legacy staging_events (WAL-only capture)';
 END
 $$;
 
@@ -1926,63 +1918,6 @@ BEGIN
                 )
             );
     END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flashback.staging_events'::regclass
-          AND conname = 'staging_events_tracking_fk'
-    ) THEN
-        ALTER TABLE flashback.staging_events
-            ADD CONSTRAINT staging_events_tracking_fk
-            FOREIGN KEY (tracking_id)
-            REFERENCES flashback.tracking_lifecycles(tracking_id)
-            ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flashback.staging_events'::regclass
-          AND conname = 'staging_events_generation_tracking_stream_fk'
-    ) THEN
-        ALTER TABLE flashback.staging_events
-            ADD CONSTRAINT staging_events_generation_tracking_stream_fk
-            FOREIGN KEY (generation_id, tracking_id, stream_id)
-            REFERENCES flashback.coverage_generations(
-                generation_id, tracking_id, stream_id
-            )
-            ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flashback.staging_events'::regclass
-          AND conname = 'staging_events_binding_shape_check'
-    ) THEN
-        ALTER TABLE flashback.staging_events
-            ADD CONSTRAINT staging_events_binding_shape_check CHECK (
-                (
-                    tracking_id IS NULL
-                    AND generation_id IS NULL
-                    AND stream_id IS NULL
-                ) OR (
-                    tracking_id IS NOT NULL
-                    AND generation_id IS NOT NULL
-                    AND stream_id IS NOT NULL
-                )
-            );
-    END IF;
-END
-$$;
-
--- lz4 compression for staging_events JSONB columns
-DO $$
-BEGIN
-    IF to_regclass('flashback.staging_events') IS NOT NULL THEN
-        BEGIN
-            ALTER TABLE flashback.staging_events ALTER COLUMN old_data SET COMPRESSION lz4;
-            ALTER TABLE flashback.staging_events ALTER COLUMN new_data SET COMPRESSION lz4;
-        EXCEPTION WHEN feature_not_supported THEN
-            NULL; -- silently skip if lz4 not available
-        END;
-    END IF;
 END
 $$;
 
@@ -2027,10 +1962,10 @@ CREATE OR REPLACE VIEW flashback.pg_stat_flashback AS
 SELECT
     (SELECT count(*) FROM flashback.tracked_tables WHERE is_active) AS tracked_tables,
     (SELECT count(*) FROM flashback.tracked_tables WHERE NOT is_active) AS untracked_tables,
-    (SELECT count(*) FROM flashback.staging_events) AS pending_events,
+    (SELECT count(*) FROM flashback.pending_wal_events) AS pending_events,
     (SELECT count(*) FROM flashback.delta_log) AS total_deltas,
     (SELECT pg_size_pretty(pg_total_relation_size('flashback.delta_log'))) AS delta_storage,
-    (SELECT pg_size_pretty(pg_total_relation_size('flashback.staging_events'))) AS staging_storage,
+    (SELECT pg_size_pretty(pg_total_relation_size('flashback.pending_wal_events'))) AS staging_storage,
     (SELECT count(*) FROM flashback.snapshots) AS total_snapshots,
     (SELECT count(*) FROM flashback.restore_log) AS total_restores,
     (SELECT count(*) FROM flashback.restore_log WHERE success) AS successful_restores,
