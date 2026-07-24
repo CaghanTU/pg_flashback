@@ -71,7 +71,8 @@ record_step() {
 cleanup() {
     local rc=$?
     set +e
-    if [[ -x "$PG_BIN/pg_ctl" && -d "$DATA" ]]; then
+    # Keep-alive mode leaves the instance running for follow-on benches.
+    if [[ "${PGFB_QUAL_KEEP:-0}" != "1" && -x "$PG_BIN/pg_ctl" && -d "$DATA" ]]; then
         "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 || \
             "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
     fi
@@ -173,6 +174,49 @@ q "$DB_NAME" "CREATE EXTENSION pg_flashback;" >/dev/null
 q postgres "ALTER SYSTEM SET pg_flashback.target_databases = '$DB_NAME';" >/dev/null
 restart_pg || die "restart after target_databases"
 wait_flashback_ready "$DB_NAME" 120 || die "flashback_worker_readiness not ready for $DB_NAME"
+
+# Product creates the logical slot on first protect. Do a tiny warmup lifecycle
+# so bench preflight sees an existing slot, capture attachment, and near-zero lag
+# with no leftover tracked tables.
+warmup_logical_slot() {
+    local db=$1
+    local rel=public._pgfb_qual_warmup_$$
+    local slot tid st i lag
+    q "$db" "CREATE TABLE ${rel} (id int PRIMARY KEY);" >/dev/null
+    q "$db" "SELECT flashback_protect('${rel}');" >/dev/null
+    slot="$(q "$db" "SELECT flashback_effective_slot_name();")"
+    [[ -n "$slot" ]] || return 1
+    q "$db" "INSERT INTO ${rel} VALUES (1);" >/dev/null
+    tid="$(q "$db" "SELECT tracking_id FROM flashback.tracked_tables
+                     WHERE format('%I.%I', schema_name, table_name) = '${rel}'
+                     ORDER BY tracking_id DESC LIMIT 1;")"
+    for _ in $(seq 1 60); do
+        q "$db" "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+        lag="$(q "$db" "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn),0)::bigint
+                        FROM pg_replication_slots
+                        WHERE slot_name = '${slot}' AND database = current_database();")"
+        [[ -n "$lag" && "$lag" -le 1048576 ]] && break
+        sleep 0.25
+    done
+    q "$db" "SELECT flashback_unprotect('${rel}');" >/dev/null 2>&1 || true
+    for _ in $(seq 1 80); do
+        q "$db" "SELECT flashback_finalize_unprotect_operations();" >/dev/null 2>&1 || true
+        st="$(q "$db" "SELECT COALESCE((SELECT protection_state FROM flashback.tracked_tables
+                         WHERE tracking_id = ${tid}::bigint LIMIT 1), 'gone');")"
+        [[ "$st" == "unprotected" || "$st" == "gone" || "$st" == "cleaned" || "$st" == "inactive" ]] && break
+        sleep 0.25
+    done
+    if [[ -n "$tid" ]]; then
+        q "$db" "BEGIN; SET LOCAL pg_flashback.enabled = on; SELECT flashback_cleanup(${tid}::bigint, false); COMMIT;" \
+            >/dev/null 2>&1 || true
+    fi
+    q "$db" "BEGIN; SET LOCAL pg_flashback.enabled = on; DROP TABLE IF EXISTS ${rel} CASCADE; COMMIT;" \
+        >/dev/null 2>&1 || true
+    q "$db" "SELECT EXISTS (
+        SELECT 1 FROM pg_replication_slots
+         WHERE slot_name = '${slot}' AND database = current_database());" | grep -qx t
+}
+warmup_logical_slot "$DB_NAME" || die "warmup logical slot lifecycle failed"
 
 export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE="$DB_NAME"
 PGUSER="$(id -un)"

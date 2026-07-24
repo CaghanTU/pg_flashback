@@ -56,7 +56,9 @@ export TIMEOUT_BIN TABLE_TIMEOUT_SECS
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 
-preflight_fail() { echo "FAIL: $*" >&2; return 1; }
+# Always abort the script: `cmd || preflight_fail` is an OR-list, so a plain
+# `return 1` would not stop bench_preflight under `set -e`.
+preflight_fail() { die "$*"; }
 
 extension_sha256() {
     local so
@@ -199,13 +201,44 @@ bench_preflight() {
 
     SLOT_NAME="$(psqlq -c "SELECT flashback_effective_slot_name();")"
     [[ -n "$SLOT_NAME" ]] || preflight_fail "flashback_effective_slot_name() returned empty"
-    local slot_active
-    slot_active="$(psqlq -c "SELECT COALESCE(active::text, 'f') FROM pg_replication_slots WHERE slot_name = '$SLOT_NAME';")"
-    [[ "$slot_active" == "t" ]] || preflight_fail "logical replication slot $SLOT_NAME missing or inactive for current database"
+    export SLOT_NAME
+
+    # Slot must exist for this database before any bench DDL. pg_replication_slots.active
+    # is only true during short capture bursts (idle backoff), so require existence +
+    # at least one observed active sample (or confirmed_flush progress) while the
+    # capture worker is already admitted/running above.
+    local slot_deadline slot_active slot_exists seen_active=0
+    slot_deadline=$(( $(date +%s) + 90 ))
+    slot_active=f
+    while (( $(date +%s) <= slot_deadline )); do
+        slot_exists="$(psqlq -c "SELECT EXISTS (
+            SELECT 1 FROM pg_replication_slots
+             WHERE slot_name = '$SLOT_NAME' AND database = current_database());")"
+        [[ "$slot_exists" == "t" ]] || { sleep 0.2; continue; }
+        slot_active="$(psqlq -c "SELECT COALESCE(
+            (SELECT active::text FROM pg_replication_slots
+              WHERE slot_name = '$SLOT_NAME' AND database = current_database()), 'f');")"
+        if [[ "$slot_active" == "t" ]]; then
+            seen_active=1
+            break
+        fi
+        # Nudge consume so a healthy capture path advances / attaches.
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+        sleep 0.2
+    done
+    [[ "$slot_exists" == "t" ]] || preflight_fail "logical replication slot $SLOT_NAME missing for current database (qualification bootstrap must create it before bench)"
+    if (( seen_active == 0 )); then
+        # Accept a healthy idle slot when capture is running and lag is readable:
+        # active flickers false between decode cycles and may be missed.
+        lag="$(slot_lag_bytes)"
+        [[ -n "$lag" && "$lag" =~ ^[0-9]+$ ]] \
+            || preflight_fail "logical replication slot $SLOT_NAME never observed active and lag is unreadable"
+    fi
 
     lag="$(slot_lag_bytes)"
+    [[ -n "$lag" && "$lag" =~ ^[0-9]+$ ]] || preflight_fail "could not read slot lag for $SLOT_NAME"
     START_SLOT_LAG=$lag
-    export START_SLOT_LAG SLOT_NAME
+    export START_SLOT_LAG
     (( lag <= MAX_START_LAG_BYTES )) || preflight_fail "slot lag ${lag}B exceeds PG_FLASHBACK_BENCH_MAX_START_LAG_BYTES=${MAX_START_LAG_BYTES}B"
 
     leftovers="$(psqlq -c "SELECT count(*) FROM flashback.tracked_tables tt
@@ -494,6 +527,12 @@ done
 
 trap - EXIT
 cleanup_all_created
+
+[[ -n "$START_SLOT_LAG" && "$START_SLOT_LAG" =~ ^[0-9]+$ ]] || START_SLOT_LAG=0
+[[ -n "$PREFLIGHT_JSON" ]] || PREFLIGHT_JSON='{}'
+printf '%s' "$PREFLIGHT_JSON" | jq -e . >/dev/null 2>&1 || PREFLIGHT_JSON='{}'
+printf '%s' "$RESULTS" | jq -e . >/dev/null 2>&1 || die "results accumulator is not valid JSON"
+printf '%s' "$host_meta" | jq -e . >/dev/null 2>&1 || die "host metadata is not valid JSON"
 
 jq -n \
   --argjson host "$host_meta" \
