@@ -59,6 +59,10 @@ mod tests {
     }
 
     sql_test!(
+        it_wal_test_seam_contract,
+        "../tests/sql/integration/wal_test_seam_contract.sql"
+    );
+    sql_test!(
         it_dml_insert_restore,
         "../tests/sql/integration/dml_insert_restore.sql"
     );

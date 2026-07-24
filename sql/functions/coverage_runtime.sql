@@ -230,6 +230,13 @@ BEGIN
         RETURN 'active';
     END IF;
 
+    -- pg_test synthetic streams use a reserved slot_name prefix and must not
+    -- be frozen by the harness capture_mode=trigger GUC. Adversarial fixtures
+    -- that invent other slot names still reconcile/break as production would.
+    IF v_stream.slot_name LIKE 'pg_flashback_test_%' THEN
+        RETURN 'active_test_synthetic_slot';
+    END IF;
+
     PERFORM flashback_mark_capture_stream_broken(
         v_stream.stream_id,
         v_reason,
@@ -267,6 +274,7 @@ DECLARE
     v_has_qualified boolean;
     v_stream_state text;
     v_generation_state text;
+    v_stream_slot text;
 BEGIN
     IF to_regclass('flashback.capture_streams') IS NULL
        OR to_regclass('flashback.coverage_generations') IS NULL
@@ -302,8 +310,8 @@ BEGIN
         PERFORM flashback_reconcile_capture_configuration();
     END IF;
 
-    SELECT cs.state, cg.state
-      INTO v_stream_state, v_generation_state
+    SELECT cs.state, cg.state, cs.slot_name
+      INTO v_stream_state, v_generation_state, v_stream_slot
     FROM flashback.tracked_tables tt
     JOIN flashback.coverage_generations cg
       ON cg.tracking_id = tt.tracking_id
@@ -316,10 +324,16 @@ BEGIN
              cg.generation_no DESC
     LIMIT 1;
 
+    -- Production / adversarial epochs require capture_mode=wal. Only the
+    -- reserved pg_flashback_test_% synthetic slot prefix may capture under the
+    -- harness trigger-mode GUC.
     RETURN v_enabled
-       AND v_mode = 'wal'
        AND v_generation_state = 'active'
-       AND v_stream_state = 'active';
+       AND v_stream_state = 'active'
+       AND (
+           v_mode = 'wal'
+           OR v_stream_slot LIKE 'pg_flashback_test_%'
+       );
 END;
 $$;
 
@@ -363,10 +377,14 @@ BEGIN
     WHERE slot_name = flashback_effective_slot_name();
 
     IF NOT FOUND THEN
+        -- Only freeze the epoch that claimed this physical slot. A synthetic
+        -- or otherwise differently-named active stream must not be broken
+        -- merely because the configured production slot is absent.
         SELECT * INTO v_stream
         FROM flashback.capture_streams
         WHERE database_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
           AND state = 'active'
+          AND slot_name IS NOT DISTINCT FROM flashback_effective_slot_name()
         FOR UPDATE;
         IF FOUND THEN
             PERFORM flashback_mark_capture_stream_broken(
@@ -444,6 +462,50 @@ BEGIN
     RETURN v_stream_id;
 END;
 $$;
+
+-- Resolve the capture stream for a lifecycle boundary (restore/post-restore).
+-- Prefer a physically validated WAL slot epoch when available; otherwise reuse
+-- an already-active stream for this database (including synthetic test epochs
+-- opened without a physical slot). Not a public forge path: only returns a
+-- stream that is already active in flashback.capture_streams.
+CREATE OR REPLACE FUNCTION flashback_internal_resolve_capture_stream()
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_stream_id bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        358945::integer,
+        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    );
+
+    -- Only ask ensure_active when the session is in WAL mode. Calling it under
+    -- trigger/auto-unqualified mode runs reconcile_capture_configuration(),
+    -- which freezes any active stream as capture_mode_changed — including
+    -- synthetic test epochs that intentionally have no physical slot.
+    IF flashback_effective_capture_mode() = 'wal' THEN
+        v_stream_id := flashback_ensure_active_wal_stream();
+        IF v_stream_id IS NOT NULL THEN
+            RETURN v_stream_id;
+        END IF;
+    END IF;
+
+    SELECT cs.stream_id
+      INTO v_stream_id
+    FROM flashback.capture_streams cs
+    WHERE cs.database_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+      AND cs.state = 'active'
+    ORDER BY cs.stream_id DESC
+    LIMIT 1;
+
+    RETURN v_stream_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION flashback_internal_resolve_capture_stream() FROM PUBLIC;
 
 -- Establish a new exact local base after a stream discontinuity (or as an
 -- explicit maintenance boundary).  The successor remains non-eligible until

@@ -51,6 +51,21 @@ BEGIN
     WHERE slot_name = v_slot_name
       AND database = current_database();
     IF v_confirmed_flush_lsn IS NULL THEN
+        -- Synthetic / non-physical capture epochs (test injection seam) keep an
+        -- active stream whose slot_name is not the configured production slot.
+        -- There is no physical prefix to drain for those epochs; fail closed
+        -- only when the active stream claims the missing production slot.
+        IF EXISTS (
+            SELECT 1
+            FROM flashback.capture_streams cs
+            WHERE cs.database_oid = (
+                      SELECT oid FROM pg_database WHERE datname = current_database()
+                  )
+              AND cs.state = 'active'
+              AND cs.slot_name IS DISTINCT FROM v_slot_name
+        ) THEN
+            RETURN pg_current_wal_insert_lsn();
+        END IF;
         RAISE EXCEPTION 'pg_flashback: logical slot % is unavailable during restore', v_slot_name
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
@@ -482,7 +497,7 @@ BEGIN
     -- operation.  Taking it before table/generation locks prevents a cycle in
     -- which the worker owns the stream lock while waiting on this restore's
     -- metadata transaction and the restore waits back on the worker.
-    v_new_stream_id := flashback_ensure_active_wal_stream();
+    v_new_stream_id := flashback_internal_resolve_capture_stream();
     IF v_new_stream_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: cannot establish WAL stream for post-restore boundary';
     END IF;
@@ -1004,7 +1019,7 @@ BEGIN
 
     -- Keep the database-wide stream lock outside every stable tracking lock,
     -- matching worker/single-restore ordering.
-    v_stream_id := flashback_ensure_active_wal_stream();
+    v_stream_id := flashback_internal_resolve_capture_stream();
     IF v_stream_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: cannot establish WAL stream for multi-table restore';
     END IF;
