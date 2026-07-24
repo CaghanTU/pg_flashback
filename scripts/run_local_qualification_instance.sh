@@ -123,7 +123,6 @@ max_replication_slots = 16
 max_wal_senders = 16
 max_worker_processes = 16
 max_slot_wal_keep_size = '4GB'
-track_commit_timestamp = on
 fsync = on
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal

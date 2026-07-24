@@ -17,10 +17,15 @@ fail closed. Use `pg_flashback config recommend` for read-only advice.
 |---|---|
 | PostgreSQL | 15, 16, 17, 18 |
 | Operating system | Linux |
-| Capture | Logical WAL (`local_delta`) |
+| Capture | Logical WAL only (`local_delta`); capture worker + logical slot required |
 | Topology | Writable primary with one local logical slot per configured database |
 | CLI dependencies | `psql`, `jq`, libpq connection settings |
 | Operator role | Login role with `flashback_admin` (superuser only for install) |
+| `wal_level` | `logical` (required) |
+| `track_commit_timestamp` | Not required |
+| `capture_mode` | Deprecated compatibility GUC; only `wal` is valid |
+| DML capture triggers | Not installed on user tables |
+| Ordinary (non-internal) triggers | Preserved through protect/restore |
 
 Native macOS is not supported. Linux/aarch64 development under Lima and
 Linux/x86_64 builds are separate environments; evidence from one architecture
@@ -133,6 +138,7 @@ successful verified recovery.
 | `cleanup --tracking-id` | Supported with dry-run and safety checks |
 | Downgrade | Unsupported |
 | Extension upgrade | `0.1.0` to `0.2.0` only |
+| Upgrade from legacy trigger installs | Flush old `staging_events` (previous binary) or unprotect/drain, then upgrade; nonempty staging refuses WAL-only migration |
 | PostgreSQL major `pg_upgrade` | Not yet a supported workflow |
 
 ## Physical-backup subsystem (deferred)

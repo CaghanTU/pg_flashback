@@ -226,10 +226,6 @@ mod tests {
         "../tests/sql/integration/batch_replay_mixed_ops.sql"
     );
     sql_test!(
-        it_noop_update_skip,
-        "../tests/sql/integration/noop_update_skip.sql"
-    );
-    sql_test!(
         it_native_partition_restore,
         "../tests/sql/integration/native_partition_restore.sql"
     );
@@ -290,14 +286,6 @@ mod tests {
         "../tests/sql/integration/dependent_view_chain_restore.sql"
     );
     sql_test!(
-        it_staging_events_logged,
-        "../tests/sql/integration/staging_events_logged.sql"
-    );
-    sql_test!(
-        it_leaf_partition_trigger_type,
-        "../tests/sql/integration/leaf_partition_trigger_type.sql"
-    );
-    sql_test!(
         it_leaf_partition_restore_reattach,
         "../tests/sql/integration/leaf_partition_restore_reattach.sql"
     );
@@ -320,10 +308,6 @@ mod tests {
     sql_test!(
         it_retention_active_partition_survives,
         "../tests/sql/integration/retention_active_partition_survives.sql"
-    );
-    sql_test!(
-        it_trigger_pipeline_restore,
-        "../tests/sql/integration/trigger_pipeline_restore.sql"
     );
     sql_test!(
         it_coverage_schema_contract,
@@ -361,6 +345,26 @@ mod tests {
         it_disaster_points_ambiguous_generation,
         "../tests/sql/integration/disaster_points_ambiguous_generation.sql"
     );
+    sql_test!(
+        it_wal_only_fresh_install,
+        "../tests/sql/integration/wal_only_fresh_install.sql"
+    );
+    sql_test!(
+        it_unsupported_capture_mode_rejected,
+        "../tests/sql/integration/unsupported_capture_mode_rejected.sql"
+    );
+    sql_test!(
+        it_wal_prerequisites_failclosed,
+        "../tests/sql/integration/wal_prerequisites_failclosed.sql"
+    );
+    sql_test!(
+        it_upgrade_staging_migration,
+        "../tests/sql/integration/upgrade_staging_migration.sql"
+    );
+    sql_test!(
+        it_production_capture_surface_absent,
+        "../tests/sql/integration/production_capture_surface_absent.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.
@@ -378,7 +382,7 @@ pub mod pg_test {
             "wal_level=logical",
             "max_replication_slots=10",
             "shared_preload_libraries='pg_flashback'",
-            "pg_flashback.capture_mode='trigger'",
+            "pg_flashback.capture_mode='wal'",
             "pg_flashback.local_max_snapshot_bytes='8GB'",
             "pg_flashback.local_max_restore_peak_bytes='16GB'",
             "pg_flashback.local_min_filesystem_bytes='64MB'",

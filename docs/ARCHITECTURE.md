@@ -19,6 +19,14 @@ transactionally aligned base image plus a proven prefix of logical WAL.
 
 ## Capture path
 
+pg_flashback is WAL-only. There is no trigger-based DML capture path and no
+`auto` fallback. `pg_flashback.capture_mode` remains as a deprecated
+compatibility GUC; only `wal` is operational. Capture requires
+`wal_level=logical`, an admitted capture worker, and a logical replication
+slot per configured database. `track_commit_timestamp` is not required.
+Ordinary user triggers on protected tables are preserved; the extension does
+not attach `flashback_capture_*` DML triggers.
+
 ```text
 application transaction
         |
@@ -39,6 +47,17 @@ The decoder may observe row changes before it sees their commit record.
 pg_flashback does not make them recoverable until the complete transaction is
 known. The coverage watermark is therefore a COMMIT-LSN boundary, not an event
 timestamp.
+
+### Upgrading from a legacy trigger install
+
+Older builds used DML capture triggers and `flashback.staging_events`. Before
+reloading a WAL-only binary:
+
+1. Flush or drain any non-empty staging with the previous binary
+   (`flashback_flush_staging`), or unprotect/re-anchor after draining capture.
+2. Do not manually `DELETE` staging rows.
+3. Reload/upgrade; empty leftover staging and `flashback_capture_*` triggers
+   are dropped automatically. Non-empty staging fails closed.
 
 ## Coverage generations
 

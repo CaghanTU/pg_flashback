@@ -35,9 +35,12 @@ BEGIN
         RAISE EXCEPTION 'boundary generation not active at injected COMMIT LSN';
     END IF;
 
-    -- Inject ordered multi-event commit under capture_mode=trigger (harness default).
-    PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
+    -- Inject ordered multi-event commit (WAL-only; session mode must be wal).
+    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     SELECT flashback_effective_capture_mode() INTO v_mode_a;
+    IF v_mode_a <> 'wal' THEN
+        RAISE EXCEPTION 'expected wal effective mode, got %', v_mode_a;
+    END IF;
 
     PERFORM flashback_test_inject_commit(
         v_tracking_id,
@@ -154,11 +157,11 @@ BEGIN
         RAISE EXCEPTION 'expected frontier to remain 0/2000 after lower LSN attempt, got %', v_vt;
     END IF;
 
-    -- Same inject under capture_mode=wal must not depend on session mode.
+    -- Same inject remains independent of re-asserting capture_mode=wal.
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     SELECT flashback_effective_capture_mode() INTO v_mode_b;
-    IF v_mode_a = v_mode_b THEN
-        RAISE EXCEPTION 'mode independence setup failed';
+    IF v_mode_b <> 'wal' THEN
+        RAISE EXCEPTION 'expected wal effective mode on re-assert, got %', v_mode_b;
     END IF;
 
     PERFORM flashback_test_inject_commit(
@@ -202,7 +205,7 @@ BEGIN
     END IF;
 
     -- Non-superuser must not EXECUTE internal promote core.
-    PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
+    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     v_failed := false;
     BEGIN
         EXECUTE $q$

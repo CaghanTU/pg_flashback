@@ -68,7 +68,6 @@ Every file under `tests/sql/integration/*.sql` is classified exactly once in
 | class | meaning |
 | --- | --- |
 | `supported-core` | Supported WAL/local_delta product behavior; fixtures use the pg_test-only WAL injection seam |
-| `legacy-trigger` | Validates legacy trigger capture mode itself (kept until trigger-mode removal) |
 | `infra` | Shared setup, RBAC/schema scaffolding, or capture-source-independent checks |
 
 Validate with:
@@ -87,6 +86,13 @@ not contain test-semantics markers (`pg_flashback_test_`,
 
 ```bash
 PG_MAJOR=17 scripts/check_generated_sql_no_test_surface.sh
+```
+
+Production SQL and the capture worker must also remain WAL-only (no
+`staging_events` / trigger-capture CREATE surface):
+
+```bash
+PG_MAJOR=17 scripts/check_core_wal_only_surface.sh
 ```
 
 ## Focused integration suites

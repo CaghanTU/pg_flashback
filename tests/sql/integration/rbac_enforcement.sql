@@ -137,7 +137,6 @@ BEGIN
             ('flashback_admin', 'public.flashback_recover_deleted_lsn(text,pg_lsn)'),
             ('flashback_admin', 'public.flashback_checkpoint(text)'),
             ('flashback_admin', 'public.flashback_reanchor(text)'),
-            ('flashback_admin', 'public.flashback_flush_staging(integer)'),
             ('flashback_admin', 'public.flashback_consume_wal(integer)'),
             ('flashback_admin', 'public.flashback_apply_retention()'),
             ('flashback_admin', 'public.flashback_query(text,timestamp with time zone,text)'),
@@ -284,17 +283,17 @@ BEGIN
         'flashback_admin',
         'public.flashback_set_restore_in_progress(boolean)',
         'EXECUTE'
-    ) OR has_function_privilege(
-        'flashback_admin',
-        'public.flashback_attach_capture_trigger(text,text)',
-        'EXECUTE'
-    ) OR has_function_privilege(
-        'flashback_admin',
-        'public.flashback_detach_capture_trigger(text,text)',
-        'EXECUTE'
     ) THEN
         RAISE EXCEPTION
             'flashback_admin can execute capture-bypass internals';
+    END IF;
+
+    -- Legacy trigger-capture admin APIs must not exist at all.
+    IF to_regprocedure('flashback_flush_staging(integer)') IS NOT NULL
+       OR to_regprocedure('flashback_attach_capture_trigger(text,text)') IS NOT NULL
+       OR to_regprocedure('flashback_detach_capture_trigger(text,text)') IS NOT NULL
+    THEN
+        RAISE EXCEPTION 'legacy flush/attach/detach capture functions must not exist';
     END IF;
 
     -- pg_monitor must NOT execute payload-bearing flashback_history().

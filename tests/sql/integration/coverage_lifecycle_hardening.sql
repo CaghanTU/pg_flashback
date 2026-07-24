@@ -325,9 +325,9 @@ BEGIN
         NULL;
     END;
 
-    -- A caller-local trigger GUC cannot reroute DDL from an already-qualified
-    -- WAL generation. The synchronous guard freezes the epoch and fails
-    -- closed; no unbound trigger payload may be manufactured.
+    -- A caller-local illegal capture_mode GUC cannot reroute DDL from an
+    -- already-qualified WAL generation. The synchronous guard freezes the
+    -- epoch and fails closed.
     PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
     v_failed := false;
     BEGIN
@@ -337,7 +337,8 @@ BEGIN
         );
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%capture configuration%' OR
-           SQLERRM LIKE '%WAL stream%' THEN
+           SQLERRM LIKE '%WAL stream%' OR
+           SQLERRM LIKE '%not supported%' THEN
             v_failed := true;
         ELSE
             RAISE;
@@ -355,7 +356,7 @@ BEGIN
     END IF;
 
     IF flashback_reconcile_capture_configuration() <> 'capture_mode_changed' THEN
-        RAISE EXCEPTION 'capture_mode transition was not reconciled as a break';
+        RAISE EXCEPTION 'illegal capture_mode transition was not reconciled as a break';
     END IF;
     IF NOT EXISTS (
         SELECT 1 FROM flashback.capture_streams
@@ -368,7 +369,7 @@ BEGIN
           AND source_generation_id = v_generation_2
           AND reason = 'capture_mode_changed'
     ) THEN
-        RAISE EXCEPTION 'capture_mode transition did not durably freeze coverage';
+        RAISE EXCEPTION 'illegal capture_mode transition did not durably freeze coverage';
     END IF;
 
     v_failed := false;
@@ -379,7 +380,8 @@ BEGIN
         );
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM LIKE '%DDL capture refused because WAL stream%'
-           OR SQLERRM LIKE '%capture configuration%' THEN
+           OR SQLERRM LIKE '%capture configuration%'
+           OR SQLERRM LIKE '%not supported%' THEN
             v_failed := true;
         ELSE
             RAISE;
@@ -587,17 +589,8 @@ BEGIN
     ) RETURNING generation_id INTO v_enabled_generation;
 
     -- A session-local SUSET override must not bypass the worker's epoch
-    -- protocol.  The real capture trigger reconciles enabled=off itself,
-    -- opens one LOGGED gap, and refuses to stage the row.
-    PERFORM flashback_attach_capture_trigger('public', 'it_enabled_hardening');
+    -- protocol. enabled=off reconciles as a break and opens one LOGGED gap.
     PERFORM set_config('pg_flashback.enabled', 'off', true);
-    INSERT INTO public.it_enabled_hardening VALUES (1, 'session-disabled');
-    IF EXISTS (
-        SELECT 1 FROM flashback.staging_events
-        WHERE rel_oid = 'public.it_enabled_hardening'::regclass
-    ) THEN
-        RAISE EXCEPTION 'session-local enabled=off bypassed the qualified capture guard';
-    END IF;
     IF flashback_reconcile_capture_configuration() NOT IN ('capture_disabled', 'disabled') THEN
         RAISE EXCEPTION 'enabled=off transition was not reconciled as a break';
     END IF;

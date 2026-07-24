@@ -56,13 +56,13 @@ BEGIN
       AND n.nspname = 'flashback'
       AND c.relname IN (
           'tracking_lifecycles', 'tracked_tables', 'delta_log', 'snapshots', 'restore_log',
-          'staging_events', 'schema_versions', 'capture_streams', 'capture_commits',
+          'schema_versions', 'capture_streams', 'capture_commits',
           'coverage_generations', 'coverage_gaps', 'pending_wal_events',
           'generation_payload_retirements'
       );
 
-    IF v_cnt <> 13 THEN
-        RAISE EXCEPTION 'expected 13 core/coverage tables owned by extension, got %', v_cnt;
+    IF v_cnt <> 12 THEN
+        RAISE EXCEPTION 'expected 12 core/coverage tables owned by extension, got %', v_cnt;
     END IF;
 END;
 $tv2$;

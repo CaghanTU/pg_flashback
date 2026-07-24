@@ -8,8 +8,12 @@ product.
 
 Protection cost is driven by **table size**, **change rate**, and **free disk**,
 not by total database size. The supported path is local base image + logical
-WAL capture. Physical-backup recovery is deferred and not part of the tree
-(see [deferred backup](DEFERRED_BACKUP.md)).
+WAL capture only (`wal_level=logical`, capture worker + logical slot). There is
+no trigger-based DML capture path and no auto fallback. Physical-backup recovery
+is deferred and not part of the tree (see [deferred backup](DEFERRED_BACKUP.md)).
+
+`pg_flashback.capture_mode` is deprecated compatibility wiring: only `wal` is
+operational. `track_commit_timestamp` is not required.
 
 ## Prerequisites
 
@@ -33,6 +37,7 @@ max_replication_slots = 8
 max_wal_senders = 8
 max_slot_wal_keep_size = '4GB'
 pg_flashback.enabled = on
+# Deprecated compatibility GUC — only wal is valid (trigger/auto fail closed).
 pg_flashback.capture_mode = wal
 pg_flashback.target_databases = 'appdb'
 pg_flashback.max_workers = 4
@@ -44,7 +49,7 @@ pg_flashback.local_safety_reserve_bytes = '64MB'
 
 `local_max_snapshot_bytes`, `local_max_restore_peak_bytes`, and
 `local_min_filesystem_bytes` are mandatory. When unset, `protect` and restore
-fail closed.
+fail closed. `track_commit_timestamp` is not required.
 
 pg_flashback does **not** edit `postgresql.conf` for you. Copy the lines,
 restart PostgreSQL, then continue.

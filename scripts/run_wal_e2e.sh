@@ -1228,6 +1228,7 @@ echo "  ok: enabled=off ile re-anchor arasındaki boşluk kalıcı reddedildi"
 
 CONFIG_MODE_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams WHERE state='active'")
 CONFIG_MODE_GENERATION=$CONFIG_ENABLED_REANCHOR
+# Illegal capture_mode must break the stream (WAL-only: trigger is rejected).
 qp "ALTER SYSTEM SET pg_flashback.capture_mode = 'trigger'" > /dev/null
 qp "SELECT pg_reload_conf()" > /dev/null
 for _ in $(seq 1 100); do
@@ -1235,10 +1236,10 @@ for _ in $(seq 1 100); do
                WHERE stream_id=$CONFIG_MODE_STREAM")" == "capture_mode_changed" ]] && break
     sleep 0.1
 done
-assert_eq "capture_mode=trigger stream'i senkron kırdı" "capture_mode_changed" \
+assert_eq "illegal capture_mode=trigger stream'i senkron kırdı" "capture_mode_changed" \
     "$(q "SELECT invalidation_reason FROM flashback.capture_streams
            WHERE stream_id=$CONFIG_MODE_STREAM")"
-assert_eq "capture_mode değişimi orders için tek LOGGED gap açtı" "1" \
+assert_eq "illegal capture_mode değişimi orders için tek LOGGED gap açtı" "1" \
     "$(q "SELECT count(*) FROM flashback.coverage_gaps
            WHERE source_generation_id=$CONFIG_MODE_GENERATION
              AND reason='capture_mode_changed'")"
@@ -1251,7 +1252,7 @@ $PSQL -d "$DB" -qc "ALTER TABLE orders SET (autovacuum_enabled = false)" \
 # the durable stream-state check, the fail-closed guard reports either the
 # stream state or the disabled/no-active-epoch reason. Both are the required
 # invariant: no DDL may commit while the qualified WAL stream is broken.
-grep -Eq "DDL capture refused because (WAL stream|capture configuration is disabled)" \
+grep -Eq "DDL capture refused because (WAL stream|capture configuration is disabled)|capture_mode=.*is not supported" \
     /tmp/pg_flashback_mode_ddl_reject.out
 echo "  ok: broken qualified stream üzerinde DDL fail-closed"
 

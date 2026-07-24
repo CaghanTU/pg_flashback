@@ -1,4 +1,5 @@
 -- Adversarial: production restore/drain/guard must not trust synthetic streams.
+-- Stay on capture_mode=wal; never treat trigger mode as a production path.
 DO $tv$
 DECLARE
     v_stream_id bigint;
@@ -9,6 +10,7 @@ DECLARE
     v_snap text;
 BEGIN
     CREATE TABLE public.it_failclosed_synth (id int PRIMARY KEY);
+    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
 
     -- 1) Configured physical slot missing + differently-named active stream:
     --    drain must fail closed.
@@ -35,8 +37,10 @@ BEGIN
         END IF;
     END;
 
-    -- 2) Active stream named pg_flashback_test_*: guard must NOT qualify under
-    --    trigger mode just because of the slot name.
+    -- 2) Active stream named pg_flashback_test_*: under wal, names never relax
+    --    the gate. configuration_guard is mode/state based (returns true while
+    --    enabled+wal+active), but drain must still fail closed without a
+    --    physical slot — no synthetic-name bypass into drained admission.
     UPDATE flashback.capture_streams
        SET slot_name = 'pg_flashback_test_adversarial'
      WHERE stream_id = v_stream_id;
@@ -77,20 +81,35 @@ BEGIN
         clock_timestamp()
     );
 
-    PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
     v_ok := flashback_capture_configuration_guard('public.it_failclosed_synth'::regclass);
-    IF v_ok THEN
-        RAISE EXCEPTION 'guard must not accept qualified generation under trigger mode via test slot name';
+    IF NOT v_ok THEN
+        RAISE EXCEPTION 'wal+enabled+active generation should pass configuration_guard (names are irrelevant)';
     END IF;
 
-    -- 3) capture_mode trigger: reconcile must break active stream (no name exemption).
-    PERFORM flashback_reconcile_capture_configuration();
+    BEGIN
+        PERFORM flashback_assert_relation_wal_drained(
+            ARRAY['public.it_failclosed_synth'::regclass::oid]
+        );
+        RAISE EXCEPTION 'synthetic test slot name must not bypass drain without a physical slot';
+    EXCEPTION WHEN others THEN
+        GET STACKED DIAGNOSTICS v_err = MESSAGE_TEXT;
+        IF position('unavailable' IN lower(v_err)) = 0 THEN
+            RAISE EXCEPTION 'unexpected drain error under synthetic name: %', v_err;
+        END IF;
+    END;
+
+    -- 3) enabled=off: reconcile must break active stream (no name exemption).
+    PERFORM set_config('pg_flashback.enabled', 'off', true);
+    IF flashback_reconcile_capture_configuration() NOT IN ('capture_disabled', 'disabled') THEN
+        RAISE EXCEPTION 'enabled=off reconcile did not break the adversarial stream';
+    END IF;
     IF EXISTS (
         SELECT 1 FROM flashback.capture_streams
         WHERE stream_id = v_stream_id AND state = 'active'
     ) THEN
-        RAISE EXCEPTION 'reconcile left test-named stream active under trigger mode';
+        RAISE EXCEPTION 'reconcile left test-named stream active under enabled=off';
     END IF;
+    PERFORM set_config('pg_flashback.enabled', 'on', true);
 
     -- 4) Configured slot missing with stale active stream: ensure_active fails
     --    closed and breaks the stale epoch.
@@ -105,7 +124,6 @@ BEGIN
         '0/1'::pg_lsn, '0/1'::pg_lsn, clock_timestamp()
     ) RETURNING stream_id INTO v_stream_id;
 
-    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     IF flashback_ensure_active_wal_stream() IS NOT NULL THEN
         RAISE EXCEPTION 'ensure_active must not return a stream when physical slot is absent';
     END IF;

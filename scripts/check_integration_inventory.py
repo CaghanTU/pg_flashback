@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION = ROOT / "tests" / "sql" / "integration"
 INVENTORY = INTEGRATION / "INVENTORY.json"
 LIB_RS = ROOT / "src" / "lib.rs"
-ALLOWED = {"supported-core", "legacy-trigger", "infra"}
+ALLOWED = {"supported-core", "infra"}
 DIRECT_DELTA_RE = re.compile(
     r"INSERT\s+INTO\s+flashback\.(delta_log|pending_wal_events)\b",
     re.IGNORECASE,
@@ -99,7 +99,7 @@ def main() -> int:
 
     print("Integration inventory OK")
     print(f"  total_sql={len(on_disk)}")
-    for cls in ("supported-core", "legacy-trigger", "infra"):
+    for cls in ("supported-core", "infra"):
         print(f"  {cls}={counts[cls]}")
     print(f"  registered_tests={len(registered_tests)}")
     print(f"  shared_setup_files={len(shared_setup_files)}")

@@ -16,7 +16,6 @@ DECLARE
     v_failed boolean;
     v_msg text;
     v_advice record;
-    v_tracked boolean;
 BEGIN
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     PERFORM set_config('pg_flashback.local_max_snapshot_bytes', '1kB', true);
@@ -125,14 +124,25 @@ BEGIN
         RAISE EXCEPTION 'filesystem available bytes probe returned non-positive value';
     END IF;
 
-    -- Trigger-mode track still functions for legacy tests without depending on
-    -- the WAL-only lock/copy path exercised above.
+    -- Illegal capture_mode must not admit a successful track path.
     PERFORM set_config('pg_flashback.capture_mode', 'trigger', true);
     PERFORM set_config('pg_flashback.local_max_snapshot_bytes', '8GB', true);
-    v_tracked := flashback_track('public.it_capacity_guard');
-    IF NOT v_tracked THEN
-        RAISE EXCEPTION 'bounded trigger track failed unexpectedly';
+    v_failed := false;
+    BEGIN
+        PERFORM flashback_track('public.it_capacity_guard');
+    EXCEPTION WHEN OTHERS THEN
+        v_failed := true;
+        v_msg := SQLERRM;
+    END;
+    IF NOT v_failed OR v_msg NOT LIKE '%not supported%' THEN
+        RAISE EXCEPTION 'trigger capture_mode track must be rejected, got: %', v_msg;
     END IF;
-    PERFORM flashback_untrack('public.it_capacity_guard');
+    IF EXISTS (
+        SELECT 1 FROM flashback.tracked_tables
+        WHERE table_name = 'it_capacity_guard'
+    ) THEN
+        RAISE EXCEPTION 'rejected trigger-mode track left tracked_tables metadata';
+    END IF;
+    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
 END;
 $test$;

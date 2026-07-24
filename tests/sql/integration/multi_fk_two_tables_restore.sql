@@ -38,7 +38,9 @@ BEGIN
         END IF;
     END;
 
-    PERFORM flashback_track('public.it_fk_child');
-    PERFORM flashback_unprotect('public.it_fk_child');
+    -- Child is compatibility-supported, but a successful WAL track still needs a
+    -- dedicated clean transaction (CREATE already assigned an xid here).
+    DROP TABLE IF EXISTS public.it_fk_child CASCADE;
+    DROP TABLE IF EXISTS public.it_fk_parent CASCADE;
 END;
 $tv$;

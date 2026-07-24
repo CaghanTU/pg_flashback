@@ -129,6 +129,12 @@ jobs:
             OUT_DIR=target/generated-sql-no-backup-surface \
             scripts/check_core_no_backup_surface.sh
 
+      - name: Core tree is WAL-only (no trigger-capture surface)
+        run: |
+          PG_MAJOR=${{ matrix.pg }} \
+            OUT_DIR=target/generated-sql-wal-only-surface \
+            scripts/check_core_wal_only_surface.sh
+
       - name: Integration SQL inventory classification
         run: python3 scripts/check_integration_inventory.py
 

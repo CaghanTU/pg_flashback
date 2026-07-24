@@ -2,8 +2,7 @@
   "files": {
     "_common_setup.sql": {
       "class": "infra",
-      "reason": "shared truncate + legacy fake-trigger helpers; adversarial-fixture direct capture-table write",
-      "adversarial_fixture": true
+      "reason": "shared truncate helpers for integration harness"
     },
     "acl_preservation_restore.sql": {
       "class": "supported-core",
@@ -35,12 +34,12 @@
     },
     "coverage_lifecycle_hardening.sql": {
       "class": "infra",
-      "reason": "lifecycle hardening with adversarial fixtures",
+      "reason": "lifecycle hardening with adversarial fixtures under wal",
       "adversarial_fixture": true
     },
     "coverage_schema_contract.sql": {
       "class": "infra",
-      "reason": "coverage schema scaffolding; adversarial-fixture direct capture-table write",
+      "reason": "coverage schema scaffolding; wal-only streams; adversarial-fixture direct capture-table write",
       "adversarial_fixture": true
     },
     "ddl_drop_recreate_same_name_restore.sql": {
@@ -124,6 +123,10 @@
       "class": "supported-core",
       "reason": "toast restore via seam"
     },
+    "exact_drop_identity_propagation.sql": {
+      "class": "supported-core",
+      "reason": "exact DROP disaster_event_id propagation lock_phase\u2192core\u2192expected_proof"
+    },
     "flashback_query_basic.sql": {
       "class": "supported-core",
       "reason": "flashback_query via seam"
@@ -144,13 +147,9 @@
       "class": "infra",
       "reason": "leaf partition track rejection"
     },
-    "leaf_partition_trigger_type.sql": {
-      "class": "legacy-trigger",
-      "reason": "asserts production trigger attach type on leaf"
-    },
     "local_capacity_admission.sql": {
       "class": "infra",
-      "reason": "capacity admission"
+      "reason": "capacity admission under wal; illegal mode rejected"
     },
     "lsn_target_adversarial.sql": {
       "adversarial_fixture": true,
@@ -185,17 +184,13 @@
       "class": "supported-core",
       "reason": "non-public schema restore via seam"
     },
-    "noop_update_skip.sql": {
-      "class": "infra",
-      "reason": "noop update skip without fake trigger fixture"
-    },
     "partitioned_table_restore.sql": {
       "class": "infra",
       "reason": "partitioned parent track rejection"
     },
     "pgdump_compat.sql": {
       "class": "infra",
-      "reason": "pg_dump compatibility scaffolding"
+      "reason": "pg_dump compatibility scaffolding without staging_events"
     },
     "pitr_time_filtering.sql": {
       "class": "supported-core",
@@ -205,9 +200,18 @@
       "class": "supported-core",
       "reason": "post-restore checkpoint via seam"
     },
+    "production_capture_surface_absent.sql": {
+      "class": "supported-core",
+      "reason": "catalog asserts no legacy trigger-capture CREATE surface"
+    },
+    "production_failclosed_no_synthetic_bypass.sql": {
+      "class": "infra",
+      "adversarial_fixture": true,
+      "reason": "adversarial-fixture: production must not trust synthetic streams/names under wal"
+    },
     "rbac_enforcement.sql": {
       "class": "infra",
-      "reason": "RBAC grant surface"
+      "reason": "RBAC grant surface; legacy capture APIs absent"
     },
     "recover_deleted_rows.sql": {
       "class": "supported-core",
@@ -261,17 +265,13 @@
       "class": "infra",
       "reason": "slot health actions"
     },
-    "staging_events_logged.sql": {
-      "class": "infra",
-      "reason": "staging_events logging scaffolding"
-    },
     "subtxn_rollback_restore.sql": {
       "class": "supported-core",
       "reason": "subtransaction restore via seam"
     },
-    "trigger_pipeline_restore.sql": {
-      "class": "legacy-trigger",
-      "reason": "real user trigger pipeline under trigger capture"
+    "unsupported_capture_mode_rejected.sql": {
+      "class": "supported-core",
+      "reason": "trigger/auto capture_mode rejected fail-closed"
     },
     "unsupported_local_topology_rejected.sql": {
       "class": "infra",
@@ -281,30 +281,33 @@
       "class": "supported-core",
       "reason": "untrack/retrack restore via seam"
     },
+    "upgrade_staging_migration.sql": {
+      "class": "infra",
+      "reason": "legacy staging_events cleanup contract via test helper"
+    },
     "view_options_restore.sql": {
       "class": "supported-core",
       "reason": "view options restore via seam"
     },
     "wal_mode_behaviors.sql": {
-      "class": "legacy-trigger",
-      "reason": "asserts trigger vs wal flashback_track capture_mode semantics"
+      "class": "supported-core",
+      "reason": "WAL-only capture_mode reject/default semantics"
+    },
+    "wal_only_fresh_install.sql": {
+      "class": "supported-core",
+      "reason": "fresh install wal-only surface + ordinary trigger restore"
     },
     "wal_payload_type_replay.sql": {
       "class": "supported-core",
       "reason": "WAL payload type replay via seam"
     },
+    "wal_prerequisites_failclosed.sql": {
+      "class": "supported-core",
+      "reason": "illegal mode and non-dedicated-txn leave no metadata"
+    },
     "wal_test_seam_contract.sql": {
       "class": "supported-core",
-      "reason": "seam contract regressions"
-    },
-    "production_failclosed_no_synthetic_bypass.sql": {
-      "class": "infra",
-      "adversarial_fixture": true,
-      "reason": "adversarial-fixture: production must not trust synthetic streams/names"
-    },
-    "exact_drop_identity_propagation.sql": {
-      "class": "supported-core",
-      "reason": "exact DROP disaster_event_id propagation lock_phase→core→expected_proof"
+      "reason": "seam contract regressions under wal"
     }
   },
   "schema_version": 1

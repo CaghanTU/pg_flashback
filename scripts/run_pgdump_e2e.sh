@@ -73,9 +73,17 @@ mkdir -p "$SOCKET_DIR"
     printf "unix_socket_directories = '%s'\n" "$SOCKET_DIR"
     printf "shared_preload_libraries = 'pg_flashback'\n"
     printf "wal_level = 'logical'\n"
-    printf "track_commit_timestamp = 'on'\n"
-    printf "pg_flashback.capture_mode = 'trigger'\n"
-    printf "pg_flashback.target_databases = ''\n"
+    printf "max_replication_slots = 8\n"
+    printf "max_wal_senders = 8\n"
+    printf "max_worker_processes = 16\n"
+    printf "pg_flashback.enabled = on\n"
+    printf "pg_flashback.capture_mode = 'wal'\n"
+    printf "pg_flashback.target_databases = 'pgdump_src'\n"
+    printf "pg_flashback.max_workers = 4\n"
+    printf "pg_flashback.local_max_snapshot_bytes = '8GB'\n"
+    printf "pg_flashback.local_max_restore_peak_bytes = '16GB'\n"
+    printf "pg_flashback.local_min_filesystem_bytes = '64MB'\n"
+    printf "pg_flashback.local_safety_reserve_bytes = '16MB'\n"
 } >>"$PGDATA/postgresql.conf"
 
 "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -w start >/dev/null
@@ -85,6 +93,9 @@ PSQL=("$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -U postgres -h "$SOCKET_DIR" -p "$POR
 CREATEDB=("$PG_BIN/createdb" -U postgres -h "$SOCKET_DIR" -p "$PORT")
 
 "${CREATEDB[@]}" pgdump_src
+# Capture workers bind at postmaster start; restart so pgdump_src is admitted.
+"$PG_BIN/pg_ctl" -D "$PGDATA" -l "$LOGFILE" -w restart >/dev/null
+
 "${PSQL[@]}" -d pgdump_src <<'SQL'
 CREATE EXTENSION pg_flashback;
 CREATE TABLE public.orders (
@@ -96,13 +107,17 @@ INSERT INTO public.orders VALUES
     (1, 'Ada', 10.00),
     (2, 'Linus', 20.00),
     (3, 'Grace', 30.00);
+SQL
 
-SELECT flashback_track('public.orders');
-SELECT flashback_checkpoint('public.orders');
-SELECT flashback_ensure_delta_partition(current_date);
+# flashback_track requires a dedicated transaction with an admitted capture worker.
+"${PSQL[@]}" -d pgdump_src -c "SELECT flashback_track('public.orders');"
+
+"${PSQL[@]}" -d pgdump_src <<'SQL'
+-- WAL capture is asynchronous; for dump-compat we only need application
+-- rows + extension-owned payload adoption, not drained deltas or legacy
+-- full-table checkpoints (disabled for correctness-qualified WAL generations).
 UPDATE public.orders SET amount = amount + 5 WHERE id = 2;
 INSERT INTO public.orders VALUES (4, 'Edsger', 40.00);
-SELECT flashback_flush_staging(1000);
 
 -- Simulate payload created by a pre-fix installation, then run the explicit
 -- upgrade helper. The second call proves idempotency.
@@ -141,7 +156,7 @@ BEGIN
     ) member ON member.objid = c.oid
     WHERE flashback_payload_kind(c.oid::regclass) IS NOT NULL;
 
-    IF v_payloads < 4 THEN
+    IF v_payloads < 2 THEN
         RAISE EXCEPTION 'source payload exercise is incomplete: only % relations', v_payloads;
     END IF;
     IF v_orphans <> 0 THEN
@@ -182,7 +197,6 @@ BEGIN
         + (SELECT count(*) FROM flashback.pending_wal_events)
         + (SELECT count(*) FROM flashback.snapshots)
         + (SELECT count(*) FROM flashback.delta_log)
-        + (SELECT count(*) FROM flashback.staging_events)
         + (SELECT count(*) FROM flashback.schema_versions)
         + (SELECT count(*) FROM flashback.restore_log)
       INTO v_state_rows;

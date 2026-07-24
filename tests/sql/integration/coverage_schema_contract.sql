@@ -128,23 +128,25 @@ BEGIN
     RETURNING stream_id INTO v_stream_id;
 
     INSERT INTO flashback.capture_streams (
-        database_oid, database_name, epoch_no, capture_mode, state, retired_at
+        database_oid, database_name, epoch_no, capture_mode, state, retired_at,
+        timeline_id, slot_name, plugin_name
     ) VALUES (
         (SELECT oid FROM pg_database WHERE datname = current_database()),
-        current_database(), 97, 'trigger', 'retired', clock_timestamp()
+        current_database(), 97, 'wal', 'retired', clock_timestamp(),
+        1, 'it_cov_slot_retired', 'pg_flashback'
     ) RETURNING stream_id INTO v_other_stream_id;
 
-    -- Trigger epochs cannot carry logical-slot/plugin identity.
+    -- Non-wal capture_mode rows are rejected by the WAL-only check constraint.
     BEGIN
         INSERT INTO flashback.capture_streams (
             database_oid, database_name, epoch_no, capture_mode, slot_name,
-            plugin_name, state, activated_at
+            plugin_name, state, activated_at, timeline_id
         ) VALUES (
             (SELECT oid FROM pg_database WHERE datname = current_database()),
-            current_database(), 98, 'trigger', NULL, 'pg_flashback',
-            'active', clock_timestamp()
+            current_database(), 98, 'trigger', 'it_cov_slot_bad', 'pg_flashback',
+            'active', clock_timestamp(), 1
         );
-        RAISE EXCEPTION 'trigger stream with a plugin identity was accepted';
+        RAISE EXCEPTION 'non-wal capture_mode stream was accepted';
     EXCEPTION WHEN check_violation THEN
         NULL;
     END;
@@ -153,10 +155,11 @@ BEGIN
     BEGIN
         INSERT INTO flashback.capture_streams (
             database_oid, database_name, epoch_no, capture_mode, state,
-            activated_at
+            activated_at, timeline_id, slot_name, plugin_name
         ) VALUES (
             (SELECT oid FROM pg_database WHERE datname = current_database()),
-            current_database(), 2, 'trigger', 'active', clock_timestamp()
+            current_database(), 2, 'wal', 'active', clock_timestamp(),
+            1, 'it_cov_slot_2', 'pg_flashback'
         );
         RAISE EXCEPTION 'second active capture stream was accepted';
     EXCEPTION WHEN unique_violation THEN
@@ -278,13 +281,13 @@ BEGIN
     END;
 
     BEGIN
-        INSERT INTO flashback.staging_events (
-            rel_oid, tracking_id, event_type, table_name
+        INSERT INTO flashback.pending_wal_events (
+            tracking_id, generation_id, stream_id, event_type, source_xid, event_lsn
         ) VALUES (
-            v_original_oid, v_tracking_id, 'INSERT', 'public.it_cov_contract'
+            v_tracking_id, v_generation_1, v_stream_id, 'INSERT', 1, v_lsn
         );
-        RAISE EXCEPTION 'partial staging coverage binding was accepted';
-    EXCEPTION WHEN check_violation THEN
+        RAISE EXCEPTION 'partial pending_wal coverage binding was accepted';
+    EXCEPTION WHEN check_violation OR not_null_violation OR foreign_key_violation THEN
         NULL;
     END;
 
@@ -513,9 +516,6 @@ BEGIN
             ('delta_log', 'generation_id'),
             ('delta_log', 'stream_id'),
             ('delta_log', 'commit_lsn'),
-            ('staging_events', 'tracking_id'),
-            ('staging_events', 'generation_id'),
-            ('staging_events', 'stream_id'),
             ('snapshots', 'tracking_id'),
             ('snapshots', 'payload_state'),
             ('snapshots', 'retired_at'),
@@ -557,7 +557,6 @@ BEGIN
           AND conrelid IN (
               'flashback.tracked_tables'::regclass,
               'flashback.delta_log'::regclass,
-              'flashback.staging_events'::regclass,
               'flashback.snapshots'::regclass,
               'flashback.coverage_generations'::regclass,
               'flashback.coverage_gaps'::regclass,
@@ -566,7 +565,7 @@ BEGIN
           AND contype = 'f'
           AND condeferrable
           AND condeferred
-    ) <> 7 THEN
+    ) <> 6 THEN
         RAISE EXCEPTION 'lifecycle children are not bound to immutable parent';
     END IF;
 
@@ -590,18 +589,16 @@ BEGIN
         FROM pg_constraint
         WHERE conrelid IN (
               'flashback.delta_log'::regclass,
-              'flashback.staging_events'::regclass,
               'flashback.pending_wal_events'::regclass
           )
           AND conname IN (
               'delta_log_generation_tracking_stream_fk',
-              'staging_events_generation_tracking_stream_fk',
               'pending_wal_events_generation_fk'
           )
           AND contype = 'f'
           AND condeferrable
           AND condeferred
-    ) <> 3 THEN
+    ) <> 2 THEN
         RAISE EXCEPTION 'payload tuples are not bound to generation/stream identity';
     END IF;
 

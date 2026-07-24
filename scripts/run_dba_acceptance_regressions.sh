@@ -68,7 +68,6 @@ wal_level = logical
 max_replication_slots = 16
 max_wal_senders = 16
 max_worker_processes = 16
-track_commit_timestamp = on
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
 pg_flashback.worker_interval_ms = 25

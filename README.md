@@ -70,8 +70,10 @@ See [the support matrix](docs/SUPPORT.md) for the precise contract.
 ## Requirements
 
 - A supported PostgreSQL server and matching development/package files
-- `wal_level = logical`
+- `wal_level = logical` (required; capture is WAL-only)
 - `shared_preload_libraries = 'pg_flashback'`
+- An admitted capture worker and a logical replication slot per configured
+  database (`pg_flashback.target_databases`)
 - Explicit capacity budgets:
   `pg_flashback.local_max_snapshot_bytes`,
   `pg_flashback.local_max_restore_peak_bytes`,
@@ -79,6 +81,11 @@ See [the support matrix](docs/SUPPORT.md) for the precise contract.
 - Enough `max_worker_processes` capacity for one capture worker and one
   maintenance worker per configured database
 - `psql` and `jq` for the `pg_flashback` command
+
+`track_commit_timestamp` is **not** required. `pg_flashback.capture_mode` is a
+deprecated compatibility GUC; only `wal` is valid (`trigger` and `auto` fail
+closed). pg_flashback does **not** install DML capture triggers on user tables;
+ordinary user triggers are preserved through protect/restore.
 
 See [Quickstart](docs/QUICKSTART.md) and
 [`docs/samples/postgresql.pg_flashback.conf`](docs/samples/postgresql.pg_flashback.conf).
