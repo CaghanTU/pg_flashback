@@ -62,6 +62,49 @@ if [[ -n "${PREV_EXT_SO:-}" && -n "${PREV_EXT_SQL:-}" && -f "${PREV_EXT_SO}" && 
     log "PREV_* provided — upgrade path requires operator-staged 0.1.0 artifacts"
 fi
 
+# ------------------------------------------------------------------
+# H. Fresh-install collision: user-owned same-name objects must survive
+#    a refused CREATE EXTENSION (ownership-proven finalize fail-closed).
+# ------------------------------------------------------------------
+log "H: pre-create colliding user function + staging table"
+"${PSQL[@]}" <<'SQL'
+CREATE FUNCTION public.flashback_capture_insert_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+    -- user-owned collision fingerprint
+    RETURN NEW;
+END;
+$fn$;
+CREATE SCHEMA IF NOT EXISTS flashback;
+CREATE TABLE flashback.staging_events (
+    event_id bigserial PRIMARY KEY,
+    note text NOT NULL
+);
+INSERT INTO flashback.staging_events (note) VALUES ('fresh-install-collision');
+SQL
+FN_FP_BEFORE=$("${PSQL[@]}" -c "SELECT md5(pg_get_functiondef('public.flashback_capture_insert_trigger()'::regprocedure));")
+STG_FP_BEFORE=$("${PSQL[@]}" -c "SELECT md5(string_agg(note, ',' ORDER BY event_id)) FROM flashback.staging_events;")
+
+set +e
+CREATE_ERR=$("${PSQL[@]}" -c "CREATE EXTENSION pg_flashback;" 2>&1)
+CREATE_RC=$?
+set -e
+[[ "$CREATE_RC" -ne 0 ]] || die "H: CREATE EXTENSION must fail-closed on user-owned collision"
+echo "$CREATE_ERR" | rg -qi 'not a pg_flashback extension member|refusing' \
+    || die "H: CREATE EXTENSION error must mention ownership collision; got: $CREATE_ERR"
+[[ "$("${PSQL[@]}" -c "SELECT COUNT(*) FROM pg_extension WHERE extname='pg_flashback';")" == "0" ]] \
+    || die "H: extension must not remain installed after collision refuse"
+FN_FP_AFTER=$("${PSQL[@]}" -c "SELECT md5(pg_get_functiondef('public.flashback_capture_insert_trigger()'::regprocedure));")
+STG_FP_AFTER=$("${PSQL[@]}" -c "SELECT md5(string_agg(note, ',' ORDER BY event_id)) FROM flashback.staging_events;")
+[[ "$FN_FP_BEFORE" == "$FN_FP_AFTER" ]] || die "H: user function definition changed"
+[[ "$STG_FP_BEFORE" == "$STG_FP_AFTER" ]] || die "H: user staging rows changed"
+log "H: collision refuse preserved user function+table fingerprints"
+
+"${PSQL[@]}" -c "DROP TABLE flashback.staging_events;"
+"${PSQL[@]}" -c "DROP FUNCTION public.flashback_capture_insert_trigger();"
+
 "${PSQL[@]}" -c "CREATE EXTENSION pg_flashback;"
 VER=$("${PSQL[@]}" -c "SELECT extversion FROM pg_extension WHERE extname='pg_flashback';")
 [[ "$VER" == "0.2.0" ]] || die "expected extension 0.2.0, got $VER"
@@ -98,7 +141,7 @@ jq -n \
   --arg mode "$MODE" \
   --arg version "$VER" \
   --arg status "passed" \
-  --arg note "Downgrade unsupported per ADR 0001; historical tag v0.4.0 is not an upgrade source." \
+  --arg note "Downgrade unsupported per ADR 0001; historical tag v0.4.0 is not an upgrade source. Fresh-install collision (H) refuse verified." \
   '{
      qualification_kind: "extension_upgrade_e2e",
      status: $status,
@@ -106,6 +149,7 @@ jq -n \
      extension_version: $version,
      supported_upgrade: "0.1.0->0.2.0",
      downgrade: "refuse",
+     fresh_install_collision: "refused_preserved",
      note: $note
    }' > "$RESULT"
 

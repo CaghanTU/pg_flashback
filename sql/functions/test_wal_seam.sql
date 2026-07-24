@@ -512,53 +512,16 @@ BEGIN
 END;
 $$;
 
--- pg_test-only helper: run the same empty-staging cleanup contract as
--- schema_bootstrap WAL-only migration (refuse nonempty; drop empty table +
--- flashback_capture_* triggers + legacy capture functions).
+-- pg_test-only wrapper: exercise the production ownership-proven finalize
+-- routine (never a forked cleanup algorithm).
 CREATE OR REPLACE FUNCTION flashback_test_wal_only_staging_cleanup()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-DECLARE
-    v_count bigint;
-    r record;
 BEGIN
-    IF to_regclass('flashback.staging_events') IS NULL THEN
-        RETURN;
-    END IF;
-
-    EXECUTE 'SELECT count(*) FROM flashback.staging_events' INTO v_count;
-    IF v_count > 0 THEN
-        RAISE EXCEPTION
-            'pg_flashback: flashback.staging_events still contains % row(s); WAL-only upgrade cannot discard them',
-            v_count
-            USING HINT =
-                'Flush with the previous pg_flashback binary (flashback_flush_staging), or unprotect/re-anchor after draining capture, then reload/upgrade. Do not DELETE staging rows manually.';
-    END IF;
-
-    FOR r IN
-        SELECT n.nspname AS sch, c.relname AS tbl, t.tgname
-        FROM pg_trigger t
-        JOIN pg_class c ON c.oid = t.tgrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE NOT t.tgisinternal
-          AND t.tgname LIKE 'flashback_capture_%'
-    LOOP
-        EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I.%I', r.tgname, r.sch, r.tbl);
-    END LOOP;
-
-    DROP FUNCTION IF EXISTS flashback_flush_staging(integer) CASCADE;
-    DROP FUNCTION IF EXISTS flashback_attach_capture_trigger(text, text) CASCADE;
-    DROP FUNCTION IF EXISTS flashback_detach_capture_trigger(text, text) CASCADE;
-    DROP FUNCTION IF EXISTS flashback_capture_insert_trigger() CASCADE;
-    DROP FUNCTION IF EXISTS flashback_capture_insert_row_trigger() CASCADE;
-    DROP FUNCTION IF EXISTS flashback_capture_delete_row_trigger() CASCADE;
-    DROP FUNCTION IF EXISTS flashback_capture_update_trigger() CASCADE;
-    DROP FUNCTION IF EXISTS flashback_capture_delete_trigger() CASCADE;
-
-    DROP TABLE flashback.staging_events;
+    PERFORM flashback_internal_finalize_wal_only_upgrade();
 END;
 $$;
 
