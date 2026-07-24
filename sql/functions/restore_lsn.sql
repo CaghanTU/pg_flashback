@@ -422,7 +422,8 @@ RETURNS TABLE (
     out_tracking_id bigint,
     out_rel_oid oid,
     out_schema_name text,
-    out_table_name text
+    out_table_name text,
+    out_disaster_event_id bigint
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -577,6 +578,7 @@ BEGIN
     out_rel_oid := admission.rel_oid;
     out_schema_name := admission.schema_name;
     out_table_name := admission.table_name;
+    out_disaster_event_id := v_disaster_event_id;
     RETURN NEXT;
     RETURN;
 END;
@@ -584,10 +586,13 @@ $$;
 
 REVOKE ALL ON FUNCTION flashback_restore_lsn_lock_phase(text, pg_lsn) FROM PUBLIC;
 
+DROP FUNCTION IF EXISTS flashback_internal_restore_lsn_core(text, pg_lsn, bigint);
+
 CREATE OR REPLACE FUNCTION flashback_internal_restore_lsn_core(
     p_target_table text,
     p_target_lsn pg_lsn,
-    p_stream_id bigint
+    p_stream_id bigint,
+    p_disaster_event_id bigint DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -627,11 +632,6 @@ DECLARE
     v_restored_rel regclass;
     v_expected_proof jsonb;
     v_restore_verification jsonb;
-    v_disaster_event_id bigint := NULL;
-    v_disaster_commit_lsn pg_lsn := NULL;
-    v_source_xid bigint := NULL;
-    v_disaster_event_type text := NULL;
-    v_audited text;
 BEGIN
     PERFORM flashback_set_restore_in_progress(true);
 
@@ -690,6 +690,8 @@ BEGIN
     );
 
     -- Independent expected proof from pre-swap shadow + target schema_def.
+    -- Manifest selection uses the lock-phase disaster identity only — never
+    -- "latest for tracking_id".
     v_expected_proof := public.flashback_build_expected_restore_proof(
         to_regclass(format('flashback.%I', v_shadow_name)),
         materialized.target_schema_def,
@@ -697,7 +699,7 @@ BEGIN
             SELECT to_jsonb(m) - 'raw_ddl'
             FROM flashback.drop_dependency_manifests m
             WHERE m.tracking_id = admission.tracking_id
-              AND m.disaster_event_id IS NOT DISTINCT FROM v_disaster_event_id
+              AND m.disaster_event_id IS NOT DISTINCT FROM p_disaster_event_id
             LIMIT 1
         ), '{}'::jsonb),
         jsonb_build_object(
@@ -707,7 +709,7 @@ BEGIN
             'boundary_snapshot_id', admission.boundary_snapshot_id,
             'boundary_lsn', admission.boundary_lsn,
             'target_lsn', p_target_lsn,
-            'disaster_event_id', v_disaster_event_id
+            'disaster_event_id', p_disaster_event_id
         )
     );
 
@@ -1024,7 +1026,10 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION flashback_internal_restore_lsn_core(text, pg_lsn, bigint) FROM PUBLIC;
+-- Role-scoped denies for flashback_admin / pg_monitor are applied by the
+-- extension-wide deny-by-default pass in rbac_grants.sql (roles may not exist
+-- yet when this file is loaded during CREATE EXTENSION).
+REVOKE ALL ON FUNCTION flashback_internal_restore_lsn_core(text, pg_lsn, bigint, bigint) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION flashback_restore_lsn(
     p_target_table text,
@@ -1068,7 +1073,10 @@ BEGIN
     PERFORM flashback_assert_relation_wal_drained(ARRAY[v_locked.out_rel_oid]);
 
     RETURN flashback_internal_restore_lsn_core(
-        p_target_table, p_target_lsn, v_stream_id
+        p_target_table,
+        p_target_lsn,
+        v_stream_id,
+        v_locked.out_disaster_event_id
     );
 EXCEPTION WHEN OTHERS THEN
     PERFORM flashback_set_restore_in_progress(false);

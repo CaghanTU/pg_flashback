@@ -317,6 +317,10 @@
       "class": "infra",
       "adversarial_fixture": true,
       "reason": "adversarial-fixture: production must not trust synthetic streams/names"
+    },
+    "exact_drop_identity_propagation.sql": {
+      "class": "supported-core",
+      "reason": "exact DROP disaster_event_id propagation lock_phase\u2192core\u2192expected_proof"
     }
   },
   "schema_version": 1

@@ -450,6 +450,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_stream_id bigint;
+    v_locked record;
 BEGIN
     PERFORM pg_advisory_xact_lock(
         358945::integer,
@@ -468,10 +469,14 @@ BEGIN
         RAISE EXCEPTION 'flashback_test_restore_lsn: no active capture stream from test bootstrap';
     END IF;
 
-    PERFORM flashback_restore_lsn_lock_phase(p_target_table, p_target_lsn);
+    SELECT * INTO STRICT v_locked
+    FROM flashback_restore_lsn_lock_phase(p_target_table, p_target_lsn);
 
     RETURN flashback_internal_restore_lsn_core(
-        p_target_table, p_target_lsn, v_stream_id
+        p_target_table,
+        p_target_lsn,
+        v_stream_id,
+        v_locked.out_disaster_event_id
     );
 END;
 $$;
