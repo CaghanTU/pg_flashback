@@ -503,7 +503,11 @@ DECLARE
     v_parts text[];
     v_schema text;
     v_table text;
-    v_count integer;
+    v_count bigint;
+    v_out_tracking_id bigint;
+    v_out_rel_oid oid;
+    v_out_schema_name text;
+    v_out_table_name text;
 BEGIN
     IF p_target_table IS NULL OR btrim(p_target_table) = '' THEN
         RAISE EXCEPTION 'pg_flashback: table identifier is required'
@@ -517,40 +521,74 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END;
 
+    -- Match count and the candidate row are read in one statement (one
+    -- READ COMMITTED snapshot): a separate COUNT(*) followed by a separate
+    -- LIMIT-1 SELECT can straddle a concurrent commit that adds or activates
+    -- a same-named lifecycle in another schema between the two snapshots,
+    -- letting the second statement return an arbitrary row the first one
+    -- never proved unique. No second query ever searches by table name
+    -- again; only the row captured by this same statement is ever returned.
     IF cardinality(v_parts) = 2 THEN
         v_schema := v_parts[1];
         v_table := v_parts[2];
 
-        RETURN QUERY
-        SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND tt.schema_name = v_schema
-          AND tt.table_name = v_table
+        WITH matches AS MATERIALIZED (
+            SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
+            FROM flashback.tracked_tables tt
+            WHERE tt.is_active
+              AND tt.recovery_profile = 'local_delta'
+              AND tt.schema_name = v_schema
+              AND tt.table_name = v_table
+        )
+        SELECT count(*) OVER (),
+               m.tracking_id, m.rel_oid, m.schema_name, m.table_name
+          INTO v_count,
+               v_out_tracking_id, v_out_rel_oid, v_out_schema_name, v_out_table_name
+        FROM matches m
         LIMIT 1;
-        RETURN;
-    ELSIF cardinality(v_parts) = 1 THEN
-        v_table := v_parts[1];
 
-        SELECT count(*) INTO v_count
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND tt.table_name = v_table;
-
+        IF NOT FOUND THEN
+            RETURN;
+        END IF;
+        -- Defensive: tracked_tables_active_name_key already enforces at most
+        -- one active (schema_name, table_name) row, but never trust that
+        -- silently -- fail closed exactly like the unqualified branch below
+        -- if it is ever violated.
         IF v_count > 1 THEN
             RAISE EXCEPTION 'pg_flashback: ambiguous table; use schema-qualified name (%)', p_target_table
                 USING ERRCODE = 'invalid_parameter_value';
         END IF;
 
         RETURN QUERY
-        SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND tt.table_name = v_table
+        SELECT v_out_tracking_id, v_out_rel_oid, v_out_schema_name, v_out_table_name;
+        RETURN;
+    ELSIF cardinality(v_parts) = 1 THEN
+        v_table := v_parts[1];
+
+        WITH matches AS MATERIALIZED (
+            SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
+            FROM flashback.tracked_tables tt
+            WHERE tt.is_active
+              AND tt.recovery_profile = 'local_delta'
+              AND tt.table_name = v_table
+        )
+        SELECT count(*) OVER (),
+               m.tracking_id, m.rel_oid, m.schema_name, m.table_name
+          INTO v_count,
+               v_out_tracking_id, v_out_rel_oid, v_out_schema_name, v_out_table_name
+        FROM matches m
         LIMIT 1;
+
+        IF NOT FOUND THEN
+            RETURN;
+        END IF;
+        IF v_count > 1 THEN
+            RAISE EXCEPTION 'pg_flashback: ambiguous table; use schema-qualified name (%)', p_target_table
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        RETURN QUERY
+        SELECT v_out_tracking_id, v_out_rel_oid, v_out_schema_name, v_out_table_name;
         RETURN;
     ELSE
         RAISE EXCEPTION 'pg_flashback: % is not a valid table identifier', p_target_table

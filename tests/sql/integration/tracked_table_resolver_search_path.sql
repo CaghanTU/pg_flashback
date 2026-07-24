@@ -5,6 +5,13 @@
 -- with pg_catalog.parse_ident() and matches purely against
 -- flashback.tracked_tables metadata -- never to_regclass() on untrusted
 -- input, never dynamic SQL built from the caller string.
+--
+-- The resolver also captures its match count and the winning row from one
+-- WITH ... SELECT ... INTO statement (one READ COMMITTED snapshot) per
+-- branch, never a separate COUNT(*) followed by a separate LIMIT-1 SELECT.
+-- Scenarios 2 and 3b below check every returned column, not just
+-- tracking_id, so a resolver that regressed back to two separate snapshots
+-- and returned a row from an unrelated match would be caught here too.
 DO $test$
 DECLARE
     v_row record;
@@ -66,12 +73,21 @@ BEGIN
             v_row.tracking_id, v_tracking_orders;
     END IF;
 
-    -- 2. Unqualified "orders" has exactly one active lifecycle.
+    -- 2. Unqualified "orders" has exactly one active lifecycle. Check the
+    -- full row (tracking_id, rel_oid, schema_name, table_name): the count
+    -- and this row come from the same statement, so a regression back to a
+    -- separate COUNT(*) + LIMIT-1 SELECT that raced a concurrent commit
+    -- could return a mismatched or unrelated row even with the right count.
     SELECT * INTO STRICT v_row
     FROM flashback_internal_resolve_tracked_table('orders');
-    IF v_row.tracking_id <> v_tracking_orders THEN
-        RAISE EXCEPTION 'unqualified orders resolved to tracking_id %, expected %',
-            v_row.tracking_id, v_tracking_orders;
+    IF v_row.tracking_id <> v_tracking_orders
+       OR v_row.rel_oid <> 'public.orders'::regclass
+       OR v_row.schema_name <> 'public'
+       OR v_row.table_name <> 'orders'
+    THEN
+        RAISE EXCEPTION 'unqualified orders resolved to (%,%,%,%), expected (%,public.orders,public,orders)',
+            v_row.tracking_id, v_row.rel_oid, v_row.schema_name, v_row.table_name,
+            v_tracking_orders;
     END IF;
 
     -- 3. Same unqualified name in two schemas: fail closed as ambiguous.
@@ -89,18 +105,30 @@ BEGIN
         RAISE EXCEPTION 'ambiguous unqualified table name was not rejected';
     END IF;
 
-    -- Schema-qualifying either side disambiguates cleanly.
+    -- Schema-qualifying either side disambiguates cleanly, and each still
+    -- selects its own exact tracking_id (full row checked, same reasoning
+    -- as scenario 2).
     SELECT * INTO STRICT v_row
     FROM flashback_internal_resolve_tracked_table('it_res_s1.dup_name');
-    IF v_row.tracking_id <> v_tracking_dup_s1 THEN
-        RAISE EXCEPTION 'it_res_s1.dup_name resolved to tracking_id %, expected %',
-            v_row.tracking_id, v_tracking_dup_s1;
+    IF v_row.tracking_id <> v_tracking_dup_s1
+       OR v_row.rel_oid <> 'it_res_s1.dup_name'::regclass
+       OR v_row.schema_name <> 'it_res_s1'
+       OR v_row.table_name <> 'dup_name'
+    THEN
+        RAISE EXCEPTION 'it_res_s1.dup_name resolved to (%,%,%,%), expected (%,it_res_s1.dup_name,it_res_s1,dup_name)',
+            v_row.tracking_id, v_row.rel_oid, v_row.schema_name, v_row.table_name,
+            v_tracking_dup_s1;
     END IF;
     SELECT * INTO STRICT v_row
     FROM flashback_internal_resolve_tracked_table('it_res_s2.dup_name');
-    IF v_row.tracking_id <> v_tracking_dup_s2 THEN
-        RAISE EXCEPTION 'it_res_s2.dup_name resolved to tracking_id %, expected %',
-            v_row.tracking_id, v_tracking_dup_s2;
+    IF v_row.tracking_id <> v_tracking_dup_s2
+       OR v_row.rel_oid <> 'it_res_s2.dup_name'::regclass
+       OR v_row.schema_name <> 'it_res_s2'
+       OR v_row.table_name <> 'dup_name'
+    THEN
+        RAISE EXCEPTION 'it_res_s2.dup_name resolved to (%,%,%,%), expected (%,it_res_s2.dup_name,it_res_s2,dup_name)',
+            v_row.tracking_id, v_row.rel_oid, v_row.schema_name, v_row.table_name,
+            v_tracking_dup_s2;
     END IF;
 
     -- 4. Quoted schema/table (mixed case, embedded space).
