@@ -126,6 +126,15 @@ jobs:
           scripts/check_generated_sql_duplicates.sh \
             target/generated-pg${{ matrix.pg }}.sql
 
+      - name: Production generated SQL has no flashback_test_* surface
+        run: |
+          PG_MAJOR=${{ matrix.pg }} \
+            OUT_DIR=target/generated-sql-no-test-surface \
+            scripts/check_generated_sql_no_test_surface.sh
+
+      - name: Integration SQL inventory classification
+        run: python3 scripts/check_integration_inventory.py
+
   audit:
     name: Security audit
     runs-on: ubuntu-22.04

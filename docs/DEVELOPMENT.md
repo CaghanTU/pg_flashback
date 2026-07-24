@@ -61,6 +61,29 @@ cargo pgrx test pg18
 Do not hard-code the expected test count in documentation. The command exit
 status and external run artifact are authoritative.
 
+## Integration SQL inventory
+
+Every file under `tests/sql/integration/*.sql` is classified exactly once in
+`tests/sql/integration/INVENTORY.json`:
+
+| class | meaning |
+| --- | --- |
+| `supported-core` | Supported WAL/local_delta product behavior; fixtures use the pg_test-only WAL injection seam |
+| `legacy-trigger` | Validates legacy trigger capture mode itself (kept until trigger-mode removal) |
+| `infra` | Shared setup, RBAC/schema scaffolding, or capture-source-independent checks |
+
+Validate with:
+
+```bash
+python3 scripts/check_integration_inventory.py
+```
+
+Production install SQL must not define `flashback_test_*` functions:
+
+```bash
+PG_MAJOR=17 scripts/check_generated_sql_no_test_surface.sh
+```
+
 ## Focused integration suites
 
 The `scripts/` directory contains isolated-cluster suites for:
