@@ -217,6 +217,10 @@
       "class": "infra",
       "reason": "centralized state/progress/lock/journal authority regressions"
     },
+    "tracked_table_resolver_search_path.sql": {
+      "class": "infra",
+      "reason": "tracked-table name resolution without writable search_path"
+    },
     "recover_deleted_rows.sql": {
       "class": "supported-core",
       "reason": "recover_deleted_lsn via seam"

@@ -474,6 +474,104 @@ BEGIN
 END;
 $$;
 
+-- Resolve a caller-supplied table identifier to its active local_delta
+-- lifecycle from flashback.tracked_tables metadata alone. Deliberately does
+-- NOT call to_regclass(): DROP recovery must resolve a table whose physical
+-- relation no longer exists, and tracked_tables is the authoritative source.
+-- pg_catalog.parse_ident() is the only identifier parser used (strict mode:
+-- trailing garbage after the identifier is rejected, not silently ignored),
+-- so this never builds dynamic SQL from an untrusted string and never calls
+-- an unqualified function that a same-named object in public could shadow.
+--   1 part  (table)        -> match tracked_tables.table_name; more than one
+--                              active match across schemas fails closed.
+--   2 parts (schema.table) -> exact schema_name + table_name match.
+-- Anything else (0 parts, or 3+ for a database-qualified name) fails closed.
+CREATE OR REPLACE FUNCTION flashback_internal_resolve_tracked_table(
+    p_target_table text
+)
+RETURNS TABLE (
+    tracking_id bigint,
+    rel_oid oid,
+    schema_name text,
+    table_name text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_parts text[];
+    v_schema text;
+    v_table text;
+    v_count integer;
+BEGIN
+    IF p_target_table IS NULL OR btrim(p_target_table) = '' THEN
+        RAISE EXCEPTION 'pg_flashback: table identifier is required'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    BEGIN
+        v_parts := pg_catalog.parse_ident(p_target_table, true);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'pg_flashback: % is not a valid table identifier', p_target_table
+            USING ERRCODE = 'invalid_parameter_value';
+    END;
+
+    IF cardinality(v_parts) = 2 THEN
+        v_schema := v_parts[1];
+        v_table := v_parts[2];
+
+        RETURN QUERY
+        SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND tt.schema_name = v_schema
+          AND tt.table_name = v_table
+        LIMIT 1;
+        RETURN;
+    ELSIF cardinality(v_parts) = 1 THEN
+        v_table := v_parts[1];
+
+        SELECT count(*) INTO v_count
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND tt.table_name = v_table;
+
+        IF v_count > 1 THEN
+            RAISE EXCEPTION 'pg_flashback: ambiguous table; use schema-qualified name (%)', p_target_table
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        RETURN QUERY
+        SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND tt.table_name = v_table
+        LIMIT 1;
+        RETURN;
+    ELSE
+        RAISE EXCEPTION 'pg_flashback: % is not a valid table identifier', p_target_table
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM flashback_admin';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM pg_monitor';
+    END IF;
+END
+$$;
+
 -- Establish a new exact local base after a stream discontinuity (or as an
 -- explicit maintenance boundary).  The successor remains non-eligible until
 -- the worker observes this transaction's real COMMIT LSN.  A cross-stream
@@ -483,7 +581,7 @@ CREATE OR REPLACE FUNCTION flashback_reanchor(p_target_table text)
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_tracking_id bigint;
@@ -513,18 +611,9 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: public.flashback_reanchor() requires READ COMMITTED isolation for a fresh post-lock snapshot';
     END IF;
 
-    SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
+    SELECT r.tracking_id, r.rel_oid, r.schema_name, r.table_name
       INTO v_tracking_id, v_rel_oid, v_schema_name, v_table_name
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND (
-          tt.rel_oid = to_regclass(p_target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_target_table
-          OR (position('.' IN p_target_table) = 0 AND tt.table_name = p_target_table)
-      )
-    ORDER BY (tt.rel_oid = to_regclass(p_target_table)::oid) DESC
-    LIMIT 1;
+    FROM public.flashback_internal_resolve_tracked_table(p_target_table) r;
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_reanchor: table % is not actively tracked with local_delta',
             p_target_table;
@@ -737,7 +826,7 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_tracking_id bigint;
@@ -747,20 +836,9 @@ BEGIN
         RAISE EXCEPTION 'flashback target LSN is required';
     END IF;
 
-    SELECT tt.tracking_id
+    SELECT r.tracking_id
       INTO v_tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND (
-          tt.rel_oid = to_regclass(p_target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_target_table
-          OR (position('.' IN p_target_table) = 0 AND tt.table_name = p_target_table)
-      )
-    ORDER BY
-        (tt.rel_oid = to_regclass(p_target_table)::oid) DESC,
-        (format('%I.%I', tt.schema_name, tt.table_name) = p_target_table) DESC
-    LIMIT 1;
+    FROM public.flashback_internal_resolve_tracked_table(p_target_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: table % is not actively tracked with local_delta', p_target_table;
@@ -903,7 +981,7 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_tracking_id bigint;
@@ -916,17 +994,8 @@ DECLARE
     v_bad_before boolean;
     v_bad_after boolean;
 BEGIN
-    SELECT tt.tracking_id INTO v_tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND (
-          tt.rel_oid = to_regclass(p_target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_target_table
-          OR (position('.' IN p_target_table) = 0 AND tt.table_name = p_target_table)
-      )
-    ORDER BY (tt.rel_oid = to_regclass(p_target_table)::oid) DESC
-    LIMIT 1;
+    SELECT r.tracking_id INTO v_tracking_id
+    FROM public.flashback_internal_resolve_tracked_table(p_target_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_resolve_target: table % is not actively tracked', p_target_table;
