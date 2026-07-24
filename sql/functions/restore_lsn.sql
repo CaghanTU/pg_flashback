@@ -459,6 +459,7 @@ DECLARE
     v_disaster_event_id bigint := NULL;
     v_disaster_commit_lsn pg_lsn := NULL;
     v_source_xid bigint := NULL;
+    v_disaster_event_type text := NULL;
     v_audited text;
 BEGIN
     PERFORM flashback_require_primary('flashback_restore_lsn');
@@ -493,9 +494,17 @@ BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
-    -- Conservative CASCADE: exact event-bound manifest is mandatory.
-    -- Resolve disaster_event_id from the audited recover operation, else from
-    -- the first DROP after the admitted target LSN for this lifecycle.
+    v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
+    IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
+        RAISE EXCEPTION 'pg_flashback: refusing restore of %.% because a different relation already uses that name (live oid %, tracked oid %)',
+            admission.schema_name, admission.table_name, v_live_oid, admission.rel_oid
+            USING HINT = 'Rename or move the newer table before recover; pg_flashback will not silently overwrite an identity-mismatched relation.';
+    END IF;
+
+    -- Exact event-bound DROP dependency manifests are mandatory for DROP
+    -- reconstruction (live relation gone) and for audited recover selections
+    -- whose disaster is a DROP. Pure DML/schema point-in-time restore against
+    -- a still-live relation must not invent or require a DROP identity.
     v_audited := NULLIF(
         btrim(COALESCE(current_setting('pg_flashback.audited_recover_operation_id', true), '')),
         ''
@@ -507,45 +516,52 @@ BEGIN
         WHERE o.operation_id = v_audited::bigint;
     END IF;
 
-    IF v_disaster_event_id IS NULL THEN
-        SELECT dl.event_id, dl.commit_lsn, dl.source_xid
-          INTO v_disaster_event_id, v_disaster_commit_lsn, v_source_xid
-        FROM flashback.delta_log dl
-        WHERE dl.tracking_id = admission.tracking_id
-          AND dl.event_type = 'DROP'
-          AND dl.commit_lsn IS NOT NULL
-          AND dl.commit_lsn > p_target_lsn
-        ORDER BY dl.commit_lsn ASC, dl.event_id ASC
-        LIMIT 1;
-    ELSE
-        SELECT dl.commit_lsn, dl.source_xid
-          INTO v_disaster_commit_lsn, v_source_xid
+    IF v_live_oid IS NULL THEN
+        IF v_disaster_event_id IS NULL THEN
+            SELECT dl.event_id, dl.commit_lsn, dl.source_xid
+              INTO v_disaster_event_id, v_disaster_commit_lsn, v_source_xid
+            FROM flashback.delta_log dl
+            WHERE dl.tracking_id = admission.tracking_id
+              AND dl.event_type = 'DROP'
+              AND dl.commit_lsn IS NOT NULL
+              AND dl.commit_lsn > p_target_lsn
+            ORDER BY dl.commit_lsn ASC, dl.event_id ASC
+            LIMIT 1;
+        ELSE
+            SELECT dl.commit_lsn, dl.source_xid
+              INTO v_disaster_commit_lsn, v_source_xid
+            FROM flashback.delta_log dl
+            WHERE dl.event_id = v_disaster_event_id
+            LIMIT 1;
+        END IF;
+
+        IF v_disaster_event_id IS NULL THEN
+            RAISE EXCEPTION
+                'pg_flashback: restore refused: cannot resolve exact DROP identity for dependency manifest (tracking_id %, target_lsn %)',
+                admission.tracking_id, p_target_lsn
+                USING ERRCODE = 'invalid_parameter_value',
+                      HINT = 'Use flashback_recover_begin/execute so the selected disaster_event_id is audited, or ensure the DROP is captured in delta_log.';
+        END IF;
+
+        PERFORM flashback_bind_drop_dependency_manifests();
+        PERFORM flashback_require_supported_drop_manifest(
+            admission.tracking_id,
+            v_disaster_event_id
+        );
+    ELSIF v_disaster_event_id IS NOT NULL THEN
+        SELECT dl.commit_lsn, dl.source_xid, dl.event_type
+          INTO v_disaster_commit_lsn, v_source_xid, v_disaster_event_type
         FROM flashback.delta_log dl
         WHERE dl.event_id = v_disaster_event_id
         LIMIT 1;
-    END IF;
 
-    IF v_disaster_event_id IS NULL THEN
-        RAISE EXCEPTION
-            'pg_flashback: restore refused: cannot resolve exact DROP identity for dependency manifest (tracking_id %, target_lsn %)',
-            admission.tracking_id, p_target_lsn
-            USING ERRCODE = 'invalid_parameter_value',
-                  HINT = 'Use flashback_recover_begin/execute so the selected disaster_event_id is audited, or ensure the DROP is captured in delta_log.';
-    END IF;
-
-    -- Best-effort bind before the hard gate (idempotent).
-    PERFORM flashback_bind_drop_dependency_manifests();
-
-    PERFORM flashback_require_supported_drop_manifest(
-        admission.tracking_id,
-        v_disaster_event_id
-    );
-
-    v_live_oid := to_regclass(format('%I.%I', admission.schema_name, admission.table_name));
-    IF v_live_oid IS NOT NULL AND v_live_oid IS DISTINCT FROM admission.rel_oid THEN
-        RAISE EXCEPTION 'pg_flashback: refusing restore of %.% because a different relation already uses that name (live oid %, tracked oid %)',
-            admission.schema_name, admission.table_name, v_live_oid, admission.rel_oid
-            USING HINT = 'Rename or move the newer table before recover; pg_flashback will not silently overwrite an identity-mismatched relation.';
+        IF v_disaster_event_type = 'DROP' THEN
+            PERFORM flashback_bind_drop_dependency_manifests();
+            PERFORM flashback_require_supported_drop_manifest(
+                admission.tracking_id,
+                v_disaster_event_id
+            );
+        END IF;
     END IF;
     IF v_live_oid IS NOT NULL THEN
         v_capacity_rel := v_live_oid;

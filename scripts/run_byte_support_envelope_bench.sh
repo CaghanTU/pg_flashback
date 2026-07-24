@@ -358,11 +358,16 @@ run_one_table() {
     psqlq -c "DROP TABLE $rel;"
     catchup_deadline=$(( $(date +%s) + size_based_secs ))
     st=""
+    local catchup_i=0
     while (( $(date +%s) <= catchup_deadline )); do
       st=$(psqlq -c "SELECT status FROM flashback_disaster_points('$rel', interval '1 day') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
       [[ "$st" == "restorable" ]] && break
-      psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
-      sleep 0.25
+      # Avoid fighting the capture worker for the logical slot: nudge rarely.
+      if (( catchup_i % 8 == 0 )); then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+      fi
+      catchup_i=$((catchup_i + 1))
+      sleep 0.5
     done
     t_discover=$(( ($(date +%s%N) - t1) / 1000000 ))
 
@@ -371,6 +376,7 @@ run_one_table() {
     catchup_deadline=$(( $(date +%s) + size_based_secs ))
     plan=""
     plan_status=""
+    catchup_i=0
     while (( $(date +%s) <= catchup_deadline )); do
       plan=$(psqlq -c "SELECT flashback_recover_plan('$rel', interval '1 day');")
       plan_status=$(printf '%s' "$plan" | jq -r '.status // empty')
@@ -380,8 +386,11 @@ run_one_table() {
         echo "FAIL plan $rel: $plan" >&2
         exit 1
       fi
-      psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
-      sleep 0.25
+      if (( catchup_i % 8 == 0 )); then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+      fi
+      catchup_i=$((catchup_i + 1))
+      sleep 0.5
     done
     t_dry=$(( ($(date +%s%N) - t2) / 1000000 ))
     token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')

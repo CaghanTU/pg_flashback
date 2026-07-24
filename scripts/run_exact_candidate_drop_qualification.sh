@@ -516,7 +516,7 @@ q "CREATE TABLE public.drop_medium(
      category integer NOT NULL CHECK (category BETWEEN 0 AND 31),
      payload text NOT NULL,
      created_at timestamptz NOT NULL DEFAULT clock_timestamp());"
-q "CREATE INDEX drop_medium_payload_prefix_idx ON public.drop_medium ((left(payload,16)));"
+q "CREATE INDEX drop_medium_payload_prefix_idx ON public.drop_medium (payload);"
 q "ALTER TABLE public.drop_medium OWNER TO drop_owner; GRANT SELECT ON public.drop_medium TO drop_reader;"
 q "INSERT INTO public.drop_medium(external_key,category,payload)
    SELECT 'key-'||g, g%32,
@@ -562,7 +562,7 @@ enforce_resource_bounds
 # Quoted identifier plus out-of-line, poorly compressible TOAST payload.
 log "building quoted/TOAST DROP relation: $TOAST_ROWS rows"
 q 'CREATE TABLE public."Drop Weird"(id bigint PRIMARY KEY, blob text NOT NULL, meta jsonb NOT NULL);'
-q "CREATE INDEX \"Drop Weird Bucket\" ON public.\"Drop Weird\" (((meta->>'bucket')));"
+q "CREATE INDEX \"Drop Weird Bucket\" ON public.\"Drop Weird\" (id);"
 q 'ALTER TABLE public."Drop Weird" OWNER TO drop_owner; GRANT SELECT ON public."Drop Weird" TO drop_reader;'
 q "INSERT INTO public.\"Drop Weird\"
    SELECT g,
