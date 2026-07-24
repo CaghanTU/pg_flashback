@@ -29,7 +29,11 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct HEAD)}"
 export TZ=UTC
 
 if [[ -z "$PG_CONFIG" ]]; then
-    if command -v cargo >/dev/null && cargo pgrx info pg-config "$PG_MAJOR" >/dev/null 2>&1; then
+    # Prefer the explicit system prefix for the requested major. cargo pgrx
+    # info can resolve a different installed major when ~/.pgrx is mixed.
+    if [[ -x "/usr/local/pgsql-${PG_MAJOR}/bin/pg_config" ]]; then
+        PG_CONFIG="/usr/local/pgsql-${PG_MAJOR}/bin/pg_config"
+    elif command -v cargo >/dev/null && cargo pgrx info pg-config "$PG_MAJOR" >/dev/null 2>&1; then
         PG_CONFIG="$(cargo pgrx info pg-config "$PG_MAJOR")"
     else
         PG_CONFIG="/usr/local/pgsql-${PG_MAJOR}/bin/pg_config"
@@ -42,10 +46,12 @@ fi
 
 STAGE="$OUT_DIR/stage"
 ARCHIVE_ROOT="pg_flashback-${VERSION}-pg${PG_MAJOR}-${ARCH_LABEL}-linux"
-rm -rf "${STAGE:?}/${ARCHIVE_ROOT:?}"
+# Wipe prior major leftovers under pgrx-package so find(1) cannot pull the
+# wrong .so/.sql into this archive.
+rm -rf "${STAGE:?}/${ARCHIVE_ROOT:?}" "${STAGE:?}/pgrx-package"
 mkdir -p "$STAGE/$ARCHIVE_ROOT"/{lib,bin,share/extension,docs/samples,scripts} "$OUT_DIR"
 
-echo "Building local package version=$VERSION pg=$PG_MAJOR commit=$SOURCE_COMMIT"
+echo "Building local package version=$VERSION pg=$PG_MAJOR commit=$SOURCE_COMMIT pg_config=$PG_CONFIG"
 
 cargo pgrx package \
     --manifest-path "$ROOT/Cargo.toml" \
@@ -56,12 +62,30 @@ cargo pgrx package \
 
 package_so="$(find "$STAGE/pgrx-package" -type f -name pg_flashback.so -print -quit)"
 package_control="$(find "$STAGE/pgrx-package" -type f -name pg_flashback.control -print -quit)"
-mapfile -t package_sql < <(find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' | sort)
+# Prefer the SQL written beside the selected pg_config sharedir; fall back to
+# a single uniquely named extension script.
+mapfile -t package_sql < <(
+    find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' \
+        | awk -v maj="$PG_MAJOR" '
+            index($0, "/pgsql-" maj "/") { print; found=1 }
+            END { if (!found) exit 1 }
+          ' \
+        || find "$STAGE/pgrx-package" -type f -name 'pg_flashback--*.sql' | sort -u
+)
 [[ -n "$package_so" && -n "$package_control" && ${#package_sql[@]} -gt 0 ]]
+# Deduplicate by basename so install never tries to write the same dest twice.
+declare -A _sql_seen=()
+package_sql_unique=()
+for f in "${package_sql[@]}"; do
+    base="$(basename "$f")"
+    [[ -n "${_sql_seen[$base]:-}" ]] && continue
+    _sql_seen[$base]=1
+    package_sql_unique+=("$f")
+done
 
 install -m 0755 "$package_so" "$STAGE/$ARCHIVE_ROOT/lib/pg_flashback.so"
 install -m 0755 "$ROOT/scripts/pg_flashback" "$STAGE/$ARCHIVE_ROOT/bin/pg_flashback"
-install -m 0644 "$package_control" "${package_sql[@]}" "$STAGE/$ARCHIVE_ROOT/share/extension/"
+install -m 0644 "$package_control" "${package_sql_unique[@]}" "$STAGE/$ARCHIVE_ROOT/share/extension/"
 # Fresh-install-only: do not ship broken 0.1→0.2 upgrade paths.
 printf '%s\n' "$PG_MAJOR" > "$STAGE/$ARCHIVE_ROOT/PG_MAJOR"
 printf '%s\n' "fresh-install-only" > "$STAGE/$ARCHIVE_ROOT/INSTALL_CONTRACT"
