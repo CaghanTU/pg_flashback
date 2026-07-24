@@ -46,6 +46,7 @@ install -m 0755 "$PKG/lib/pg_flashback.so" "$("$PG_CONFIG" --pkglibdir)/pg_flash
 install -m 0644 "$PKG"/share/extension/pg_flashback.control \
     "$PKG"/share/extension/pg_flashback--*.sql \
     "$("$PG_CONFIG" --sharedir)/extension/"
+mkdir -p "$WORKDIR/bin"
 install -m 0755 "$PKG/bin/pg_flashback" "$WORKDIR/bin/pg_flashback"
 export PATH="$WORKDIR/bin:$PATH"
 
