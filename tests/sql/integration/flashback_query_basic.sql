@@ -9,7 +9,7 @@ DECLARE
     v_tracking_drop bigint;
     v_stream_drop bigint;
     v_gen_drop bigint;
-    v_drop_lsn pg_lsn := '0/3000'::pg_lsn;
+    v_drop_lsn pg_lsn := '0/6000'::pg_lsn;
     v_drop_count bigint;
     v_exc boolean := false;
     v_xid bigint;
@@ -18,14 +18,21 @@ BEGIN
     CREATE TABLE public.it_fb_query (id int primary key, name text, price numeric);
     INSERT INTO public.it_fb_query VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30);
 
-    SELECT flashback_test_bootstrap_lifecycle('public.it_fb_query') INTO v_boot;
+    SELECT public.flashback_test_bootstrap_lifecycle('public.it_fb_query') INTO v_boot;
     v_tracking_id := (v_boot->>'tracking_id')::bigint;
     v_point_lsn := (v_boot->>'boundary_lsn')::pg_lsn;
+
+    DROP TABLE IF EXISTS public.it_fb_query_drop;
+    CREATE TABLE public.it_fb_query_drop (id int primary key, val text);
+    SELECT public.flashback_test_bootstrap_lifecycle('public.it_fb_query_drop') INTO v_boot_drop;
+    v_tracking_drop := (v_boot_drop->>'tracking_id')::bigint;
+    v_stream_drop := (v_boot_drop->>'stream_id')::bigint;
+    v_gen_drop := (v_boot_drop->>'generation_id')::bigint;
 
     UPDATE public.it_fb_query SET price = 999 WHERE id = 1;
     DELETE FROM public.it_fb_query WHERE id = 2;
     INSERT INTO public.it_fb_query VALUES (4, 'delta', 40);
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_id,
         '0/4000'::pg_lsn,
         clock_timestamp(),
@@ -38,7 +45,7 @@ BEGIN
     );
 
     SELECT count(*) INTO v_count
-    FROM flashback_query_lsn('public.it_fb_query', v_point_lsn)
+    FROM public.flashback_query_lsn('public.it_fb_query', v_point_lsn)
          AS t(id int, name text, price numeric);
 
     IF v_count <> 3 THEN
@@ -46,7 +53,7 @@ BEGIN
     END IF;
 
     SELECT t.name INTO v_name
-    FROM flashback_query_lsn('public.it_fb_query', v_point_lsn)
+    FROM public.flashback_query_lsn('public.it_fb_query', v_point_lsn)
          AS t(id int, name text, price numeric)
     WHERE id = 1;
 
@@ -58,17 +65,11 @@ BEGIN
         RAISE EXCEPTION 'flashback_query_lsn should not modify the actual table';
     END IF;
 
-    DROP TABLE IF EXISTS public.it_fb_query_drop;
-    CREATE TABLE public.it_fb_query_drop (id int primary key, val text);
-    SELECT flashback_test_bootstrap_lifecycle('public.it_fb_query_drop') INTO v_boot_drop;
-    v_tracking_drop := (v_boot_drop->>'tracking_id')::bigint;
-    v_stream_drop := (v_boot_drop->>'stream_id')::bigint;
-    v_gen_drop := (v_boot_drop->>'generation_id')::bigint;
 
     INSERT INTO public.it_fb_query_drop VALUES (1, 'exists');
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_drop,
-        '0/2000'::pg_lsn,
+        '0/5000'::pg_lsn,
         clock_timestamp(),
         951002,
         jsonb_build_array(
@@ -76,22 +77,22 @@ BEGIN
         )
     );
 
-    PERFORM flashback_capture_drop_dependency_manifest(
+    PERFORM public.flashback_capture_drop_dependency_manifest(
         'public', 'it_fb_query_drop', false
     );
     v_xid := (txid_current() % 4294967296)::bigint;
     DROP TABLE public.it_fb_query_drop;
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM public.flashback_test_inject_ddl_commit(
         v_tracking_drop,
         v_drop_lsn,
         clock_timestamp(),
         v_xid,
         'DROP'
     );
-    PERFORM flashback_bind_drop_dependency_manifests();
+    PERFORM public.flashback_bind_drop_dependency_manifests();
 
     SELECT count(*) INTO v_drop_count
-    FROM flashback_query_lsn('public.it_fb_query_drop', v_drop_lsn)
+    FROM public.flashback_query_lsn('public.it_fb_query_drop', v_drop_lsn)
          AS t(id int, val text);
 
     IF v_drop_count <> 0 THEN
@@ -101,7 +102,7 @@ BEGIN
     DROP TABLE IF EXISTS public.it_fb_query_drop;
 
     SELECT count(*) INTO v_count
-    FROM flashback_query_lsn('public.it_fb_query', v_point_lsn)
+    FROM public.flashback_query_lsn('public.it_fb_query', v_point_lsn)
          AS t(id int, name text, price numeric);
 
     IF v_count <> 3 THEN
@@ -110,7 +111,7 @@ BEGIN
 
     BEGIN
         SELECT t.id INTO v_count
-        FROM flashback_query_lsn('public.it_fb_query', v_point_lsn, 'id = 1; DELETE FROM pg_class')
+        FROM public.flashback_query_lsn('public.it_fb_query', v_point_lsn, 'id = 1; DELETE FROM pg_class')
              AS t(id int, name text, price numeric) LIMIT 1;
     EXCEPTION WHEN OTHERS THEN
         v_exc := true;

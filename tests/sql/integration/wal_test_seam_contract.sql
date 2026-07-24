@@ -4,6 +4,8 @@ DECLARE
     v_boot jsonb;
     v_tracking_id bigint;
     v_generation_id bigint;
+    v_ddl_tracking_id bigint;
+    v_ddl_generation_id bigint;
     v_stream_id bigint;
     v_boundary_lsn pg_lsn;
     v_commit_lsn pg_lsn := '0/2000'::pg_lsn;
@@ -17,7 +19,7 @@ BEGIN
     DROP TABLE IF EXISTS public.it_seam_contract CASCADE;
     CREATE TABLE public.it_seam_contract (id int PRIMARY KEY, val text);
 
-    SELECT flashback_test_bootstrap_lifecycle('public.it_seam_contract') INTO v_boot;
+    SELECT public.flashback_test_bootstrap_lifecycle('public.it_seam_contract') INTO v_boot;
     v_tracking_id := (v_boot->>'tracking_id')::bigint;
     v_generation_id := (v_boot->>'generation_id')::bigint;
     v_stream_id := (v_boot->>'stream_id')::bigint;
@@ -26,6 +28,12 @@ BEGIN
     IF v_boundary_lsn IS NULL THEN
         RAISE EXCEPTION 'bootstrap did not return boundary_lsn';
     END IF;
+
+    -- DDL seam must stage through the shared product core (exact LSN/generation).
+    CREATE TABLE public.it_seam_ddl (id int PRIMARY KEY, note text);
+    SELECT public.flashback_test_bootstrap_lifecycle('public.it_seam_ddl') INTO v_boot;
+    v_ddl_tracking_id := (v_boot->>'tracking_id')::bigint;
+    v_ddl_generation_id := (v_boot->>'generation_id')::bigint;
 
     SELECT state, boundary_lsn, valid_through_lsn
       INTO v_mode_a, v_commit_lsn, v_vt
@@ -37,12 +45,12 @@ BEGIN
 
     -- Inject ordered multi-event commit (WAL-only; session mode must be wal).
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
-    SELECT flashback_effective_capture_mode() INTO v_mode_a;
+    SELECT public.flashback_effective_capture_mode() INTO v_mode_a;
     IF v_mode_a <> 'wal' THEN
         RAISE EXCEPTION 'expected wal effective mode, got %', v_mode_a;
     END IF;
 
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_id,
         '0/2000'::pg_lsn,
         TIMESTAMPTZ '2024-01-01 00:00:02+00',
@@ -110,7 +118,7 @@ BEGIN
     END IF;
 
     -- Duplicate injection must follow consumer idempotency (no second apply).
-    v_dup := flashback_test_inject_commit(
+    v_dup := public.flashback_test_inject_commit(
         v_tracking_id,
         '0/2000'::pg_lsn,
         TIMESTAMPTZ '2024-01-01 00:00:02+00',
@@ -130,7 +138,7 @@ BEGIN
     -- Non-monotonic / lower watermark must not rewind.
     v_failed := false;
     BEGIN
-        PERFORM flashback_test_inject_commit(
+        PERFORM public.flashback_test_inject_commit(
             v_tracking_id,
             '0/1500'::pg_lsn,
             TIMESTAMPTZ '2024-01-01 00:00:01+00',
@@ -159,12 +167,12 @@ BEGIN
 
     -- Same inject remains independent of re-asserting capture_mode=wal.
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
-    SELECT flashback_effective_capture_mode() INTO v_mode_b;
+    SELECT public.flashback_effective_capture_mode() INTO v_mode_b;
     IF v_mode_b <> 'wal' THEN
         RAISE EXCEPTION 'expected wal effective mode on re-assert, got %', v_mode_b;
     END IF;
 
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_id,
         '0/3000'::pg_lsn,
         TIMESTAMPTZ '2024-01-01 00:00:03+00',
@@ -184,7 +192,7 @@ BEGIN
     END IF;
 
     -- Foreign OID must not qualify into this generation.
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_id,
         '0/4000'::pg_lsn,
         TIMESTAMPTZ '2024-01-01 00:00:04+00',
@@ -217,7 +225,7 @@ BEGIN
                 EXECUTE format('CREATE ROLE %I LOGIN', v_role);
                 EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', v_role);
                 PERFORM set_config('role', v_role, true);
-                PERFORM flashback_apply_decoded_wal_batch(1, NULL, NULL);
+                PERFORM public.flashback_apply_decoded_wal_batch(1, NULL, NULL);
             END;
             $u$;
         $q$;
@@ -230,13 +238,8 @@ BEGIN
         RAISE EXCEPTION 'non-superuser was able to call flashback_apply_decoded_wal_batch';
     END IF;
 
-    -- DDL seam must stage through the shared product core (exact LSN/generation).
-    CREATE TABLE public.it_seam_ddl (id int PRIMARY KEY, note text);
-    SELECT flashback_test_bootstrap_lifecycle('public.it_seam_ddl') INTO v_boot;
-    v_tracking_id := (v_boot->>'tracking_id')::bigint;
-    v_generation_id := (v_boot->>'generation_id')::bigint;
-    PERFORM flashback_test_inject_ddl_commit(
-        v_tracking_id,
+    PERFORM public.flashback_test_inject_ddl_commit(
+        v_ddl_tracking_id,
         '0/5000'::pg_lsn,
         TIMESTAMPTZ '2024-01-01 00:00:05+00',
         910005,
@@ -244,8 +247,8 @@ BEGIN
     );
     IF NOT EXISTS (
         SELECT 1 FROM flashback.delta_log
-        WHERE tracking_id = v_tracking_id
-          AND generation_id = v_generation_id
+        WHERE tracking_id = v_ddl_tracking_id
+          AND generation_id = v_ddl_generation_id
           AND event_type = 'TRUNCATE'
           AND commit_lsn = '0/5000'::pg_lsn
     ) THEN
@@ -253,7 +256,7 @@ BEGIN
     END IF;
     IF has_function_privilege(
            'public',
-           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)',
+           'public.flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)',
            'EXECUTE'
        )
     THEN

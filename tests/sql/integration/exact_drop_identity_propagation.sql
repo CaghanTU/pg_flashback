@@ -38,7 +38,7 @@ BEGIN
     );
     INSERT INTO public.it_exact_drop_id VALUES (1, 'drop1-marker');
 
-    v_boot := flashback_test_bootstrap_lifecycle('public.it_exact_drop_id');
+    v_boot := public.flashback_test_bootstrap_lifecycle('public.it_exact_drop_id');
     v_tid := (v_boot->>'tracking_id')::bigint;
     v_boundary := (v_boot->>'boundary_lsn')::pg_lsn;
 
@@ -47,7 +47,7 @@ BEGIN
         BEFORE INSERT ON public.it_exact_drop_id
         FOR EACH ROW EXECUTE FUNCTION public.it_exact_drop_id_trg_fn();
 
-    PERFORM flashback_capture_drop_dependency_manifest(
+    PERFORM public.flashback_capture_drop_dependency_manifest(
         'public', 'it_exact_drop_id', false
     );
     v_xid := 91001;
@@ -56,14 +56,14 @@ BEGIN
      WHERE tracking_id = v_tid
        AND disaster_event_id IS NULL;
     DROP TABLE public.it_exact_drop_id CASCADE;
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM public.flashback_test_inject_ddl_commit(
         v_tid,
         '0/2000'::pg_lsn,
         clock_timestamp(),
         v_xid,
         'DROP'
     );
-    PERFORM flashback_bind_drop_dependency_manifests();
+    PERFORM public.flashback_bind_drop_dependency_manifests();
 
     SELECT disaster_event_id INTO v_drop1_id
     FROM flashback.drop_dependency_manifests
@@ -76,12 +76,12 @@ BEGIN
     END IF;
 
     -- Restore + resolve so a second DROP can land on the same tracking_id.
-    PERFORM flashback_test_restore_lsn('public.it_exact_drop_id', v_boundary);
-    PERFORM flashback_test_resolve_post_restore_boundary(v_tid, '0/2500'::pg_lsn);
+    PERFORM public.flashback_test_restore_lsn('public.it_exact_drop_id', v_boundary);
+    PERFORM public.flashback_test_resolve_post_restore_boundary(v_tid, '0/2500'::pg_lsn);
 
     TRUNCATE public.it_exact_drop_id;
     INSERT INTO public.it_exact_drop_id VALUES (1, 'drop2-marker');
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tid,
         '0/2800'::pg_lsn,
         clock_timestamp(),
@@ -95,7 +95,7 @@ BEGIN
         BEFORE INSERT ON public.it_exact_drop_id
         FOR EACH ROW EXECUTE FUNCTION public.it_exact_drop_id_trg_fn();
 
-    PERFORM flashback_capture_drop_dependency_manifest(
+    PERFORM public.flashback_capture_drop_dependency_manifest(
         'public', 'it_exact_drop_id', false
     );
     v_xid := 91003;
@@ -104,14 +104,14 @@ BEGIN
      WHERE tracking_id = v_tid
        AND disaster_event_id IS NULL;
     DROP TABLE public.it_exact_drop_id CASCADE;
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM public.flashback_test_inject_ddl_commit(
         v_tid,
         '0/3000'::pg_lsn,
         clock_timestamp(),
         v_xid,
         'DROP'
     );
-    PERFORM flashback_bind_drop_dependency_manifests();
+    PERFORM public.flashback_bind_drop_dependency_manifests();
 
     SELECT disaster_event_id INTO v_drop2_id
     FROM flashback.drop_dependency_manifests
@@ -133,7 +133,7 @@ BEGIN
     END IF;
 
     -- Audited recover selection of DROP#1 while DROP#2 is the latest identity.
-    v_audit_op := flashback_operation_begin(
+    v_audit_op := public.flashback_operation_begin(
         'recover',
         'public.it_exact_drop_id',
         v_tid,
@@ -151,7 +151,7 @@ BEGIN
     );
 
     SELECT * INTO v_locked
-    FROM flashback_restore_lsn_lock_phase('public.it_exact_drop_id', v_boundary);
+    FROM public.flashback_restore_lsn_lock_phase('public.it_exact_drop_id', v_boundary);
 
     IF v_locked.out_disaster_event_id IS DISTINCT FROM v_drop1_id THEN
         RAISE EXCEPTION
@@ -159,11 +159,14 @@ BEGIN
             v_locked.out_disaster_event_id, v_drop1_id, v_drop2_id;
     END IF;
 
-    PERFORM flashback_test_restore_lsn('public.it_exact_drop_id', v_boundary);
+    PERFORM public.flashback_test_restore_lsn('public.it_exact_drop_id', v_boundary);
 
-    SELECT details->'expected_proof' INTO v_proof
-    FROM flashback.operations
-    WHERE operation_id = v_audit_op;
+    SELECT payload->'expected_proof' INTO v_proof
+    FROM flashback.operation_events
+    WHERE operation_id = v_audit_op
+      AND event_type = 'applied_coverage_pending'
+    ORDER BY event_id DESC
+    LIMIT 1;
 
     IF v_proof IS NULL OR v_proof = 'null'::jsonb THEN
         RAISE EXCEPTION 'exact_drop_identity: expected_proof missing on audited recover op %',
@@ -206,9 +209,9 @@ BEGIN
     END IF;
 
     -- Live DML restore path: disaster_event_id must stay NULL in proof binding.
-    PERFORM flashback_test_resolve_post_restore_boundary(v_tid, '0/4000'::pg_lsn);
+    PERFORM public.flashback_test_resolve_post_restore_boundary(v_tid, '0/4000'::pg_lsn);
     INSERT INTO public.it_exact_drop_id VALUES (2, 'live-dml');
-    PERFORM flashback_test_inject_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tid,
         '0/5000'::pg_lsn,
         clock_timestamp(),
@@ -218,7 +221,7 @@ BEGIN
         )
     );
 
-    v_dml_op := flashback_operation_begin(
+    v_dml_op := public.flashback_operation_begin(
         'recover',
         'public.it_exact_drop_id',
         v_tid,
@@ -234,11 +237,14 @@ BEGIN
         v_dml_op::text,
         true
     );
-    PERFORM flashback_test_restore_lsn('public.it_exact_drop_id', '0/5000'::pg_lsn);
+    PERFORM public.flashback_test_restore_lsn('public.it_exact_drop_id', '0/5000'::pg_lsn);
 
-    SELECT details->'expected_proof' INTO v_dml_proof
-    FROM flashback.operations
-    WHERE operation_id = v_dml_op;
+    SELECT payload->'expected_proof' INTO v_dml_proof
+    FROM flashback.operation_events
+    WHERE operation_id = v_dml_op
+      AND event_type = 'applied_coverage_pending'
+    ORDER BY event_id DESC
+    LIMIT 1;
 
     IF v_dml_proof IS NULL OR v_dml_proof = 'null'::jsonb THEN
         RAISE EXCEPTION 'exact_drop_identity: DML expected_proof missing';
@@ -261,7 +267,7 @@ BEGIN
     -- RBAC: new 4-arg core signature must not be EXECUTE-able by PUBLIC/admin/monitor.
     IF has_function_privilege(
         'public',
-        'flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
+        'public.flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
         'EXECUTE'
     ) THEN
         RAISE EXCEPTION 'exact_drop_identity: PUBLIC EXECUTE not revoked on new core signature';
@@ -269,7 +275,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin')
        AND has_function_privilege(
             'flashback_admin',
-            'flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
+            'public.flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
             'EXECUTE'
        )
     THEN
@@ -277,7 +283,7 @@ BEGIN
     END IF;
     IF has_function_privilege(
         'pg_monitor',
-        'flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
+        'public.flashback_internal_restore_lsn_core(text,pg_lsn,bigint,bigint)',
         'EXECUTE'
     ) THEN
         RAISE EXCEPTION 'exact_drop_identity: pg_monitor EXECUTE not revoked on new core signature';

@@ -213,6 +213,10 @@
       "class": "infra",
       "reason": "RBAC grant surface; legacy capture APIs absent"
     },
+    "state_authority_transitions.sql": {
+      "class": "infra",
+      "reason": "centralized state/progress/lock/journal authority regressions"
+    },
     "recover_deleted_rows.sql": {
       "class": "supported-core",
       "reason": "recover_deleted_lsn via seam"
