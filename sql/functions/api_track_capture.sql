@@ -369,11 +369,8 @@ BEGIN
     -- stream -> canonical pre-identity key -> stable tracking ID ->
     -- relation.  Take the database key before slot creation so two first
     -- trackers cannot race while creating the same per-database slot.
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer
-         FROM pg_database
-         WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
 
     -- Capture the current replica identity BEFORE we change it so that
@@ -512,14 +509,14 @@ BEGIN
 
     v_snapshot_table_name := format('snap_%s_%s', v_rel_oid::text, v_snapshot_id::text);
 
-    PERFORM public.flashback_drop_payload_table(
+    PERFORM flashback_drop_payload_table(
         to_regclass(format('flashback.%I', v_snapshot_table_name))
     );
     EXECUTE format(
         'CREATE TABLE flashback.%I AS TABLE %I.%I',
         v_snapshot_table_name, v_schema_name, v_table_name
     );
-    PERFORM public.flashback_own_payload_table(
+    PERFORM flashback_own_payload_table(
         to_regclass(format('flashback.%I', v_snapshot_table_name))
     );
     EXECUTE format('SELECT count(*) FROM flashback.%I', v_snapshot_table_name)
@@ -692,15 +689,19 @@ BEGIN
             RETURN 0;
         END IF;
 
-        UPDATE flashback.capture_streams
-           SET details = COALESCE(details, '{}'::jsonb)
-               || jsonb_build_object(
-                    'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                    'safe_slot_advance_upto_lsn', v_upto_lsn,
-                    'safe_slot_advance_recorded_at', clock_timestamp()
-                  )
-         WHERE stream_id = v_stream_id
-           AND state = 'active';
+        PERFORM flashback_internal_advance_capture_stream_progress(
+            v_stream_id,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            jsonb_build_object(
+                'safe_slot_advance_start_lsn', v_scan_start_lsn,
+                'safe_slot_advance_upto_lsn', v_upto_lsn,
+                'safe_slot_advance_recorded_at', clock_timestamp()
+            ),
+            NULL
+        );
 
         SELECT count(*)::integer
           INTO v_discarded
@@ -734,17 +735,19 @@ BEGIN
         WHERE slot_name = v_slot_name
           AND database = current_database();
 
-        UPDATE flashback.capture_streams
-           SET confirmed_flush_lsn = v_confirmed_flush_lsn,
-               restart_lsn = v_restart_lsn,
-               details = COALESCE(details, '{}'::jsonb)
-                   || jsonb_build_object(
-                        'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                        'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
-                        'safe_slot_advance_recorded_at', clock_timestamp()
-                      )
-         WHERE stream_id = v_stream_id
-           AND state = 'active';
+        PERFORM flashback_internal_advance_capture_stream_progress(
+            v_stream_id,
+            NULL,
+            NULL,
+            v_confirmed_flush_lsn,
+            v_restart_lsn,
+            jsonb_build_object(
+                'safe_slot_advance_start_lsn', v_scan_start_lsn,
+                'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
+                'safe_slot_advance_recorded_at', clock_timestamp()
+            ),
+            NULL
+        );
         RETURN 0;
     END IF;
 
@@ -840,24 +843,26 @@ BEGIN
     FOR lock_rec IN
         SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
     LOOP
-        IF NOT pg_try_advisory_xact_lock(
-            358944::integer, hashint8(lock_rec.tracking_id)
-        ) THEN
+        IF NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
             RETURN 0;
         END IF;
     END LOOP;
 
     -- The required locks are now pinned. Record this consumer's exact safe
     -- advancement and fetch the full payload in the same transaction.
-    UPDATE flashback.capture_streams
-       SET details = COALESCE(details, '{}'::jsonb)
-           || jsonb_build_object(
-                'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                'safe_slot_advance_upto_lsn', v_upto_lsn,
-                'safe_slot_advance_recorded_at', clock_timestamp()
-              )
-     WHERE stream_id = v_stream_id
-       AND state = 'active';
+    PERFORM flashback_internal_advance_capture_stream_progress(
+        v_stream_id,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        jsonb_build_object(
+            'safe_slot_advance_start_lsn', v_scan_start_lsn,
+            'safe_slot_advance_upto_lsn', v_upto_lsn,
+            'safe_slot_advance_recorded_at', clock_timestamp()
+        ),
+        NULL
+    );
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
     CREATE TEMP TABLE _fb_wal_batch (
@@ -1079,11 +1084,10 @@ BEGIN
         -- tracking order. Untrack consumes the slot before retiring the
         -- binding, so taking only the tracking key first would deadlock
         -- against the worker (which takes the database key first).
-        PERFORM pg_advisory_xact_lock(
-            358945::integer,
-            (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+        PERFORM flashback_internal_lock_database_stream(
+            (SELECT oid FROM pg_database WHERE datname = current_database())
         );
-        PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+        PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
         IF EXISTS (
             SELECT 1 FROM flashback.coverage_generations cg
             WHERE cg.tracking_id = v_tracking_id AND cg.state = 'building'
@@ -1142,7 +1146,7 @@ BEGIN
         IF v_base_snapshot !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
             RAISE EXCEPTION 'flashback_untrack: invalid snapshot ref: %', v_base_snapshot;
         END IF;
-        PERFORM public.flashback_drop_payload_table(to_regclass(v_base_snapshot));
+        PERFORM flashback_drop_payload_table(to_regclass(v_base_snapshot));
     END IF;
 
     FOR snap_rec IN
@@ -1156,7 +1160,7 @@ BEGIN
                 RAISE WARNING 'flashback_untrack: skipping invalid snapshot ref: %', snap_rec.snapshot_table;
                 CONTINUE;
             END IF;
-            PERFORM public.flashback_drop_payload_table(
+            PERFORM flashback_drop_payload_table(
                 to_regclass(snap_rec.snapshot_table)
             );
         END IF;
@@ -1177,20 +1181,50 @@ BEGIN
        OR (NOT v_has_generations AND rel_oid = v_rel_oid);
 
     IF v_has_generations THEN
-        UPDATE flashback.coverage_generations
-           SET state = 'sealed',
-               superseded_before_lsn = valid_through_lsn + 1,
-               superseded_before_time = clock_timestamp(),
-               sealed_at = clock_timestamp(),
-               state_reason = 'untracked'
-         WHERE tracking_id = v_tracking_id
-           AND state = 'active';
-        UPDATE flashback.coverage_generations
-           SET state = 'retired',
-               retired_at = clock_timestamp(),
-               state_reason = 'untracked'
-         WHERE tracking_id = v_tracking_id
-           AND state = 'sealed';
+        FOR snap_rec IN
+            SELECT generation_id, tracking_id, valid_through_lsn
+            FROM flashback.coverage_generations
+            WHERE tracking_id = v_tracking_id
+              AND state = 'active'
+            ORDER BY generation_id
+        LOOP
+            PERFORM flashback_internal_transition_coverage_generation(
+                snap_rec.generation_id,
+                snap_rec.tracking_id,
+                'active',
+                'sealed',
+                'untracked',
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                snap_rec.valid_through_lsn + 1,
+                clock_timestamp(),
+                '{}'::jsonb
+            );
+        END LOOP;
+        FOR snap_rec IN
+            SELECT generation_id, tracking_id
+            FROM flashback.coverage_generations
+            WHERE tracking_id = v_tracking_id
+              AND state = 'sealed'
+            ORDER BY generation_id
+        LOOP
+            PERFORM flashback_internal_transition_coverage_generation(
+                snap_rec.generation_id,
+                snap_rec.tracking_id,
+                'sealed',
+                'retired',
+                'untracked',
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                '{}'::jsonb
+            );
+        END LOOP;
     END IF;
 
     DELETE FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
@@ -1279,8 +1313,7 @@ BEGIN
         -- Serialize DDL routing with stream breaks and generation retirement.
         -- The configuration reconciler holds the database-stream key first
         -- and then this key; this path never takes the outer database key.
-        PERFORM pg_advisory_xact_lock(358944::integer,
-                                      hashint8(tracked.tracking_id));
+        PERFORM flashback_internal_lock_lifecycle(tracked.tracking_id);
 
         -- An existing qualified lifecycle is routed by its durable generation
         -- binding, never by a caller's session-local capture_mode GUC. This
@@ -1518,7 +1551,7 @@ BEGIN
               AND e.extname = 'pg_flashback'
         ) INTO v_is_owned;
         IF NOT v_is_owned THEN
-            PERFORM public.flashback_own_payload_table(v_part_oid::regclass);
+            PERFORM flashback_own_payload_table(v_part_oid::regclass);
         END IF;
         RETURN;
     END IF;
@@ -1547,7 +1580,7 @@ BEGIN
          FOR VALUES FROM (%L) TO (%L)',
         p_part_name, p_range_from, p_range_to
     );
-    PERFORM public.flashback_own_payload_table(
+    PERFORM flashback_own_payload_table(
         to_regclass(format('flashback.%I', p_part_name))
     );
 

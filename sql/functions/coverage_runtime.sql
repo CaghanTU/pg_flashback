@@ -21,15 +21,15 @@ CREATE OR REPLACE FUNCTION flashback_mark_capture_stream_broken(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_discarded_pending bigint := 0;
     v_discarded_building bigint := 0;
     v_database_oid oid;
     v_payload_oid regclass;
+    v_stream_state text;
     build_rec record;
-    lock_rec record;
 BEGIN
     IF p_reason IS NULL OR btrim(p_reason) = '' THEN
         RAISE EXCEPTION 'flashback_mark_capture_stream_broken: reason is required';
@@ -42,31 +42,36 @@ BEGIN
     FROM flashback.capture_streams
     WHERE stream_id = p_stream_id;
     IF v_database_oid IS NOT NULL THEN
-        PERFORM pg_advisory_xact_lock(358945::integer, v_database_oid::integer);
+        PERFORM public.flashback_internal_lock_database_stream(v_database_oid);
     END IF;
 
     -- Pin affected lifecycles in stable-ID order before freezing watermarks so
     -- a restore, query or retention transition cannot cross the break record.
-    FOR lock_rec IN
-        SELECT cg.tracking_id
-        FROM flashback.coverage_generations cg
-        WHERE cg.stream_id = p_stream_id
-          AND cg.state IN ('building', 'active')
-        ORDER BY cg.tracking_id
-    LOOP
-        PERFORM pg_advisory_xact_lock(358944::integer,
-                                      hashint8(lock_rec.tracking_id));
-    END LOOP;
+    PERFORM public.flashback_internal_lock_lifecycles(
+        ARRAY(
+            SELECT cg.tracking_id
+            FROM flashback.coverage_generations cg
+            WHERE cg.stream_id = p_stream_id
+              AND cg.state IN ('building', 'active')
+        )
+    );
 
-    UPDATE flashback.capture_streams
-       SET state = 'broken',
-           invalidation_reason = p_reason,
-           invalidated_at = clock_timestamp(),
-           details = details || COALESCE(p_details, '{}'::jsonb)
-     WHERE stream_id = p_stream_id
-       AND state = 'active';
+    -- Preserve early-return when the stream is already non-active (incl. broken).
+    SELECT state INTO v_stream_state
+    FROM flashback.capture_streams
+    WHERE stream_id = p_stream_id;
+    IF v_stream_state IS DISTINCT FROM 'active' THEN
+        RETURN;
+    END IF;
 
-    IF NOT FOUND THEN
+    IF NOT public.flashback_internal_transition_capture_stream(
+        p_stream_id,
+        ARRAY['active'],
+        'broken',
+        p_reason,
+        COALESCE(p_details, '{}'::jsonb)
+    ) THEN
+        -- Idempotent: already broken between the check and the transition.
         RETURN;
     END IF;
 
@@ -137,17 +142,18 @@ BEGIN
          WHERE tracking_id = build_rec.tracking_id
            AND base_snapshot_table = build_rec.snapshot_table;
 
-        UPDATE flashback.coverage_generations
-           SET state = 'aborted',
-               aborted_at = clock_timestamp(),
-               state_reason = COALESCE(state_reason, p_reason),
-               details = details || jsonb_build_object(
-                   'aborted_reason', p_reason,
-                   'aborted_stream_id', p_stream_id
-               )
-         WHERE generation_id = build_rec.generation_id
-           AND tracking_id = build_rec.tracking_id
-           AND state = 'building';
+        PERFORM public.flashback_internal_transition_coverage_generation(
+            build_rec.generation_id,
+            build_rec.tracking_id,
+            'building',
+            'aborted',
+            p_reason,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            jsonb_build_object(
+                'aborted_reason', p_reason,
+                'aborted_stream_id', p_stream_id
+            )
+        );
         v_discarded_building := v_discarded_building + 1;
     END LOOP;
 
@@ -189,7 +195,7 @@ CREATE OR REPLACE FUNCTION flashback_reconcile_capture_configuration()
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_database_oid oid;
@@ -204,14 +210,14 @@ BEGIN
 
     v_database_oid := (SELECT oid FROM pg_database WHERE datname = current_database());
     v_enabled := COALESCE(current_setting('pg_flashback.enabled', true), 'on') <> 'off';
-    -- Read configured GUC without calling flashback_effective_capture_mode(),
+    -- Read configured GUC without calling public.flashback_effective_capture_mode(),
     -- which raises for illegal values; reconcile must still break the stream.
     v_mode := NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), '');
     IF v_mode IS NULL THEN
         v_mode := 'wal';
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358945::integer, v_database_oid::integer);
+    PERFORM public.flashback_internal_lock_database_stream(v_database_oid);
     SELECT * INTO v_stream
     FROM flashback.capture_streams
     WHERE database_oid = v_database_oid
@@ -235,7 +241,7 @@ BEGIN
         RETURN 'active';
     END IF;
 
-    PERFORM flashback_mark_capture_stream_broken(
+    PERFORM public.flashback_mark_capture_stream_broken(
         v_stream.stream_id,
         v_reason,
         jsonb_build_object(
@@ -265,7 +271,7 @@ CREATE OR REPLACE FUNCTION flashback_capture_configuration_guard(
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_enabled boolean;
@@ -308,7 +314,7 @@ BEGIN
         -- This is a LOGGED write and takes the database-stream/lifecycle locks
         -- in the canonical order.  If this transaction aborts, the user DML
         -- also aborts, so no false gap can survive an aborted change.
-        PERFORM flashback_reconcile_capture_configuration();
+        PERFORM public.flashback_reconcile_capture_configuration();
     END IF;
 
     SELECT cs.state, cg.state
@@ -342,7 +348,7 @@ CREATE OR REPLACE FUNCTION flashback_ensure_active_wal_stream()
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_stream flashback.capture_streams%ROWTYPE;
@@ -353,31 +359,33 @@ DECLARE
     v_reason text;
 BEGIN
     IF COALESCE(current_setting('pg_flashback.enabled', true), 'on') = 'off' THEN
-        PERFORM flashback_reconcile_capture_configuration();
+        PERFORM public.flashback_reconcile_capture_configuration();
         RETURN NULL;
     END IF;
     IF current_setting('wal_level') IS DISTINCT FROM 'logical' THEN
         RAISE EXCEPTION 'pg_flashback: wal_level must be logical for release-qualified local tracking'
             USING HINT = 'Set wal_level=logical in postgresql.conf and restart PostgreSQL.';
     END IF;
-    -- Do not call flashback_effective_capture_mode() here: it raises for illegal
+    -- Do not call public.flashback_effective_capture_mode() here: it raises for illegal
     -- values, but we must still reconcile/break any active stream first.
     IF COALESCE(
            NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), ''),
            'wal'
        ) IS DISTINCT FROM 'wal'
     THEN
-        PERFORM flashback_reconcile_capture_configuration();
+        PERFORM public.flashback_reconcile_capture_configuration();
         RETURN NULL;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358945::integer, (SELECT oid::integer FROM pg_database WHERE datname = current_database()));
-    v_timeline := flashback_current_timeline_id();
+    PERFORM public.flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
+    );
+    v_timeline := public.flashback_current_timeline_id();
 
     SELECT slot_name, plugin, database, restart_lsn, confirmed_flush_lsn
       INTO v_slot
     FROM pg_replication_slots
-    WHERE slot_name = flashback_effective_slot_name();
+    WHERE slot_name = public.flashback_effective_slot_name();
 
     IF NOT FOUND THEN
         -- Configured physical slot missing: fail closed for any active epoch.
@@ -387,10 +395,10 @@ BEGIN
           AND state = 'active'
         FOR UPDATE;
         IF FOUND THEN
-            PERFORM flashback_mark_capture_stream_broken(
+            PERFORM public.flashback_mark_capture_stream_broken(
                 v_stream.stream_id,
                 'replication_slot_missing',
-                jsonb_build_object('slot_name', flashback_effective_slot_name())
+                jsonb_build_object('slot_name', public.flashback_effective_slot_name())
             );
         END IF;
         RETURN NULL;
@@ -430,7 +438,7 @@ BEGIN
             RETURN v_stream.stream_id;
         END IF;
 
-        PERFORM flashback_mark_capture_stream_broken(
+        PERFORM public.flashback_mark_capture_stream_broken(
             v_stream.stream_id,
             v_reason,
             jsonb_build_object(
@@ -446,18 +454,21 @@ BEGIN
     FROM flashback.capture_streams
     WHERE database_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
-    INSERT INTO flashback.capture_streams (
-        database_oid, database_name, epoch_no, capture_mode, timeline_id,
-        slot_name, plugin_name, state, valid_through_lsn,
-        confirmed_flush_lsn, restart_lsn, activated_at, details
-    ) VALUES (
-        (SELECT oid FROM pg_database WHERE datname = current_database()),
-        current_database(), v_epoch, 'wal', v_timeline,
-        v_slot.slot_name, v_slot.plugin, 'active', v_slot.confirmed_flush_lsn,
-        v_slot.confirmed_flush_lsn, v_slot.restart_lsn, clock_timestamp(),
-        jsonb_build_object('initial_confirmed_flush_lsn', v_slot.confirmed_flush_lsn)
-    )
-    RETURNING stream_id INTO v_stream_id;
+    v_stream_id := public.flashback_internal_create_capture_stream(
+        p_database_oid => (SELECT oid FROM pg_database WHERE datname = current_database()),
+        p_epoch_no => v_epoch,
+        p_timeline_id => v_timeline,
+        p_slot_name => v_slot.slot_name,
+        p_plugin_name => v_slot.plugin,
+        p_confirmed_flush_lsn => v_slot.confirmed_flush_lsn,
+        p_restart_lsn => v_slot.restart_lsn,
+        p_details => jsonb_build_object('initial_confirmed_flush_lsn', v_slot.confirmed_flush_lsn)
+    );
+    PERFORM public.flashback_internal_transition_capture_stream(
+        v_stream_id,
+        ARRAY['initializing'],
+        'active'
+    );
 
     RETURN v_stream_id;
 END;
@@ -491,15 +502,15 @@ DECLARE
     v_schema_def jsonb;
     v_row_count bigint;
 BEGIN
-    PERFORM flashback_require_primary('flashback_reanchor');
+    PERFORM public.flashback_require_primary('flashback_reanchor');
     -- Fail closed: only wal is legal (raises for trigger/auto).
-    PERFORM flashback_effective_capture_mode();
+    PERFORM public.flashback_effective_capture_mode();
     IF txid_current_if_assigned() IS NOT NULL THEN
-        RAISE EXCEPTION 'pg_flashback: flashback_reanchor() must run before any write in a dedicated transaction'
-            USING HINT = 'COMMIT or ROLLBACK, then call flashback_reanchor() as the first write in a new READ COMMITTED transaction.';
+        RAISE EXCEPTION 'pg_flashback: public.flashback_reanchor() must run before any write in a dedicated transaction'
+            USING HINT = 'COMMIT or ROLLBACK, then call public.flashback_reanchor() as the first write in a new READ COMMITTED transaction.';
     END IF;
     IF current_setting('transaction_isolation') <> 'read committed' THEN
-        RAISE EXCEPTION 'pg_flashback: flashback_reanchor() requires READ COMMITTED isolation for a fresh post-lock snapshot';
+        RAISE EXCEPTION 'pg_flashback: public.flashback_reanchor() requires READ COMMITTED isolation for a fresh post-lock snapshot';
     END IF;
 
     SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
@@ -522,13 +533,13 @@ BEGIN
     -- Database stream serialization is the outermost runtime lock, matching
     -- worker/restore ordering.  Slot recreation is never attached to an old
     -- generation; ensure_active creates a fresh stream epoch first.
-    v_stream_id := flashback_ensure_active_wal_stream();
+    v_stream_id := public.flashback_ensure_active_wal_stream();
     IF v_stream_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: no usable logical slot exists for re-anchor'
-            USING HINT = 'Recreate the pg_flashback logical slot, then retry flashback_reanchor() in a new transaction.';
+            USING HINT = 'Recreate the pg_flashback logical slot, then retry public.flashback_reanchor() in a new transaction.';
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM public.flashback_internal_lock_lifecycle(v_tracking_id);
 
     SELECT tt.rel_oid, tt.schema_name, tt.table_name
       INTO v_rel_oid, v_schema_name, v_table_name
@@ -576,8 +587,8 @@ BEGIN
 
     -- ACCESS EXCLUSIVE is intentionally taken from the outset: it blocks all
     -- writes while the exact base is scanned and avoids a later lock upgrade.
-    PERFORM flashback_admit_local_capacity(v_rel_oid, 'reanchor');
-    PERFORM flashback_apply_local_boundary_lock_timeout();
+    PERFORM public.flashback_admit_local_capacity(v_rel_oid, 'reanchor');
+    PERFORM public.flashback_apply_local_boundary_lock_timeout();
     BEGIN
         EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
                        v_schema_name, v_table_name);
@@ -605,7 +616,7 @@ BEGIN
     THEN
         RAISE EXCEPTION 'pg_flashback: tracked table identity changed under the re-anchor lock';
     END IF;
-    PERFORM flashback_admit_local_capacity(v_rel_oid, 'reanchor');
+    PERFORM public.flashback_admit_local_capacity(v_rel_oid, 'reanchor');
 
     -- Preserve full old-row WAL images for the successor generation.
     EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',
@@ -617,7 +628,7 @@ BEGIN
     FROM flashback.coverage_generations
     WHERE tracking_id = v_tracking_id;
     v_provisional_lsn := pg_current_wal_insert_lsn();
-    v_schema_def := COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
+    v_schema_def := COALESCE(public.flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
 
     INSERT INTO flashback.snapshots (
         rel_oid, tracking_id, snapshot_table, snapshot_lsn,
@@ -642,18 +653,21 @@ BEGIN
            row_count = v_row_count
      WHERE snapshot_id = v_snapshot_id;
 
-    INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, parent_generation_id, stream_id,
-        recovery_profile, state, boundary_kind, rel_oid_at_boundary,
-        boundary_snapshot_id, boundary_xid, boundary_marker, details
-    ) VALUES (
-        v_tracking_id, v_generation_no, v_parent_generation_id, v_stream_id,
-        'local_delta', 'building', 'maintenance_reanchor', v_rel_oid,
-        v_snapshot_id, v_boundary_xid,
-        format('reanchor:%s:%s:%s',
-               v_tracking_id, v_generation_no, v_boundary_xid),
-        jsonb_build_object('provisional_snapshot_lsn', v_provisional_lsn)
-    ) RETURNING generation_id INTO v_generation_id;
+    v_generation_id := public.flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tracking_id,
+        p_generation_no => v_generation_no,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'maintenance_reanchor',
+        p_rel_oid_at_boundary => v_rel_oid,
+        p_boundary_snapshot_id => v_snapshot_id,
+        p_boundary_lsn => NULL,
+        p_boundary_time => NULL,
+        p_boundary_xid => v_boundary_xid,
+        p_boundary_marker => format('reanchor:%s:%s:%s', v_tracking_id, v_generation_no, v_boundary_xid),
+        p_parent_generation_id => v_parent_generation_id,
+        p_recovery_profile => 'local_delta',
+        p_details => jsonb_build_object('provisional_snapshot_lsn', v_provisional_lsn)
+    );
 
     SELECT COALESCE(max(schema_version), 0) + 1 INTO v_schema_version
     FROM flashback.schema_versions
@@ -677,7 +691,7 @@ BEGIN
             'rls_policies', COALESCE(v_schema_def->'rls_policies', '[]'::jsonb),
             'rls_enabled', COALESCE((v_schema_def->'rls_enabled')::boolean, false)
         ),
-        flashback_helper_schema_sha256(v_rel_oid)
+        public.flashback_helper_schema_sha256(v_rel_oid)
     );
 
     UPDATE flashback.tracked_tables
@@ -756,7 +770,7 @@ BEGIN
     -- retention/restore/checkpoint path uses this same stable lifecycle key,
     -- so a durable retirement intent cannot appear between admission and
     -- materialization (query/recover previously lacked this pin).
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM public.flashback_internal_lock_lifecycle(v_tracking_id);
 
     IF NOT EXISTS (
         SELECT 1
@@ -776,7 +790,7 @@ BEGIN
           AND pending.boundary_kind = 'post_restore'
     ) THEN
         RAISE EXCEPTION 'pg_flashback: table % has an unresolved post-restore boundary', p_target_table
-            USING HINT = 'Wait for the WAL worker to resolve the swap COMMIT LSN; flashback_health() shows the pending generation.';
+            USING HINT = 'Wait for the WAL worker to resolve the swap COMMIT LSN; public.flashback_health() shows the pending generation.';
     END IF;
 
     SELECT count(*) INTO v_candidate_count
@@ -923,7 +937,7 @@ BEGIN
     -- generation/frontier state. This path deliberately does not take the
     -- database-wide stream key: a long query for one table must not stall WAL
     -- capture for every other tracked table in the database.
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM public.flashback_internal_lock_lifecycle(v_tracking_id);
 
     FOR gen IN
         SELECT cg.*, LEAST(cg.valid_through_lsn, cs.valid_through_lsn) AS frontier_lsn
@@ -999,7 +1013,7 @@ BEGIN
         END IF;
 
         -- Reuse the canonical admission checks (assets, watermark and gaps).
-        PERFORM 1 FROM flashback_admit_lsn_target(p_target_table, v_candidate_lsn);
+        PERFORM 1 FROM public.flashback_admit_lsn_target(p_target_table, v_candidate_lsn);
         v_resolved_count := v_resolved_count + 1;
         IF v_resolved_count > 1 THEN
             RAISE EXCEPTION 'pg_flashback: timestamp % resolves in multiple generations for %',
@@ -1028,5 +1042,5 @@ BEGIN
 END;
 $$;
 
--- flashback_health() is defined in health_runtime.sql (actionable projection).
+-- public.flashback_health() is defined in health_runtime.sql (actionable projection).
 

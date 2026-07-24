@@ -470,8 +470,7 @@ DECLARE
 BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
-    PERFORM pg_advisory_xact_lock(358944::integer,
-                                  hashint8(admission.tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(admission.tracking_id);
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
@@ -692,7 +691,7 @@ BEGIN
     -- Independent expected proof from pre-swap shadow + target schema_def.
     -- Manifest selection uses the lock-phase disaster identity only — never
     -- "latest for tracking_id".
-    v_expected_proof := public.flashback_build_expected_restore_proof(
+    v_expected_proof := flashback_build_expected_restore_proof(
         to_regclass(format('flashback.%I', v_shadow_name)),
         materialized.target_schema_def,
         COALESCE((
@@ -887,7 +886,7 @@ BEGIN
         );
     END IF;
 
-    v_restore_verification := public.flashback_verify_restored_relation(
+    v_restore_verification := flashback_verify_restored_relation(
         v_restored_rel,
         v_expected_proof,
         materialized.target_schema_def
@@ -909,7 +908,7 @@ BEGIN
     EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I',
                    v_new_snapshot_table,
                    materialized.source_schema_name, materialized.source_table_name);
-    PERFORM public.flashback_own_payload_table(
+    PERFORM flashback_own_payload_table(
         to_regclass(format('flashback.%I', v_new_snapshot_table))
     );
     EXECUTE format('SELECT count(*) FROM flashback.%I', v_new_snapshot_table)
@@ -923,19 +922,21 @@ BEGIN
     FROM flashback.coverage_generations
     WHERE tracking_id = admission.tracking_id;
 
-    INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, parent_generation_id, stream_id,
-        recovery_profile, state, boundary_kind, rel_oid_at_boundary,
-        boundary_snapshot_id, boundary_xid, boundary_marker,
-        restored_target_lsn, details
-    ) VALUES (
-        admission.tracking_id, v_generation_no, v_current_generation_id,
-        v_new_stream_id, 'local_delta', 'building', 'post_restore',
-        v_new_rel_oid, v_new_snapshot_id, v_boundary_xid,
-        format('post-restore:%s:%s:%s', admission.tracking_id, v_boundary_xid, v_generation_no),
-        p_target_lsn,
-        jsonb_build_object('source_generation_id', admission.generation_id)
-    ) RETURNING generation_id INTO v_new_generation_id;
+    v_new_generation_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => admission.tracking_id,
+        p_generation_no => v_generation_no,
+        p_stream_id => v_new_stream_id,
+        p_boundary_kind => 'post_restore',
+        p_rel_oid_at_boundary => v_new_rel_oid,
+        p_boundary_snapshot_id => v_new_snapshot_id,
+        p_boundary_lsn => NULL,
+        p_boundary_time => NULL,
+        p_boundary_xid => v_boundary_xid,
+        p_boundary_marker => format('post-restore:%s:%s:%s', admission.tracking_id, v_boundary_xid, v_generation_no),
+        p_parent_generation_id => v_current_generation_id,
+        p_recovery_profile => 'local_delta',
+        p_details => jsonb_build_object('source_generation_id', admission.generation_id, 'restored_target_lsn', p_target_lsn)
+    );
 
     SELECT COALESCE(max(schema_version), 0) + 1 INTO v_schema_version
     FROM flashback.schema_versions
@@ -993,10 +994,15 @@ BEGIN
     RAISE NOTICE 'pg_flashback: restore applied at target LSN %; successor coverage is pending until this transaction COMMIT is consumed. Check flashback_health() before another historical operation.',
         p_target_lsn;
 
-    -- Attach exact successor binding to the durable recover operation when present.
+    -- Attach exact successor binding and proof to the durable recover operation.
     IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NOT NULL THEN
-        UPDATE flashback.operations
-           SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object(
+        PERFORM flashback_operation_append_event(
+            current_setting('pg_flashback.audited_recover_operation_id')::bigint,
+            'applied_coverage_pending',
+            NULL, NULL,
+            'restore applied; waiting for exact successor coverage',
+            jsonb_build_object(
+                'rows_affected', materialized.events_applied,
                 'expected_proof', v_expected_proof,
                 'restore_verification', v_restore_verification,
                 'successor', jsonb_build_object(
@@ -1011,8 +1017,8 @@ BEGIN
                     'restored_target_lsn', p_target_lsn,
                     'rel_oid_at_boundary', v_new_rel_oid
                 )
-           )
-         WHERE operation_id = current_setting('pg_flashback.audited_recover_operation_id')::bigint;
+            )
+        );
     END IF;
 
     PERFORM flashback_set_restore_in_progress(false);
@@ -1145,8 +1151,7 @@ BEGIN
         ) a
         ORDER BY a.tracking_id
     LOOP
-        PERFORM pg_advisory_xact_lock(358944::integer,
-                                      hashint8(lock_rec.tracking_id));
+        PERFORM flashback_internal_lock_lifecycle(lock_rec.tracking_id);
         EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
                        lock_rec.schema_name, lock_rec.table_name);
     END LOOP;

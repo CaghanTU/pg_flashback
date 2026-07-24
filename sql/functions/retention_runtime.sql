@@ -29,9 +29,8 @@ BEGIN
     -- worker consumes WAL under database -> lifecycle, while an older version
     -- of this function took lifecycle first and later requested the database
     -- partition key, allowing a retention/worker deadlock.
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
 
     SELECT cg.tracking_id INTO v_tracking_id
@@ -41,7 +40,7 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: generation % does not exist', p_generation_id;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
 
     SELECT
         cg.generation_id, cg.tracking_id, cg.stream_id, cg.state, cg.sealed_at,
@@ -111,7 +110,7 @@ BEGIN
     END IF;
     IF gen.payload_state <> 'available'
        OR to_regclass(gen.snapshot_table) IS NULL
-       OR NOT public.flashback_payload_is_owned(to_regclass(gen.snapshot_table))
+       OR NOT flashback_payload_is_owned(to_regclass(gen.snapshot_table))
     THEN
         RAISE EXCEPTION 'pg_flashback: generation % snapshot payload is not available',
             p_generation_id;
@@ -137,7 +136,7 @@ BEGIN
           )
           AND successor_snapshot.payload_state = 'available'
           AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-          AND public.flashback_payload_is_owned(
+          AND flashback_payload_is_owned(
                   to_regclass(successor_snapshot.snapshot_table)
               )
           AND NOT EXISTS (
@@ -158,28 +157,28 @@ BEGIN
     FROM flashback.schema_versions
     WHERE generation_id = p_generation_id;
 
-    INSERT INTO flashback.generation_payload_retirements (
-        generation_id, tracking_id, reason,
-        snapshot_id, snapshot_table, snapshot_rel_oid, snapshot_row_count,
-        snapshot_schema_fingerprint,
-        expected_delta_rows, expected_schema_rows,
-        first_delta_lsn, last_delta_lsn, details
-    ) VALUES (
-        p_generation_id, gen.tracking_id, p_reason,
-        gen.snapshot_id, gen.snapshot_table,
-        to_regclass(gen.snapshot_table)::oid, gen.row_count,
-        public.flashback_payload_schema_fingerprint(
+    v_retirement_id := flashback_internal_create_retirement_intent(
+        p_generation_id => p_generation_id,
+        p_tracking_id => gen.tracking_id,
+        p_reason => p_reason,
+        p_snapshot_id => gen.snapshot_id,
+        p_snapshot_table => gen.snapshot_table,
+        p_snapshot_rel_oid => to_regclass(gen.snapshot_table)::oid,
+        p_snapshot_row_count => gen.row_count,
+        p_snapshot_schema_fingerprint => flashback_payload_schema_fingerprint(
             to_regclass(gen.snapshot_table)
         ),
-        v_delta_rows, v_schema_rows,
-        v_first_lsn, v_last_lsn,
-        jsonb_build_object(
+        p_expected_delta_rows => v_delta_rows,
+        p_expected_schema_rows => v_schema_rows,
+        p_first_delta_lsn => v_first_lsn,
+        p_last_delta_lsn => v_last_lsn,
+        p_details => jsonb_build_object(
             'sealed_at', gen.sealed_at,
             'valid_through_lsn', gen.valid_through_lsn,
             'superseded_before_lsn', gen.superseded_before_lsn,
             'retention_interval', gen.retention_interval
         )
-    ) RETURNING retirement_id INTO v_retirement_id;
+    );
 
     RETURN v_retirement_id;
 END;
@@ -205,9 +204,8 @@ BEGIN
     -- restore, and configuration reconciliation.  The intent row is durable
     -- across transactions, but each retry still participates in the common
     -- lock protocol before inspecting or deleting payload.
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
 
     SELECT tracking_id INTO v_tracking_id
@@ -218,7 +216,7 @@ BEGIN
             p_generation_id;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
 
     SELECT r.*, cg.state AS generation_state,
            cg.stream_id AS generation_stream_id,
@@ -251,10 +249,10 @@ BEGIN
        OR to_regclass(retirement.snapshot_table) IS NULL
        OR to_regclass(retirement.snapshot_table)::oid
               IS DISTINCT FROM retirement.snapshot_rel_oid
-       OR NOT public.flashback_payload_is_owned(
+       OR NOT flashback_payload_is_owned(
               to_regclass(retirement.snapshot_table)
           )
-       OR public.flashback_payload_schema_fingerprint(
+       OR flashback_payload_schema_fingerprint(
               to_regclass(retirement.snapshot_table)
           ) <> retirement.snapshot_schema_fingerprint
     THEN
@@ -288,7 +286,7 @@ BEGIN
           )
           AND successor_snapshot.payload_state = 'available'
           AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-          AND public.flashback_payload_is_owned(
+          AND flashback_payload_is_owned(
                   to_regclass(successor_snapshot.snapshot_table)
               )
           AND NOT EXISTS (
@@ -320,7 +318,7 @@ BEGIN
             );
     END IF;
 
-    PERFORM public.flashback_drop_payload_table(
+    PERFORM flashback_drop_payload_table(
         to_regclass(retirement.snapshot_table)
     );
 
@@ -353,21 +351,28 @@ BEGIN
             retirement.retirement_id;
     END IF;
 
-    UPDATE flashback.generation_payload_retirements
-       SET state = 'removed',
-           delta_rows_removed = v_removed_delta_rows,
-           schema_rows_removed = v_removed_schema_rows,
-           removed_at = clock_timestamp(),
-           removed_by = current_user
-     WHERE retirement_id = retirement.retirement_id;
+    PERFORM flashback_internal_transition_retirement(
+        retirement.retirement_id,
+        'retiring',
+        'removed',
+        v_removed_delta_rows,
+        v_removed_schema_rows
+    );
 
-    UPDATE flashback.coverage_generations
-       SET state = 'retired',
-           retired_at = clock_timestamp(),
-           state_reason = 'payload_retired'
-     WHERE generation_id = p_generation_id
-       AND state = 'sealed';
-    IF NOT FOUND THEN
+    IF NOT flashback_internal_transition_coverage_generation(
+        p_generation_id,
+        retirement.tracking_id,
+        'sealed',
+        'retired',
+        'payload_retired',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        '{}'::jsonb
+    ) THEN
         RAISE EXCEPTION 'pg_flashback: generation % retirement transition failed',
             p_generation_id;
     END IF;
@@ -438,7 +443,7 @@ BEGIN
             v_part.part_name
         ) INTO v_has_rows;
         IF NOT v_has_rows THEN
-            PERFORM public.flashback_drop_payload_table(v_part.oid::regclass);
+            PERFORM flashback_drop_payload_table(v_part.oid::regclass);
             v_dropped := v_dropped + 1;
         END IF;
     END LOOP;
@@ -463,9 +468,8 @@ BEGIN
     -- before touching any lifecycle so every path observes database ->
     -- tracking lock order, including installations that still have only
     -- legacy trigger rows and therefore skip the generation loops below.
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
 
     -- Resume intents that were committed by an earlier worker transaction.
@@ -481,9 +485,7 @@ BEGIN
         -- one table to head-of-line block cleanup for other tables; the
         -- database stream key above is already held, preserving the common
         -- database -> lifecycle lock order.
-        IF NOT pg_try_advisory_xact_lock(
-            358944::integer, hashint8(rec.tracking_id)
-        ) THEN
+        IF NOT flashback_internal_try_lock_lifecycle(rec.tracking_id) THEN
             CONTINUE;
         END IF;
         v_actions := v_actions
@@ -526,9 +528,7 @@ BEGIN
         -- eligibility check so those expected states cannot abort retention
         -- for every other lifecycle.  The explicit begin function remains
         -- strict for callers that request one generation directly.
-        IF NOT pg_try_advisory_xact_lock(
-            358944::integer, hashint8(rec.tracking_id)
-        ) THEN
+        IF NOT flashback_internal_try_lock_lifecycle(rec.tracking_id) THEN
             CONTINUE;
         END IF;
 
@@ -564,7 +564,7 @@ BEGIN
               )
               AND snap.payload_state = 'available'
               AND to_regclass(snap.snapshot_table) IS NOT NULL
-              AND public.flashback_payload_is_owned(
+              AND flashback_payload_is_owned(
                       to_regclass(snap.snapshot_table)
                   )
               AND NOT EXISTS (
@@ -591,7 +591,7 @@ BEGIN
                     )
                     AND successor_snapshot.payload_state = 'available'
                     AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-                    AND public.flashback_payload_is_owned(
+                    AND flashback_payload_is_owned(
                             to_regclass(successor_snapshot.snapshot_table)
                         )
                     AND NOT EXISTS (
@@ -650,7 +650,7 @@ BEGIN
             IF snap_rec.snapshot_table IS NOT NULL
                AND snap_rec.snapshot_table ~ '^flashback\\."?[a-zA-Z0-9_]+"?$'
             THEN
-                PERFORM public.flashback_drop_payload_table(
+                PERFORM flashback_drop_payload_table(
                     to_regclass(snap_rec.snapshot_table)
                 );
             END IF;

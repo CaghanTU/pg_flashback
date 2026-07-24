@@ -43,6 +43,7 @@ extension_sql_file!(
     name = "flashback_wal_promote_core",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_drop_dependency_manifest",
         "flashback_local_capacity"
     ],
@@ -53,6 +54,7 @@ extension_sql_file!(
     name = "flashback_lifecycle_bootstrap_core",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_payload_ownership_helpers",
         "flashback_local_capacity",
         "flashback_local_compatibility",
@@ -74,6 +76,7 @@ extension_sql_file!(
     name = "flashback_api_track_capture",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_payload_ownership_helpers",
         "flashback_local_capacity",
         "flashback_worker_admission",
@@ -96,6 +99,7 @@ extension_sql_file!(
     "../sql/functions/test_wal_seam.sql",
     name = "flashback_test_wal_seam",
     requires = [
+        "flashback_state_authority",
         "flashback_wal_promote_core",
         "flashback_lifecycle_bootstrap_core",
         "flashback_ddl_staging_core",
@@ -110,6 +114,7 @@ extension_sql_file!(
     name = "flashback_coverage_runtime",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_api_track_capture",
         "flashback_wal_only_migration",
         "flashback_local_capacity"
@@ -174,6 +179,7 @@ extension_sql_file!(
     name = "flashback_maintain_uninstall",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_operator_projections",
         "flashback_coverage_runtime",
         "flashback_operation_journal",
@@ -203,6 +209,7 @@ extension_sql_file!(
     name = "flashback_unprotect_cleanup_api",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_api_track_capture",
         "flashback_operation_journal",
         "flashback_worker_admission",
@@ -215,6 +222,7 @@ extension_sql_file!(
     name = "flashback_retention_runtime",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_payload_ownership_helpers",
         "flashback_api_track_capture",
         "flashback_coverage_runtime"

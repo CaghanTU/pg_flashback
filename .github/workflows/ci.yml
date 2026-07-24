@@ -135,6 +135,9 @@ jobs:
             OUT_DIR=target/generated-sql-wal-only-surface \
             scripts/check_core_wal_only_surface.sh
 
+      - name: Runtime state mutations are centralized
+        run: scripts/check_centralized_state_surface.sh
+
       - name: Integration SQL inventory classification
         run: python3 scripts/check_integration_inventory.py
 

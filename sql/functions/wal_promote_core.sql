@@ -17,10 +17,13 @@ DECLARE
     v_missing_commits bigint := 0;
     pending record;
     lock_rec record;
+    gen_rec record;
     v_frontier_lsn pg_lsn;
     v_frontier_time timestamptz;
     v_confirmed_flush_lsn pg_lsn := p_confirmed_flush_lsn;
     v_restart_lsn pg_lsn := p_restart_lsn;
+    v_parent_stream_id bigint;
+    v_parent_state text;
 BEGIN
     IF p_stream_id IS NULL THEN
         RAISE EXCEPTION 'flashback_apply_decoded_wal_batch: stream_id is required';
@@ -183,39 +186,54 @@ BEGIN
            );
 
         IF pending.parent_generation_id IS NOT NULL THEN
-            UPDATE flashback.coverage_generations
-               SET state = 'sealed',
-                   -- A same-stream handoff is continuous and this decoded
-                   -- batch proves the parent through the boundary.  A
-                   -- cross-stream re-anchor follows a permanent gap: retain
-                   -- the old frozen watermark instead of fabricating replay.
-                   valid_through_lsn = CASE
-                       WHEN stream_id = p_stream_id THEN pending.commit_lsn
-                       ELSE valid_through_lsn
-                   END,
-                   valid_through_time = CASE
-                       WHEN stream_id = p_stream_id THEN pending.committed_at
-                       ELSE valid_through_time
-                   END,
-                   superseded_before_lsn = pending.commit_lsn,
-                   superseded_before_time = pending.committed_at,
-                   sealed_at = clock_timestamp(),
-                   state_reason = 'successor_boundary_resolved'
-             WHERE generation_id = pending.parent_generation_id
-               AND tracking_id = pending.tracking_id
-               AND state = 'active';
+            SELECT stream_id, state INTO v_parent_stream_id, v_parent_state
+            FROM flashback.coverage_generations
+            WHERE generation_id = pending.parent_generation_id
+              AND tracking_id = pending.tracking_id;
+
+            -- A same-stream handoff is continuous and this decoded batch
+            -- proves the parent through the boundary. A cross-stream
+            -- re-anchor follows a permanent gap: retain the old frozen
+            -- watermark instead of fabricating replay. A re-anchor that
+            -- recovers from a lost initial boundary links to an already
+            -- `aborted` tombstone as lineage, not a sealable predecessor;
+            -- only an `active` parent is ever a real handoff to seal.
+            IF v_parent_state = 'active' THEN
+                PERFORM flashback_internal_transition_coverage_generation(
+                    pending.parent_generation_id,
+                    pending.tracking_id,
+                    'active',
+                    'sealed',
+                    'successor_boundary_resolved',
+                    NULL,
+                    NULL,
+                    CASE WHEN v_parent_stream_id = p_stream_id
+                         THEN pending.commit_lsn
+                         ELSE NULL END,
+                    CASE WHEN v_parent_stream_id = p_stream_id
+                         THEN pending.committed_at
+                         ELSE NULL END,
+                    pending.commit_lsn,
+                    pending.committed_at,
+                    '{}'::jsonb
+                );
+            END IF;
         END IF;
 
-        UPDATE flashback.coverage_generations
-           SET boundary_lsn = pending.commit_lsn,
-               boundary_time = pending.committed_at,
-               valid_through_lsn = pending.commit_lsn,
-               valid_through_time = pending.committed_at,
-               state = 'active',
-               activated_at = clock_timestamp(),
-               state_reason = 'boundary_commit_observed'
-         WHERE generation_id = pending.generation_id
-           AND state = 'building';
+        PERFORM flashback_internal_transition_coverage_generation(
+            pending.generation_id,
+            pending.tracking_id,
+            'building',
+            'active',
+            'boundary_commit_observed',
+            pending.commit_lsn,
+            pending.committed_at,
+            pending.commit_lsn,
+            pending.committed_at,
+            NULL,
+            NULL,
+            '{}'::jsonb
+        );
 
         UPDATE flashback.coverage_gaps
            SET gap_end_lsn = pending.commit_lsn,
@@ -288,7 +306,7 @@ BEGIN
     -- Bind pre-DROP manifests (captured with source_xid in the DROP TX) to the
     -- exact committed DROP event so plan/execute never use a newer unrelated
     -- manifest for the same tracking_id.
-    IF to_regprocedure('public.flashback_bind_drop_dependency_manifests()') IS NOT NULL THEN
+    IF to_regprocedure('flashback_bind_drop_dependency_manifests()') IS NOT NULL THEN
         PERFORM flashback_bind_drop_dependency_manifests();
     END IF;
 
@@ -309,17 +327,19 @@ BEGIN
     END IF;
 
     IF v_frontier_lsn IS NOT NULL THEN
-        UPDATE flashback.capture_streams
-           SET valid_through_lsn = GREATEST(valid_through_lsn, v_frontier_lsn),
-               valid_through_time = v_frontier_time,
-               confirmed_flush_lsn = COALESCE(v_confirmed_flush_lsn, confirmed_flush_lsn),
-               restart_lsn = COALESCE(v_restart_lsn, restart_lsn),
-               details = COALESCE(details, '{}'::jsonb)
-                   - 'safe_slot_advance_start_lsn'
-                   - 'safe_slot_advance_upto_lsn'
-                   - 'safe_slot_advance_recorded_at'
-         WHERE stream_id = p_stream_id
-           AND state = 'active';
+        PERFORM flashback_internal_advance_capture_stream_progress(
+            p_stream_id,
+            v_frontier_lsn,
+            v_frontier_time,
+            v_confirmed_flush_lsn,
+            v_restart_lsn,
+            NULL,
+            ARRAY[
+                'safe_slot_advance_start_lsn',
+                'safe_slot_advance_upto_lsn',
+                'safe_slot_advance_recorded_at'
+            ]
+        );
 
         -- Advance watermarks for lifecycles pinned for this batch. Independently
         -- try-lock idle lifecycles so an unrelated hold does not freeze their
@@ -335,38 +355,41 @@ BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM _fb_wal_lock_ids pinned
                 WHERE pinned.tracking_id = lock_rec.tracking_id
-            ) AND NOT pg_try_advisory_xact_lock(
-                358944::integer, hashint8(lock_rec.tracking_id)
-            ) THEN
+            ) AND NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
                 CONTINUE;
             END IF;
 
-            UPDATE flashback.coverage_generations
-               SET valid_through_lsn = LEAST(
-                       v_frontier_lsn,
-                       COALESCE(superseded_before_lsn, v_frontier_lsn)
-                   ),
-                   valid_through_time = CASE
-                       WHEN superseded_before_lsn IS NULL
-                            OR v_frontier_lsn < superseded_before_lsn
-                           THEN v_frontier_time
-                       ELSE valid_through_time
-                   END
-             WHERE stream_id = p_stream_id
-               AND tracking_id = lock_rec.tracking_id
-               AND state IN ('active', 'sealed')
-               AND valid_through_lsn <= v_frontier_lsn;
+            FOR gen_rec IN
+                SELECT cg.generation_id, cg.tracking_id
+                FROM flashback.coverage_generations cg
+                WHERE cg.stream_id = p_stream_id
+                  AND cg.tracking_id = lock_rec.tracking_id
+                  AND cg.state IN ('active', 'sealed')
+                  AND cg.valid_through_lsn <= v_frontier_lsn
+                ORDER BY cg.generation_id
+            LOOP
+                PERFORM flashback_internal_advance_generation_watermark(
+                    gen_rec.generation_id,
+                    gen_rec.tracking_id,
+                    v_frontier_lsn,
+                    v_frontier_time
+                );
+            END LOOP;
         END LOOP;
     ELSIF v_confirmed_flush_lsn IS NOT NULL THEN
-        UPDATE flashback.capture_streams
-           SET confirmed_flush_lsn = v_confirmed_flush_lsn,
-               restart_lsn = COALESCE(v_restart_lsn, restart_lsn),
-               details = COALESCE(details, '{}'::jsonb)
-                   - 'safe_slot_advance_start_lsn'
-                   - 'safe_slot_advance_upto_lsn'
-                   - 'safe_slot_advance_recorded_at'
-         WHERE stream_id = p_stream_id
-           AND state = 'active';
+        PERFORM flashback_internal_advance_capture_stream_progress(
+            p_stream_id,
+            NULL,
+            NULL,
+            v_confirmed_flush_lsn,
+            v_restart_lsn,
+            NULL,
+            ARRAY[
+                'safe_slot_advance_start_lsn',
+                'safe_slot_advance_upto_lsn',
+                'safe_slot_advance_recorded_at'
+            ]
+        );
     END IF;
 
     RETURN v_inserted;

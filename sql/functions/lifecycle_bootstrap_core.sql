@@ -169,7 +169,7 @@ BEGIN
     END IF;
 
     v_tracking_id := nextval('flashback.tracking_id_seq');
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
 
     PERFORM flashback_admit_local_capacity(p_rel_oid, 'track');
     PERFORM flashback_apply_local_boundary_lock_timeout();
@@ -203,10 +203,10 @@ BEGIN
             SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = old_oid
         LOOP
             IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
-                PERFORM public.flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
+                PERFORM flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
             END IF;
         END LOOP;
-        PERFORM public.flashback_drop_payload_table(
+        PERFORM flashback_drop_payload_table(
             to_regclass(format('flashback.%I', format('base_snapshot_%s', old_oid::text)))
         );
         DELETE FROM flashback.snapshots WHERE rel_oid = old_oid;
@@ -224,7 +224,7 @@ BEGIN
                 WHERE tt.rel_oid = p_rel_oid
                   AND tt.base_snapshot_table = stale_snap.snapshot_table
             ) THEN
-                PERFORM public.flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
+                PERFORM flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
                 DELETE FROM flashback.snapshots
                 WHERE rel_oid = p_rel_oid
                   AND snapshot_table = stale_snap.snapshot_table;
@@ -232,11 +232,11 @@ BEGIN
         END IF;
     END LOOP;
 
-    PERFORM public.flashback_drop_payload_table(
+    PERFORM flashback_drop_payload_table(
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I', v_snapshot_name, v_schema_name, v_table_name);
-    PERFORM public.flashback_own_payload_table(
+    PERFORM flashback_own_payload_table(
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
 
@@ -270,16 +270,21 @@ BEGIN
         v_provisional_lsn, v_schema_def, v_row_count, clock_timestamp()
     ) RETURNING snapshot_id INTO v_snapshot_id;
 
-    INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, stream_id, recovery_profile, state,
-        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
-        boundary_xid, boundary_marker, details
-    ) VALUES (
-        v_tracking_id, 1, p_stream_id, 'local_delta', 'building',
-        'initial_track', p_rel_oid, v_snapshot_id,
-        v_boundary_xid, format('initial-track:%s:%s', v_tracking_id, v_boundary_xid),
-        jsonb_build_object('provisional_snapshot_lsn', v_provisional_lsn)
-    ) RETURNING generation_id INTO v_generation_id;
+    v_generation_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tracking_id,
+        p_generation_no => 1,
+        p_stream_id => p_stream_id,
+        p_boundary_kind => 'initial_track',
+        p_rel_oid_at_boundary => p_rel_oid,
+        p_boundary_snapshot_id => v_snapshot_id,
+        p_boundary_lsn => NULL,
+        p_boundary_time => NULL,
+        p_boundary_xid => v_boundary_xid,
+        p_boundary_marker => format('initial-track:%s:%s', v_tracking_id, v_boundary_xid),
+        p_parent_generation_id => NULL,
+        p_recovery_profile => 'local_delta',
+        p_details => jsonb_build_object('provisional_snapshot_lsn', v_provisional_lsn)
+    );
 
     DELETE FROM flashback.schema_versions WHERE rel_oid = p_rel_oid;
 

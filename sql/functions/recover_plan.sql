@@ -499,6 +499,7 @@ DECLARE
     v_header_tracking bigint;
     v_header_state text;
     v_binding jsonb;
+    v_proof_payload jsonb;
 BEGIN
     PERFORM flashback_require_primary('flashback_recover_execute');
 
@@ -575,18 +576,13 @@ BEGIN
 
     v_rows := flashback_restore_lsn(v_table, v_lsn);
 
-    SELECT COALESCE(o.details->'successor', '{}'::jsonb) INTO v_binding
-    FROM flashback.operations o
-    WHERE o.operation_id = v_op;
-
-    PERFORM flashback_operation_append_event(
-        v_op, 'applied_coverage_pending', NULL, NULL,
-        'restore applied; waiting for exact successor coverage',
-        jsonb_build_object(
-            'rows_affected', v_rows,
-            'successor', v_binding
-        )
-    );
+    SELECT COALESCE(e.payload->'successor', '{}'::jsonb), e.payload
+      INTO v_binding, v_proof_payload
+    FROM flashback.operation_events e
+    WHERE e.operation_id = v_op
+      AND e.event_type = 'applied_coverage_pending'
+    ORDER BY e.event_id DESC
+    LIMIT 1;
 
     RETURN jsonb_build_object(
         'schema_version', 1,

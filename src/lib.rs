@@ -209,6 +209,10 @@ mod tests {
         "../tests/sql/integration/rbac_enforcement.sql"
     );
     sql_test!(
+        it_state_authority_transitions,
+        "../tests/sql/integration/state_authority_transitions.sql"
+    );
+    sql_test!(
         it_pitr_time_filtering,
         "../tests/sql/integration/pitr_time_filtering.sql"
     );

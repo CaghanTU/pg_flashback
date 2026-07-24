@@ -230,6 +230,7 @@ DECLARE
     v_original_ri "char";
     v_original_ri_idx text;
     v_ri_clause text;
+    gen_rec record;
 BEGIN
     v_slot := flashback_effective_slot_name();
     SELECT confirmed_flush_lsn INTO v_flush
@@ -292,14 +293,28 @@ BEGIN
             END;
         END IF;
 
-        UPDATE flashback.coverage_generations
-           SET state = 'sealed',
-               superseded_before_lsn = COALESCE(valid_through_lsn, v_commit) + 1,
-               superseded_before_time = clock_timestamp(),
-               sealed_at = clock_timestamp(),
-               state_reason = 'unprotected'
-         WHERE tracking_id = r.tracking_id
-           AND state = 'active';
+        FOR gen_rec IN
+            SELECT generation_id, tracking_id, valid_through_lsn
+            FROM flashback.coverage_generations
+            WHERE tracking_id = r.tracking_id
+              AND state = 'active'
+            ORDER BY generation_id
+        LOOP
+            PERFORM flashback_internal_transition_coverage_generation(
+                gen_rec.generation_id,
+                gen_rec.tracking_id,
+                'active',
+                'sealed',
+                'unprotected',
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                COALESCE(gen_rec.valid_through_lsn, v_commit) + 1,
+                clock_timestamp(),
+                '{}'::jsonb
+            );
+        END LOOP;
 
         UPDATE flashback.tracked_tables
            SET is_active = false,
@@ -349,6 +364,7 @@ DECLARE
     v_snap_count bigint;
     v_delta_count bigint;
     v_manifest_count bigint;
+    gen_rec record;
 BEGIN
     PERFORM flashback_require_primary('flashback_cleanup');
 
@@ -408,13 +424,13 @@ BEGIN
               AND snapshot_table IS NOT NULL
               AND snapshot_table ~ '^flashback\."?[a-zA-Z0-9_]+"?$'
         LOOP
-            PERFORM public.flashback_drop_payload_table(to_regclass(snap_rec.snapshot_table));
+            PERFORM flashback_drop_payload_table(to_regclass(snap_rec.snapshot_table));
         END LOOP;
 
         IF r.base_snapshot_table IS NOT NULL AND r.base_snapshot_table <> ''
            AND r.base_snapshot_table ~ '^flashback\."?[a-zA-Z0-9_]+"?$'
         THEN
-            PERFORM public.flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
+            PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
         END IF;
     END;
 
@@ -428,12 +444,55 @@ BEGIN
         DELETE FROM flashback.drop_dependency_manifests WHERE tracking_id = p_tracking_id;
     END IF;
 
-    UPDATE flashback.coverage_generations
-       SET state = 'retired',
-           retired_at = clock_timestamp(),
-           state_reason = 'cleaned'
-     WHERE tracking_id = p_tracking_id
-       AND state IN ('sealed', 'active');
+    -- Forbidden: active → retired. Seal any remaining active generations first,
+    -- then retire sealed generations.
+    FOR gen_rec IN
+        SELECT generation_id, tracking_id, valid_through_lsn
+        FROM flashback.coverage_generations
+        WHERE tracking_id = p_tracking_id
+          AND state = 'active'
+        ORDER BY generation_id
+    LOOP
+        PERFORM flashback_internal_transition_coverage_generation(
+            gen_rec.generation_id,
+            gen_rec.tracking_id,
+            'active',
+            'sealed',
+            'cleaned',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            CASE WHEN gen_rec.valid_through_lsn IS NOT NULL
+                 THEN gen_rec.valid_through_lsn + 1
+                 ELSE NULL END,
+            clock_timestamp(),
+            '{}'::jsonb
+        );
+    END LOOP;
+
+    FOR gen_rec IN
+        SELECT generation_id, tracking_id
+        FROM flashback.coverage_generations
+        WHERE tracking_id = p_tracking_id
+          AND state = 'sealed'
+        ORDER BY generation_id
+    LOOP
+        PERFORM flashback_internal_transition_coverage_generation(
+            gen_rec.generation_id,
+            gen_rec.tracking_id,
+            'sealed',
+            'retired',
+            'cleaned',
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            '{}'::jsonb
+        );
+    END LOOP;
 
     UPDATE flashback.tracked_tables
        SET protection_state = 'cleaned',

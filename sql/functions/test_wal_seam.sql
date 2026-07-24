@@ -30,9 +30,8 @@ BEGIN
         RAISE EXCEPTION 'flashback_internal_open_capture_stream: confirmed_flush_lsn required';
     END IF;
 
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
     SELECT timeline_id::bigint INTO v_timeline FROM pg_control_checkpoint();
 
@@ -59,19 +58,17 @@ BEGIN
     FROM flashback.capture_streams
     WHERE database_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
-    INSERT INTO flashback.capture_streams (
-        database_oid, database_name, epoch_no, capture_mode, timeline_id,
-        slot_name, plugin_name, state, valid_through_lsn,
-        confirmed_flush_lsn, restart_lsn, activated_at, details
-    ) VALUES (
-        (SELECT oid FROM pg_database WHERE datname = current_database()),
-        current_database(), v_epoch, 'wal', v_timeline,
-        p_slot_name, p_plugin, 'active', p_confirmed_flush_lsn,
-        p_confirmed_flush_lsn, COALESCE(p_restart_lsn, p_confirmed_flush_lsn),
-        clock_timestamp(),
-        jsonb_build_object('initial_confirmed_flush_lsn', p_confirmed_flush_lsn)
-    )
-    RETURNING stream_id INTO v_stream_id;
+    v_stream_id := flashback_internal_create_capture_stream(
+        p_database_oid => (SELECT oid FROM pg_database WHERE datname = current_database()),
+        p_initial_state => 'active',
+        p_epoch_no => v_epoch,
+        p_timeline_id => v_timeline,
+        p_slot_name => p_slot_name,
+        p_plugin_name => p_plugin,
+        p_confirmed_flush_lsn => p_confirmed_flush_lsn,
+        p_restart_lsn => COALESCE(p_restart_lsn, p_confirmed_flush_lsn),
+        p_details => jsonb_build_object('initial_confirmed_flush_lsn', p_confirmed_flush_lsn)
+    );
 
     RETURN v_stream_id;
 END;
@@ -146,7 +143,7 @@ BEGIN
         v_ord
     );
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(v_boot.out_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(v_boot.out_tracking_id);
     PERFORM flashback_apply_decoded_wal_batch(v_stream_id, NULL, NULL);
 
     IF NOT EXISTS (
@@ -238,7 +235,7 @@ BEGIN
         RAISE EXCEPTION 'flashback_test_inject_commit: tracking_id % is inactive', p_tracking_id;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(p_tracking_id);
 
     IF EXISTS (
         SELECT 1
@@ -341,7 +338,7 @@ BEGIN
         * 1000000
     )::bigint;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(p_tracking_id);
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
     CREATE TEMP TABLE _fb_wal_batch (
@@ -452,9 +449,8 @@ DECLARE
     v_stream_id bigint;
     v_locked record;
 BEGIN
-    PERFORM pg_advisory_xact_lock(
-        358945::integer,
-        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    PERFORM flashback_internal_lock_database_stream(
+        (SELECT oid FROM pg_database WHERE datname = current_database())
     );
 
     SELECT cs.stream_id

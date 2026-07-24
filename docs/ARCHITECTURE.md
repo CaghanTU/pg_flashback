@@ -107,10 +107,51 @@ abandoned.
 
 ## Locking
 
-Lifecycle operations share advisory-lock identities and acquire them in a
-stable order. Recovery refuses to wait indefinitely for an unsafe write stall.
-Capture and maintenance use separate workers so retention or checkpoint work
-does not stop logical-slot draining.
+Canonical advisory-lock order for lifecycle paths:
+
+1. Pre-identity lock (`358943`, `rel_oid`) — table registration pre-identity
+2. Database / capture-stream lock (`358945`, `database_oid`) — database stream scope
+3. Lifecycle locks (`358944`, `hashint8(tracking_id)`), sorted and DISTINCT in ascending order — tracking lifecycle scope
+4. Relation / partition lock (`358946`, `rel_oid`) — table partition/relation scope
+5. Physical payload FOR UPDATE locks
+
+Helpers live in `flashback_internal_lock_*` (`sql/functions/state_authority.sql`).
+The Rust capture worker keeps its existing **session** drain lock on namespace
+`358945`; that must not be confused with transaction lifecycle locks.
+
+## State and progress authority
+
+Direct `SET state=` mutations for capture streams, coverage generations, and
+payload retirements, as well as initial state `INSERT`s, go through narrow SECURITY DEFINER primitives in
+`state_authority.sql`. Domain commands (for example
+`flashback_mark_capture_stream_broken`) still own side effects such as durable
+gaps and payload cleanup; they call the transition primitives inside the same
+transaction. Trigger/CHECK guards remain the last line of defense.
+
+Progress fields (`valid_through_*`, `confirmed_flush_lsn`, generation
+watermarks) advance through separate helpers and cannot heal a broken stream
+or an open coverage gap back to healthy.
+
+Legal coverage generation edges (enforced by guard + authority):
+
+```text
+building → active | aborted
+active   → sealed
+sealed   → retired
+```
+
+Capture stream edges used by runtime:
+
+```text
+initializing → active | broken | retired
+active       → broken | retired
+broken       → retired
+```
+
+The operation journal keeps strictly immutable `operations` headers and append-only
+`operation_events`. Restore proof, verification, and successor identity are written
+to `operation_events` payloads. Terminal states (`verified`, `failed`, `abandoned`, `unprotected`, `cleaned`, `sealed`) refuse
+further non-matching progress; retrying the exact same terminal payload is an idempotent no-op.
 
 ## Storage
 

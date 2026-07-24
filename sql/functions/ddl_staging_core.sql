@@ -53,7 +53,7 @@ BEGIN
             p_tracking_id;
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(p_tracking_id);
 
     SELECT cg.generation_id, cg.stream_id, cs.state
       INTO v_generation_id, v_stream_id, v_stream_state

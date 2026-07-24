@@ -13,6 +13,12 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../../sql/functions/state_authority.sql",
+    name = "flashback_state_authority",
+    requires = ["flashback_storage_schema_bootstrap"],
+);
+
+extension_sql_file!(
     "../../sql/functions/rbac_grants.sql",
     name = "flashback_rbac_grants",
     requires = [

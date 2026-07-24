@@ -20,6 +20,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
+    v_tracking_id bigint;
     v_rel_oid oid;
     v_schema_name text;
     v_table_name text;
@@ -53,8 +54,8 @@ BEGIN
 
     PERFORM flashback_set_restore_in_progress(true);
 
-    SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
-        INTO v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
+    SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.tracked_since
+        INTO v_tracking_id, v_rel_oid, v_schema_name, v_table_name, v_base_snapshot_table, v_tracked_since
     FROM flashback.tracked_tables tt
     WHERE tt.recovery_profile = 'local_delta'
       AND (
@@ -69,12 +70,12 @@ BEGIN
         tt.tracked_since DESC
     LIMIT 1;
 
-    -- Serialize concurrent restores with an advisory lock (use rel_oid found above).
-    PERFORM pg_advisory_xact_lock(358944::integer, v_rel_oid::integer);
-
-    IF v_rel_oid IS NULL THEN
+    IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_restore: table % is not tracked (was it ever tracked, or was retention already applied?)', target_table;
     END IF;
+
+    -- Serialize concurrent restores with canonical lifecycle advisory lock.
+    PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
 
     IF EXISTS (
         SELECT 1
@@ -484,14 +485,14 @@ BEGIN
 
         v_post_snap_tbl := format('snap_%s_%s', v_rel_oid::text, v_post_snap_id::text);
 
-        PERFORM public.flashback_drop_payload_table(
+        PERFORM flashback_drop_payload_table(
             to_regclass(format('flashback.%I', v_post_snap_tbl))
         );
         EXECUTE format(
             'CREATE TABLE flashback.%I AS TABLE %I.%I',
             v_post_snap_tbl, v_schema_name, v_table_name
         );
-        PERFORM public.flashback_own_payload_table(
+        PERFORM flashback_own_payload_table(
             to_regclass(format('flashback.%I', v_post_snap_tbl))
         );
         EXECUTE format('SELECT count(*) FROM flashback.%I', v_post_snap_tbl)

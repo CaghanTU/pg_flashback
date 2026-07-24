@@ -47,6 +47,47 @@ BEGIN
 END
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_operations_guard_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'pg_flashback: operations rows are strictly immutable once created'
+        USING ERRCODE = 'object_not_in_prerequisite_state',
+              HINT = 'Header details cannot be updated; append to operation_events instead.';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_operation_events_guard_trigger()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'pg_flashback: operation_events rows are strictly append-only'
+        USING ERRCODE = 'object_not_in_prerequisite_state',
+              HINT = 'Events cannot be modified or deleted once recorded.';
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_flashback_operations_immutable'
+    ) THEN
+        CREATE TRIGGER trg_flashback_operations_immutable
+        BEFORE UPDATE OR DELETE ON flashback.operations
+        FOR EACH ROW EXECUTE FUNCTION public.flashback_operations_guard_trigger();
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_flashback_operation_events_immutable'
+    ) THEN
+        CREATE TRIGGER trg_flashback_operation_events_immutable
+        BEFORE UPDATE OR DELETE ON flashback.operation_events
+        FOR EACH ROW EXECUTE FUNCTION public.flashback_operation_events_guard_trigger();
+    END IF;
+END $$;
+
 -- Projected current state: last event_type wins (no UPDATE of authority rows).
 CREATE OR REPLACE VIEW flashback.operation_current_state AS
 SELECT DISTINCT ON (o.operation_id)
@@ -108,7 +149,7 @@ CREATE OR REPLACE FUNCTION flashback_operation_begin(
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_id bigint;
@@ -140,9 +181,94 @@ CREATE OR REPLACE FUNCTION flashback_operation_append_event(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
+DECLARE
+    v_command text;
+    v_cur_event_type text;
+    v_cur_payload jsonb;
+    v_cur_sqlstate text;
+    v_cur_error_code text;
+    v_cur_message text;
+    v_is_terminal boolean := false;
+    v_legal boolean := false;
 BEGIN
+    IF p_operation_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: operation_append_event requires operation_id'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_event_type IS NULL OR btrim(p_event_type) = '' THEN
+        RAISE EXCEPTION 'pg_flashback: operation_append_event requires event_type'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT command INTO v_command
+    FROM flashback.operations
+    WHERE operation_id = p_operation_id
+    FOR UPDATE;
+
+    IF v_command IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: unknown operation_id %', p_operation_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT event_type, payload, sqlstate, error_code, message
+      INTO v_cur_event_type, v_cur_payload, v_cur_sqlstate, v_cur_error_code, v_cur_message
+    FROM flashback.operation_events
+    WHERE operation_id = p_operation_id
+    ORDER BY event_id DESC
+    LIMIT 1;
+
+    v_is_terminal := (v_cur_event_type IN ('verified', 'failed', 'abandoned', 'unprotected', 'cleaned', 'sealed'));
+
+    IF v_is_terminal THEN
+        IF p_event_type IS NOT DISTINCT FROM v_cur_event_type THEN
+            IF COALESCE(p_payload, '{}'::jsonb) IS NOT DISTINCT FROM COALESCE(v_cur_payload, '{}'::jsonb)
+               AND p_sqlstate IS NOT DISTINCT FROM v_cur_sqlstate
+               AND p_error_code IS NOT DISTINCT FROM v_cur_error_code
+               AND p_message IS NOT DISTINCT FROM v_cur_message
+            THEN
+                RETURN;
+            ELSE
+                RAISE EXCEPTION 'pg_flashback: conflicting terminal event retry for operation % (state %)',
+                    p_operation_id, v_cur_event_type
+                    USING ERRCODE = 'serialization_failure';
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'pg_flashback: refuse event % on terminal operation % (state %)',
+                p_event_type, p_operation_id, v_cur_event_type
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+    END IF;
+
+    v_legal := CASE
+        WHEN v_command IN ('recover', 'restore_lsn') THEN
+            (v_cur_event_type = 'started' AND p_event_type = 'applied_coverage_pending')
+            OR (v_cur_event_type = 'applied_coverage_pending' AND p_event_type = 'verified')
+            OR (v_cur_event_type IN ('started', 'applied_coverage_pending') AND p_event_type = 'failed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
+        WHEN v_command = 'unprotect' THEN
+            (v_cur_event_type = 'started' AND p_event_type = 'stopping')
+            OR (v_cur_event_type = 'stopping' AND p_event_type = 'unprotected')
+            OR (v_cur_event_type IN ('started', 'stopping') AND p_event_type = 'failed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
+        WHEN v_command = 'cleanup' THEN
+            (v_cur_event_type = 'started' AND p_event_type = 'cleaned')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'failed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
+        WHEN v_command = 'maintain' THEN
+            (v_cur_event_type = 'started' AND p_event_type = 'sealed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'failed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
+        ELSE false
+    END;
+
+    IF NOT v_legal THEN
+        RAISE EXCEPTION 'pg_flashback: illegal journal transition % -> % for command % (operation %)',
+            v_cur_event_type, p_event_type, v_command, p_operation_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
     INSERT INTO flashback.operation_events (
         operation_id, event_type, sqlstate, error_code, message, payload
     ) VALUES (
@@ -172,7 +298,7 @@ RETURNS TABLE (
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
     SELECT
         s.operation_id, s.command, s.table_name, s.state, s.session_user_name,
@@ -185,7 +311,7 @@ AS $$
     ORDER BY s.created_at DESC, s.operation_id DESC;
 $$;
 
-COMMENT ON FUNCTION flashback_operation_history(text, interval) IS
+COMMENT ON FUNCTION public.flashback_operation_history(text, interval) IS
     'Operator operation history (not row-change payloads). Source of truth is append-only operation_events.';
 
 -- Client/reconciler: durable failure after a failed or abandoned execute TX.
@@ -201,7 +327,7 @@ CREATE OR REPLACE FUNCTION flashback_recover_mark_failed(
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_state text;
@@ -223,7 +349,7 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    PERFORM flashback_operation_append_event(
+    PERFORM public.flashback_operation_append_event(
         p_operation_id,
         'failed',
         p_sqlstate,
@@ -242,7 +368,7 @@ CREATE OR REPLACE FUNCTION flashback_reconcile_recover_operations(
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     r record;
@@ -255,7 +381,7 @@ BEGIN
           AND s.state = 'started'
           AND s.state_at < clock_timestamp() - p_stale_after
     LOOP
-        PERFORM flashback_operation_append_event(
+        PERFORM public.flashback_operation_append_event(
             r.operation_id, 'abandoned', NULL, 'recover_abandoned',
             'recover begin committed but execute never reached applied_coverage_pending',
             jsonb_build_object(
@@ -275,7 +401,7 @@ CREATE OR REPLACE FUNCTION flashback_finalize_recover_operations()
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
+SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     r record;
@@ -299,26 +425,6 @@ BEGIN
         WHERE s.command IN ('recover', 'restore_lsn')
           AND s.state = 'applied_coverage_pending'
     LOOP
-        SELECT o.details INTO v_restore_verification
-        FROM flashback.operations o
-        WHERE o.operation_id = r.operation_id;
-
-        v_verification_status := v_restore_verification->'restore_verification'->>'status';
-        IF v_verification_status IS NULL THEN
-            CONTINUE;
-        END IF;
-        IF v_verification_status = 'failed' THEN
-            PERFORM flashback_operation_append_event(
-                r.operation_id, 'failed', NULL, 'restore_verification_failed',
-                'restore verification proof marked failed',
-                COALESCE(v_restore_verification->'restore_verification', '{}'::jsonb)
-            );
-            CONTINUE;
-        END IF;
-        IF v_verification_status IS DISTINCT FROM 'passed' THEN
-            CONTINUE;
-        END IF;
-
         SELECT e.payload INTO v_payload
         FROM flashback.operation_events e
         WHERE e.operation_id = r.operation_id
@@ -326,10 +432,24 @@ BEGIN
         ORDER BY e.event_id DESC
         LIMIT 1;
 
-        SELECT COALESCE(v_payload->'successor', o.details->'successor', '{}'::jsonb)
-          INTO v_succ
-        FROM flashback.operations o
-        WHERE o.operation_id = r.operation_id;
+        v_restore_verification := v_payload->'restore_verification';
+        v_verification_status := v_restore_verification->>'status';
+        IF v_verification_status IS NULL THEN
+            CONTINUE;
+        END IF;
+        IF v_verification_status = 'failed' THEN
+            PERFORM public.flashback_operation_append_event(
+                r.operation_id, 'failed', NULL, 'restore_verification_failed',
+                'restore verification proof marked failed',
+                COALESCE(v_restore_verification, '{}'::jsonb)
+            );
+            CONTINUE;
+        END IF;
+        IF v_verification_status IS DISTINCT FROM 'passed' THEN
+            CONTINUE;
+        END IF;
+
+        v_succ := COALESCE(v_payload->'successor', '{}'::jsonb);
         v_tracking_id := NULLIF(v_succ->>'tracking_id', '')::bigint;
         v_generation_id := NULLIF(v_succ->>'generation_id', '')::bigint;
         v_stream_id := NULLIF(v_succ->>'stream_id', '')::bigint;
@@ -385,7 +505,7 @@ BEGIN
         END IF;
 
         SELECT h.* INTO v_health
-        FROM flashback_health() h
+        FROM public.flashback_health() h
         WHERE h.tracking_id = v_tracking_id
           AND h.generation_id = v_generation_id
         LIMIT 1;
@@ -398,7 +518,7 @@ BEGIN
             CONTINUE;
         END IF;
 
-        PERFORM flashback_operation_append_event(
+        PERFORM public.flashback_operation_append_event(
             r.operation_id, 'verified', NULL, NULL,
             'exact successor coverage healthy',
             jsonb_build_object(

@@ -219,7 +219,7 @@ BEGIN
         RAISE EXCEPTION 'flashback_storage_freeze_lifecycle: tracking_id is required';
     END IF;
 
-    PERFORM pg_advisory_xact_lock(358944::integer, hashint8(p_tracking_id));
+    PERFORM flashback_internal_lock_lifecycle(p_tracking_id);
 
     SELECT cg.* INTO v_gen
     FROM flashback.coverage_generations cg
@@ -631,17 +631,22 @@ BEGIN
 
         -- Normal path: the WAL worker's boundary-resolution already sealed
         -- the predecessor as part of activating the successor generation.
-        -- This UPDATE is only a defensive backstop for that race.
+        -- This transition is only a defensive backstop for that race.
         IF v_predecessor.state = 'active' THEN
-            UPDATE flashback.coverage_generations
-               SET state = 'sealed',
-                   superseded_before_lsn = COALESCE(superseded_before_lsn, v_cg.boundary_lsn),
-                   superseded_before_time = COALESCE(superseded_before_time, v_cg.boundary_time),
-                   sealed_at = clock_timestamp(),
-                   state_reason = COALESCE(state_reason, 'maintain_finalize_successor_healthy')
-             WHERE generation_id = v_predecessor_generation_id
-               AND tracking_id = v_tracking_id
-               AND state = 'active';
+            PERFORM flashback_internal_transition_coverage_generation(
+                v_predecessor_generation_id,
+                v_tracking_id,
+                'active',
+                'sealed',
+                COALESCE(v_predecessor.state_reason, 'maintain_finalize_successor_healthy'),
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                COALESCE(v_predecessor.superseded_before_lsn, v_cg.boundary_lsn),
+                COALESCE(v_predecessor.superseded_before_time, v_cg.boundary_time),
+                '{}'::jsonb
+            );
         END IF;
     END IF;
 
