@@ -1,4 +1,4 @@
--- Test: SERIAL / SEQUENCE values are restored correctly after flashback_restore_lsn().
+-- Test: SERIAL / SEQUENCE values are restored correctly after flashback_test_restore_lsn().
 -- After restore, the sequence's current value must reflect the highest ID in the
 -- restored table so new INSERTs don't collide with restored rows.
 DO $tv$
@@ -49,7 +49,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_seq', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_seq', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_seq;
     IF v_cnt <> 3 THEN

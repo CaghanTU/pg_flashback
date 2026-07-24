@@ -49,8 +49,8 @@ BEGIN
     );
     PERFORM flashback_bind_drop_dependency_manifests();
 
-    PERFORM flashback_restore_lsn('public.it_multi_drop_a', v_boundary_a);
-    PERFORM flashback_restore_lsn('public.it_multi_drop_b', v_boundary_b);
+    PERFORM flashback_test_restore_lsn('public.it_multi_drop_a', v_boundary_a);
+    PERFORM flashback_test_restore_lsn('public.it_multi_drop_b', v_boundary_b);
     IF to_regclass('public.it_multi_drop_a') IS NULL THEN
         RAISE EXCEPTION 'dropped table not restored';
     END IF;

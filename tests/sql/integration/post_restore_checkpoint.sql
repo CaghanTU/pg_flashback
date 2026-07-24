@@ -48,7 +48,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_post_ckpt', v_lsn_t2);
+    PERFORM flashback_test_restore_lsn('public.it_post_ckpt', v_lsn_t2);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_id, '0/4500'::pg_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_post_ckpt WHERE id = 3;
@@ -78,7 +78,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_post_ckpt', v_lsn_phase2);
+    PERFORM flashback_test_restore_lsn('public.it_post_ckpt', v_lsn_phase2);
 
     SELECT count(*) INTO v_cnt FROM public.it_post_ckpt WHERE id = 4;
     IF v_cnt <> 1 THEN

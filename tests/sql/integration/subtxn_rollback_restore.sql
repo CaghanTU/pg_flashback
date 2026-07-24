@@ -59,7 +59,7 @@ BEGIN
         RAISE EXCEPTION 'delta_log contains rolled-back row (val=will_rollback), count=%', v_cnt;
     END IF;
 
-    PERFORM flashback_restore_lsn('public.it_subtxn', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_subtxn', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_subtxn;
     IF v_cnt <> 1 THEN

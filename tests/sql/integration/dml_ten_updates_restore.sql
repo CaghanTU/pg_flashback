@@ -37,7 +37,7 @@ BEGIN
         v_events
     );
 
-    PERFORM flashback_restore_lsn('public.it_dml_ten_updates', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_dml_ten_updates', v_boundary_lsn);
     IF NOT EXISTS (SELECT 1 FROM public.it_dml_ten_updates WHERE id=1 AND status='v0') THEN
         RAISE EXCEPTION 'ten updates restore failed';
     END IF;

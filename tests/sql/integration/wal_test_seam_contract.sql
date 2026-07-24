@@ -227,6 +227,36 @@ BEGIN
         RAISE EXCEPTION 'non-superuser was able to call flashback_apply_decoded_wal_batch';
     END IF;
 
+    -- DDL seam must stage through the shared product core (exact LSN/generation).
+    CREATE TABLE public.it_seam_ddl (id int PRIMARY KEY, note text);
+    SELECT flashback_test_bootstrap_lifecycle('public.it_seam_ddl') INTO v_boot;
+    v_tracking_id := (v_boot->>'tracking_id')::bigint;
+    v_generation_id := (v_boot->>'generation_id')::bigint;
+    PERFORM flashback_test_inject_ddl_commit(
+        v_tracking_id,
+        '0/5000'::pg_lsn,
+        TIMESTAMPTZ '2024-01-01 00:00:05+00',
+        910005,
+        'TRUNCATE'
+    );
+    IF NOT EXISTS (
+        SELECT 1 FROM flashback.delta_log
+        WHERE tracking_id = v_tracking_id
+          AND generation_id = v_generation_id
+          AND event_type = 'TRUNCATE'
+          AND commit_lsn = '0/5000'::pg_lsn
+    ) THEN
+        RAISE EXCEPTION 'DDL seam did not promote TRUNCATE via shared staging core';
+    END IF;
+    IF has_function_privilege(
+           'public',
+           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)',
+           'EXECUTE'
+       )
+    THEN
+        RAISE EXCEPTION 'DDL staging core must not be EXECUTE-able by PUBLIC';
+    END IF;
+
     DROP TABLE IF EXISTS public.it_seam_contract CASCADE;
 END;
 $tv$;

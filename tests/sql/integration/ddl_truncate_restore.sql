@@ -24,7 +24,7 @@ BEGIN
         '[]'::jsonb
     );
 
-    PERFORM flashback_restore_lsn('public.it_ddl_truncate', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_ddl_truncate', v_boundary_lsn);
     SELECT count(*) INTO c FROM public.it_ddl_truncate;
     IF c <> 2 THEN RAISE EXCEPTION 'truncate restore failed'; END IF;
 END;

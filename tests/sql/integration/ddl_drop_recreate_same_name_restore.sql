@@ -33,7 +33,7 @@ BEGIN
     INSERT INTO public.it_ddl_drop_recreate VALUES (2, 'new', 'x');
 
     BEGIN
-        PERFORM flashback_restore_lsn('public.it_ddl_drop_recreate', v_boundary_lsn);
+        PERFORM flashback_test_restore_lsn('public.it_ddl_drop_recreate', v_boundary_lsn);
         RAISE EXCEPTION 'expected restore to refuse identity-mismatched live relation';
     EXCEPTION WHEN OTHERS THEN
         IF SQLERRM NOT ILIKE '%different relation already uses that name%'
@@ -45,7 +45,7 @@ BEGIN
     END;
 
     DROP TABLE public.it_ddl_drop_recreate;
-    PERFORM flashback_restore_lsn('public.it_ddl_drop_recreate', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_ddl_drop_recreate', v_boundary_lsn);
 
     IF EXISTS (
         SELECT 1 FROM information_schema.columns

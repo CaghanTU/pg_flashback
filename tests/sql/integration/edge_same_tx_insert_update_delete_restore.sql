@@ -32,7 +32,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_edge_same_tx', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_edge_same_tx', v_boundary_lsn);
     IF EXISTS (SELECT 1 FROM public.it_edge_same_tx) THEN
         RAISE EXCEPTION 'same tx I/U/D restore failed';
     END IF;

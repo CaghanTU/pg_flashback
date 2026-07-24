@@ -37,7 +37,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_diff_update', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_diff_update', v_point_lsn);
 
     SELECT * INTO v_row FROM public.it_diff_update WHERE id = 1;
     IF v_row.val <> 10 OR v_row.name <> 'alice' OR v_row.status <> 'active' THEN

@@ -67,7 +67,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_cpk', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_cpk', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_cpk;
     IF v_cnt <> 4 THEN

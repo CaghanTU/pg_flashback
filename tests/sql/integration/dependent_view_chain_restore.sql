@@ -1,4 +1,4 @@
--- Test: A chained view dependency survives flashback_restore_lsn().
+-- Test: A chained view dependency survives flashback_test_restore_lsn().
 DO $tv$
 DECLARE
     v_boot jsonb;
@@ -60,7 +60,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_vchain_base', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_vchain_base', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_vchain_base;
     IF v_cnt <> 4 THEN

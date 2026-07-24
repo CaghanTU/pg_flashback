@@ -60,6 +60,15 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/ddl_staging_core.sql",
+    name = "flashback_ddl_staging_core",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_lifecycle_bootstrap_core"
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/api_track_capture.sql",
     name = "flashback_api_track_capture",
     requires = [
@@ -70,7 +79,8 @@ extension_sql_file!(
         "flashback_drop_dependency_manifest",
         "flashback_local_compatibility",
         "flashback_wal_promote_core",
-        "flashback_lifecycle_bootstrap_core"
+        "flashback_lifecycle_bootstrap_core",
+        "flashback_ddl_staging_core"
     ],
 );
 
@@ -81,7 +91,9 @@ extension_sql_file!(
     requires = [
         "flashback_wal_promote_core",
         "flashback_lifecycle_bootstrap_core",
-        "flashback_api_track_capture"
+        "flashback_ddl_staging_core",
+        "flashback_api_track_capture",
+        "flashback_restore_lsn_api"
     ],
 );
 

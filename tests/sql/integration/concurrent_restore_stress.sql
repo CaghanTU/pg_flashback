@@ -59,21 +59,21 @@ BEGIN
     DELETE FROM public.it_conc_b;
     UPDATE public.it_conc_c SET val = 'DESTROYED';
 
-    PERFORM flashback_restore_lsn('public.it_conc_a', '0/2000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_a', '0/2000'::pg_lsn);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_a, '0/4500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_a;
     IF v_cnt <> 3 THEN
         RAISE EXCEPTION 'conc_a: expected 3 rows, got %', v_cnt;
     END IF;
 
-    PERFORM flashback_restore_lsn('public.it_conc_b', '0/3000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_b', '0/3000'::pg_lsn);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_b, '0/5500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_b;
     IF v_cnt <> 2 THEN
         RAISE EXCEPTION 'conc_b: expected 2 rows, got %', v_cnt;
     END IF;
 
-    PERFORM flashback_restore_lsn('public.it_conc_c', '0/4000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_c', '0/4000'::pg_lsn);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_c, '0/6500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_c WHERE val <> 'DESTROYED';
     IF v_cnt <> 4 THEN
@@ -100,9 +100,9 @@ BEGIN
     DELETE FROM public.it_conc_b;
     DELETE FROM public.it_conc_c;
 
-    PERFORM flashback_restore_lsn('public.it_conc_a', v_mid_lsn);
-    PERFORM flashback_restore_lsn('public.it_conc_b', '0/6000'::pg_lsn);
-    PERFORM flashback_restore_lsn('public.it_conc_c', '0/7000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_a', v_mid_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_b', '0/6000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_conc_c', '0/7000'::pg_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_conc_a;
     IF v_cnt <> 2 THEN

@@ -25,7 +25,7 @@ BEGIN
     );
     PERFORM flashback_bind_drop_dependency_manifests();
 
-    PERFORM flashback_restore_lsn('public.it_edge_partial', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_edge_partial', v_boundary_lsn);
     IF to_regclass('public.it_edge_partial') IS NULL THEN
         RAISE EXCEPTION 'partial drop restore failed';
     END IF;

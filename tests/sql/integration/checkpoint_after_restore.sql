@@ -29,7 +29,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_ckpt_after', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_ckpt_after', v_boundary_lsn);
     IF NOT EXISTS (SELECT 1 FROM public.it_ckpt_after WHERE id = 1 AND v = 'a') THEN
         RAISE EXCEPTION 'checkpoint restore failed';
     END IF;

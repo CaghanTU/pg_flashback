@@ -50,8 +50,8 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_multi_a', v_boundary_a);
-    PERFORM flashback_restore_lsn('public.it_multi_b', v_boundary_b);
+    PERFORM flashback_test_restore_lsn('public.it_multi_a', v_boundary_a);
+    PERFORM flashback_test_restore_lsn('public.it_multi_b', v_boundary_b);
     IF NOT EXISTS (SELECT 1 FROM public.it_multi_a WHERE id = 1 AND v = 'a0') THEN
         RAISE EXCEPTION 'multi a failed';
     END IF;

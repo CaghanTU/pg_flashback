@@ -45,7 +45,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_acl_test', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_acl_test', v_point_lsn);
 
     IF (SELECT count(*) FROM public.it_acl_test) <> 2 THEN
         RAISE EXCEPTION 'data not restored';

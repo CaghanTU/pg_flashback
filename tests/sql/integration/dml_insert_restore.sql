@@ -25,7 +25,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_dml_insert', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_dml_insert', v_boundary_lsn);
     IF EXISTS (SELECT 1 FROM public.it_dml_insert) THEN
         RAISE EXCEPTION 'insert restore failed';
     END IF;

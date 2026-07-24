@@ -27,7 +27,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_edge_nulls', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_edge_nulls', v_boundary_lsn);
     IF NOT EXISTS (SELECT 1 FROM public.it_edge_nulls WHERE id=1 AND v IS NULL AND note='n0') THEN
       RAISE EXCEPTION 'null restore failed';
     END IF;

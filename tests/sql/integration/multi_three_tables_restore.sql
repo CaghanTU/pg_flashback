@@ -64,9 +64,9 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_m3_a', v_boundary_a);
-    PERFORM flashback_restore_lsn('public.it_m3_b', v_boundary_b);
-    PERFORM flashback_restore_lsn('public.it_m3_c', v_boundary_c);
+    PERFORM flashback_test_restore_lsn('public.it_m3_a', v_boundary_a);
+    PERFORM flashback_test_restore_lsn('public.it_m3_b', v_boundary_b);
+    PERFORM flashback_test_restore_lsn('public.it_m3_c', v_boundary_c);
     IF NOT EXISTS (SELECT 1 FROM public.it_m3_a WHERE v = 'a0') THEN
         RAISE EXCEPTION 'm3 a failed';
     END IF;

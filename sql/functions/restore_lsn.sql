@@ -51,21 +51,6 @@ BEGIN
     WHERE slot_name = v_slot_name
       AND database = current_database();
     IF v_confirmed_flush_lsn IS NULL THEN
-        -- Synthetic / non-physical capture epochs (test injection seam) keep an
-        -- active stream whose slot_name is not the configured production slot.
-        -- There is no physical prefix to drain for those epochs; fail closed
-        -- only when the active stream claims the missing production slot.
-        IF EXISTS (
-            SELECT 1
-            FROM flashback.capture_streams cs
-            WHERE cs.database_oid = (
-                      SELECT oid FROM pg_database WHERE datname = current_database()
-                  )
-              AND cs.state = 'active'
-              AND cs.slot_name IS DISTINCT FROM v_slot_name
-        ) THEN
-            RETURN pg_current_wal_insert_lsn();
-        END IF;
         RAISE EXCEPTION 'pg_flashback: logical slot % is unavailable during restore', v_slot_name
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
@@ -429,11 +414,16 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION flashback_restore_lsn(
+CREATE OR REPLACE FUNCTION flashback_restore_lsn_lock_phase(
     p_target_table text,
     p_target_lsn pg_lsn
 )
-RETURNS bigint
+RETURNS TABLE (
+    out_tracking_id bigint,
+    out_rel_oid oid,
+    out_schema_name text,
+    out_table_name text
+)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
@@ -477,31 +467,6 @@ DECLARE
     v_disaster_event_type text := NULL;
     v_audited text;
 BEGIN
-    PERFORM flashback_require_primary('flashback_restore_lsn');
-
-    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NULL
-       AND NOT COALESCE(
-            NULLIF(current_setting('pg_flashback.allow_unaudited_restore', true), '')::boolean,
-            false
-       )
-    THEN
-        RAISE EXCEPTION
-            'pg_flashback: flashback_restore_lsn requires audited recover context'
-            USING ERRCODE = 'insufficient_privilege',
-                  HINT = 'Use flashback_recover_begin + flashback_recover_execute, or set pg_flashback.allow_unaudited_restore=on for emergency/lab use only.';
-    END IF;
-
-    PERFORM flashback_set_restore_in_progress(true);
-
-    -- Stream serialization is the outermost lock in every WAL lifecycle
-    -- operation.  Taking it before table/generation locks prevents a cycle in
-    -- which the worker owns the stream lock while waiting on this restore's
-    -- metadata transaction and the restore waits back on the worker.
-    v_new_stream_id := flashback_internal_resolve_capture_stream();
-    IF v_new_stream_id IS NULL THEN
-        RAISE EXCEPTION 'pg_flashback: cannot establish WAL stream for post-restore boundary';
-    END IF;
-
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
     PERFORM pg_advisory_xact_lock(358944::integer,
@@ -608,8 +573,73 @@ BEGIN
         END;
     END IF;
 
-    -- Drain against the tracked lifecycle OID (survives DROP TABLE).
-    PERFORM flashback_assert_relation_wal_drained(ARRAY[admission.rel_oid]);
+    out_tracking_id := admission.tracking_id;
+    out_rel_oid := admission.rel_oid;
+    out_schema_name := admission.schema_name;
+    out_table_name := admission.table_name;
+    RETURN NEXT;
+    RETURN;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION flashback_restore_lsn_lock_phase(text, pg_lsn) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION flashback_internal_restore_lsn_core(
+    p_target_table text,
+    p_target_lsn pg_lsn,
+    p_stream_id bigint
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    admission record;
+    materialized record;
+    def_rec record;
+    v_shadow_name text;
+    v_new_rel_oid oid;
+    v_old_rel_oid oid;
+    v_live_oid oid;
+    v_capacity_rel oid;
+    v_current_generation_id bigint;
+    v_new_stream_id bigint;
+    v_new_snapshot_id bigint;
+    v_new_snapshot_table text;
+    v_new_generation_id bigint;
+    v_generation_no bigint;
+    v_schema_version bigint;
+    v_boundary_xid bigint;
+    v_provisional_lsn pg_lsn;
+    v_row_count bigint;
+    v_seq_name text;
+    v_seq_schema text;
+    v_seq_bare text;
+    v_max_val bigint;
+    v_identity_edge bigint;
+    v_identity_start bigint;
+    v_identity_increment bigint;
+    v_cur_schema text;
+    v_cur_name text;
+    v_want_schema text;
+    v_want_name text;
+    v_restored_rel regclass;
+    v_expected_proof jsonb;
+    v_restore_verification jsonb;
+    v_disaster_event_id bigint := NULL;
+    v_disaster_commit_lsn pg_lsn := NULL;
+    v_source_xid bigint := NULL;
+    v_disaster_event_type text := NULL;
+    v_audited text;
+BEGIN
+    PERFORM flashback_set_restore_in_progress(true);
+
+    IF p_stream_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_internal_restore_lsn_core: stream_id is required';
+    END IF;
+    v_new_stream_id := p_stream_id;
+
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
@@ -994,6 +1024,58 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION flashback_internal_restore_lsn_core(text, pg_lsn, bigint) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION flashback_restore_lsn(
+    p_target_table text,
+    p_target_lsn pg_lsn
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_stream_id bigint;
+    v_locked record;
+BEGIN
+    PERFORM flashback_require_primary('flashback_restore_lsn');
+
+    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NULL
+       AND NOT COALESCE(
+            NULLIF(current_setting('pg_flashback.allow_unaudited_restore', true), '')::boolean,
+            false
+       )
+    THEN
+        RAISE EXCEPTION
+            'pg_flashback: flashback_restore_lsn requires audited recover context'
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'Use flashback_recover_begin + flashback_recover_execute, or set pg_flashback.allow_unaudited_restore=on for emergency/lab use only.';
+    END IF;
+
+    -- Stream serialization is the outermost lock in every WAL lifecycle
+    -- operation.  Taking it before table/generation locks prevents a cycle in
+    -- which the worker owns the stream lock while waiting on this restore's
+    -- metadata transaction and the restore waits back on the worker.
+    v_stream_id := flashback_ensure_active_wal_stream();
+    IF v_stream_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: cannot establish WAL stream for post-restore boundary';
+    END IF;
+
+    SELECT * INTO STRICT v_locked
+    FROM flashback_restore_lsn_lock_phase(p_target_table, p_target_lsn);
+
+    PERFORM flashback_assert_relation_wal_drained(ARRAY[v_locked.out_rel_oid]);
+
+    RETURN flashback_internal_restore_lsn_core(
+        p_target_table, p_target_lsn, v_stream_id
+    );
+EXCEPTION WHEN OTHERS THEN
+    PERFORM flashback_set_restore_in_progress(false);
+    RAISE;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_restore_lsn(
     p_tables text[],
     p_target_lsn pg_lsn
@@ -1019,7 +1101,7 @@ BEGIN
 
     -- Keep the database-wide stream lock outside every stable tracking lock,
     -- matching worker/single-restore ordering.
-    v_stream_id := flashback_internal_resolve_capture_stream();
+    v_stream_id := flashback_ensure_active_wal_stream();
     IF v_stream_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: cannot establish WAL stream for multi-table restore';
     END IF;

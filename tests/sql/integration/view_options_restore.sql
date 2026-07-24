@@ -1,4 +1,4 @@
--- Test: View reloptions (security_barrier, check_option) survive flashback_restore_lsn().
+-- Test: View reloptions (security_barrier, check_option) survive flashback_test_restore_lsn().
 DO $tv$
 DECLARE
     v_boot jsonb;
@@ -44,7 +44,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_vopts_base', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_vopts_base', v_point_lsn);
 
     IF (SELECT count(*) FROM public.it_vopts_base) <> 2 THEN
         RAISE EXCEPTION 'data not restored (expected 2 rows)';

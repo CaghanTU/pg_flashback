@@ -72,7 +72,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_retrack', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_retrack', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_retrack;
     IF v_cnt <> 3 THEN

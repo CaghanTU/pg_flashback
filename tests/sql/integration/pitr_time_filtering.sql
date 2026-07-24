@@ -50,7 +50,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_pitr', v_lsn_t1);
+    PERFORM flashback_test_restore_lsn('public.it_pitr', v_lsn_t1);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_id, '0/4500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_pitr;
     IF v_cnt <> 1 THEN
@@ -82,7 +82,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_pitr', v_lsn_t2);
+    PERFORM flashback_test_restore_lsn('public.it_pitr', v_lsn_t2);
     SELECT count(*) INTO v_cnt FROM public.it_pitr;
     IF v_cnt <> 2 THEN
         RAISE EXCEPTION 'restore to t2: expected 2, got %', v_cnt;

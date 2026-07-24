@@ -21,17 +21,21 @@ BEGIN
             jsonb_build_object('op', 'INSERT', 'new', '{"id":1,"name":"n","status":"a"}'::jsonb)
         )
     );
-
-    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     v_xid := (txid_current() % 4294967296)::bigint;
     ALTER TABLE public.it_schema_add ADD COLUMN discount numeric DEFAULT 0;
-    PERFORM flashback_capture_ddl_event('ALTER', 'public', 'it_schema_add');
+    PERFORM flashback_test_inject_ddl_commit(
+        v_tracking_id,
+        '0/2500'::pg_lsn,
+        clock_timestamp(),
+        v_xid,
+        'ALTER'
+    );
     UPDATE public.it_schema_add SET discount=10 WHERE id=1;
     PERFORM flashback_test_inject_commit(
         v_tracking_id,
         '0/3000'::pg_lsn,
         clock_timestamp(),
-        v_xid,
+        931002,
         jsonb_build_array(
             jsonb_build_object(
                 'op', 'UPDATE',
@@ -41,7 +45,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_schema_add', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_schema_add', v_point_lsn);
     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='it_schema_add' AND column_name='discount') THEN
       RAISE EXCEPTION 'discount should not exist at old time';
     END IF;

@@ -44,7 +44,7 @@ BEGIN
     );
     PERFORM flashback_bind_drop_dependency_manifests();
 
-    PERFORM flashback_restore_lsn('public.it_restore_dropped', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_restore_dropped', v_point_lsn);
     PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_id, '0/3500'::pg_lsn);
 
     IF to_regclass('public.it_restore_dropped') IS NULL THEN

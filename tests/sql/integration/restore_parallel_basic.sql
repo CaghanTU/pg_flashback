@@ -75,7 +75,7 @@ BEGIN
     PERFORM set_config('max_parallel_maintenance_workers', '2', true);
     PERFORM set_config('parallel_leader_participation', 'on', true);
 
-    PERFORM flashback_restore_lsn('public.it_parallel_restore', '0/2000'::pg_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_parallel_restore', '0/2000'::pg_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_parallel_restore WHERE val LIKE 'item_%';
     IF v_cnt <> 200 THEN

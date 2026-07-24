@@ -27,7 +27,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_dml_update', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_dml_update', v_boundary_lsn);
     IF NOT EXISTS (SELECT 1 FROM public.it_dml_update WHERE id=1 AND status='new') THEN
         RAISE EXCEPTION 'update restore failed';
     END IF;

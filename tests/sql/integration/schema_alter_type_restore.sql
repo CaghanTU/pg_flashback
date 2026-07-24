@@ -21,11 +21,15 @@ BEGIN
             jsonb_build_object('op', 'INSERT', 'new', '{"id":1,"amount":10}'::jsonb)
         )
     );
-
-    PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
     v_xid := (txid_current() % 4294967296)::bigint;
     ALTER TABLE public.it_schema_type ALTER COLUMN amount TYPE numeric USING amount::numeric;
-    PERFORM flashback_capture_ddl_event('ALTER', 'public', 'it_schema_type');
+    PERFORM flashback_test_inject_ddl_commit(
+        v_tracking_id,
+        '0/2600'::pg_lsn,
+        clock_timestamp(),
+        (txid_current() % 4294967296)::bigint,
+        'ALTER'
+    );
     UPDATE public.it_schema_type SET amount=12.5 WHERE id=1;
     PERFORM flashback_test_inject_commit(
         v_tracking_id,
@@ -41,7 +45,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_schema_type', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_schema_type', v_point_lsn);
     IF (SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='it_schema_type' AND column_name='amount') <> 'integer' THEN
       RAISE EXCEPTION 'amount should be integer at old time';
     END IF;

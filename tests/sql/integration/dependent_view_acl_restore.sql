@@ -1,5 +1,5 @@
 -- Test: ACL (GRANTs) on dependent views/matviews are automatically restored
--- after flashback_restore_lsn() drops and recreates them via DROP TABLE CASCADE.
+-- after flashback_test_restore_lsn() drops and recreates them via DROP TABLE CASCADE.
 DO $tv$
 DECLARE
     v_boot jsonb;
@@ -55,7 +55,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_vacl_base', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_vacl_base', v_point_lsn);
 
     IF (SELECT count(*) FROM public.it_vacl_base) <> 2 THEN
         RAISE EXCEPTION 'data not restored (expected 2 rows)';

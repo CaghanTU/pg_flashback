@@ -1,4 +1,4 @@
--- Test: Materialized view with indexes and populated state survives flashback_restore_lsn().
+-- Test: Materialized view with indexes and populated state survives flashback_test_restore_lsn().
 DO $tv$
 DECLARE
     v_boot jsonb;
@@ -39,7 +39,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_mview_base', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_mview_base', v_boundary_lsn);
 
     IF (SELECT count(*) FROM public.it_mview_base) <> 3 THEN
         RAISE EXCEPTION 'base table not restored (expected 3 rows)';

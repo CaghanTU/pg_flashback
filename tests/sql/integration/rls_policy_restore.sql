@@ -1,4 +1,4 @@
--- Test: Row-Level Security policies survive flashback_restore_lsn().
+-- Test: Row-Level Security policies survive flashback_test_restore_lsn().
 DO $tv$
 DECLARE
     v_boot jsonb;
@@ -58,7 +58,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_rls', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_rls', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_rls;
     IF v_cnt <> 3 THEN

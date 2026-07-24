@@ -54,7 +54,7 @@ BEGIN
         RAISE EXCEPTION 'delete did not take effect';
     END IF;
 
-    PERFORM flashback_restore_lsn('it_ns.orders', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('it_ns.orders', v_point_lsn);
 
     SELECT count(*) INTO v_cnt FROM it_ns.orders;
     IF v_cnt <> 3 THEN

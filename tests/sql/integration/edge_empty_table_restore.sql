@@ -22,7 +22,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_edge_empty', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_edge_empty', v_boundary_lsn);
     IF EXISTS (SELECT 1 FROM public.it_edge_empty) THEN RAISE EXCEPTION 'empty table restore failed'; END IF;
 END;
 $tv$;

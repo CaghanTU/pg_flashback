@@ -42,7 +42,7 @@ BEGIN
         )
     );
 
-    PERFORM flashback_restore_lsn('public.it_batch_replay', v_point_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_batch_replay', v_point_lsn);
 
     SELECT count(*) INTO v_count FROM public.it_batch_replay;
     IF v_count <> 5 THEN

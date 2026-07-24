@@ -34,7 +34,7 @@ BEGIN
         v_events
     );
 
-    PERFORM flashback_restore_lsn('public.it_dml_batch', v_boundary_lsn);
+    PERFORM flashback_test_restore_lsn('public.it_dml_batch', v_boundary_lsn);
     SELECT count(*) INTO c FROM public.it_dml_batch;
     IF c <> 0 THEN
         RAISE EXCEPTION 'batch insert restore failed, count=%', c;
