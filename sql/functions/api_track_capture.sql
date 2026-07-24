@@ -460,84 +460,9 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-DECLARE
-    v_rel_oid oid;
-    v_tracking_id bigint;
-    v_schema_name text;
-    v_table_name text;
-    v_snapshot_id bigint;
-    v_snapshot_table_name text;
-    v_row_count bigint;
 BEGIN
-    SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name
-      INTO v_rel_oid, v_tracking_id, v_schema_name, v_table_name
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND (
-          tt.rel_oid = to_regclass(target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
-          OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
-      )
-    ORDER BY
-        (tt.rel_oid = to_regclass(target_table)::oid) DESC,
-        (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
-        tt.tracked_since DESC
-    LIMIT 1;
-
-    IF v_rel_oid IS NULL THEN
-        RAISE EXCEPTION 'flashback_checkpoint: table % is not tracked', target_table;
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM flashback.coverage_generations cg
-        WHERE cg.tracking_id = v_tracking_id
-    ) THEN
-        RAISE EXCEPTION 'flashback_checkpoint: legacy checkpoint API is disabled for correctness-qualified WAL generations'
-            USING HINT = 'Use the generation-aware maintenance re-anchor operation when it is available; automatic full-table checkpoints are intentionally disabled.';
-    END IF;
-
-    -- snapshot-store-lint:allow-block start (unreachable past this point:
-    -- the guard above unconditionally raises for every currently-trackable
-    -- table, since WAL-only architecture guarantees a coverage_generations
-    -- row always exists by the time this function could run. Proven
-    -- fail-closed by
-    -- tests/sql/integration/legacy_snapshot_paths_fail_closed.sql.)
-    INSERT INTO flashback.snapshots (
-        rel_oid, snapshot_table, snapshot_lsn, schema_def, row_count, captured_at
-    )
-    VALUES (
-        v_rel_oid, '', pg_current_wal_lsn(),
-        COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb),
-        0, clock_timestamp()
-    )
-    RETURNING snapshot_id INTO v_snapshot_id;
-
-    v_snapshot_table_name := format('snap_%s_%s', v_rel_oid::text, v_snapshot_id::text);
-
-    PERFORM flashback_drop_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_table_name))
-    );
-    EXECUTE format(
-        'CREATE TABLE flashback.%I AS TABLE %I.%I',
-        v_snapshot_table_name, v_schema_name, v_table_name
-    );
-    PERFORM flashback_own_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_table_name))
-    );
-    EXECUTE format('SELECT count(*) FROM flashback.%I', v_snapshot_table_name)
-      INTO v_row_count;
-
-    UPDATE flashback.snapshots
-    SET snapshot_table = format('flashback.%I', v_snapshot_table_name),
-        snapshot_lsn = pg_current_wal_lsn(),
-        schema_def = COALESCE(flashback_collect_schema_def(v_rel_oid), '{}'::jsonb),
-        row_count = v_row_count,
-        captured_at = clock_timestamp()
-    WHERE snapshot_id = v_snapshot_id;
-
-    RETURN v_snapshot_id;
-    -- snapshot-store-lint:allow-block end
+    RAISE EXCEPTION 'flashback_checkpoint: legacy checkpoint API is disabled for correctness-qualified WAL generations'
+        USING HINT = 'Use the generation-aware maintenance re-anchor operation when it is available; automatic full-table checkpoints are intentionally disabled.';
 END;
 $$;
 
@@ -547,44 +472,9 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-DECLARE
-    rec record;
-    v_last_snapshot_at timestamptz;
-    v_taken integer := 0;
 BEGIN
-    FOR rec IN
-        SELECT tt.rel_oid, tt.schema_name, tt.table_name, tt.checkpoint_interval
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND NOT EXISTS (
-              SELECT 1 FROM flashback.coverage_generations cg
-              WHERE cg.tracking_id = tt.tracking_id
-          )
-    LOOP
-        -- Guard: relation may have been dropped without flashback_untrack().
-        -- Auto-deactivate stale entries to prevent worker crash loops.
-        IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = rec.rel_oid) THEN
-            UPDATE flashback.tracked_tables
-               SET is_active = false
-             WHERE rel_oid = rec.rel_oid;
-            RAISE WARNING 'pg_flashback: relation with OID % (%.%) no longer exists. Deactivating tracking entry. Run flashback_untrack() to clean up.',
-                rec.rel_oid, rec.schema_name, rec.table_name;
-            CONTINUE;
-        END IF;
-
-        SELECT max(s.captured_at) INTO v_last_snapshot_at
-        FROM flashback.snapshots s WHERE s.rel_oid = rec.rel_oid;
-
-        IF v_last_snapshot_at IS NULL
-           OR v_last_snapshot_at + rec.checkpoint_interval <= clock_timestamp()
-        THEN
-            PERFORM flashback_checkpoint(format('%I.%I', rec.schema_name, rec.table_name));
-            v_taken := v_taken + 1;
-        END IF;
-    END LOOP;
-
-    RETURN v_taken;
+    RAISE EXCEPTION 'flashback_take_due_checkpoints: periodic full-table checkpoint API is permanently disabled for correctness-qualified WAL coverage'
+        USING HINT = 'Automatic full-table checkpoints are intentionally disabled in the WAL-only architecture.';
 END;
 $$;
 
@@ -1158,17 +1048,12 @@ BEGIN
     FOR snap_rec IN
         SELECT snapshot_id, tracking_id, payload_state
         FROM flashback.snapshots
-        WHERE (v_has_generations AND tracking_id = v_tracking_id)
-           OR (NOT v_has_generations AND rel_oid = v_rel_oid AND tracking_id IS NOT NULL)
+        WHERE tracking_id = v_tracking_id
     LOOP
-        IF v_has_generations THEN
-            IF snap_rec.payload_state = 'available' THEN
-                PERFORM flashback_internal_snapshot_retire(
-                    snap_rec.snapshot_id, snap_rec.tracking_id, 'retired'
-                );
-            END IF;
-        ELSE
-            DELETE FROM flashback.snapshots WHERE snapshot_id = snap_rec.snapshot_id;
+        IF snap_rec.payload_state = 'available' THEN
+            PERFORM public.flashback_internal_snapshot_retire(
+                snap_rec.snapshot_id, snap_rec.tracking_id, 'retired'
+            );
         END IF;
     END LOOP;
 

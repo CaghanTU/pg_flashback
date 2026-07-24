@@ -168,11 +168,14 @@ BEGIN
         ORDER BY cg.generation_id
         FOR UPDATE OF cg
     LOOP
-        UPDATE flashback.snapshots
-           SET snapshot_lsn = pending.commit_lsn,
-               captured_at = pending.committed_at
-         WHERE snapshot_id = pending.boundary_snapshot_id
-           AND tracking_id = pending.tracking_id;
+        PERFORM public.flashback_internal_snapshot_refine_boundary(
+            pending.boundary_snapshot_id,
+            pending.tracking_id,
+            pending.generation_id,
+            p_stream_id,
+            pending.commit_lsn,
+            pending.committed_at
+        );
 
         UPDATE flashback.schema_versions
            SET applied_lsn = pending.commit_lsn,

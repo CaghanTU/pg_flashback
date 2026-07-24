@@ -589,7 +589,6 @@ pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum
             }
         }
         if is_capture_enabled() && !is_any_restore_active() {
-            run_periodic_checkpoints();
             run_ensure_partitions();
             run_retention_purge();
         }
@@ -781,19 +780,6 @@ fn consume_wal_changes() -> Option<i32> {
         return None;
     }
     inserted
-}
-
-fn run_periodic_checkpoints() {
-    run_bounded_maintenance(
-        "CHECKPOINT_WORKER",
-        "DO $$
-                         BEGIN
-                             IF to_regprocedure('flashback_take_due_checkpoints()') IS NOT NULL THEN
-                                 PERFORM flashback_take_due_checkpoints();
-                             END IF;
-                         END
-                         $$",
-    );
 }
 
 fn run_retention_purge() {

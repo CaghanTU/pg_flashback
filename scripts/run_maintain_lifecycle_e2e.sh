@@ -187,4 +187,29 @@ q "INSERT INTO public.ml_other VALUES (2,'b')" >/dev/null
 wait_healthy public.ml_other || { echo "FAIL: ml_other unhealthy after DML post-freeze"; exit 1; }
 echo "  ok: ml_other unaffected"
 
+echo "-- maintenance worker cadence --"
+INITIAL_PID=$(q "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_flashback maintenance worker' LIMIT 1")
+[[ -n "$INITIAL_PID" ]] || { echo "FAIL: maintenance worker not running"; exit 1; }
+
+# Find the active postgresql.log for the worker
+LOG_PATH="${PGFB_LOG_FILE:-}"
+if [[ -n "$LOG_PATH" && -f "$LOG_PATH" ]]; then
+    ERR_BEFORE=$(grep -c "flashback_internal_checkpoint" "$LOG_PATH" || true)
+else
+    ERR_BEFORE=0
+fi
+
+sleep 2
+CURRENT_PID=$(q "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_flashback maintenance worker' LIMIT 1")
+[[ "$CURRENT_PID" == "$INITIAL_PID" ]] || { echo "FAIL: maintenance worker restarted (crashed?) $INITIAL_PID -> $CURRENT_PID"; exit 1; }
+
+if [[ -n "$LOG_PATH" && -f "$LOG_PATH" ]]; then
+    ERR_AFTER=$(grep -c "flashback_internal_checkpoint" "$LOG_PATH" || true)
+    if [[ "$ERR_AFTER" -gt "$ERR_BEFORE" ]]; then
+        echo "FAIL: checkpoint exception found in postgresql log!"
+        exit 1
+    fi
+fi
+echo "  ok: maintenance worker survived"
+
 echo "PASS: maintain lifecycle E2E"

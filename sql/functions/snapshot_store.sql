@@ -104,7 +104,7 @@ BEGIN
                              THEN COALESCE(retired_at, clock_timestamp())
                              ELSE retired_at END
      WHERE snapshot_id = p_snapshot_id
-       AND tracking_id = p_tracking_id
+       AND tracking_id IS NOT DISTINCT FROM p_tracking_id
        AND payload_state = v_row.payload_state;
     GET DIAGNOSTICS v_n = ROW_COUNT;
     IF v_n <> 1 THEN
@@ -493,6 +493,275 @@ BEGIN
 END;
 $$;
 
+-- ------------------------------------------------------------------
+-- refine_boundary: single authority for refining snapshot_lsn and
+-- captured_at when resolving a building coverage generation's exact
+-- boundary transaction COMMIT LSN/time.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_refine_boundary(
+    p_snapshot_id bigint,
+    p_tracking_id bigint,
+    p_generation_id bigint,
+    p_stream_id bigint,
+    p_commit_lsn pg_lsn,
+    p_committed_at timestamptz
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_snap flashback.snapshots%ROWTYPE;
+    v_gen flashback.coverage_generations%ROWTYPE;
+    v_commit_xid bigint;
+BEGIN
+    IF p_snapshot_id IS NULL OR p_tracking_id IS NULL OR p_generation_id IS NULL
+       OR p_stream_id IS NULL OR p_commit_lsn IS NULL OR p_committed_at IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot boundary refinement requires snapshot_id, tracking_id, generation_id, stream_id, commit_lsn, committed_at'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT * INTO v_snap
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown snapshot artifact % (tracking %)',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF v_snap.payload_state <> 'available' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % state is % (must be available for boundary refinement)',
+            p_snapshot_id, v_snap.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT * INTO v_gen
+    FROM flashback.coverage_generations
+    WHERE generation_id = p_generation_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown coverage generation % (tracking %)',
+            p_generation_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF v_gen.state NOT IN ('building', 'active') THEN
+        RAISE EXCEPTION 'pg_flashback: coverage generation % state is % (must be building or active for boundary refinement)',
+            p_generation_id, v_gen.state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF v_gen.boundary_snapshot_id IS DISTINCT FROM p_snapshot_id THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % is not boundary_snapshot_id (%) for generation %',
+            p_snapshot_id, v_gen.boundary_snapshot_id, p_generation_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF v_gen.stream_id IS DISTINCT FROM p_stream_id THEN
+        RAISE EXCEPTION 'pg_flashback: stream_id mismatch for generation %: expected %, got %',
+            p_generation_id, v_gen.stream_id, p_stream_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Verify commit coordinate in capture_commits matches boundary_xid
+    SELECT source_xid INTO v_commit_xid
+    FROM flashback.capture_commits
+    WHERE stream_id = p_stream_id
+      AND commit_lsn = p_commit_lsn
+      AND committed_at = p_committed_at;
+    IF NOT FOUND OR v_commit_xid IS NULL OR v_commit_xid <> v_gen.boundary_xid THEN
+        RAISE EXCEPTION 'pg_flashback: commit coordinate LSN % time % on stream % does not match capture_commits xid % for generation %',
+            p_commit_lsn, p_committed_at, p_stream_id, v_gen.boundary_xid, p_generation_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Idempotent check: if snapshot coordinate ALREADY matches target refinement coordinate
+    IF v_snap.snapshot_lsn = p_commit_lsn AND v_snap.captured_at = p_committed_at THEN
+        IF v_gen.state = 'active' AND (v_gen.boundary_lsn IS DISTINCT FROM p_commit_lsn OR v_gen.boundary_time IS DISTINCT FROM p_committed_at) THEN
+            RAISE EXCEPTION 'pg_flashback: snapshot % matches coordinate LSN % time % but generation % is active with mismatching boundary LSN % time %',
+                p_snapshot_id, p_commit_lsn, p_committed_at, p_generation_id, v_gen.boundary_lsn, v_gen.boundary_time
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        RETURN false; -- Idempotent retry
+    END IF;
+
+    -- Fail-closed checks when snapshot or generation boundary was already refined to a different LSN
+    IF v_gen.boundary_lsn IS NOT NULL THEN
+        IF p_commit_lsn < v_gen.boundary_lsn THEN
+            RAISE EXCEPTION 'pg_flashback: refined snapshot LSN % cannot regress from existing refined LSN %',
+                p_commit_lsn, v_gen.boundary_lsn
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        RAISE EXCEPTION 'pg_flashback: generation % boundary already refined to LSN % (time %), cannot refine to different coordinate LSN % (time %)',
+            p_generation_id, v_gen.boundary_lsn, v_gen.boundary_time, p_commit_lsn, p_committed_at
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    UPDATE flashback.snapshots
+       SET snapshot_lsn = p_commit_lsn,
+           captured_at = p_committed_at
+     WHERE snapshot_id = p_snapshot_id AND tracking_id = p_tracking_id;
+
+    RETURN true;
+END;
+$$;
+
+-- ------------------------------------------------------------------
+-- retire_legacy: migration-only primitive to safely retire legacy
+-- snapshot artifacts (tracking_id IS NULL). Physical payload is dropped
+-- if pg_flashback-owned and unreferenced by any active lifecycle; the
+-- catalog row is retained in a terminal state (retired or missing).
+-- Never DELETEs snapshot history rows. Fail-closed for user-owned relations.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_retire_legacy(
+    p_snapshot_id bigint,
+    p_target_state text DEFAULT 'retired'
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_snap flashback.snapshots%ROWTYPE;
+    v_parts text[];
+    v_schema text;
+    v_rel text;
+    v_oid oid;
+    v_kind text;
+    v_is_owned boolean;
+BEGIN
+    IF p_snapshot_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot_id is required'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF p_target_state NOT IN ('retired', 'missing') THEN
+        RAISE EXCEPTION 'pg_flashback: invalid target state % for legacy snapshot retirement (must be retired or missing)',
+            p_target_state
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT * INTO v_snap
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id AND tracking_id IS NULL
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown legacy snapshot artifact %', p_snapshot_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Idempotent terminal state retry
+    IF v_snap.payload_state = p_target_state THEN
+        RETURN false;
+    END IF;
+
+    -- Different terminal state target fails closed
+    IF v_snap.payload_state IN ('retired', 'missing', 'aborted') THEN
+        RAISE EXCEPTION 'pg_flashback: legacy snapshot % is already in terminal state % (cannot transition to %)',
+            p_snapshot_id, v_snap.payload_state, p_target_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF v_snap.payload_state NOT IN ('available', 'retiring') THEN
+        RAISE EXCEPTION 'pg_flashback: legacy snapshot % state is % (must be available or retiring)',
+            p_snapshot_id, v_snap.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    -- Active reference check 1: coverage_generations boundary_snapshot_id
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_generations
+        WHERE boundary_snapshot_id = p_snapshot_id
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: legacy snapshot % is referenced as boundary_snapshot_id in coverage_generations',
+            p_snapshot_id
+            USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+
+    -- Active reference check 2: tracked_tables base_snapshot_table
+    IF v_snap.snapshot_table IS NOT NULL AND EXISTS (
+        SELECT 1 FROM flashback.tracked_tables
+        WHERE base_snapshot_table = v_snap.snapshot_table
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: legacy snapshot % (table %) is referenced as base_snapshot_table in tracked_tables',
+            p_snapshot_id, v_snap.snapshot_table
+            USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+
+    -- Parse payload relation identity
+    v_parts := NULL;
+    IF v_snap.storage_backend = 'heap_v1' AND v_snap.locator IS NOT NULL
+       AND v_snap.locator ? 'schema' AND v_snap.locator ? 'relation'
+    THEN
+        v_schema := v_snap.locator->>'schema';
+        v_rel := v_snap.locator->>'relation';
+        v_oid := to_regclass(format('%I.%I', v_schema, v_rel));
+    ELSIF v_snap.snapshot_table IS NOT NULL AND btrim(v_snap.snapshot_table) <> '' THEN
+        BEGIN
+            v_parts := pg_catalog.parse_ident(v_snap.snapshot_table, true);
+            IF cardinality(v_parts) = 2 THEN
+                v_schema := v_parts[1];
+                v_rel := v_parts[2];
+                v_oid := to_regclass(format('%I.%I', v_schema, v_rel));
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            v_oid := NULL;
+        END;
+    END IF;
+
+    -- State graph: available -> retiring transition first (if dropping payload)
+    IF v_snap.payload_state = 'available' THEN
+        UPDATE flashback.snapshots
+           SET payload_state = 'retiring'
+         WHERE snapshot_id = p_snapshot_id AND tracking_id IS NULL;
+    END IF;
+
+    -- Payload inspection and drop
+    IF v_oid IS NOT NULL THEN
+        -- Active reference check 3: open operations / recovery active on relation
+        IF EXISTS (
+            SELECT 1 FROM flashback.operations o
+            JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
+            WHERE (o.details->>'snapshot_table' = v_snap.snapshot_table
+               OR o.details->>'relation' = format('%I.%I', v_schema, v_rel))
+              AND s.state NOT IN ('verified', 'failed', 'abandoned', 'unprotected', 'cleaned', 'sealed')
+        ) THEN
+            RAISE EXCEPTION 'pg_flashback: legacy snapshot % payload is in use by active operation',
+                p_snapshot_id
+                USING ERRCODE = 'dependent_objects_still_exist';
+        END IF;
+
+        -- BOTH payload kind AND extension ownership MUST be verified
+        v_kind := public.flashback_payload_kind(v_oid);
+        v_is_owned := public.flashback_payload_is_owned(v_oid);
+
+        IF v_kind NOT IN ('base_snapshot', 'checkpoint_snapshot') OR NOT v_is_owned THEN
+            -- Reject without setting metadata to retired/missing!
+            RAISE EXCEPTION 'pg_flashback: legacy snapshot % payload % is not an owned flashback payload (kind=%, owned=%)',
+                p_snapshot_id, v_snap.snapshot_table, COALESCE(v_kind, 'none'), COALESCE(v_is_owned, false)
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        -- Drop payload relation safely
+        PERFORM public.flashback_drop_payload_table(v_oid);
+    END IF;
+
+    -- Final transition to target state (retired or missing)
+    UPDATE flashback.snapshots
+       SET payload_state = CASE WHEN v_oid IS NULL OR v_kind IS NULL THEN 'missing' ELSE p_target_state END,
+           retired_at = COALESCE(retired_at, clock_timestamp())
+     WHERE snapshot_id = p_snapshot_id AND tracking_id IS NULL;
+
+    RETURN true;
+END;
+$$;
+
 COMMENT ON FUNCTION flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb)
     IS '[Internal] SnapshotStore: sole mutation authority for flashback.snapshots.payload_state (CAS).';
 COMMENT ON FUNCTION flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb)
@@ -509,6 +778,10 @@ COMMENT ON FUNCTION flashback_internal_snapshot_sizes(bigint, text[])
     IS '[Internal] SnapshotStore: per-artifact byte size for capacity/monitoring/health.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire(bigint, bigint, text)
     IS '[Internal] SnapshotStore: drop the exact artifact''s payload and transition to retired or missing.';
+COMMENT ON FUNCTION flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz)
+    IS '[Internal] SnapshotStore: refine snapshot_lsn and captured_at when resolving a building generation boundary.';
+COMMENT ON FUNCTION flashback_internal_snapshot_retire_legacy(bigint, text)
+    IS '[Internal] SnapshotStore: safely retire legacy (tracking_id IS NULL) snapshot artifact payload.';
 
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb) FROM PUBLIC;
@@ -518,6 +791,8 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_require_available(bigi
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM PUBLIC;
 
 DO $$
 BEGIN
@@ -530,6 +805,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM pg_monitor';
@@ -540,6 +817,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM pg_monitor';
     END IF;
 END
 $$;

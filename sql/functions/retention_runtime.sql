@@ -649,34 +649,18 @@ BEGIN
              WHERE rel_oid = rec.rel_oid;
         END IF;
 
-        -- snapshot-store-lint:allow-block start (legacy pre-generations
-        -- trigger lifecycle: tracking_id IS NULL rows are outside
-        -- SnapshotStore's tracking_id-scoped domain by construction --
-        -- flashback_internal_snapshot_retire() requires a non-NULL
-        -- tracking_id and would itself raise "unknown snapshot artifact"
-        -- for one of these rows. flashback_effective_capture_mode() is
-        -- always 'wal' in this build, so no currently-trackable table can
-        -- produce a new row here; this loop only ever matches leftover
-        -- rows from a pre-WAL-only install, if any still exist.)
         FOR snap_rec IN
-            SELECT snapshot_id, snapshot_table
+            SELECT snapshot_id
             FROM flashback.snapshots s
             WHERE s.rel_oid = rec.rel_oid
               AND s.tracking_id IS NULL
               AND s.captured_at < clock_timestamp() - rec.retention_interval
+              AND s.payload_state = 'available'
         LOOP
-            IF snap_rec.snapshot_table IS NOT NULL
-               AND snap_rec.snapshot_table ~ '^flashback\\."?[a-zA-Z0-9_]+"?$'
-            THEN
-                PERFORM flashback_drop_payload_table(
-                    to_regclass(snap_rec.snapshot_table)
-                );
+            IF public.flashback_internal_snapshot_retire_legacy(snap_rec.snapshot_id, 'retired') THEN
+                v_actions := v_actions + 1;
             END IF;
-            DELETE FROM flashback.snapshots
-            WHERE snapshot_id = snap_rec.snapshot_id;
-            v_actions := v_actions + 1;
         END LOOP;
-        -- snapshot-store-lint:allow-block end
     END LOOP;
 
     v_actions := v_actions + flashback_drop_empty_delta_partitions();

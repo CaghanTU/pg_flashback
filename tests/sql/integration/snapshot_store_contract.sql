@@ -436,17 +436,389 @@ BEGIN
 END;
 $s11$;
 
--- Scenarios 12-15 (existing-snapshot upgrade backfill copies no data,
--- pg_dump/restore preserves locator/ownership, capacity/health calculations
--- match prior results, full track->DML->DROP->recover->successor->retention
--- lifecycle) are not representable inside cargo pgrx test's single
--- always-rolled-back transaction: backfill needs a genuinely pre-migration
--- on-disk schema, and pg_dump/restore needs a real committed database and
--- an external pg_dump process. They are covered instead by
--- scripts/run_extension_upgrade_e2e.sh, scripts/run_pgdump_e2e.sh, and the
--- existing tests::pg_it_local_capacity_admission /
--- tests::pg_it_slot_health_actions / tests::pg_it_coverage_lifecycle_hardening
--- / tests::pg_it_recover_deleted_rows suites, all of which exercise the
--- SnapshotStore-migrated call sites in local_capacity.sql, monitoring_cache.sql,
--- health_runtime.sql and the full track/DML/DROP/recover/reanchor/retention
--- chain respectively.
+-- 12. Boundary refinement: exact coordinate refinement succeeds.
+DO $s12$
+DECLARE
+    v_tid bigint := 820014;
+    v_snap_id bigint;
+    v_gen_id bigint;
+    v_stream_id bigint;
+    v_xid bigint := 990002;
+    v_lsn pg_lsn := '0/1000200';
+    v_time timestamptz := clock_timestamp();
+    v_res boolean;
+    v_snap record;
+BEGIN
+    v_stream_id := flashback_internal_open_capture_stream(
+        'test_refine_slot'::text, 'pg_flashback'::text, '0/1'::pg_lsn, '0/1'::pg_lsn
+    );
+
+    INSERT INTO flashback.capture_commits (stream_id, commit_lsn, source_xid, committed_at)
+    VALUES (v_stream_id, v_lsn, v_xid, v_time);
+
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/1000100', 'generation'
+    );
+
+    v_gen_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tid,
+        p_generation_no => 1,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'reanchor',
+        p_rel_oid_at_boundary => 'public.snst_src1'::regclass,
+        p_boundary_snapshot_id => v_snap_id,
+        p_boundary_xid => v_xid,
+        p_boundary_marker => 'marker_refine_1'
+    );
+
+    v_res := flashback_internal_snapshot_refine_boundary(
+        v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn, v_time
+    );
+
+    IF NOT v_res THEN
+        RAISE EXCEPTION 's12: expected refine_boundary to return true for first refinement';
+    END IF;
+
+    SELECT * INTO v_snap FROM flashback_internal_snapshot_resolve(v_snap_id, v_tid);
+    IF v_snap.snapshot_lsn <> v_lsn THEN
+        RAISE EXCEPTION 's12: expected snapshot_lsn %, got %', v_lsn, v_snap.snapshot_lsn;
+    END IF;
+END;
+$s12$;
+
+-- 13. Boundary refinement idempotency: same coordinate retry returns false.
+DO $s13$
+DECLARE
+    v_tid bigint := 820015;
+    v_snap_id bigint;
+    v_gen_id bigint;
+    v_stream_id bigint;
+    v_xid bigint := 990004;
+    v_lsn pg_lsn := '0/2000200';
+    v_time timestamptz := clock_timestamp();
+    v_res boolean;
+BEGIN
+    v_stream_id := flashback_internal_open_capture_stream(
+        'test_refine_slot'::text, 'pg_flashback'::text, '0/1'::pg_lsn, '0/1'::pg_lsn
+    );
+
+    INSERT INTO flashback.capture_commits (stream_id, commit_lsn, source_xid, committed_at)
+    VALUES (v_stream_id, v_lsn, v_xid, v_time);
+
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/2000100', 'generation'
+    );
+
+    v_gen_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tid,
+        p_generation_no => 1,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'reanchor',
+        p_rel_oid_at_boundary => 'public.snst_src1'::regclass,
+        p_boundary_snapshot_id => v_snap_id,
+        p_boundary_xid => v_xid,
+        p_boundary_marker => 'marker_refine_2'
+    );
+
+    PERFORM flashback_internal_snapshot_refine_boundary(
+        v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn, v_time
+    );
+
+    -- Second call with exact same coordinate
+    v_res := flashback_internal_snapshot_refine_boundary(
+        v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn, v_time
+    );
+
+    IF v_res THEN
+        RAISE EXCEPTION 's13: expected refine_boundary retry to return false (idempotent)';
+    END IF;
+END;
+$s13$;
+
+-- 14. Boundary refinement fail-closed: different second coordinate is rejected.
+DO $s14$
+DECLARE
+    v_tid bigint := 820016;
+    v_snap_id bigint;
+    v_gen_id bigint;
+    v_stream_id bigint;
+    v_xid bigint := 990006;
+    v_lsn1 pg_lsn := '0/3000200';
+    v_lsn2 pg_lsn := '0/3000300';
+    v_time1 timestamptz := clock_timestamp();
+    v_time2 timestamptz := clock_timestamp() + interval '1 second';
+    v_raised boolean := false;
+BEGIN
+    v_stream_id := flashback_internal_open_capture_stream(
+        'test_refine_slot'::text, 'pg_flashback'::text, '0/1'::pg_lsn, '0/1'::pg_lsn
+    );
+
+    INSERT INTO flashback.capture_commits (stream_id, commit_lsn, source_xid, committed_at)
+    VALUES (v_stream_id, v_lsn1, v_xid, v_time1),
+           (v_stream_id, v_lsn2, v_xid, v_time2);
+
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/3000100', 'generation'
+    );
+
+    v_gen_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tid,
+        p_generation_no => 1,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'reanchor',
+        p_rel_oid_at_boundary => 'public.snst_src1'::regclass,
+        p_boundary_snapshot_id => v_snap_id,
+        p_boundary_xid => v_xid,
+        p_boundary_marker => 'marker_refine_3'
+    );
+
+    PERFORM flashback_internal_snapshot_refine_boundary(
+        v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn1, v_time1
+    );
+
+    PERFORM flashback_internal_transition_coverage_generation(
+        v_gen_id, v_tid, 'building', 'active', 'boundary_commit_observed',
+        v_lsn1, v_time1, v_lsn1, v_time1, NULL, NULL, '{}'::jsonb
+    );
+
+    BEGIN
+        PERFORM flashback_internal_snapshot_refine_boundary(
+            v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn2, v_time2
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's14: second refinement with different coordinate was accepted';
+    END IF;
+END;
+$s14$;
+
+-- 15. Wrong generation/snapshot/tracking/stream/XID or missing capture_commits rejected.
+DO $s15$
+DECLARE
+    v_tid bigint := 820017;
+    v_snap_id bigint;
+    v_gen_id bigint;
+    v_stream_id bigint;
+    v_xid bigint := 990008;
+    v_lsn pg_lsn := '0/4000200';
+    v_time timestamptz := clock_timestamp();
+    v_raised boolean := false;
+BEGIN
+    v_stream_id := flashback_internal_open_capture_stream(
+        'test_refine_slot'::text, 'pg_flashback'::text, '0/1'::pg_lsn, '0/1'::pg_lsn
+    );
+
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/4000100', 'generation'
+    );
+
+    v_gen_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tid,
+        p_generation_no => 1,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'reanchor',
+        p_rel_oid_at_boundary => 'public.snst_src1'::regclass,
+        p_boundary_snapshot_id => v_snap_id,
+        p_boundary_xid => v_xid,
+        p_boundary_marker => 'marker_refine_4'
+    );
+
+    -- Missing from capture_commits
+    BEGIN
+        PERFORM flashback_internal_snapshot_refine_boundary(
+            v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn, v_time
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's15: coordinate missing from capture_commits was accepted';
+    END IF;
+END;
+$s15$;
+
+-- 16. Guard trigger: direct mutation to available artifact LSN/evidence rejected.
+DO $s16$
+DECLARE
+    v_tid bigint := 820018;
+    v_snap_id bigint;
+    v_raised boolean := false;
+BEGIN
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/5000100', 'generation'
+    );
+
+    BEGIN
+        UPDATE flashback.snapshots
+           SET snapshot_lsn = '0/9999999'
+         WHERE snapshot_id = v_snap_id AND tracking_id = v_tid;
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's16: direct UPDATE snapshot_lsn was accepted';
+    END IF;
+END;
+$s16$;
+
+-- 17. Guard trigger: direct DELETE on flashback.snapshots rejected.
+DO $s17$
+DECLARE
+    v_tid bigint := 820019;
+    v_snap_id bigint;
+    v_raised boolean := false;
+BEGIN
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        '0/6000100', 'generation'
+    );
+
+    BEGIN
+        DELETE FROM flashback.snapshots
+         WHERE snapshot_id = v_snap_id AND tracking_id = v_tid;
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's17: direct DELETE from flashback.snapshots was accepted';
+    END IF;
+END;
+$s17$;
+
+-- 18. Legacy nullable-tracking snapshot safe retirement.
+DO $s18$
+DECLARE
+    v_leg_snap_id bigint;
+    v_payload_name text := 'base_snapshot_t99901';
+    v_row record;
+BEGIN
+    PERFORM public.flashback_drop_payload_table(
+        to_regclass(format('flashback.%I', v_payload_name))
+    );
+    EXECUTE format('CREATE TABLE flashback.%I AS TABLE public.snst_src1', v_payload_name);
+    PERFORM public.flashback_own_payload_table(
+        to_regclass(format('flashback.%I', v_payload_name))
+    );
+
+    INSERT INTO flashback.snapshots (
+        rel_oid, snapshot_table, snapshot_lsn, schema_def, row_count, captured_at, payload_state, storage_backend, locator
+    ) VALUES (
+        'public.snst_src1'::regclass, format('flashback.%I', v_payload_name), '0/7000100',
+        '{}'::jsonb, 2, clock_timestamp(), 'creating', 'heap_v1',
+        jsonb_build_object('schema', 'flashback', 'relation', v_payload_name)
+    ) RETURNING snapshot_id INTO v_leg_snap_id;
+
+    UPDATE flashback.snapshots SET payload_state = 'available', available_at = clock_timestamp() WHERE snapshot_id = v_leg_snap_id AND tracking_id IS NULL;
+
+    PERFORM flashback_internal_snapshot_retire_legacy(v_leg_snap_id, 'retired');
+
+    SELECT * INTO v_row FROM flashback.snapshots WHERE snapshot_id = v_leg_snap_id AND tracking_id IS NULL;
+    IF v_row.payload_state <> 'retired' THEN
+        RAISE EXCEPTION 's18: expected retired payload_state, got %', v_row.payload_state;
+    END IF;
+    IF to_regclass(format('flashback.%I', v_payload_name)) IS NOT NULL THEN
+        RAISE EXCEPTION 's18: physical payload table was not dropped';
+    END IF;
+END;
+$s18$;
+
+-- 19. User-owned legacy relation retirement fails closed.
+DO $s19$
+DECLARE
+    v_leg_snap_id bigint;
+    v_payload_name text := 'user_owned_legacy_rel_test';
+    v_raised boolean := false;
+BEGIN
+    EXECUTE format('CREATE TABLE public.%I (id int)', v_payload_name);
+
+    INSERT INTO flashback.snapshots (
+        rel_oid, snapshot_table, snapshot_lsn, schema_def, row_count, captured_at, payload_state, storage_backend, locator
+    ) VALUES (
+        'public.snst_src1'::regclass, format('public.%I', v_payload_name), '0/8000100',
+        '{}'::jsonb, 0, clock_timestamp(), 'creating', 'heap_v1',
+        jsonb_build_object('schema', 'public', 'relation', v_payload_name)
+    ) RETURNING snapshot_id INTO v_leg_snap_id;
+
+    UPDATE flashback.snapshots SET payload_state = 'available', available_at = clock_timestamp() WHERE snapshot_id = v_leg_snap_id AND tracking_id IS NULL;
+
+    BEGIN
+        PERFORM flashback_internal_snapshot_retire_legacy(v_leg_snap_id, 'retired');
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's19: user-owned relation retirement was accepted';
+    END IF;
+
+    EXECUTE format('DROP TABLE public.%I', v_payload_name);
+END;
+$s19$;
+
+-- 20. Idempotent refinement rejects mismatching boundaries on ACTIVE generations
+DO $s20$
+DECLARE
+    v_tid bigint := 820030;
+    v_snap_id bigint;
+    v_stream_id bigint;
+    v_gen_id bigint;
+    v_xid bigint := 990020;
+    v_lsn_A pg_lsn := '0/9000100';
+    v_time_A timestamptz := clock_timestamp();
+    v_lsn_B pg_lsn := '0/9000200';
+    v_time_B timestamptz;
+    v_raised boolean := false;
+BEGIN
+    v_stream_id := flashback_internal_open_capture_stream(
+        'test_refine_slot'::text, 'pg_flashback'::text, '0/1'::pg_lsn, '0/1'::pg_lsn
+    );
+
+    v_snap_id := flashback_internal_snapshot_create(
+        v_tid, 'public.snst_src1'::regclass, 'public', 'snst_src1',
+        v_lsn_B, 'generation'
+    );
+    SELECT captured_at INTO v_time_B FROM flashback.snapshots WHERE snapshot_id = v_snap_id AND tracking_id = v_tid;
+
+    v_gen_id := flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tid,
+        p_generation_no => 20,
+        p_stream_id => v_stream_id,
+        p_boundary_kind => 'reanchor',
+        p_rel_oid_at_boundary => 'public.snst_src1'::regclass,
+        p_boundary_snapshot_id => v_snap_id,
+        p_boundary_xid => v_xid,
+        p_boundary_marker => 'marker_refine_20'
+    );
+
+    PERFORM flashback_internal_transition_coverage_generation(
+        v_gen_id, v_tid, 'building', 'active', 'boundary_commit_observed',
+        v_lsn_A, v_time_A, v_lsn_A, v_time_A, NULL, NULL, '{}'::jsonb
+    );
+
+    INSERT INTO flashback.capture_commits (stream_id, commit_lsn, source_xid, committed_at)
+    VALUES (v_stream_id, v_lsn_B, v_xid, v_time_B);
+
+    BEGIN
+        PERFORM flashback_internal_snapshot_refine_boundary(
+            v_snap_id, v_tid, v_gen_id, v_stream_id, v_lsn_B, v_time_B
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_raised := true;
+    END;
+
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 's20: refine_boundary with snapshot coordinate B on active generation with boundary coordinate A was accepted';
+    END IF;
+END;
+$s20$;

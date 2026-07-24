@@ -937,13 +937,47 @@ BEGIN
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
 
-    -- Backend/locator are frozen the instant an artifact leaves `creating`:
-    -- exactly the substitution-prevention item 2 requires. snapshot_lsn and
-    -- captured_at are deliberately excluded: the WAL promote path
-    -- (flashback_apply_decoded_wal_batch) refines them exactly once, from
-    -- the provisional pre-commit estimate captured at CTAS time to the
-    -- real boundary COMMIT LSN/time once the worker observes it -- the
-    -- same pre-existing behavior this module preserves unchanged.
+    -- available_at can only be set during creating -> available transition
+    IF NEW.available_at IS DISTINCT FROM OLD.available_at THEN
+        IF NOT (OLD.payload_state = 'creating' AND NEW.payload_state = 'available') THEN
+            RAISE EXCEPTION 'pg_flashback: available_at can only be set during creating -> available transition'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+    END IF;
+
+    -- retired_at can only be set during transition to terminal state
+    IF NEW.retired_at IS DISTINCT FROM OLD.retired_at THEN
+        IF NEW.payload_state NOT IN ('retired', 'missing', 'aborted') THEN
+            RAISE EXCEPTION 'pg_flashback: retired_at can only be set during terminal transition'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+    END IF;
+
+    -- snapshot_lsn and captured_at can only be refined when resolving a building generation boundary
+    IF NEW.snapshot_lsn IS DISTINCT FROM OLD.snapshot_lsn
+       OR NEW.captured_at IS DISTINCT FROM OLD.captured_at
+    THEN
+        IF OLD.payload_state <> 'available' THEN
+            RAISE EXCEPTION 'pg_flashback: snapshot_lsn and captured_at can only be refined on available artifacts'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM flashback.coverage_generations cg
+            JOIN flashback.capture_commits cc ON cc.stream_id = cg.stream_id
+            WHERE cg.tracking_id IS NOT DISTINCT FROM OLD.tracking_id
+              AND cg.boundary_snapshot_id = OLD.snapshot_id
+              AND cg.state = 'building'
+              AND cc.commit_lsn = NEW.snapshot_lsn
+              AND cc.committed_at = NEW.captured_at
+              AND cc.source_xid = cg.boundary_xid
+        ) THEN
+            RAISE EXCEPTION 'pg_flashback: snapshot_lsn and captured_at refinement requires matching building generation and capture_commits coordinate'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+    END IF;
+
+    -- Backend, locator, snapshot_table, schema_def, row_count are frozen once created
     IF OLD.payload_state <> 'creating'
        AND (
            NEW.storage_backend IS DISTINCT FROM OLD.storage_backend

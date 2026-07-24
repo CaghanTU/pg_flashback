@@ -249,8 +249,11 @@ if [[ "$MODE" == "matrices" || "$MODE" == "all" ]]; then
     run_child "local_compatibility_matrix" \
         env REQUIRE_LIVE=1 PG_CONFIG="$PG_CONFIG" "$ROOT/scripts/run_local_compatibility_matrix.sh"
     run_child "maintain_lifecycle_e2e" \
-        env REQUIRE_LIVE=1 PGDATABASE="$DB_NAME" PGHOST="$SOCKET" PGPORT="$PORT" \
+        env REQUIRE_LIVE=1 PGDATABASE="$DB_NAME" PGHOST="$SOCKET" PGPORT="$PORT" PGFB_LOG_FILE="$LOG" \
             "$ROOT/scripts/run_maintain_lifecycle_e2e.sh" "$PG_BIN"
+    run_child "local_capacity_e2e" \
+        env REQUIRE_LIVE=1 PGDATABASE="$DB_NAME" PGHOST="$SOCKET" PGPORT="$PORT" \
+            "$ROOT/scripts/run_local_capacity_e2e.sh" "$PG_BIN"
 fi
 
 if [[ "$MODE" == "bench" || "$MODE" == "all" ]]; then
