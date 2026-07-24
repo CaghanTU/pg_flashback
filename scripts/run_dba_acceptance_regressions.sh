@@ -247,9 +247,13 @@ TOKENA=$(q "SELECT flashback_recover_plan('public.dba_abandon')->>'plan_token';"
 OPA=$(q "SELECT flashback_recover_begin('public.dba_abandon', '$TOKENA')->>'operation_id';")
 [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OPA;")" == "started" ]] \
     || die "f1 abandon not started"
-# Force stale window then reconcile
-q "UPDATE flashback.operation_events SET recorded_at = clock_timestamp() - interval '10 minutes'
-    WHERE operation_id=$OPA AND event_type='started';" >/dev/null
+# Force stale window then reconcile. operation_events is append-only
+# (trg_flashback_operation_events_immutable); backdating this harness-only
+# probe row requires the standard superuser bypass, never a product API.
+q "SET session_replication_role = replica;
+   UPDATE flashback.operation_events SET recorded_at = clock_timestamp() - interval '10 minutes'
+    WHERE operation_id=$OPA AND event_type='started';
+   SET session_replication_role = DEFAULT;" >/dev/null
 q "SELECT flashback_reconcile_recover_operations(interval '1 minute');" >/dev/null
 [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OPA;")" == "abandoned" ]] \
     || die "f1 reconcile did not abandon"
