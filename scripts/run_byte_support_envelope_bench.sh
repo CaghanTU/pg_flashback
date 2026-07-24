@@ -345,31 +345,54 @@ run_one_table() {
     fp=$(psqlq -c "SELECT md5(count(*)::text || ':' || coalesce(sum(hashtext(t::text)),0)::text) FROM $rel t;")
     rows_live=$(psqlq -c "SELECT count(*) FROM $rel;")
 
+    # Large inserts leave the slot far behind the DROP LSN; scale catch-up wait
+    # with target bytes (floor 300s + ~2s/MiB, ceiling CATCHUP_TIMEOUT).
+    local catchup_timeout_secs catchup_deadline size_based_secs
+    catchup_timeout_secs="${PG_FLASHBACK_BENCH_CATCHUP_TIMEOUT_SECS:-1800}"
+    if (( catchup_timeout_secs < 300 )); then catchup_timeout_secs=300; fi
+    size_based_secs=$(( 300 + (bytes / (1024 * 1024)) * 2 ))
+    if (( size_based_secs > catchup_timeout_secs )); then size_based_secs=$catchup_timeout_secs; fi
+
     local t1 t_discover st
     t1=$(date +%s%N)
     psqlq -c "DROP TABLE $rel;"
-    for _ in $(seq 1 240); do
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    st=""
+    while (( $(date +%s) <= catchup_deadline )); do
       st=$(psqlq -c "SELECT status FROM flashback_disaster_points('$rel', interval '1 day') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
       [[ "$st" == "restorable" ]] && break
+      psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
       sleep 0.25
     done
     t_discover=$(( ($(date +%s%N) - t1) / 1000000 ))
 
-    local t2 t_dry plan plan_status token
+    local t2 t_dry plan plan_status token plan_code
     t2=$(date +%s%N)
-    for _ in $(seq 1 240); do
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    plan=""
+    plan_status=""
+    while (( $(date +%s) <= catchup_deadline )); do
       plan=$(psqlq -c "SELECT flashback_recover_plan('$rel', interval '1 day');")
       plan_status=$(printf '%s' "$plan" | jq -r '.status // empty')
       [[ "$plan_status" == "restorable" ]] && break
+      plan_code=$(printf '%s' "$plan" | jq -r '.code // empty')
+      if [[ "$plan_status" == "error" && "$plan_code" != "capture_catchup_pending" && "$plan_code" != "manifest_pending" ]]; then
+        echo "FAIL plan $rel: $plan" >&2
+        exit 1
+      fi
+      psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
       sleep 0.25
     done
     t_dry=$(( ($(date +%s%N) - t2) / 1000000 ))
-    token=$(printf '%s' "$plan" | jq -r '.plan_token')
-    [[ -n "$token" && "$token" != "null" ]] || { echo "FAIL plan $rel: $plan" >&2; exit 1; }
+    token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')
+    [[ "$plan_status" == "restorable" && -n "$token" && "$token" != "null" ]] \
+      || { echo "FAIL plan $rel after ${size_based_secs}s catch-up: $plan" >&2; exit 1; }
 
     local t3 op exec_err exec_rc t_recover fp2 ok disk_peak
     t3=$(date +%s%N)
-    for _ in $(seq 1 240); do
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    exec_rc=1
+    while (( $(date +%s) <= catchup_deadline )); do
       op=$(psqlq -c "SELECT flashback_recover_begin('$rel', '$token', interval '1 day')->>'operation_id';")
       set +e
       exec_err=$(psqlq -c "SELECT flashback_recover_execute('$rel', '$token', interval '1 day', NULL, NULL, NULL, $op);" 2>&1)
@@ -377,17 +400,20 @@ run_one_table() {
       set -e
       [[ $exec_rc -eq 0 ]] && break
       if printf '%s' "$exec_err" | grep -qi 'logical slot is .* bytes behind'; then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
         sleep 0.5
         plan=$(psqlq -c "SELECT flashback_recover_plan('$rel', interval '1 day');")
-        token=$(printf '%s' "$plan" | jq -r '.plan_token')
+        token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')
         [[ -n "$token" && "$token" != "null" ]] || { echo "FAIL replan $rel: $plan" >&2; exit 1; }
         continue
       fi
       echo "FAIL recover_execute $rel: $exec_err" >&2
       exit 1
     done
-    [[ $exec_rc -eq 0 ]] || { echo "FAIL recover_execute $rel: WAL never drained (last: $exec_err)" >&2; exit 1; }
-    for _ in $(seq 1 300); do
+    [[ $exec_rc -eq 0 ]] || { echo "FAIL recover_execute $rel: WAL never drained in ${size_based_secs}s (last: $exec_err)" >&2; exit 1; }
+    local verify_deadline
+    verify_deadline=$(( $(date +%s) + size_based_secs ))
+    while (( $(date +%s) <= verify_deadline )); do
       st=$(psqlq -c "SELECT COALESCE(flashback_operation_state($op),'missing');")
       [[ "$st" == "verified" || "$st" == "failed" ]] && break
       sleep 0.5
@@ -561,3 +587,14 @@ jq -n \
   }' > "$OUT_JSON"
 echo "Wrote $OUT_JSON"
 jq -r '.results[] | "\(.size_label)\t\(.shape)\t\(.status // "ran")\tprotect=\(.protect_ms // "-")ms recover=\(.recover_ms // "-")ms ok=\(.fingerprint_ok // false)"' "$OUT_JSON"
+
+failed_n="$(jq '[.results[] | select(
+    (.fingerprint_ok == false and (.status // "") != "blocked" and (.status // "") != "skipped")
+    or (.status == "error") or (.status == "timeout")
+  )] | length' "$OUT_JSON")"
+blocked_after_fail_n="$(jq '[.results[] | select(.status == "blocked")] | length' "$OUT_JSON")"
+if (( failed_n > 0 )); then
+  echo "FAIL: $failed_n envelope shape(s) failed (plus $blocked_after_fail_n blocked)" >&2
+  exit 1
+fi
+echo "byte_support_envelope_bench PASS"
