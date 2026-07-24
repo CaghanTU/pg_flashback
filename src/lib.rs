@@ -367,6 +367,10 @@ mod tests {
         "../tests/sql/integration/restore_verify_regression.sql"
     );
     sql_test!(
+        it_production_failclosed_no_synthetic_bypass,
+        "../tests/sql/integration/production_failclosed_no_synthetic_bypass.sql"
+    );
+    sql_test!(
         it_disaster_points_ambiguous_generation,
         "../tests/sql/integration/disaster_points_ambiguous_generation.sql"
     );

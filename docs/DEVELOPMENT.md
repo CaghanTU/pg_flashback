@@ -78,7 +78,13 @@ Validate with:
 python3 scripts/check_integration_inventory.py
 ```
 
-Production install SQL must not define `flashback_test_*` functions:
+The validator reports `registered_tests` (sql_test! entries) separately from
+`shared_setup_files` (`_common_setup.sql`). Infra files that insert into
+`delta_log` / `pending_wal_events` must set `adversarial_fixture: true`.
+
+Production install SQL must not define `flashback_test_*` functions and must
+not contain test-semantics markers (`pg_flashback_test_`,
+`active_test_synthetic_slot`, etc.):
 
 ```bash
 PG_MAJOR=17 scripts/check_generated_sql_no_test_surface.sh

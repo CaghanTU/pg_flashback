@@ -2,7 +2,8 @@
   "files": {
     "_common_setup.sql": {
       "class": "infra",
-      "reason": "shared truncate + legacy fake-trigger helpers"
+      "reason": "shared truncate + legacy fake-trigger helpers; adversarial-fixture direct capture-table write",
+      "adversarial_fixture": true
     },
     "acl_preservation_restore.sql": {
       "class": "supported-core",
@@ -42,11 +43,13 @@
     },
     "coverage_lifecycle_hardening.sql": {
       "class": "infra",
-      "reason": "lifecycle hardening with adversarial fixtures"
+      "reason": "lifecycle hardening with adversarial fixtures",
+      "adversarial_fixture": true
     },
     "coverage_schema_contract.sql": {
       "class": "infra",
-      "reason": "coverage schema scaffolding"
+      "reason": "coverage schema scaffolding; adversarial-fixture direct capture-table write",
+      "adversarial_fixture": true
     },
     "ddl_drop_recreate_same_name_restore.sql": {
       "class": "supported-core",
@@ -309,6 +312,11 @@
     "wal_test_seam_contract.sql": {
       "class": "supported-core",
       "reason": "seam contract regressions"
+    },
+    "production_failclosed_no_synthetic_bypass.sql": {
+      "class": "infra",
+      "adversarial_fixture": true,
+      "reason": "adversarial-fixture: production must not trust synthetic streams/names"
     }
   },
   "schema_version": 1
