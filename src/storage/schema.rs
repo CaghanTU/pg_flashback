@@ -19,6 +19,15 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../../sql/functions/snapshot_store.sql",
+    name = "flashback_snapshot_store",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_payload_ownership_helpers"
+    ],
+);
+
+extension_sql_file!(
     "../../sql/functions/rbac_grants.sql",
     name = "flashback_rbac_grants",
     requires = [
@@ -39,6 +48,7 @@ extension_sql_file!(
         "flashback_restore_lsn_api",
         "flashback_restore_replay_helpers",
         "flashback_payload_ownership_helpers",
+        "flashback_snapshot_store",
         "flashback_local_capacity",
         flashback_set_restore_in_progress,
         flashback_is_restore_in_progress,

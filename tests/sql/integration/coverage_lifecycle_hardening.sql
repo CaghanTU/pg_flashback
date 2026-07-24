@@ -78,7 +78,11 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name)
+       SET snapshot_table = format('flashback.%I', v_snapshot_name),
+           storage_backend = 'heap_v1',
+           locator = jsonb_build_object('schema', 'flashback', 'relation', v_snapshot_name),
+           payload_state = 'available',
+           available_at = clock_timestamp()
      WHERE snapshot_id = v_snapshot_1;
 
     INSERT INTO flashback.coverage_generations (
@@ -116,7 +120,11 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name)
+       SET snapshot_table = format('flashback.%I', v_snapshot_name),
+           storage_backend = 'heap_v1',
+           locator = jsonb_build_object('schema', 'flashback', 'relation', v_snapshot_name),
+           payload_state = 'available',
+           available_at = clock_timestamp()
      WHERE snapshot_id = v_snapshot_2;
 
     INSERT INTO flashback.coverage_generations (
@@ -161,7 +169,11 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name)
+       SET snapshot_table = format('flashback.%I', v_snapshot_name),
+           storage_backend = 'heap_v1',
+           locator = jsonb_build_object('schema', 'flashback', 'relation', v_snapshot_name),
+           payload_state = 'available',
+           available_at = clock_timestamp()
      WHERE snapshot_id = v_blocked_snapshot;
 
     INSERT INTO flashback.coverage_generations (
@@ -434,7 +446,11 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name)
+       SET snapshot_table = format('flashback.%I', v_snapshot_name),
+           storage_backend = 'heap_v1',
+           locator = jsonb_build_object('schema', 'flashback', 'relation', v_snapshot_name),
+           payload_state = 'available',
+           available_at = clock_timestamp()
      WHERE snapshot_id = v_snapshot_3;
 
     INSERT INTO flashback.coverage_generations (
@@ -491,7 +507,11 @@ BEGIN
         to_regclass(format('flashback.%I', v_snapshot_name))
     );
     UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name)
+       SET snapshot_table = format('flashback.%I', v_snapshot_name),
+           storage_backend = 'heap_v1',
+           locator = jsonb_build_object('schema', 'flashback', 'relation', v_snapshot_name),
+           payload_state = 'available',
+           available_at = clock_timestamp()
      WHERE snapshot_id = v_pending_snapshot;
     UPDATE flashback.tracked_tables
        SET base_snapshot_table = format('flashback.%I', v_snapshot_name)
@@ -572,9 +592,14 @@ BEGIN
         schema_def, row_count, captured_at
     ) VALUES (
         'public.it_enabled_hardening'::regclass, v_enabled_tracking_id,
-        'flashback.it_enabled_hardening_snapshot', '0/7000',
-        '{}'::jsonb, 0, v_base + interval '7 seconds'
+        '', '0/7000', '{}'::jsonb, 0, v_base + interval '7 seconds'
     ) RETURNING snapshot_id INTO v_enabled_snapshot;
+    PERFORM flashback_internal_snapshot_transition(
+        v_enabled_snapshot, v_enabled_tracking_id, ARRAY['creating'], 'available',
+        'heap_v1',
+        jsonb_build_object('schema', 'flashback', 'relation', 'it_enabled_hardening_snapshot'),
+        'flashback.it_enabled_hardening_snapshot', 0, NULL
+    );
     INSERT INTO flashback.coverage_generations (
         tracking_id, generation_no, stream_id, recovery_profile, state,
         boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
@@ -671,9 +696,14 @@ BEGIN
         schema_def, row_count, captured_at
     ) VALUES (
         'public.it_retire_resume'::regclass, v_tracking_id,
-        'flashback.base_snapshot_990001', '0/100',
-        '{}'::jsonb, 1, v_base
+        '', '0/100', '{}'::jsonb, 1, v_base
     ) RETURNING snapshot_id INTO v_pred_snapshot;
+    PERFORM flashback_internal_snapshot_transition(
+        v_pred_snapshot, v_tracking_id, ARRAY['creating'], 'available',
+        'heap_v1',
+        jsonb_build_object('schema', 'flashback', 'relation', 'base_snapshot_990001'),
+        'flashback.base_snapshot_990001', 1, NULL
+    );
 
     INSERT INTO flashback.coverage_generations (
         tracking_id, generation_no, stream_id, recovery_profile, state,
@@ -699,14 +729,17 @@ BEGIN
     INSERT INTO flashback.generation_payload_retirements (
         generation_id, tracking_id, reason, intent_txid,
         snapshot_id, snapshot_table, snapshot_rel_oid, snapshot_row_count,
-        snapshot_schema_fingerprint, expected_delta_rows, expected_schema_rows
+        snapshot_schema_fingerprint, snapshot_storage_backend, snapshot_locator,
+        expected_delta_rows, expected_schema_rows
     ) VALUES (
         v_pred_generation, v_tracking_id, 'retire_resume_fixture', 1,
         v_pred_snapshot, 'flashback.base_snapshot_990001',
         'flashback.base_snapshot_990001'::regclass::oid, 1,
         flashback_payload_schema_fingerprint(
             'flashback.base_snapshot_990001'::regclass
-        ), 0, 0
+        ),
+        'heap_v1', jsonb_build_object('schema', 'flashback', 'relation', 'base_snapshot_990001'),
+        0, 0
     );
 
     -- No active successor exists: resume must fail closed.
@@ -733,9 +766,14 @@ BEGIN
         schema_def, row_count, captured_at
     ) VALUES (
         'public.it_retire_resume'::regclass, v_tracking_id,
-        'flashback.base_snapshot_990002', '0/600',
-        '{}'::jsonb, 1, v_base + interval '6 seconds'
+        '', '0/600', '{}'::jsonb, 1, v_base + interval '6 seconds'
     ) RETURNING snapshot_id INTO v_succ_snapshot;
+    PERFORM flashback_internal_snapshot_transition(
+        v_succ_snapshot, v_tracking_id, ARRAY['creating'], 'available',
+        'heap_v1',
+        jsonb_build_object('schema', 'flashback', 'relation', 'base_snapshot_990002'),
+        'flashback.base_snapshot_990002', 1, NULL
+    );
 
     INSERT INTO flashback.coverage_generations (
         tracking_id, generation_no, stream_id, recovery_profile, state,

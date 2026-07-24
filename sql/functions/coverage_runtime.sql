@@ -27,7 +27,6 @@ DECLARE
     v_discarded_pending bigint := 0;
     v_discarded_building bigint := 0;
     v_database_oid oid;
-    v_payload_oid regclass;
     v_stream_state text;
     build_rec record;
 BEGIN
@@ -100,7 +99,7 @@ BEGIN
     -- swapped it); the next explicit re-anchor establishes a fresh exact base.
     FOR build_rec IN
         SELECT cg.generation_id, cg.tracking_id, cg.boundary_snapshot_id,
-               snap.snapshot_table
+               snap.snapshot_table, snap.payload_state
         FROM flashback.coverage_generations cg
         LEFT JOIN flashback.snapshots snap
           ON snap.snapshot_id = cg.boundary_snapshot_id
@@ -109,15 +108,12 @@ BEGIN
           AND cg.state = 'building'
         ORDER BY cg.tracking_id, cg.generation_id
     LOOP
-        v_payload_oid := to_regclass(build_rec.snapshot_table);
-        IF v_payload_oid IS NOT NULL THEN
-            IF public.flashback_payload_kind(v_payload_oid) IS NULL THEN
-                RAISE EXCEPTION
-                    'pg_flashback: pending generation % references an unrecognized payload relation %',
-                    build_rec.generation_id, build_rec.snapshot_table
-                    USING HINT = 'Repair the pending snapshot metadata; the stream break was rolled back fail-closed.';
-            END IF;
-            PERFORM public.flashback_drop_payload_table(v_payload_oid);
+        IF build_rec.boundary_snapshot_id IS NOT NULL
+           AND build_rec.payload_state = 'available'
+        THEN
+            PERFORM public.flashback_internal_snapshot_retire(
+                build_rec.boundary_snapshot_id, build_rec.tracking_id, 'missing'
+            );
         END IF;
 
         DELETE FROM flashback.schema_versions
@@ -127,13 +123,6 @@ BEGIN
         DELETE FROM flashback.delta_log
         WHERE generation_id = build_rec.generation_id
           AND tracking_id = build_rec.tracking_id;
-
-        UPDATE flashback.snapshots
-           SET payload_state = 'missing',
-               retired_at = COALESCE(retired_at, clock_timestamp())
-         WHERE snapshot_id = build_rec.boundary_snapshot_id
-           AND tracking_id = build_rec.tracking_id
-           AND payload_state = 'available';
 
         -- Avoid leaving a dangling current-binding pointer after a failed
         -- post-restore boundary.  Re-anchor will replace it atomically.
@@ -636,7 +625,6 @@ DECLARE
     v_provisional_lsn pg_lsn;
     v_schema_version bigint;
     v_schema_def jsonb;
-    v_row_count bigint;
 BEGIN
     PERFORM public.flashback_require_primary('flashback_reanchor');
     -- Fail closed: only wal is legal (raises for trigger/auto).
@@ -755,30 +743,16 @@ BEGIN
     FROM flashback.coverage_generations
     WHERE tracking_id = v_tracking_id;
     v_provisional_lsn := pg_current_wal_insert_lsn();
-    v_schema_def := COALESCE(public.flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
 
-    INSERT INTO flashback.snapshots (
-        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-        schema_def, row_count, captured_at
-    ) VALUES (
-        v_rel_oid, v_tracking_id, '', v_provisional_lsn,
-        v_schema_def, 0, clock_timestamp()
-    ) RETURNING snapshot_id INTO v_snapshot_id;
-
-    -- Use the established reserved payload namespace so ownership validation
-    -- remains deny-by-default instead of widening its name allowlist.
-    v_snapshot_name := format('snap_%s_%s', v_tracking_id, v_snapshot_id);
-    EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I',
-                   v_snapshot_name, v_schema_name, v_table_name);
-    PERFORM public.flashback_own_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_name))
+    -- Reserved payload namespace, ownership adoption, row count and schema
+    -- metadata capture all happen inside SnapshotStore so ownership
+    -- validation stays deny-by-default instead of widening its allowlist.
+    v_snapshot_id := public.flashback_internal_snapshot_create(
+        v_tracking_id, v_rel_oid, v_schema_name, v_table_name,
+        v_provisional_lsn, 'generation'
     );
-    EXECUTE format('SELECT count(*) FROM flashback.%I', v_snapshot_name)
-      INTO v_row_count;
-    UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_snapshot_name),
-           row_count = v_row_count
-     WHERE snapshot_id = v_snapshot_id;
+    v_snapshot_name := format('snap_%s_%s', v_tracking_id, v_snapshot_id);
+    v_schema_def := COALESCE(public.flashback_collect_schema_def(v_rel_oid), '{}'::jsonb);
 
     v_generation_id := public.flashback_internal_create_coverage_generation(
         p_tracking_id => v_tracking_id,
@@ -916,6 +890,7 @@ BEGIN
       ON snap.snapshot_id = cg.boundary_snapshot_id
      AND snap.tracking_id = cg.tracking_id
      AND snap.snapshot_lsn = cg.boundary_lsn
+    CROSS JOIN LATERAL public.flashback_internal_snapshot_resolve(snap.snapshot_id, snap.tracking_id) sr
     WHERE cg.tracking_id = v_tracking_id
       AND cg.recovery_profile = 'local_delta'
       AND cg.state IN ('active', 'sealed')
@@ -923,9 +898,9 @@ BEGIN
       AND p_target_lsn <= cg.valid_through_lsn
       AND p_target_lsn <= cs.valid_through_lsn
       AND (cg.superseded_before_lsn IS NULL OR p_target_lsn < cg.superseded_before_lsn)
-      AND snap.payload_state = 'available'
-      AND to_regclass(snap.snapshot_table) IS NOT NULL
-      AND public.flashback_payload_is_owned(to_regclass(snap.snapshot_table))
+      AND sr.payload_state = 'available'
+      AND sr.payload_relid IS NOT NULL
+      AND public.flashback_payload_is_owned(sr.payload_relid)
       AND NOT EXISTS (
           SELECT 1
           FROM flashback.generation_payload_retirements retirement
@@ -970,15 +945,16 @@ BEGIN
       ON snap.snapshot_id = cg.boundary_snapshot_id
      AND snap.tracking_id = cg.tracking_id
      AND snap.snapshot_lsn = cg.boundary_lsn
+    CROSS JOIN LATERAL public.flashback_internal_snapshot_resolve(snap.snapshot_id, snap.tracking_id) sr
     WHERE cg.tracking_id = v_tracking_id
       AND cg.state IN ('active', 'sealed')
       AND cg.boundary_lsn <= p_target_lsn
       AND p_target_lsn <= cg.valid_through_lsn
       AND p_target_lsn <= cs.valid_through_lsn
       AND (cg.superseded_before_lsn IS NULL OR p_target_lsn < cg.superseded_before_lsn)
-      AND snap.payload_state = 'available'
-      AND to_regclass(snap.snapshot_table) IS NOT NULL
-      AND public.flashback_payload_is_owned(to_regclass(snap.snapshot_table))
+      AND sr.payload_state = 'available'
+      AND sr.payload_relid IS NOT NULL
+      AND public.flashback_payload_is_owned(sr.payload_relid)
       AND NOT EXISTS (
           SELECT 1
           FROM flashback.generation_payload_retirements retirement

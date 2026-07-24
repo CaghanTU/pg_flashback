@@ -24,6 +24,10 @@
       "class": "supported-core",
       "reason": "long chain restore via seam"
     },
+    "cleanup_snapshot_store_retire.sql": {
+      "class": "infra",
+      "reason": "flashback_cleanup retires only available SnapshotStore artifacts, skips terminal ones"
+    },
     "composite_pk_restore.sql": {
       "class": "supported-core",
       "reason": "composite pk restore via seam"
@@ -146,6 +150,10 @@
     "leaf_partition_restore_reattach.sql": {
       "class": "infra",
       "reason": "leaf partition track rejection"
+    },
+    "legacy_snapshot_paths_fail_closed.sql": {
+      "class": "infra",
+      "reason": "proves pre-generation legacy snapshot APIs fail closed under WAL coverage"
     },
     "local_capacity_admission.sql": {
       "class": "infra",
@@ -272,6 +280,10 @@
     "slot_health_actions.sql": {
       "class": "infra",
       "reason": "slot health actions"
+    },
+    "snapshot_store_contract.sql": {
+      "class": "infra",
+      "reason": "SnapshotStore create/resolve/require_available/materialize/retire regression suite"
     },
     "subtxn_rollback_restore.sql": {
       "class": "supported-core",

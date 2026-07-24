@@ -413,30 +413,24 @@ BEGIN
         jsonb_build_object('dry_run', false)
     );
 
-    -- Retire snapshot payload tables; never touch unrelated lifecycles.
+    -- Retire snapshot payload tables via SnapshotStore; never touch unrelated
+    -- lifecycles. Only `available` artifacts need retiring here -- rows
+    -- already retired/missing/aborted are terminal and immutable, so this
+    -- must skip them rather than re-issue their transition.
     DECLARE
         snap_rec record;
     BEGIN
         FOR snap_rec IN
-            SELECT snapshot_table
+            SELECT snapshot_id
             FROM flashback.snapshots
             WHERE tracking_id = p_tracking_id
-              AND snapshot_table IS NOT NULL
-              AND snapshot_table ~ '^flashback\."?[a-zA-Z0-9_]+"?$'
+              AND payload_state = 'available'
         LOOP
-            PERFORM flashback_drop_payload_table(to_regclass(snap_rec.snapshot_table));
+            PERFORM flashback_internal_snapshot_retire(
+                snap_rec.snapshot_id, p_tracking_id, 'retired'
+            );
         END LOOP;
-
-        IF r.base_snapshot_table IS NOT NULL AND r.base_snapshot_table <> ''
-           AND r.base_snapshot_table ~ '^flashback\."?[a-zA-Z0-9_]+"?$'
-        THEN
-            PERFORM flashback_drop_payload_table(to_regclass(r.base_snapshot_table));
-        END IF;
     END;
-
-    UPDATE flashback.snapshots
-       SET payload_state = 'retired', retired_at = clock_timestamp()
-     WHERE tracking_id = p_tracking_id;
 
     DELETE FROM flashback.delta_log WHERE tracking_id = p_tracking_id;
     DELETE FROM flashback.schema_versions WHERE tracking_id = p_tracking_id;

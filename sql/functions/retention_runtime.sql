@@ -19,6 +19,7 @@ DECLARE
     v_schema_rows bigint;
     v_first_lsn pg_lsn;
     v_last_lsn pg_lsn;
+    v_snap record;
 BEGIN
     IF p_reason IS NULL OR btrim(p_reason) = '' THEN
         RAISE EXCEPTION 'flashback_begin_generation_retirement: reason is required';
@@ -108,9 +109,11 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: generation % backlog has not drained through its immutable upper bound',
             p_generation_id;
     END IF;
+    SELECT * INTO v_snap
+    FROM flashback_internal_snapshot_resolve(gen.snapshot_id, gen.tracking_id);
     IF gen.payload_state <> 'available'
-       OR to_regclass(gen.snapshot_table) IS NULL
-       OR NOT flashback_payload_is_owned(to_regclass(gen.snapshot_table))
+       OR v_snap.payload_relid IS NULL
+       OR NOT flashback_payload_is_owned(v_snap.payload_relid)
     THEN
         RAISE EXCEPTION 'pg_flashback: generation % snapshot payload is not available',
             p_generation_id;
@@ -128,17 +131,18 @@ BEGIN
         JOIN flashback.snapshots successor_snapshot
           ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
          AND successor_snapshot.tracking_id = successor.tracking_id
+        CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
+            successor_snapshot.snapshot_id, successor_snapshot.tracking_id
+        ) sr
         WHERE successor.tracking_id = gen.tracking_id
           AND successor.state = 'active'
           AND (
               successor.stream_id IS DISTINCT FROM gen.stream_id
               OR successor.boundary_lsn >= gen.superseded_before_lsn
           )
-          AND successor_snapshot.payload_state = 'available'
-          AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-          AND flashback_payload_is_owned(
-                  to_regclass(successor_snapshot.snapshot_table)
-              )
+          AND sr.payload_state = 'available'
+          AND sr.payload_relid IS NOT NULL
+          AND flashback_payload_is_owned(sr.payload_relid)
           AND NOT EXISTS (
               SELECT 1
               FROM flashback.generation_payload_retirements successor_retirement
@@ -163,11 +167,13 @@ BEGIN
         p_reason => p_reason,
         p_snapshot_id => gen.snapshot_id,
         p_snapshot_table => gen.snapshot_table,
-        p_snapshot_rel_oid => to_regclass(gen.snapshot_table)::oid,
+        p_snapshot_rel_oid => v_snap.payload_relid::oid,
         p_snapshot_row_count => gen.row_count,
         p_snapshot_schema_fingerprint => flashback_payload_schema_fingerprint(
-            to_regclass(gen.snapshot_table)
+            v_snap.payload_relid
         ),
+        p_snapshot_storage_backend => v_snap.storage_backend,
+        p_snapshot_locator => v_snap.locator,
         p_expected_delta_rows => v_delta_rows,
         p_expected_schema_rows => v_schema_rows,
         p_first_delta_lsn => v_first_lsn,
@@ -199,6 +205,7 @@ DECLARE
     v_current_schema_rows bigint;
     v_removed_delta_rows bigint;
     v_removed_schema_rows bigint;
+    v_snap record;
 BEGIN
     -- Keep the same database-stream -> lifecycle ordering as WAL consume,
     -- restore, and configuration reconciliation.  The intent row is durable
@@ -245,16 +252,18 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: retirement % expected a sealed generation, found %',
             retirement.retirement_id, retirement.generation_state;
     END IF;
+    SELECT * INTO v_snap
+    FROM flashback_internal_snapshot_resolve(retirement.snapshot_id, retirement.tracking_id);
     IF retirement.payload_state <> 'available'
-       OR to_regclass(retirement.snapshot_table) IS NULL
-       OR to_regclass(retirement.snapshot_table)::oid
-              IS DISTINCT FROM retirement.snapshot_rel_oid
-       OR NOT flashback_payload_is_owned(
-              to_regclass(retirement.snapshot_table)
-          )
-       OR flashback_payload_schema_fingerprint(
-              to_regclass(retirement.snapshot_table)
-          ) <> retirement.snapshot_schema_fingerprint
+       OR v_snap.payload_relid IS NULL
+       OR v_snap.payload_relid::oid IS DISTINCT FROM retirement.snapshot_rel_oid
+       OR NOT flashback_payload_is_owned(v_snap.payload_relid)
+       OR flashback_payload_schema_fingerprint(v_snap.payload_relid)
+              <> retirement.snapshot_schema_fingerprint
+       OR (retirement.snapshot_storage_backend IS NOT NULL
+           AND v_snap.storage_backend IS DISTINCT FROM retirement.snapshot_storage_backend)
+       OR (retirement.snapshot_locator IS NOT NULL
+           AND v_snap.locator IS DISTINCT FROM retirement.snapshot_locator)
     THEN
         RAISE EXCEPTION 'pg_flashback: retirement % snapshot evidence changed before cleanup',
             retirement.retirement_id;
@@ -278,17 +287,18 @@ BEGIN
         JOIN flashback.snapshots successor_snapshot
           ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
          AND successor_snapshot.tracking_id = successor.tracking_id
+        CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
+            successor_snapshot.snapshot_id, successor_snapshot.tracking_id
+        ) sr
         WHERE successor.tracking_id = retirement.tracking_id
           AND successor.state = 'active'
           AND (
               successor.stream_id IS DISTINCT FROM retirement.generation_stream_id
               OR successor.boundary_lsn >= retirement.generation_superseded_before_lsn
           )
-          AND successor_snapshot.payload_state = 'available'
-          AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-          AND flashback_payload_is_owned(
-                  to_regclass(successor_snapshot.snapshot_table)
-              )
+          AND sr.payload_state = 'available'
+          AND sr.payload_relid IS NOT NULL
+          AND flashback_payload_is_owned(sr.payload_relid)
           AND NOT EXISTS (
               SELECT 1
               FROM flashback.generation_payload_retirements successor_retirement
@@ -318,8 +328,8 @@ BEGIN
             );
     END IF;
 
-    PERFORM flashback_drop_payload_table(
-        to_regclass(retirement.snapshot_table)
+    PERFORM flashback_internal_snapshot_retire(
+        retirement.snapshot_id, retirement.tracking_id, 'retired'
     );
 
     DELETE FROM flashback.delta_log
@@ -329,13 +339,10 @@ BEGIN
     WHERE generation_id = p_generation_id;
     GET DIAGNOSTICS v_removed_schema_rows = ROW_COUNT;
 
-    UPDATE flashback.snapshots
-       SET payload_state = 'retired',
-           retired_at = clock_timestamp()
-     WHERE snapshot_id = retirement.snapshot_id
-       AND tracking_id = retirement.tracking_id;
-
-    IF to_regclass(retirement.snapshot_table) IS NOT NULL
+    SELECT * INTO v_snap
+    FROM flashback_internal_snapshot_resolve(retirement.snapshot_id, retirement.tracking_id);
+    IF v_snap.payload_relid IS NOT NULL
+       OR v_snap.payload_state <> 'retired'
        OR EXISTS (
            SELECT 1 FROM flashback.delta_log
            WHERE generation_id = p_generation_id
@@ -542,6 +549,9 @@ BEGIN
             JOIN flashback.snapshots snap
               ON snap.snapshot_id = cg.boundary_snapshot_id
              AND snap.tracking_id = cg.tracking_id
+            CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
+                snap.snapshot_id, snap.tracking_id
+            ) sr
             WHERE cg.generation_id = rec.generation_id
               AND cg.tracking_id = rec.tracking_id
               AND cg.recovery_profile = 'local_delta'
@@ -562,11 +572,9 @@ BEGIN
                         AND closed_gap.gap_end_lsn >= cg.superseded_before_lsn
                   )
               )
-              AND snap.payload_state = 'available'
-              AND to_regclass(snap.snapshot_table) IS NOT NULL
-              AND flashback_payload_is_owned(
-                      to_regclass(snap.snapshot_table)
-                  )
+              AND sr.payload_state = 'available'
+              AND sr.payload_relid IS NOT NULL
+              AND flashback_payload_is_owned(sr.payload_relid)
               AND NOT EXISTS (
                   SELECT 1
                   FROM flashback.pending_wal_events pending
@@ -583,17 +591,18 @@ BEGIN
                   JOIN flashback.snapshots successor_snapshot
                     ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
                    AND successor_snapshot.tracking_id = successor.tracking_id
+                  CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
+                      successor_snapshot.snapshot_id, successor_snapshot.tracking_id
+                  ) ssr
                   WHERE successor.tracking_id = cg.tracking_id
                     AND successor.state = 'active'
                     AND (
                         successor.stream_id IS DISTINCT FROM cg.stream_id
                         OR successor.boundary_lsn >= cg.superseded_before_lsn
                     )
-                    AND successor_snapshot.payload_state = 'available'
-                    AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-                    AND flashback_payload_is_owned(
-                            to_regclass(successor_snapshot.snapshot_table)
-                        )
+                    AND ssr.payload_state = 'available'
+                    AND ssr.payload_relid IS NOT NULL
+                    AND flashback_payload_is_owned(ssr.payload_relid)
                     AND NOT EXISTS (
                         SELECT 1
                         FROM flashback.generation_payload_retirements successor_retirement
@@ -640,6 +649,15 @@ BEGIN
              WHERE rel_oid = rec.rel_oid;
         END IF;
 
+        -- snapshot-store-lint:allow-block start (legacy pre-generations
+        -- trigger lifecycle: tracking_id IS NULL rows are outside
+        -- SnapshotStore's tracking_id-scoped domain by construction --
+        -- flashback_internal_snapshot_retire() requires a non-NULL
+        -- tracking_id and would itself raise "unknown snapshot artifact"
+        -- for one of these rows. flashback_effective_capture_mode() is
+        -- always 'wal' in this build, so no currently-trackable table can
+        -- produce a new row here; this loop only ever matches leftover
+        -- rows from a pre-WAL-only install, if any still exist.)
         FOR snap_rec IN
             SELECT snapshot_id, snapshot_table
             FROM flashback.snapshots s
@@ -658,6 +676,7 @@ BEGIN
             WHERE snapshot_id = snap_rec.snapshot_id;
             v_actions := v_actions + 1;
         END LOOP;
+        -- snapshot-store-lint:allow-block end
     END LOOP;
 
     v_actions := v_actions + flashback_drop_empty_delta_partitions();

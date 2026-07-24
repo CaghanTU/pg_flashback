@@ -257,17 +257,10 @@ BEGIN
             clock_timestamp()
         ) RETURNING stream_id INTO v_stream_id;
 
-        EXECUTE 'CREATE TABLE flashback.base_snapshot_990010 AS TABLE public."My Table"';
-        PERFORM flashback_own_payload_table('flashback.base_snapshot_990010'::regclass);
-
-        INSERT INTO flashback.snapshots (
-            rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-            schema_def, row_count, captured_at
-        ) VALUES (
-            'public."My Table"'::regclass, v_tracking_space,
-            'flashback.base_snapshot_990010', '0/1000',
-            '{}'::jsonb, 0, clock_timestamp()
-        ) RETURNING snapshot_id INTO v_snapshot_id;
+        v_snapshot_id := flashback_internal_snapshot_create(
+            v_tracking_space, 'public."My Table"'::regclass,
+            'public', 'My Table', '0/1000'::pg_lsn, 'generation'
+        );
 
         INSERT INTO flashback.coverage_generations (
             tracking_id, generation_no, stream_id, recovery_profile, state,

@@ -50,9 +50,14 @@ BEGIN
         schema_def, row_count, captured_at
     ) VALUES (
         'public.it_lsn_adversarial'::regclass, v_tracking_id,
-        'flashback.base_snapshot_987654320', '0/1000',
-        '{}'::jsonb, 1, v_base
+        '', '0/1000', '{}'::jsonb, 1, v_base
     ) RETURNING snapshot_id INTO v_snapshot_id;
+    PERFORM flashback_internal_snapshot_transition(
+        v_snapshot_id, v_tracking_id, ARRAY['creating'], 'available',
+        'heap_v1',
+        jsonb_build_object('schema', 'flashback', 'relation', 'base_snapshot_987654320'),
+        'flashback.base_snapshot_987654320', 1, NULL
+    );
 
     INSERT INTO flashback.coverage_generations (
         tracking_id, generation_no, stream_id, recovery_profile, state,

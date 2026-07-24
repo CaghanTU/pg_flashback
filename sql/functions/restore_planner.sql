@@ -87,6 +87,13 @@ BEGIN
             USING HINT = 'Call flashback_resolve_target(table, timestamp), inspect its pinned frontier, then execute flashback_restore_lsn(table, resolved_lsn).';
     END IF;
 
+    -- snapshot-store-lint:allow-block start (unreachable past this point:
+    -- the guard above unconditionally raises for every currently-trackable
+    -- local_delta table, since WAL-only architecture guarantees a
+    -- coverage_generations row always exists by the time this function
+    -- could run. Proven fail-closed by
+    -- tests/sql/integration/legacy_snapshot_paths_fail_closed.sql and
+    -- tests/sql/integration/lsn_target_adversarial.sql.)
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_restore: target_time % is before tracked_since %', target_time, v_tracked_since;
     END IF;
@@ -533,6 +540,7 @@ EXCEPTION WHEN OTHERS THEN
 
     PERFORM flashback_set_restore_in_progress(false);
     RAISE;
+    -- snapshot-store-lint:allow-block end
 END;
 $$;
 
@@ -702,6 +710,12 @@ BEGIN
         RAISE EXCEPTION 'flashback_query(timestamp) is disabled for correctness-qualified WAL coverage'
             USING HINT = 'Resolve the timestamp with flashback_resolve_target(), then call flashback_query_lsn().';
     END IF;
+    -- snapshot-store-lint:allow-block start (unreachable past this point:
+    -- the guard above unconditionally raises for every currently-trackable
+    -- local_delta table, since WAL-only architecture guarantees a
+    -- coverage_generations row always exists by the time this function
+    -- could run. Proven fail-closed by
+    -- tests/sql/integration/legacy_snapshot_paths_fail_closed.sql.)
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_query: target_time % is before tracked_since %', target_time, v_tracked_since;
     END IF;
@@ -868,6 +882,7 @@ BEGIN
     END IF;
 
     RETURN QUERY EXECUTE v_query;
+    -- snapshot-store-lint:allow-block end
 END;
 $$;
 
@@ -1038,6 +1053,12 @@ BEGIN
         RAISE EXCEPTION 'flashback_recover_deleted(timestamp) is disabled for correctness-qualified WAL coverage'
             USING HINT = 'Resolve the timestamp with flashback_resolve_target(), then call flashback_recover_deleted_lsn().';
     END IF;
+    -- snapshot-store-lint:allow-block start (unreachable past this point:
+    -- the guard above unconditionally raises for every currently-trackable
+    -- local_delta table, since WAL-only architecture guarantees a
+    -- coverage_generations row always exists by the time this function
+    -- could run. Proven fail-closed by
+    -- tests/sql/integration/legacy_snapshot_paths_fail_closed.sql.)
     IF target_time < v_tracked_since THEN
         RAISE EXCEPTION 'flashback_recover_deleted: target_time % is before tracked_since %',
             target_time, v_tracked_since;
@@ -1203,5 +1224,6 @@ BEGIN
         target_table, recovered, target_time;
 
     RETURN recovered;
+    -- snapshot-store-lint:allow-block end
 END;
 $$;

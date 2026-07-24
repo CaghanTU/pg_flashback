@@ -218,6 +218,8 @@ BEGIN
         p_snapshot_rel_oid => v_rel,
         p_snapshot_row_count => 0,
         p_snapshot_schema_fingerprint => md5('dummy_schema'),
+        p_snapshot_storage_backend => 'heap_v1',
+        p_snapshot_locator => jsonb_build_object('schema', 'flashback', 'relation', 'it_state_auth_snap'),
         p_expected_delta_rows => 0,
         p_expected_schema_rows => 0,
         p_first_delta_lsn => v_lsn,

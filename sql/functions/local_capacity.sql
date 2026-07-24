@@ -176,13 +176,9 @@ BEGIN
     LIMIT 1;
 
     IF v_tracking_id IS NOT NULL THEN
-        SELECT COALESCE(sum(pg_total_relation_size(to_regclass(s.snapshot_table))), 0)
+        SELECT COALESCE(sum(size_bytes), 0)
           INTO v_retained
-        FROM flashback.snapshots s
-        WHERE s.tracking_id = v_tracking_id
-          AND COALESCE(s.payload_state, 'available') = 'available'
-          AND NULLIF(s.snapshot_table, '') IS NOT NULL
-          AND to_regclass(s.snapshot_table) IS NOT NULL;
+        FROM flashback_internal_snapshot_sizes(v_tracking_id, ARRAY['available']);
         v_retained := COALESCE(v_retained, 0) + COALESCE((
             SELECT sum(pg_column_size(dl))::bigint
             FROM flashback.delta_log dl

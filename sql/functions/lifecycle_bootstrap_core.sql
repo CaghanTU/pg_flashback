@@ -124,8 +124,6 @@ DECLARE
     v_generation_id bigint;
     v_boundary_xid bigint;
     v_provisional_lsn pg_lsn;
-    v_schema_def jsonb;
-    v_row_count bigint;
     stale_snap record;
     old_oid oid;
 BEGIN
@@ -189,8 +187,11 @@ BEGIN
     PERFORM flashback_admit_local_capacity(p_rel_oid, 'track');
     EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
 
-    v_snapshot_name := format('base_snapshot_t%s', v_tracking_id::text);
-
+    -- Unreachable in current schema, kept as a defensive no-op: the
+    -- precondition check above (line ~161) already refuses first-track
+    -- whenever any *active* row shares this schema_name/table_name
+    -- regardless of rel_oid, and tracked_tables_active_name_key enforces
+    -- the same uniqueness at the catalog level. old_oid can never resolve.
     SELECT rel_oid INTO old_oid
     FROM flashback.tracked_tables
     WHERE schema_name = v_schema_name AND table_name = v_table_name
@@ -200,45 +201,49 @@ BEGIN
 
     IF old_oid IS NOT NULL THEN
         FOR stale_snap IN
-            SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = old_oid
+            SELECT snapshot_id, tracking_id, payload_state
+            FROM flashback.snapshots WHERE rel_oid = old_oid
         LOOP
-            IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
-                PERFORM flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
+            IF stale_snap.payload_state = 'available' THEN
+                PERFORM flashback_internal_snapshot_retire(
+                    stale_snap.snapshot_id, stale_snap.tracking_id, 'retired'
+                );
             END IF;
         END LOOP;
-        PERFORM flashback_drop_payload_table(
-            to_regclass(format('flashback.%I', format('base_snapshot_%s', old_oid::text)))
-        );
-        DELETE FROM flashback.snapshots WHERE rel_oid = old_oid;
         DELETE FROM flashback.delta_log WHERE rel_oid = old_oid;
         DELETE FROM flashback.schema_versions WHERE rel_oid = old_oid;
         DELETE FROM flashback.tracked_tables WHERE rel_oid = old_oid;
     END IF;
 
+    -- Orphaned snapshot artifacts for this exact rel_oid (leftover from an
+    -- imperfect earlier untrack/crash) are not the current base_snapshot_table
+    -- of any tracked_tables row and are retired through SnapshotStore rather
+    -- than deleted, so the retirement audit trail is preserved instead of
+    -- erased. Already-terminal rows need no action.
     FOR stale_snap IN
-        SELECT snapshot_table FROM flashback.snapshots WHERE rel_oid = p_rel_oid
+        SELECT snapshot_id, tracking_id, snapshot_table
+        FROM flashback.snapshots
+        WHERE rel_oid = p_rel_oid
+          AND payload_state = 'available'
+          AND tracking_id IS NOT NULL
     LOOP
-        IF stale_snap.snapshot_table IS NOT NULL AND stale_snap.snapshot_table <> '' THEN
-            IF NOT EXISTS (
-                SELECT 1 FROM flashback.tracked_tables tt
-                WHERE tt.rel_oid = p_rel_oid
-                  AND tt.base_snapshot_table = stale_snap.snapshot_table
-            ) THEN
-                PERFORM flashback_drop_payload_table(to_regclass(stale_snap.snapshot_table));
-                DELETE FROM flashback.snapshots
-                WHERE rel_oid = p_rel_oid
-                  AND snapshot_table = stale_snap.snapshot_table;
-            END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM flashback.tracked_tables tt
+            WHERE tt.rel_oid = p_rel_oid
+              AND tt.base_snapshot_table = stale_snap.snapshot_table
+        ) THEN
+            PERFORM flashback_internal_snapshot_retire(
+                stale_snap.snapshot_id, stale_snap.tracking_id, 'retired'
+            );
         END IF;
     END LOOP;
 
-    PERFORM flashback_drop_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_name))
+    v_provisional_lsn := pg_current_wal_insert_lsn();
+    v_snapshot_id := flashback_internal_snapshot_create(
+        v_tracking_id, p_rel_oid, v_schema_name, v_table_name,
+        v_provisional_lsn, 'initial_track'
     );
-    EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I', v_snapshot_name, v_schema_name, v_table_name);
-    PERFORM flashback_own_payload_table(
-        to_regclass(format('flashback.%I', v_snapshot_name))
-    );
+    v_snapshot_name := format('base_snapshot_t%s', v_tracking_id::text);
 
     INSERT INTO flashback.tracked_tables (
         tracking_id, rel_oid, schema_name, table_name, base_snapshot_table,
@@ -258,17 +263,6 @@ BEGIN
     FROM flashback.tracked_tables WHERE tracking_id = v_tracking_id;
 
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
-    v_provisional_lsn := pg_current_wal_insert_lsn();
-    v_schema_def := COALESCE(flashback_collect_schema_def(p_rel_oid), '{}'::jsonb);
-    EXECUTE format('SELECT count(*) FROM flashback.%I', v_snapshot_name) INTO v_row_count;
-
-    INSERT INTO flashback.snapshots (
-        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-        schema_def, row_count, captured_at
-    ) VALUES (
-        p_rel_oid, v_tracking_id, format('flashback.%I', v_snapshot_name),
-        v_provisional_lsn, v_schema_def, v_row_count, clock_timestamp()
-    ) RETURNING snapshot_id INTO v_snapshot_id;
 
     v_generation_id := flashback_internal_create_coverage_generation(
         p_tracking_id => v_tracking_id,

@@ -9,7 +9,10 @@ fn flashback_sha256(input: &str) -> String {
 extension_sql_file!(
     "../sql/functions/local_capacity.sql",
     name = "flashback_local_capacity",
-    requires = ["flashback_storage_schema_bootstrap"],
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_snapshot_store"
+    ],
 );
 
 extension_sql_file!(
@@ -56,6 +59,7 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
         "flashback_payload_ownership_helpers",
+        "flashback_snapshot_store",
         "flashback_local_capacity",
         "flashback_local_compatibility",
         flashback_sha256
@@ -78,6 +82,7 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
         "flashback_payload_ownership_helpers",
+        "flashback_snapshot_store",
         "flashback_local_capacity",
         "flashback_worker_admission",
         "flashback_drop_dependency_manifest",
@@ -115,6 +120,7 @@ extension_sql_file!(
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
+        "flashback_snapshot_store",
         "flashback_api_track_capture",
         "flashback_wal_only_migration",
         "flashback_local_capacity"
@@ -126,6 +132,7 @@ extension_sql_file!(
     name = "flashback_health_runtime",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_snapshot_store",
         "flashback_api_track_capture",
         "flashback_coverage_runtime",
         "flashback_local_capacity",
@@ -149,7 +156,10 @@ extension_sql_file!(
 extension_sql_file!(
     "../sql/functions/monitoring_cache.sql",
     name = "flashback_monitoring_cache",
-    requires = ["flashback_storage_schema_bootstrap"],
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_snapshot_store"
+    ],
 );
 
 extension_sql_file!(
@@ -210,6 +220,7 @@ extension_sql_file!(
     requires = [
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
+        "flashback_snapshot_store",
         "flashback_api_track_capture",
         "flashback_operation_journal",
         "flashback_worker_admission",
@@ -224,6 +235,7 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
         "flashback_payload_ownership_helpers",
+        "flashback_snapshot_store",
         "flashback_api_track_capture",
         "flashback_coverage_runtime"
     ],

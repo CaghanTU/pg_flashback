@@ -841,6 +841,8 @@ CREATE OR REPLACE FUNCTION flashback_internal_create_retirement_intent(
     p_snapshot_rel_oid oid,
     p_snapshot_row_count bigint,
     p_snapshot_schema_fingerprint text,
+    p_snapshot_storage_backend text,
+    p_snapshot_locator jsonb,
     p_expected_delta_rows bigint,
     p_expected_schema_rows bigint,
     p_first_delta_lsn pg_lsn DEFAULT NULL,
@@ -865,12 +867,14 @@ BEGIN
     INSERT INTO flashback.generation_payload_retirements (
         generation_id, tracking_id, state, reason,
         snapshot_id, snapshot_table, snapshot_rel_oid, snapshot_row_count,
-        snapshot_schema_fingerprint, expected_delta_rows, expected_schema_rows,
+        snapshot_schema_fingerprint, snapshot_storage_backend, snapshot_locator,
+        expected_delta_rows, expected_schema_rows,
         first_delta_lsn, last_delta_lsn, details
     ) VALUES (
         p_generation_id, p_tracking_id, 'retiring', p_reason,
         p_snapshot_id, p_snapshot_table, p_snapshot_rel_oid, p_snapshot_row_count,
-        p_snapshot_schema_fingerprint, p_expected_delta_rows, p_expected_schema_rows,
+        p_snapshot_schema_fingerprint, p_snapshot_storage_backend, p_snapshot_locator,
+        p_expected_delta_rows, p_expected_schema_rows,
         p_first_delta_lsn, p_last_delta_lsn, COALESCE(p_details, '{}'::jsonb)
     )
     RETURNING retirement_id INTO v_ret_id;
@@ -892,7 +896,7 @@ REVOKE ALL ON FUNCTION public.flashback_internal_advance_generation_watermark(bi
 REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
 
 DO $$
 BEGIN
@@ -908,7 +912,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM flashback_admin';
-        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_lock_database_stream(oid) FROM pg_monitor';
@@ -922,7 +926,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM pg_monitor';
-        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
     END IF;
 END
 $$;

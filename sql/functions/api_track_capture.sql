@@ -497,6 +497,12 @@ BEGIN
             USING HINT = 'Use the generation-aware maintenance re-anchor operation when it is available; automatic full-table checkpoints are intentionally disabled.';
     END IF;
 
+    -- snapshot-store-lint:allow-block start (unreachable past this point:
+    -- the guard above unconditionally raises for every currently-trackable
+    -- table, since WAL-only architecture guarantees a coverage_generations
+    -- row always exists by the time this function could run. Proven
+    -- fail-closed by
+    -- tests/sql/integration/legacy_snapshot_paths_fail_closed.sql.)
     INSERT INTO flashback.snapshots (
         rel_oid, snapshot_table, snapshot_lsn, schema_def, row_count, captured_at
     )
@@ -531,6 +537,7 @@ BEGIN
     WHERE snapshot_id = v_snapshot_id;
 
     RETURN v_snapshot_id;
+    -- snapshot-store-lint:allow-block end
 END;
 $$;
 
@@ -1142,32 +1149,24 @@ BEGIN
         END;
     END IF;
 
-    IF v_base_snapshot IS NOT NULL AND v_base_snapshot <> '' THEN
-        IF v_base_snapshot !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
-            RAISE EXCEPTION 'flashback_untrack: invalid snapshot ref: %', v_base_snapshot;
-        END IF;
-        PERFORM flashback_drop_payload_table(to_regclass(v_base_snapshot));
-    END IF;
+    -- v_base_snapshot is tracked_tables.base_snapshot_table's compatibility
+    -- text projection of the same row the loop below already reaches by
+    -- snapshot_id/tracking_id (v_has_generations is always true for a
+    -- WAL-only local_delta lifecycle), so a separate early drop here would
+    -- only race SnapshotStore's own drop for the identical artifact.
 
     FOR snap_rec IN
-        SELECT snapshot_id, snapshot_table
+        SELECT snapshot_id, tracking_id, payload_state
         FROM flashback.snapshots
         WHERE (v_has_generations AND tracking_id = v_tracking_id)
-           OR (NOT v_has_generations AND rel_oid = v_rel_oid)
+           OR (NOT v_has_generations AND rel_oid = v_rel_oid AND tracking_id IS NOT NULL)
     LOOP
-        IF snap_rec.snapshot_table IS NOT NULL AND snap_rec.snapshot_table <> '' THEN
-            IF snap_rec.snapshot_table !~ '^flashback\."?[a-zA-Z0-9_]+"?$' THEN
-                RAISE WARNING 'flashback_untrack: skipping invalid snapshot ref: %', snap_rec.snapshot_table;
-                CONTINUE;
-            END IF;
-            PERFORM flashback_drop_payload_table(
-                to_regclass(snap_rec.snapshot_table)
-            );
-        END IF;
         IF v_has_generations THEN
-            UPDATE flashback.snapshots
-               SET payload_state = 'retired', retired_at = clock_timestamp()
-             WHERE snapshot_id = snap_rec.snapshot_id;
+            IF snap_rec.payload_state = 'available' THEN
+                PERFORM flashback_internal_snapshot_retire(
+                    snap_rec.snapshot_id, snap_rec.tracking_id, 'retired'
+                );
+            END IF;
         ELSE
             DELETE FROM flashback.snapshots WHERE snapshot_id = snap_rec.snapshot_id;
         END IF;

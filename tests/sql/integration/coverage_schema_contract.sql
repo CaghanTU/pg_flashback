@@ -469,14 +469,19 @@ BEGIN
         RAISE EXCEPTION 're-anchor erased or failed to preserve permanent gap';
     END IF;
 
-    -- A boundary snapshot cannot be removed while generation metadata uses it.
+    -- A snapshot artifact can never be removed at all: SnapshotStore's
+    -- immutable-audit-trail guard (flashback_guard_snapshot_artifact)
+    -- refuses every DELETE unconditionally, which is a strictly stronger
+    -- invariant than (and now fires before) the FK that used to be the
+    -- only thing stopping this specific referenced-while-in-use case.
+    -- PG18 reports ON DELETE RESTRICT as restrict_violation; older majors
+    -- use foreign_key_violation for that FK path, kept here as a fallback
+    -- in case the guard trigger is ever bypassed by a future schema change.
     BEGIN
         DELETE FROM flashback.snapshots WHERE snapshot_id = v_snapshot_id;
         SET CONSTRAINTS flashback.coverage_generations_boundary_snapshot_tracking_fk IMMEDIATE;
         RAISE EXCEPTION 'referenced boundary snapshot was deletable';
-    -- PG18 reports ON DELETE RESTRICT as restrict_violation; older majors use
-    -- foreign_key_violation for this path.
-    EXCEPTION WHEN foreign_key_violation OR restrict_violation THEN
+    EXCEPTION WHEN integrity_constraint_violation OR foreign_key_violation OR restrict_violation THEN
         SET CONSTRAINTS flashback.coverage_generations_boundary_snapshot_tracking_fk DEFERRED;
     END;
 

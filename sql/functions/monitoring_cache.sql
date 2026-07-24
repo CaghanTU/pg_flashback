@@ -38,11 +38,9 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'flashback';
 
-    SELECT COALESCE(sum(pg_total_relation_size(to_regclass(s.snapshot_table))), 0)
+    SELECT COALESCE(sum(size_bytes), 0)
       INTO v_reclaimable
-    FROM flashback.snapshots s
-    WHERE s.payload_state = 'retired'
-      AND to_regclass(s.snapshot_table) IS NOT NULL;
+    FROM flashback_internal_snapshot_sizes(NULL, ARRAY['retired']);
 
     SELECT min(COALESCE(d.committed_at, d.event_time))
       INTO v_oldest

@@ -330,6 +330,18 @@ mod tests {
         "../tests/sql/integration/lsn_target_adversarial.sql"
     );
     sql_test!(
+        it_legacy_snapshot_paths_fail_closed,
+        "../tests/sql/integration/legacy_snapshot_paths_fail_closed.sql"
+    );
+    sql_test!(
+        it_cleanup_snapshot_store_retire,
+        "../tests/sql/integration/cleanup_snapshot_store_retire.sql"
+    );
+    sql_test!(
+        it_snapshot_store_contract,
+        "../tests/sql/integration/snapshot_store_contract.sql"
+    );
+    sql_test!(
         it_local_capacity_admission,
         "../tests/sql/integration/local_capacity_admission.sql"
     );

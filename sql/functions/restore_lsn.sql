@@ -215,10 +215,10 @@ BEGIN
            ) THEN ' OVERRIDING SYSTEM VALUE' ELSE '' END
       INTO v_identity_override;
 
-    EXECUTE format(
-        'INSERT INTO %I.%I (%s)%s SELECT %s FROM %s',
+    PERFORM flashback_internal_snapshot_materialize(
+        admission.boundary_snapshot_id, admission.tracking_id,
         p_destination_schema, p_destination_table,
-        v_col_list, v_identity_override, v_col_list, admission.snapshot_table
+        v_col_list, v_identity_override
     );
 
     PERFORM flashback_apply_deferred_pk(
@@ -431,6 +431,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     admission record;
+    v_boundary_snap record;
     materialized record;
     def_rec record;
     v_shadow_name text;
@@ -548,7 +549,9 @@ BEGIN
     ELSE
         -- DROP TABLE reconstruct: live heap is gone. Budget restore peak from
         -- the admitted boundary snapshot payload (heap+TOAST proxy).
-        v_capacity_rel := to_regclass(admission.snapshot_table);
+        SELECT * INTO v_boundary_snap
+        FROM flashback_internal_snapshot_resolve(admission.boundary_snapshot_id, admission.tracking_id);
+        v_capacity_rel := v_boundary_snap.payload_relid;
         IF v_capacity_rel IS NULL THEN
             RAISE EXCEPTION 'pg_flashback: cannot admit restore capacity for dropped table % without boundary snapshot %',
                 p_target_table, admission.snapshot_table;
@@ -600,6 +603,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     admission record;
+    v_boundary_snap record;
     materialized record;
     def_rec record;
     v_shadow_name text;
@@ -616,7 +620,6 @@ DECLARE
     v_schema_version bigint;
     v_boundary_xid bigint;
     v_provisional_lsn pg_lsn;
-    v_row_count bigint;
     v_seq_name text;
     v_seq_schema text;
     v_seq_bare text;
@@ -646,7 +649,9 @@ BEGIN
     IF v_live_oid IS NOT NULL THEN
         v_capacity_rel := v_live_oid;
     ELSE
-        v_capacity_rel := to_regclass(admission.snapshot_table);
+        SELECT * INTO v_boundary_snap
+        FROM flashback_internal_snapshot_resolve(admission.boundary_snapshot_id, admission.tracking_id);
+        v_capacity_rel := v_boundary_snap.payload_relid;
         IF v_capacity_rel IS NULL THEN
             RAISE EXCEPTION 'pg_flashback: cannot revalidate restore capacity for dropped table % without boundary snapshot %',
                 p_target_table, admission.snapshot_table;
@@ -895,28 +900,13 @@ BEGIN
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
     v_provisional_lsn := pg_current_wal_insert_lsn();
 
-    INSERT INTO flashback.snapshots (
-        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-        schema_def, row_count, captured_at
-    ) VALUES (
-        v_new_rel_oid, admission.tracking_id, '', v_provisional_lsn,
-        materialized.target_schema_def, 0, clock_timestamp()
-    ) RETURNING snapshot_id INTO v_new_snapshot_id;
-
+    v_new_snapshot_id := flashback_internal_snapshot_create(
+        admission.tracking_id, v_new_rel_oid,
+        materialized.source_schema_name, materialized.source_table_name,
+        v_provisional_lsn, 'generation', materialized.target_schema_def
+    );
     v_new_snapshot_table := format('snap_%s_%s',
                                    admission.tracking_id, v_new_snapshot_id);
-    EXECUTE format('CREATE TABLE flashback.%I AS TABLE %I.%I',
-                   v_new_snapshot_table,
-                   materialized.source_schema_name, materialized.source_table_name);
-    PERFORM flashback_own_payload_table(
-        to_regclass(format('flashback.%I', v_new_snapshot_table))
-    );
-    EXECUTE format('SELECT count(*) FROM flashback.%I', v_new_snapshot_table)
-      INTO v_row_count;
-    UPDATE flashback.snapshots
-       SET snapshot_table = format('flashback.%I', v_new_snapshot_table),
-           row_count = v_row_count
-     WHERE snapshot_id = v_new_snapshot_id;
 
     SELECT COALESCE(max(generation_no), 0) + 1 INTO v_generation_no
     FROM flashback.coverage_generations

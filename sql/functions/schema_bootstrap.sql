@@ -668,22 +668,37 @@ DO $$
 BEGIN
     IF to_regclass('flashback.snapshots') IS NULL THEN
         EXECUTE 'CREATE TABLE flashback.snapshots (
-            snapshot_id    BIGSERIAL PRIMARY KEY,
-            rel_oid        OID NOT NULL,
-            tracking_id    BIGINT,
-            snapshot_table TEXT NOT NULL,
-            snapshot_lsn   PG_LSN NOT NULL,
-            schema_def     JSONB NOT NULL,
-            row_count      BIGINT NOT NULL,
-            captured_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-            payload_state  TEXT NOT NULL DEFAULT ''available'',
-            retired_at     TIMESTAMPTZ,
+            snapshot_id      BIGSERIAL PRIMARY KEY,
+            rel_oid          OID NOT NULL,
+            tracking_id      BIGINT,
+            snapshot_table   TEXT NOT NULL,
+            snapshot_lsn     PG_LSN NOT NULL,
+            schema_def       JSONB NOT NULL,
+            row_count        BIGINT NOT NULL,
+            captured_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            payload_state    TEXT NOT NULL DEFAULT ''creating'',
+            retired_at       TIMESTAMPTZ,
+            storage_backend  TEXT NOT NULL DEFAULT ''heap_v1'',
+            locator          JSONB,
+            available_at     TIMESTAMPTZ,
             CONSTRAINT snapshots_payload_state_check
-                CHECK (payload_state IN (''available'', ''retired'', ''missing'')),
+                CHECK (payload_state IN (
+                    ''creating'', ''available'', ''retiring'',
+                    ''retired'', ''missing'', ''aborted''
+                )),
             CONSTRAINT snapshots_payload_state_shape_check
                 CHECK (
-                    (payload_state = ''available'' AND retired_at IS NULL)
-                    OR (payload_state IN (''retired'', ''missing'') AND retired_at IS NOT NULL)
+                    (payload_state IN (''creating'', ''available'', ''retiring'')
+                         AND retired_at IS NULL)
+                    OR (payload_state IN (''retired'', ''missing'', ''aborted'')
+                         AND retired_at IS NOT NULL)
+                ),
+            CONSTRAINT snapshots_storage_backend_check
+                CHECK (storage_backend = ''heap_v1''),
+            CONSTRAINT snapshots_available_shape_check
+                CHECK (
+                    payload_state <> ''available''
+                    OR (locator IS NOT NULL AND available_at IS NOT NULL)
                 ),
             CONSTRAINT snapshots_snapshot_tracking_key UNIQUE (snapshot_id, tracking_id),
             CONSTRAINT snapshots_snapshot_tracking_lsn_key
@@ -692,6 +707,265 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Backend-neutral artifact metadata (Step 5 / SnapshotStore). storage_backend
+-- is 'heap_v1' only in this step; locator carries {schema, relation} for that
+-- backend. snapshot_table remains as a read-only compatibility projection,
+-- kept in sync by the SnapshotStore create/retire primitives; new production
+-- logic must resolve payload identity from locator, never by parsing
+-- snapshot_table. payload_state gains three transient/terminal states
+-- (creating, retiring, aborted) alongside the pre-existing available/
+-- retired/missing so the full lifecycle is representable; see
+-- flashback_guard_snapshot_artifact() below for the legal-edge graph.
+DO $$
+BEGIN
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'heap_v1';
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS locator JSONB;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_payload_state_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%creating%'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            DROP CONSTRAINT snapshots_payload_state_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_payload_state_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_payload_state_check
+            CHECK (payload_state IN (
+                'creating', 'available', 'retiring',
+                'retired', 'missing', 'aborted'
+            )) NOT VALID;
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_payload_state_check;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_payload_state_shape_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%retiring%'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            DROP CONSTRAINT snapshots_payload_state_shape_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_payload_state_shape_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_payload_state_shape_check
+            CHECK (
+                (payload_state IN ('creating', 'available', 'retiring')
+                     AND retired_at IS NULL)
+                OR (payload_state IN ('retired', 'missing', 'aborted')
+                     AND retired_at IS NOT NULL)
+            ) NOT VALID;
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_payload_state_shape_check;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_storage_backend_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_storage_backend_check
+            CHECK (storage_backend = 'heap_v1') NOT VALID;
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_storage_backend_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_available_shape_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_available_shape_check
+            CHECK (
+                payload_state <> 'available'
+                OR (locator IS NOT NULL AND available_at IS NOT NULL)
+            ) NOT VALID;
+        -- Validated only after the backfill below has populated locator for
+        -- every currently-available row (or downgraded it to missing).
+    END IF;
+END
+$$;
+
+-- Backfill: every pre-existing row is a heap_v1 artifact. No payload data is
+-- copied or moved; only catalog metadata is derived. snapshot_table is
+-- parsed with pg_catalog.parse_ident() (never string-split) since it may
+-- reference a relation that no longer physically exists (retired/missing).
+-- A row claiming 'available' whose relation cannot be proven to be a live,
+-- pg_flashback-owned payload is downgraded to 'missing' rather than trusted.
+DO $$
+DECLARE
+    r record;
+    v_parts text[];
+    v_oid oid;
+    v_kind text;
+BEGIN
+    FOR r IN
+        SELECT snapshot_id, tracking_id, snapshot_table, payload_state, captured_at
+        FROM flashback.snapshots
+        WHERE locator IS NULL
+    LOOP
+        v_parts := NULL;
+        IF r.snapshot_table IS NOT NULL AND btrim(r.snapshot_table) <> '' THEN
+            BEGIN
+                v_parts := pg_catalog.parse_ident(r.snapshot_table, true);
+            EXCEPTION WHEN OTHERS THEN
+                v_parts := NULL;
+            END;
+        END IF;
+
+        IF v_parts IS NOT NULL AND cardinality(v_parts) = 2 THEN
+            UPDATE flashback.snapshots
+               SET storage_backend = 'heap_v1',
+                   locator = jsonb_build_object('schema', v_parts[1], 'relation', v_parts[2])
+             WHERE snapshot_id = r.snapshot_id AND tracking_id = r.tracking_id;
+
+            IF r.payload_state = 'available' THEN
+                v_oid := to_regclass(format('%I.%I', v_parts[1], v_parts[2]));
+                v_kind := CASE WHEN v_oid IS NULL THEN NULL
+                               ELSE flashback_payload_kind(v_oid) END;
+                IF v_oid IS NULL
+                   OR v_kind NOT IN ('base_snapshot', 'checkpoint_snapshot')
+                   OR NOT flashback_payload_is_owned(v_oid)
+                THEN
+                    UPDATE flashback.snapshots
+                       SET payload_state = 'missing',
+                           retired_at = COALESCE(retired_at, clock_timestamp())
+                     WHERE snapshot_id = r.snapshot_id AND tracking_id = r.tracking_id;
+                ELSE
+                    UPDATE flashback.snapshots
+                       SET available_at = COALESCE(available_at, r.captured_at)
+                     WHERE snapshot_id = r.snapshot_id AND tracking_id = r.tracking_id;
+                END IF;
+            END IF;
+        ELSE
+            -- Unparseable or empty snapshot_table: a pre-generation-era row
+            -- or an in-progress two-phase insert that never committed a
+            -- finalized name. There is no usable locator either way.
+            UPDATE flashback.snapshots
+               SET storage_backend = 'heap_v1'
+             WHERE snapshot_id = r.snapshot_id AND tracking_id = r.tracking_id;
+            IF r.payload_state = 'available' THEN
+                UPDATE flashback.snapshots
+                   SET payload_state = 'missing',
+                       retired_at = COALESCE(retired_at, clock_timestamp())
+                 WHERE snapshot_id = r.snapshot_id AND tracking_id = r.tracking_id;
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_available_shape_check'
+          AND convalidated
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_available_shape_check;
+    END IF;
+END
+$$;
+
+-- Single mutation authority for artifact state (mirrors the coverage
+-- generation / capture stream guards above): backend/locator/evidence are
+-- immutable once set, DELETE is always refused, and the transition graph is
+-- exactly:
+--   creating  -> available | aborted
+--   available -> retiring | missing
+--   retiring  -> retired | missing
+-- retired/missing/aborted are terminal.
+CREATE OR REPLACE FUNCTION flashback_guard_snapshot_artifact()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, flashback
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % is immutable', OLD.snapshot_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.payload_state <> 'creating' THEN
+            RAISE EXCEPTION 'pg_flashback: a snapshot artifact must be created as creating'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.payload_state IN ('retired', 'missing', 'aborted') THEN
+        RAISE EXCEPTION 'pg_flashback: terminal snapshot artifact % is immutable', OLD.snapshot_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NOT (
+        NEW.payload_state = OLD.payload_state
+        OR (OLD.payload_state = 'creating' AND NEW.payload_state = 'available')
+        OR (OLD.payload_state = 'creating' AND NEW.payload_state = 'aborted')
+        OR (OLD.payload_state = 'available' AND NEW.payload_state = 'retiring')
+        OR (OLD.payload_state = 'available' AND NEW.payload_state = 'missing')
+        OR (OLD.payload_state = 'retiring' AND NEW.payload_state = 'retired')
+        OR (OLD.payload_state = 'retiring' AND NEW.payload_state = 'missing')
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: invalid snapshot artifact transition % -> %',
+            OLD.payload_state, NEW.payload_state
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NEW.snapshot_id IS DISTINCT FROM OLD.snapshot_id
+       OR NEW.tracking_id IS DISTINCT FROM OLD.tracking_id
+       OR NEW.rel_oid IS DISTINCT FROM OLD.rel_oid
+    THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % identity is immutable', OLD.snapshot_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    -- Backend/locator are frozen the instant an artifact leaves `creating`:
+    -- exactly the substitution-prevention item 2 requires. snapshot_lsn and
+    -- captured_at are deliberately excluded: the WAL promote path
+    -- (flashback_apply_decoded_wal_batch) refines them exactly once, from
+    -- the provisional pre-commit estimate captured at CTAS time to the
+    -- real boundary COMMIT LSN/time once the worker observes it -- the
+    -- same pre-existing behavior this module preserves unchanged.
+    IF OLD.payload_state <> 'creating'
+       AND (
+           NEW.storage_backend IS DISTINCT FROM OLD.storage_backend
+           OR NEW.locator IS DISTINCT FROM OLD.locator
+           OR NEW.snapshot_table IS DISTINCT FROM OLD.snapshot_table
+           OR NEW.schema_def IS DISTINCT FROM OLD.schema_def
+           OR NEW.row_count IS DISTINCT FROM OLD.row_count
+       )
+    THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % identity/evidence is immutable once created',
+            OLD.snapshot_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS snapshots_artifact_guard ON flashback.snapshots;
+CREATE TRIGGER snapshots_artifact_guard
+BEFORE INSERT OR UPDATE OR DELETE ON flashback.snapshots
+FOR EACH ROW EXECUTE FUNCTION flashback_guard_snapshot_artifact();
 
 DO $$
 BEGIN
@@ -1159,6 +1433,8 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
     snapshot_row_count         BIGINT NOT NULL CHECK (snapshot_row_count >= 0),
     snapshot_schema_fingerprint TEXT NOT NULL
                                CHECK (snapshot_schema_fingerprint ~ '^[0-9a-f]{32}$'),
+    snapshot_storage_backend  TEXT,
+    snapshot_locator          JSONB,
     expected_delta_rows        BIGINT NOT NULL CHECK (expected_delta_rows >= 0),
     expected_schema_rows       BIGINT NOT NULL CHECK (expected_schema_rows >= 0),
     first_delta_lsn            PG_LSN,
@@ -1194,6 +1470,13 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
     CONSTRAINT generation_payload_retirements_snapshot_identity_check CHECK (
         state = 'removed' OR snapshot_rel_oid IS NOT NULL
     ),
+    CONSTRAINT generation_payload_retirements_backend_identity_check CHECK (
+        state = 'removed'
+        OR (snapshot_storage_backend IS NOT NULL AND snapshot_locator IS NOT NULL)
+    ),
+    CONSTRAINT generation_payload_retirements_storage_backend_check CHECK (
+        snapshot_storage_backend IS NULL OR snapshot_storage_backend = 'heap_v1'
+    ),
     CONSTRAINT generation_payload_retirements_lsn_order_check CHECK (
         first_delta_lsn IS NULL OR last_delta_lsn IS NULL
         OR first_delta_lsn <= last_delta_lsn
@@ -1221,6 +1504,78 @@ BEGIN
         ALTER TABLE flashback.generation_payload_retirements
             ADD CONSTRAINT generation_payload_retirements_snapshot_identity_check
             CHECK (state = 'removed' OR snapshot_rel_oid IS NOT NULL) NOT VALID;
+    END IF;
+END
+$$;
+
+-- Backend-neutral evidence: older intents predate storage_backend/locator on
+-- flashback.snapshots itself. Backfill an in-progress ('retiring') intent's
+-- locator the same way schema_bootstrap backfills flashback.snapshots -- from
+-- its recorded snapshot_table, which is the only heap_v1 evidence that
+-- existed before this column did. Already-'removed' history is left NULL:
+-- its physical payload is already gone and re-deriving a locator from a
+-- possibly-reused name would fabricate evidence for a relation this intent
+-- no longer has any claim to.
+DO $$
+DECLARE
+    r record;
+    v_parts text[];
+BEGIN
+    ALTER TABLE flashback.generation_payload_retirements
+        ADD COLUMN IF NOT EXISTS snapshot_storage_backend TEXT;
+    ALTER TABLE flashback.generation_payload_retirements
+        ADD COLUMN IF NOT EXISTS snapshot_locator JSONB;
+
+    FOR r IN
+        SELECT retirement_id, snapshot_table
+        FROM flashback.generation_payload_retirements
+        WHERE snapshot_locator IS NULL
+          AND state = 'retiring'
+    LOOP
+        v_parts := NULL;
+        IF r.snapshot_table IS NOT NULL AND btrim(r.snapshot_table) <> '' THEN
+            BEGIN
+                v_parts := pg_catalog.parse_ident(r.snapshot_table, true);
+            EXCEPTION WHEN OTHERS THEN
+                v_parts := NULL;
+            END;
+        END IF;
+
+        IF v_parts IS NOT NULL AND cardinality(v_parts) = 2 THEN
+            UPDATE flashback.generation_payload_retirements
+               SET snapshot_storage_backend = 'heap_v1',
+                   snapshot_locator = jsonb_build_object(
+                       'schema', v_parts[1], 'relation', v_parts[2]
+                   )
+             WHERE retirement_id = r.retirement_id;
+        END IF;
+    END LOOP;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
+          AND conname = 'generation_payload_retirements_backend_identity_check'
+    ) THEN
+        ALTER TABLE flashback.generation_payload_retirements
+            ADD CONSTRAINT generation_payload_retirements_backend_identity_check
+            CHECK (
+                state = 'removed'
+                OR (snapshot_storage_backend IS NOT NULL AND snapshot_locator IS NOT NULL)
+            ) NOT VALID;
+        ALTER TABLE flashback.generation_payload_retirements
+            VALIDATE CONSTRAINT generation_payload_retirements_backend_identity_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
+          AND conname = 'generation_payload_retirements_storage_backend_check'
+    ) THEN
+        ALTER TABLE flashback.generation_payload_retirements
+            ADD CONSTRAINT generation_payload_retirements_storage_backend_check
+            CHECK (snapshot_storage_backend IS NULL OR snapshot_storage_backend = 'heap_v1')
+            NOT VALID;
+        ALTER TABLE flashback.generation_payload_retirements
+            VALIDATE CONSTRAINT generation_payload_retirements_storage_backend_check;
     END IF;
 END
 $$;
@@ -1265,6 +1620,8 @@ BEGIN
        OR NEW.snapshot_rel_oid IS DISTINCT FROM OLD.snapshot_rel_oid
        OR NEW.snapshot_row_count IS DISTINCT FROM OLD.snapshot_row_count
        OR NEW.snapshot_schema_fingerprint IS DISTINCT FROM OLD.snapshot_schema_fingerprint
+       OR NEW.snapshot_storage_backend IS DISTINCT FROM OLD.snapshot_storage_backend
+       OR NEW.snapshot_locator IS DISTINCT FROM OLD.snapshot_locator
        OR NEW.expected_delta_rows IS DISTINCT FROM OLD.expected_delta_rows
        OR NEW.expected_schema_rows IS DISTINCT FROM OLD.expected_schema_rows
        OR NEW.first_delta_lsn IS DISTINCT FROM OLD.first_delta_lsn

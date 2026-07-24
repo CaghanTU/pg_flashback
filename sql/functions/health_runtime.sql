@@ -237,9 +237,9 @@ BEGIN
                       OR NOT EXISTS (
                           SELECT 1
                           FROM flashback.coverage_generations successor
-                          JOIN flashback.snapshots successor_snapshot
-                            ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
-                           AND successor_snapshot.tracking_id = successor.tracking_id
+                          CROSS JOIN LATERAL public.flashback_internal_snapshot_resolve(
+                              successor.boundary_snapshot_id, successor.tracking_id
+                          ) successor_snapshot
                           WHERE successor.tracking_id = sealed.tracking_id
                             AND successor.state = 'active'
                             AND (
@@ -247,10 +247,8 @@ BEGIN
                                 OR successor.boundary_lsn >= sealed.superseded_before_lsn
                             )
                             AND successor_snapshot.payload_state = 'available'
-                            AND to_regclass(successor_snapshot.snapshot_table) IS NOT NULL
-                            AND public.flashback_payload_is_owned(
-                                    to_regclass(successor_snapshot.snapshot_table)
-                                )
+                            AND successor_snapshot.payload_relid IS NOT NULL
+                            AND public.flashback_payload_is_owned(successor_snapshot.payload_relid)
                       )
                   )
             ) AS blocked

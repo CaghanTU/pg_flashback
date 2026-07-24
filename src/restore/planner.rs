@@ -30,6 +30,7 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_state_authority",
         "flashback_payload_ownership_helpers",
+        "flashback_snapshot_store",
         "flashback_restore_replay_helpers",
         "flashback_coverage_runtime",
         "flashback_restore_planner_api",
