@@ -181,15 +181,17 @@ wait_flashback_ready "$DB_NAME" 120 || die "flashback_worker_readiness not ready
 warmup_logical_slot() {
     local db=$1
     local rel=public._pgfb_qual_warmup_$$
-    local slot tid st i lag
+    local slot tid st lag
     q "$db" "CREATE TABLE ${rel} (id int PRIMARY KEY);" >/dev/null
-    q "$db" "SELECT flashback_protect('${rel}');" >/dev/null
+    # flashback_track must be the first write in its transaction.
+    q "$db" "SELECT flashback_track('${rel}');" >/dev/null
     slot="$(q "$db" "SELECT flashback_effective_slot_name();")"
     [[ -n "$slot" ]] || return 1
     q "$db" "INSERT INTO ${rel} VALUES (1);" >/dev/null
     tid="$(q "$db" "SELECT tracking_id FROM flashback.tracked_tables
                      WHERE format('%I.%I', schema_name, table_name) = '${rel}'
                      ORDER BY tracking_id DESC LIMIT 1;")"
+    [[ -n "$tid" ]] || return 1
     for _ in $(seq 1 60); do
         q "$db" "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
         lag="$(q "$db" "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn),0)::bigint
@@ -206,10 +208,8 @@ warmup_logical_slot() {
         [[ "$st" == "unprotected" || "$st" == "gone" || "$st" == "cleaned" || "$st" == "inactive" ]] && break
         sleep 0.25
     done
-    if [[ -n "$tid" ]]; then
-        q "$db" "BEGIN; SET LOCAL pg_flashback.enabled = on; SELECT flashback_cleanup(${tid}::bigint, false); COMMIT;" \
-            >/dev/null 2>&1 || true
-    fi
+    q "$db" "BEGIN; SET LOCAL pg_flashback.enabled = on; SELECT flashback_cleanup(${tid}::bigint, false); COMMIT;" \
+        >/dev/null 2>&1 || true
     q "$db" "BEGIN; SET LOCAL pg_flashback.enabled = on; DROP TABLE IF EXISTS ${rel} CASCADE; COMMIT;" \
         >/dev/null 2>&1 || true
     q "$db" "SELECT EXISTS (
