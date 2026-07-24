@@ -3,8 +3,8 @@
 #
 # This is the product-claim gate for DROP recovery. It is intentionally
 # separate from the 24-hour stability soak: the soak proves elapsed stability,
-# while this suite repeatedly destroys real relations and proves reconstruction
-# through both supported recovery profiles.
+# while this suite repeatedly destroys real relations and proves local_delta
+# reconstruction.
 #
 # Installs ONLY from CANDIDATE_DIR archives. Never cargo-builds.
 
@@ -15,19 +15,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib/exact_candidate_identity.sh"
 
 CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
-PGBACKREST="${PGBACKREST:-/usr/local/bin/pgbackrest}"
 KEEP="${PGFB_DROP_KEEP:-1}"
 
 REPEAT_COUNT="${PGFB_DROP_REPEAT_COUNT:-100}"
 REPEAT_ROWS="${PGFB_DROP_REPEAT_ROWS:-256}"
 MEDIUM_ROWS="${PGFB_DROP_MEDIUM_ROWS:-50000}"
 TOAST_ROWS="${PGFB_DROP_TOAST_ROWS:-2000}"
-BACKUP_ROWS="${PGFB_DROP_BACKUP_ROWS:-20000}"
-BACKUP_WAL_ROWS="${PGFB_DROP_BACKUP_WAL_ROWS:-1000}"
 MIN_FREE_BYTES="${PGFB_DROP_MIN_FREE_BYTES:-4294967296}"
 MAX_WORK_BYTES="${PGFB_DROP_MAX_WORK_BYTES:-4294967296}"
 
-for numeric in REPEAT_COUNT REPEAT_ROWS MEDIUM_ROWS TOAST_ROWS BACKUP_ROWS BACKUP_WAL_ROWS MIN_FREE_BYTES MAX_WORK_BYTES; do
+for numeric in REPEAT_COUNT REPEAT_ROWS MEDIUM_ROWS TOAST_ROWS MIN_FREE_BYTES MAX_WORK_BYTES; do
     [[ "${!numeric}" =~ ^[0-9]+$ ]] || {
         echo "FAIL: $numeric must be a non-negative integer" >&2
         exit 2
@@ -37,7 +34,7 @@ done
     echo "FAIL: PGFB_DROP_REPEAT_COUNT must be between 10 and 500" >&2
     exit 2
 }
-(( REPEAT_ROWS >= 32 && MEDIUM_ROWS >= 10000 && TOAST_ROWS >= 100 && BACKUP_ROWS >= 5000 )) || {
+(( REPEAT_ROWS >= 32 && MEDIUM_ROWS >= 10000 && TOAST_ROWS >= 100 )) || {
     echo "FAIL: DROP qualification row counts are below their meaningful minimums" >&2
     exit 2
 }
@@ -66,7 +63,6 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BG_WRITER_PID=""
 BG_WRITER_STOP=""
 SOCKET_DIR=""
-HELPER_SOCKET_DIR=""
 PRIMARY_DIR=""
 
 log() { printf '[exact-candidate-drop] %s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$PROGRESS_LOG"; }
@@ -102,16 +98,15 @@ enforce_resource_bounds() {
 
 record_case() {
     local profile=$1 scenario=$2 iteration=$3 rows=$4 logical_bytes=$5 physical_bytes=$6 restore_ms=$7
-    local helper_durations=${8:-null}
     jq -cn \
         --arg profile "$profile" --arg scenario "$scenario" \
         --argjson iteration "$iteration" --argjson rows "$rows" \
         --argjson logical_bytes "$logical_bytes" --argjson physical_bytes "$physical_bytes" \
-        --argjson restore_ms "$restore_ms" --argjson helper_durations "$helper_durations" \
+        --argjson restore_ms "$restore_ms" \
         '{profile:$profile, scenario:$scenario, iteration:$iteration,
           rows_at_drop:$rows, logical_tuple_bytes_at_drop:$logical_bytes,
           physical_relation_bytes_at_drop:$physical_bytes,
-          restore_wall_ms:$restore_ms, helper_durations:$helper_durations,
+          restore_wall_ms:$restore_ms,
           relation_absent_after_drop:true, row_fingerprint_verified:true,
           schema_verified:true, owner_verified:true, acl_verified:true}' >> "$CASES_JSONL"
 }
@@ -141,10 +136,7 @@ write_result() {
             p99:$s[((length * 0.99 | ceil) - 1)],
             max:$s[-1]
           } end;
-      {
-        local_restore_wall_ms:([$cases[] | select(.profile == "local_delta") | .restore_wall_ms] | stats),
-        backup_restore_wall_ms:([$cases[] | select(.profile == "backup") | .restore_wall_ms] | stats)
-      }')"
+      {local_restore_wall_ms:([$cases[].restore_wall_ms] | stats)}')"
     mkdir -p "$(dirname "$RESULT_JSON")"
     jq -n \
         --arg status "$STATUS" --arg started "$STARTED_AT" \
@@ -170,7 +162,7 @@ write_result() {
           resources:{peak_work_bytes:$peak_work, max_work_bytes:$max_work,
             start_free_bytes:$start_free, min_free_bytes:$min_free},
           timing_summary:$timings, cases:$cases, identity:$identity,
-          claim:"Repeated exact-candidate DROP-to-restore qualification across local_delta and pgBackRest-backed profiles."
+          claim:"Repeated exact-candidate local_delta DROP-to-restore qualification."
         }' > "$RESULT_JSON"
     log "result written: $RESULT_JSON status=$STATUS drops=$DROP_PASSED/$DROP_ATTEMPTED"
 }
@@ -187,7 +179,7 @@ cleanup() {
     if [[ "$PRIMARY_STARTED" == 1 ]]; then
         "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" stop -m fast -w -t 60 >/dev/null 2>&1 || true
     fi
-    rm -rf -- "$SOCKET_DIR" "$HELPER_SOCKET_DIR" 2>/dev/null || true
+    rm -rf -- "$SOCKET_DIR" 2>/dev/null || true
     if [[ "$PREFIX_INSTALLED" == 1 ]]; then
         exact_candidate_restore_prefix || rc=1
         PREFIX_INSTALLED=0
@@ -212,7 +204,6 @@ mkdir -p "$RUN_ROOT" "$BASE/results" "$RUN_ROOT/log"
 : > "$CASES_JSONL"
 : > "$PROGRESS_LOG"
 
-require_executable "$PGBACKREST"
 require_executable "$(command -v jq)"
 require_executable "$(command -v python3)"
 START_FREE_BYTES="$(exact_candidate_free_bytes "$REPO_ROOT")"
@@ -224,35 +215,15 @@ EC_EXTRACT_DIR="$RUN_ROOT/extract"
 exact_candidate_bind_dir "$CANDIDATE_DIR" || die "candidate identity bind failed"
 exact_candidate_install_into_prefix || die "candidate install failed"
 PREFIX_INSTALLED=1
-HELPER="$EC_HELPER_BIN"
-CONTROLLER="$EC_HELPER_ROOT/bin/pg_flashback_backup_restore.sh"
-require_executable "$HELPER"
-require_executable "$CONTROLLER"
-
-STANZA=drop_qualification
 DB_NAME=dropdb
-PORT_BASE=$((39000 + ($$ % 15000)))
-PRIMARY_PORT=$PORT_BASE
-HELPER_PORT=$((PORT_BASE + 1))
+PRIMARY_PORT=$((39000 + ($$ % 15000)))
 SOCKET_DIR="/tmp/pgfb-drop-$RUN_ID"
-HELPER_SOCKET_DIR="/tmp/pgfb-droph-$RUN_ID"
 PRIMARY_DIR="$RUN_ROOT/primary"
-REPO_DIR="$RUN_ROOT/repo"
-WORK_ROOT="$RUN_ROOT/helper-work"
 LOG_DIR="$RUN_ROOT/log"
-PGBACKREST_CONFIG="$RUN_ROOT/pgbackrest.conf"
-PROOF_HMAC_KEY_FILE="$RUN_ROOT/proof-hmac.key"
-HELPER_CONFIG="$RUN_ROOT/helper.json"
-EXPIRE_LOCK="$RUN_ROOT/expire.lock"
 
-mkdir -p "$REPO_DIR" "$WORK_ROOT" "$LOG_DIR" "$SOCKET_DIR" "$HELPER_SOCKET_DIR"
-chmod 700 "$WORK_ROOT" "$SOCKET_DIR" "$HELPER_SOCKET_DIR"
-umask 077
-od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$PROOF_HMAC_KEY_FILE"
-chmod 600 "$PROOF_HMAC_KEY_FILE"
-: > "$EXPIRE_LOCK"
+mkdir -p "$LOG_DIR" "$SOCKET_DIR"
+chmod 700 "$SOCKET_DIR"
 
-pgbr() { "$PGBACKREST" --config="$PGBACKREST_CONFIG" --stanza="$STANZA" "$@"; }
 q() { "$PG_BIN/psql" -X -v ON_ERROR_STOP=1 -qAt -h "$SOCKET_DIR" -p "$PRIMARY_PORT" -d "$DB_NAME" -c "$1"; }
 fingerprint_of() {
     local rel=$1
@@ -386,68 +357,12 @@ perform_local_drop_restore() {
     record_case local_delta "$scenario" "$iteration" "$rows" "$logical" "$physical" "$restore_ms"
 }
 
-force_archive() { q "SELECT pg_switch_wal();" >/dev/null; sleep 2; }
-backup_info() {
-    local field=$1
-    pgbr info --output=json | jq -r --arg field "$field" '
-      .[0].backup | sort_by(.timestamp.stop) | last
-      | if $field == "label" then .label elif $field == "stop" then .lsn.stop else empty end'
-}
-write_helper_config() {
-    jq -n \
-        --arg profile drop_backup --arg pgbackrest "$PGBACKREST" \
-        --arg pgbackrest_config "$PGBACKREST_CONFIG" --arg pg_bin_dir "$PG_BIN" \
-        --arg repository_path "$REPO_DIR" --arg stanza "$STANZA" \
-        --arg work_root "$WORK_ROOT" --arg socket_root "$HELPER_SOCKET_DIR" \
-        --arg expire_lock "$EXPIRE_LOCK" --arg controller_host "$SOCKET_DIR" \
-        --arg controller_database "$DB_NAME" --arg recovery_user "$(id -un)" \
-        --arg proof_hmac_key_file "$PROOF_HMAC_KEY_FILE" \
-        --argjson controller_port "$PRIMARY_PORT" --argjson recovery_port "$HELPER_PORT" \
-        '{profile:$profile, pgbackrest_bin:$pgbackrest, pgbackrest_config:$pgbackrest_config,
-          pg_bin_dir:$pg_bin_dir, cp_bin:"/usr/bin/cp", repository_path:$repository_path,
-          repository_key:1, stanza:$stanza, work_root:$work_root, socket_root:$socket_root,
-          recovery_port:$recovery_port, recovery_user:$recovery_user,
-          snapshot_provider:"xfs_reflink", expire_lock_path:$expire_lock,
-          max_work_bytes:2147483648, max_work_root_bytes:3221225472, min_free_bytes:1,
-          artifact_ttl_seconds:86400, max_retained_artifacts:16,
-          max_retained_artifact_bytes:2147483648, command_timeout_seconds:180,
-          recovery_timeout_seconds:300, proof_hmac_key_file:$proof_hmac_key_file,
-          controller:{host:$controller_host,port:$controller_port,database:$controller_database,user:$recovery_user}}' \
-        > "$HELPER_CONFIG"
-    chmod 600 "$HELPER_CONFIG"
-}
-
 "$PG_BIN/initdb" -D "$PRIMARY_DIR" --no-locale --encoding=UTF8 --auth=trust > "$LOG_DIR/initdb.log"
-cat > "$PGBACKREST_CONFIG" <<EOF
-[global]
-repo1-path=$REPO_DIR
-repo1-retention-full=99
-repo1-hardlink=y
-repo1-bundle=n
-repo1-block=n
-start-fast=y
-compress-type=none
-archive-async=n
-spool-path=$RUN_ROOT/spool
-log-path=$LOG_DIR
-log-level-console=info
-log-level-file=detail
-
-[$STANZA]
-pg1-path=$PRIMARY_DIR
-pg1-port=$PRIMARY_PORT
-pg1-socket-path=$SOCKET_DIR
-EOF
-chmod 600 "$PGBACKREST_CONFIG"
-
 cat >> "$PRIMARY_DIR/postgresql.conf" <<EOF
 port = $PRIMARY_PORT
 unix_socket_directories = '$SOCKET_DIR'
 listen_addresses = ''
 wal_level = logical
-archive_mode = on
-archive_command = '$PGBACKREST --config=$PGBACKREST_CONFIG --stanza=$STANZA archive-push %p'
-archive_timeout = 1
 max_wal_senders = 10
 max_replication_slots = 10
 shared_preload_libraries = 'pg_flashback'
@@ -465,11 +380,9 @@ EOF
 "$PG_BIN/pg_ctl" -D "$PRIMARY_DIR" -l "$LOG_DIR/primary.log" start -w -t 60 >/dev/null
 PRIMARY_STARTED=1
 "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PRIMARY_PORT" "$DB_NAME"
-pgbr stanza-create
 q "CREATE EXTENSION pg_flashback;"
 wait_capture_ready || die "capture worker not ready before first track"
 q "CREATE ROLE drop_owner LOGIN; CREATE ROLE drop_reader LOGIN;"
-write_helper_config
 enforce_resource_bounds
 
 # Case 1: repeatedly destroy and reconstruct the same tracked lifecycle. This
@@ -588,93 +501,9 @@ perform_local_drop_restore quoted_toast 1 'public."Drop Weird"' "$TOAST_TRACKING
     "$target_lsn" "$fp" "$schema" "$owner" "$acl" "$rows" "$logical" "$physical"
 enforce_resource_bounds
 
-# Backup profile: retained FULL + continuous WAL, real DROP, packaged helper,
-# checksum-verified import and extension-side production shadow swap.
-log "building backup DROP relation: $BACKUP_ROWS base + $BACKUP_WAL_ROWS WAL rows"
-q "CREATE TABLE public.backup_drop_medium(
-     id bigserial PRIMARY KEY, marker text NOT NULL, payload bytea NOT NULL);"
-q "CREATE INDEX backup_drop_medium_marker_idx ON public.backup_drop_medium(marker);"
-q "ALTER TABLE public.backup_drop_medium OWNER TO drop_owner;
-   GRANT SELECT ON public.backup_drop_medium TO drop_reader;"
-q "INSERT INTO public.backup_drop_medium(marker,payload)
-   SELECT 'base', decode((SELECT string_agg(md5(g::text||':'||s::text),'' ORDER BY s)
-                          FROM generate_series(1,32) s),'hex')
-   FROM generate_series(1,$BACKUP_ROWS) g;"
-q "CHECKPOINT;"
-pgbr backup --type=full --no-expire-auto >/dev/null
-log "backup anchor $(backup_info label) stop=$(backup_info stop)"
-q "SELECT flashback_track_backup('public.backup_drop_medium','drop_backup');" >/dev/null
-for _ in $(seq 1 400); do
-    BACKUP_TRACKING_ID="$(q "SELECT tracking_id FROM flashback.tracked_tables
-                              WHERE table_name='backup_drop_medium' AND is_active;")"
-    marker="$(q "SELECT details->>'tracking_marker_lsn' FROM flashback.coverage_generations
-                  WHERE tracking_id=${BACKUP_TRACKING_ID:-0} AND recovery_profile='backup'
-                    AND state='building' ORDER BY generation_no DESC LIMIT 1;" 2>/dev/null || true)"
-    [[ -n "$BACKUP_TRACKING_ID" && -n "$marker" ]] && break
-    q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-    sleep 0.05
-done
-[[ -n "${BACKUP_TRACKING_ID:-}" && -n "${marker:-}" ]] || die "backup tracking marker unresolved"
-q "INSERT INTO public.backup_drop_medium(marker,payload)
-   SELECT 'wal',decode(repeat(md5(('wal-'||g)::text),16),'hex')
-   FROM generate_series(1,$BACKUP_WAL_ROWS) g;" >/dev/null
-target_lsn="$(q "SELECT pg_current_wal_lsn()::text;")"
-force_archive
-verify_request="$RUN_ROOT/verify-backup.json"
-jq -n --arg request_id drop-qualification-anchor --argjson tracking_id "$BACKUP_TRACKING_ID" \
-    '{request_id:$request_id,tracking_id:$tracking_id}' > "$verify_request"
-"$HELPER" verify-anchor --config "$HELPER_CONFIG" --request "$verify_request" \
-    > "$RUN_ROOT/verify-backup.result.json"
-[[ "$(jq -r .status "$RUN_ROOT/verify-backup.result.json")" == verified ]] \
-    || die "backup anchor verification failed"
-fp="$(fingerprint_of public.backup_drop_medium)"
-schema="$(schema_signature public.backup_drop_medium)"
-owner="$(owner_of public.backup_drop_medium)"
-acl="$(acl_of public.backup_drop_medium)"
-rows="$(row_count_of public.backup_drop_medium)"
-logical="$(logical_bytes_of public.backup_drop_medium)"
-physical="$(physical_bytes_of public.backup_drop_medium)"
-q "DROP TABLE public.backup_drop_medium;" >/dev/null
-DROP_ATTEMPTED=$((DROP_ATTEMPTED + 1))
-CUMULATIVE_ROWS_DROPPED=$((CUMULATIVE_ROWS_DROPPED + rows))
-CUMULATIVE_LOGICAL_BYTES_DROPPED=$((CUMULATIVE_LOGICAL_BYTES_DROPPED + logical))
-CUMULATIVE_PHYSICAL_BYTES_DROPPED=$((CUMULATIVE_PHYSICAL_BYTES_DROPPED + physical))
-[[ "$(q "SELECT to_regclass('public.backup_drop_medium') IS NULL;")" == t ]] \
-    || die "backup DROP did not remove relation"
-force_archive
-controller_start="$(monotonic_ms)"
-PGHOST="$SOCKET_DIR" PGPORT="$PRIMARY_PORT" PGUSER="$(id -un)" \
-    "$CONTROLLER" --config "$HELPER_CONFIG" --dbname "$DB_NAME" \
-      --table public.backup_drop_medium --target-lsn "$target_lsn" --helper "$HELPER" \
-      > "$RUN_ROOT/controller-backup-drop.result.json"
-controller_end="$(monotonic_ms)"
-controller_ms=$((controller_end - controller_start))
-[[ "$(jq -r .status "$RUN_ROOT/controller-backup-drop.result.json")" == completed ]] \
-    || die "backup DROP controller did not complete"
-request_id="$(jq -r .request_id "$RUN_ROOT/controller-backup-drop.result.json")"
-helper_result="$WORK_ROOT/$request_id/result.json"
-[[ -f "$helper_result" ]] || die "backup DROP helper result missing"
-helper_durations="$(jq -c '.durations' "$helper_result")"
-[[ "$(fingerprint_of public.backup_drop_medium)" == "$fp" ]] || die "backup DROP row fingerprint mismatch"
-[[ "$(schema_signature public.backup_drop_medium)" == "$schema" ]] || die "backup DROP schema mismatch"
-[[ "$(owner_of public.backup_drop_medium)" == "$owner" ]] || die "backup DROP owner mismatch"
-[[ "$(acl_of public.backup_drop_medium)" == "$acl" ]] || die "backup DROP ACL mismatch"
-for _ in $(seq 1 400); do
-    post_health="$(q "SELECT health FROM flashback_health()
-                      WHERE table_name='public.backup_drop_medium';")"
-    [[ "$post_health" == backup_reanchor_required ]] && break
-    q "SELECT flashback_consume_wal(8192);" >/dev/null || true
-    sleep 0.05
-done
-[[ "${post_health:-}" == backup_reanchor_required ]] \
-    || die "backup DROP post-swap health was ${post_health:-missing}, expected backup_reanchor_required"
-DROP_PASSED=$((DROP_PASSED + 1))
-record_case backup retained_full_plus_wal 1 "$rows" "$logical" "$physical" "$controller_ms" "$helper_durations"
-enforce_resource_bounds
-
 [[ "$DROP_PASSED" == "$DROP_ATTEMPTED" ]] || die "only $DROP_PASSED/$DROP_ATTEMPTED DROP cases passed"
-[[ "$DROP_PASSED" -ge $((REPEAT_COUNT + 3)) ]] \
-    || die "DROP count $DROP_PASSED below expected $((REPEAT_COUNT + 3))"
+[[ "$DROP_PASSED" -ge $((REPEAT_COUNT + 2)) ]] \
+    || die "DROP count $DROP_PASSED below expected $((REPEAT_COUNT + 2))"
 exact_candidate_verify_installed || die "candidate binary hash mismatch at end"
 RUN_COMPLETE=1
 log "DROP qualification passed: $DROP_PASSED destructive DROP-to-restore cases"

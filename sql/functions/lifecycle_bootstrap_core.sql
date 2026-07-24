@@ -1,6 +1,99 @@
 -- Internal local_delta lifecycle bootstrap shared by flashback_track() (WAL)
 -- and the pg_test injection seam. Not a public API: no EXECUTE grants.
 
+-- Shared schema-contract fingerprint helpers used by the qualified local_delta
+-- lifecycle to stamp schema_versions.helper_schema_sha256.
+CREATE OR REPLACE FUNCTION flashback_helper_schema_contract(target_rel oid)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+STRICT
+SET search_path = pg_catalog
+AS $$
+    WITH columns AS (
+        SELECT a.attnum, a.attname,
+               format_type(a.atttypid, a.atttypmod) AS data_type,
+               a.attnotnull, a.attidentity, a.attgenerated,
+               CASE WHEN a.attcollation = 0 THEN NULL
+                    ELSE a.attcollation::regcollation::text END AS collation,
+               pg_get_expr(d.adbin, d.adrelid) AS default_expression
+        FROM pg_attribute AS a
+        LEFT JOIN pg_attrdef AS d
+          ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        WHERE a.attrelid = target_rel
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+    ), constraints AS (
+        SELECT conname, contype, condeferrable, condeferred, convalidated,
+               pg_get_constraintdef(oid, true) AS definition
+        FROM pg_constraint
+        WHERE conrelid = target_rel
+    ), indexes AS (
+        SELECT c.relname, pg_get_indexdef(i.indexrelid) AS definition
+        FROM pg_index AS i
+        JOIN pg_class AS c ON c.oid = i.indexrelid
+        WHERE i.indrelid = target_rel
+    ), triggers AS (
+        SELECT tgname, pg_get_triggerdef(oid, true) AS definition
+        FROM pg_trigger
+        WHERE tgrelid = target_rel AND NOT tgisinternal
+    ), policies AS (
+        SELECT polname, polcmd, polpermissive, polroles,
+               pg_get_expr(polqual, polrelid) AS using_expression,
+               pg_get_expr(polwithcheck, polrelid) AS check_expression
+        FROM pg_policy
+        WHERE polrelid = target_rel
+    )
+    SELECT jsonb_build_object(
+        'table', (
+            SELECT jsonb_build_object(
+                'schema', n.nspname,
+                'name', c.relname,
+                'kind', c.relkind,
+                'persistence', c.relpersistence,
+                'replica_identity', c.relreplident,
+                'row_security', c.relrowsecurity,
+                'force_row_security', c.relforcerowsecurity,
+                'options', c.reloptions,
+                'partition_bound', pg_get_expr(c.relpartbound, c.oid)
+            )
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.oid = target_rel
+        ),
+        'columns', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(columns) ORDER BY attnum), '[]'::jsonb)
+            FROM columns
+        ),
+        'constraints', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(constraints) ORDER BY conname), '[]'::jsonb)
+            FROM constraints
+        ),
+        'indexes', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(indexes) ORDER BY relname), '[]'::jsonb)
+            FROM indexes
+        ),
+        'triggers', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(triggers) ORDER BY tgname), '[]'::jsonb)
+            FROM triggers
+        ),
+        'policies', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(policies) ORDER BY polname), '[]'::jsonb)
+            FROM policies
+        )
+    );
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_helper_schema_sha256(target_rel oid)
+RETURNS text
+LANGUAGE sql
+STABLE
+STRICT
+SET search_path = pg_catalog, public
+AS $$
+    SELECT flashback_sha256(flashback_helper_schema_contract(target_rel)::text);
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_bootstrap_local_delta_lifecycle_core(
     p_rel_oid oid,
     p_stream_id bigint,
@@ -54,15 +147,6 @@ BEGIN
 
     PERFORM flashback_require_supported_local_table(p_rel_oid);
     PERFORM flashback_require_local_compatibility(p_rel_oid);
-
-    IF EXISTS (
-        SELECT 1 FROM flashback.tracked_tables
-        WHERE rel_oid = p_rel_oid
-          AND is_active
-          AND recovery_profile = 'backup'
-    ) THEN
-        RAISE EXCEPTION 'flashback_bootstrap_local_delta_lifecycle_core: table is already tracked with the backup profile';
-    END IF;
 
     PERFORM pg_advisory_xact_lock(
         358943::integer,

@@ -1,9 +1,9 @@
 # Support matrix
 
 This document defines the current local DROP-recovery contract (`local_delta`
-+ logical WAL). Code may exist outside this matrix; that does not make it a
-supported product path. Backup/pgBackRest helpers are experimental and are not
-part of the primary local product.
++ logical WAL). This is the only supported product path. Physical-backup
+recovery is deferred and not part of the tree (see
+[deferred backup](DEFERRED_BACKUP.md)).
 
 Capacity is sized by **protected table size**, **change rate**, and **free
 disk**, not by total database size. The three capacity GUCs
@@ -135,8 +135,8 @@ successful verified recovery.
 | Extension upgrade | `0.1.0` to `0.2.0` only |
 | PostgreSQL major `pg_upgrade` | Not yet a supported workflow |
 
-## Backup-backed subsystem
+## Physical-backup subsystem (deferred)
 
-The pgBackRest provider is experimental and not part of this local support
-contract. Differential/incremental chains, other backup providers, and a
-general large-database claim are not supported.
+The physical-backup recovery prototype has been removed from the tree and its
+redesign is deferred; see [deferred backup](DEFERRED_BACKUP.md). There is no
+supported large-database or backup-provider claim.

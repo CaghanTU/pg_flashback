@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Exact-candidate identity and installation primitives.
+# Exact-candidate identity and installation primitives for the supported
+# local_delta extension package.
 #
-# Sourced by packaged qualification suites. Never cargo-builds extension/helper.
+# Sourced by packaged qualification suites. Never cargo-builds the extension.
 # Requires bash 4+. Callers must set REPO_ROOT before sourcing, or leave it unset
 # so this library resolves it from this file's location.
 #
@@ -55,17 +56,13 @@ exact_candidate_bind_dir() {
     EC_ARCH="$(jq -r '.provenance.arch' "$MANIFEST")"
     EC_PACKAGE_SHA="$(jq -r '.artifacts.package_sha256' "$MANIFEST")"
     EC_EXT_ARCHIVE="$(jq -r '.artifacts.extension_archive.name' "$MANIFEST")"
-    EC_HELPER_ARCHIVE="$(jq -r '.artifacts.helper_archive.name' "$MANIFEST")"
     EC_SRC_ARCHIVE="$(jq -r '.artifacts.source_archive.name' "$MANIFEST")"
     EC_EXT_BIN_SHA="$(jq -r '.artifacts.extension_binary_sha256' "$MANIFEST")"
-    EC_HELPER_BIN_SHA="$(jq -r '.artifacts.helper_binary_sha256' "$MANIFEST")"
     EC_SRC_SHA="$(jq -r '.artifacts.source_archive.sha256' "$MANIFEST")"
     EC_EXT_ARCHIVE_SHA="$(jq -r '.artifacts.extension_archive.sha256' "$MANIFEST")"
-    EC_HELPER_ARCHIVE_SHA="$(jq -r '.artifacts.helper_archive.sha256' "$MANIFEST")"
 
     [[ -n "$EC_SOURCE_COMMIT" && "$EC_SOURCE_COMMIT" != null ]] || exact_candidate_die "manifest source_commit missing" || return 1
     [[ -f "$CANDIDATE_DIR/$EC_EXT_ARCHIVE" ]] || exact_candidate_die "missing $EC_EXT_ARCHIVE" || return 1
-    [[ -f "$CANDIDATE_DIR/$EC_HELPER_ARCHIVE" ]] || exact_candidate_die "missing $EC_HELPER_ARCHIVE" || return 1
     [[ -f "$CANDIDATE_DIR/$EC_SRC_ARCHIVE" ]] || exact_candidate_die "missing $EC_SRC_ARCHIVE" || return 1
 
     # Verify archive digests before any extract/install.
@@ -75,7 +72,6 @@ exact_candidate_bind_dir() {
         echo "$EC_PACKAGE_SHA  $EC_EXT_ARCHIVE" | sha256sum -c - >/dev/null
         echo "$EC_SRC_SHA  $EC_SRC_ARCHIVE" | sha256sum -c - >/dev/null
         echo "$EC_EXT_ARCHIVE_SHA  $EC_EXT_ARCHIVE" | sha256sum -c - >/dev/null
-        echo "$EC_HELPER_ARCHIVE_SHA  $EC_HELPER_ARCHIVE" | sha256sum -c - >/dev/null
     ) || { exact_candidate_die "archive SHA-256 verification failed"; return 1; }
 
     # Source HEAD/tree must match the packaged candidate.
@@ -103,7 +99,7 @@ exact_candidate_bind_dir() {
     EC_SHARE_EXT="$("$PG_BIN/pg_config" --sharedir)/extension"
     EC_STASH_DIR="${EC_STASH_DIR:-$REPO_ROOT/target/exact-candidate-prefix-stash/$$}"
     EC_EXTRACT_DIR="${EC_EXTRACT_DIR:-$REPO_ROOT/target/exact-candidate-extract/$$}"
-    mkdir -p "$EC_STASH_DIR" "$EC_EXTRACT_DIR/ext" "$EC_EXTRACT_DIR/helper"
+    mkdir -p "$EC_STASH_DIR" "$EC_EXTRACT_DIR/ext"
 
     # Refuse unsafe shared-prefix alteration when foreign postgres holds the .so.
     if [[ -f "$EC_PKGLIB/pg_flashback.so" ]] && command -v lsof >/dev/null 2>&1; then
@@ -117,19 +113,13 @@ exact_candidate_bind_dir() {
 
     # Extract archives only (no cargo).
     tar -C "$EC_EXTRACT_DIR/ext" -xzf "$CANDIDATE_DIR/$EC_EXT_ARCHIVE"
-    tar -C "$EC_EXTRACT_DIR/helper" -xzf "$CANDIDATE_DIR/$EC_HELPER_ARCHIVE"
     EC_EXT_ROOT="$(find "$EC_EXTRACT_DIR/ext" -maxdepth 1 -type d -name 'pg_flashback-candidate-*' -print -quit)"
-    EC_HELPER_ROOT="$(find "$EC_EXTRACT_DIR/helper" -maxdepth 1 -type d -name 'pg-flashback-recovery-candidate-*' -print -quit)"
-    [[ -n "$EC_EXT_ROOT" && -n "$EC_HELPER_ROOT" ]] || exact_candidate_die "unexpected archive layout" || return 1
-    EC_HELPER_BIN="$EC_HELPER_ROOT/bin/pg-flashback-recovery"
-    [[ -x "$EC_HELPER_BIN" ]] || exact_candidate_die "helper binary missing in archive" || return 1
+    [[ -n "$EC_EXT_ROOT" ]] || exact_candidate_die "unexpected archive layout" || return 1
     [[ "$(cat "$EC_EXT_ROOT/PG_MAJOR")" == "$EC_PG_MAJOR" ]] || exact_candidate_die "archive PG_MAJOR mismatch" || return 1
 
-    local got_ext got_helper
+    local got_ext
     got_ext="$(exact_candidate_sha256 "$EC_EXT_ROOT/lib/pg_flashback.so")"
-    got_helper="$(exact_candidate_sha256 "$EC_HELPER_BIN")"
     [[ "$got_ext" == "$EC_EXT_BIN_SHA" ]] || exact_candidate_die "extracted extension SHA $got_ext != manifest $EC_EXT_BIN_SHA" || return 1
-    [[ "$got_helper" == "$EC_HELPER_BIN_SHA" ]] || exact_candidate_die "extracted helper SHA $got_helper != manifest $EC_HELPER_BIN_SHA" || return 1
 
     EC_BOUND=1
     return 0
@@ -178,15 +168,11 @@ exact_candidate_install_into_prefix() {
 
 exact_candidate_verify_installed() {
     [[ "${EC_BOUND:-0}" == "1" ]] || exact_candidate_die "not bound" || return 1
-    local got_so got_helper
+    local got_so
     got_so="$(exact_candidate_sha256 "$EC_PKGLIB/pg_flashback.so")"
-    got_helper="$(exact_candidate_sha256 "$EC_HELPER_BIN")"
     [[ "$got_so" == "$EC_EXT_BIN_SHA" ]] || exact_candidate_die "installed .so SHA $got_so != manifest $EC_EXT_BIN_SHA" || return 1
-    [[ "$got_helper" == "$EC_HELPER_BIN_SHA" ]] || exact_candidate_die "helper SHA $got_helper != manifest $EC_HELPER_BIN_SHA" || return 1
     EC_INSTALLED_SO_PATH="$EC_PKGLIB/pg_flashback.so"
     EC_INSTALLED_SO_SHA="$got_so"
-    EC_INSTALLED_HELPER_PATH="$EC_HELPER_BIN"
-    EC_INSTALLED_HELPER_SHA="$got_helper"
     return 0
 }
 
@@ -250,11 +236,8 @@ exact_candidate_identity_json() {
         --arg source_tree "$EC_SOURCE_TREE" \
         --arg package_sha "$EC_PACKAGE_SHA" \
         --arg ext_bin "$EC_EXT_BIN_SHA" \
-        --arg helper_bin "$EC_HELPER_BIN_SHA" \
         --arg so_path "${EC_INSTALLED_SO_PATH:-}" \
         --arg so_sha "${EC_INSTALLED_SO_SHA:-}" \
-        --arg helper_path "${EC_INSTALLED_HELPER_PATH:-}" \
-        --arg helper_sha "${EC_INSTALLED_HELPER_SHA:-}" \
         --arg arch "$EC_ARCH" \
         --arg pg_major "$EC_PG_MAJOR" \
         --arg candidate_dir "$CANDIDATE_DIR" \
@@ -264,11 +247,8 @@ exact_candidate_identity_json() {
           source_tree: $source_tree,
           package_sha256: $package_sha,
           extension_binary_sha256: $ext_bin,
-          helper_binary_sha256: $helper_bin,
           installed_extension_path: $so_path,
           installed_extension_sha256: $so_sha,
-          installed_helper_path: $helper_path,
-          installed_helper_sha256: $helper_sha,
           arch: $arch,
           pg_major: $pg_major,
           install_source: "candidate_archives_only"

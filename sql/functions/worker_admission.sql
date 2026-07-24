@@ -216,7 +216,7 @@ COMMENT ON FUNCTION flashback_max_worker_pairs() IS
 COMMENT ON FUNCTION flashback_worker_readiness() IS
     'Read-only admission projection for the current database: list membership, max_workers truncation, live capture/maintenance process identity, and bgworker capacity.';
 COMMENT ON FUNCTION flashback_require_admitted_capture_worker(text) IS
-    'Fail-closed gate used by flashback_track/flashback_track_backup before creating a lifecycle without a running admitted capture worker.';
+    'Fail-closed gate used by flashback_track before creating a lifecycle without a running admitted capture worker.';
 
 -- =================================================================
 -- Primary-only mutating API guard (HA / physical standby fail-closed)

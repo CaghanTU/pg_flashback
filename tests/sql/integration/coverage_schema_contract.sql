@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS public.it_cov_retrack CASCADE;
 DROP TABLE IF EXISTS flashback.it_cov_snapshot CASCADE;
 DROP TABLE IF EXISTS flashback.it_cov_snapshot_2 CASCADE;
 DROP TABLE IF EXISTS flashback.it_cov_snapshot_3 CASCADE;
+DROP TABLE IF EXISTS flashback.it_cov_snapshot_other CASCADE;
 
 CREATE TABLE public.it_cov_contract (id integer PRIMARY KEY, note text);
 CREATE TABLE public.it_cov_replacement (id integer PRIMARY KEY, note text);
@@ -15,6 +16,7 @@ CREATE TABLE public.it_cov_retrack (id integer PRIMARY KEY, note text);
 CREATE TABLE flashback.it_cov_snapshot AS TABLE public.it_cov_contract;
 CREATE TABLE flashback.it_cov_snapshot_2 AS TABLE public.it_cov_contract;
 CREATE TABLE flashback.it_cov_snapshot_3 AS TABLE public.it_cov_contract;
+CREATE TABLE flashback.it_cov_snapshot_other AS TABLE public.it_cov_other;
 
 DO $tv$
 DECLARE
@@ -28,21 +30,17 @@ DECLARE
     v_retrack_oid oid := 'public.it_cov_retrack'::regclass;
     v_stream_id bigint;
     v_other_stream_id bigint;
-    v_backup_anchor_id bigint;
+    v_other_snapshot_id bigint;
     v_snapshot_id bigint;
     v_snapshot_id_2 bigint;
     v_snapshot_id_3 bigint;
     v_generation_1 bigint;
     v_generation_2 bigint;
     v_other_generation bigint;
-    v_other_pending_generation bigint;
     v_gap_id bigint;
     v_boundary timestamptz := clock_timestamp();
     v_lsn pg_lsn := '0/1000';
     v_lsn_2 pg_lsn := '0/2000';
-    v_backup_marker_lsn pg_lsn := '0/100';
-    v_backup_start_lsn pg_lsn := '0/200';
-    v_backup_stop_lsn pg_lsn := '0/400';
     v_config_count integer;
 BEGIN
     INSERT INTO flashback.tracked_tables (
@@ -116,7 +114,7 @@ BEGIN
         rel_oid, schema_name, table_name, base_snapshot_table,
         recovery_profile
     ) VALUES (
-        v_other_oid, 'public', 'it_cov_other', NULL, 'backup'
+        v_other_oid, 'public', 'it_cov_other', NULL, 'local_delta'
     ) RETURNING tracking_id INTO v_other_tracking_id;
 
     INSERT INTO flashback.capture_streams (
@@ -214,122 +212,40 @@ BEGIN
 
     BEGIN
         UPDATE flashback.tracking_lifecycles
-           SET recovery_profile = 'backup'
+           SET initial_table_name = 'it_cov_renamed'
          WHERE tracking_id = v_tracking_id;
-        RAISE EXCEPTION 'immutable lifecycle profile was mutable';
+        RAISE EXCEPTION 'immutable lifecycle identity was mutable';
     EXCEPTION WHEN integrity_constraint_violation THEN
         NULL;
     END;
 
-    INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, recovery_profile, state,
-        boundary_kind, rel_oid_at_boundary, boundary_marker
+    -- v_other gets a plain active local_delta generation so the cross-tracking
+    -- ownership checks below still exercise a real second lifecycle.
+    INSERT INTO flashback.snapshots (
+        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
+        schema_def, row_count, captured_at
     ) VALUES (
-        v_other_tracking_id, 2, 'backup', 'building',
-        'post_restore', v_other_oid, 'it_cov_pending_backup_generation'
-    ) RETURNING generation_id INTO v_other_pending_generation;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM flashback.coverage_generations
-        WHERE generation_id = v_other_pending_generation
-          AND state = 'building'
-          AND boundary_marker = 'it_cov_pending_backup_generation'
-          AND boundary_lsn IS NULL
-    ) THEN
-        RAISE EXCEPTION 'pending backup generation without a stop LSN was rejected';
-    END IF;
-
-    -- A pending backup boundary may exist without its stop LSN, but it cannot
-    -- be published as active until that exact LSN has been qualified.
-    BEGIN
-        UPDATE flashback.coverage_generations
-           SET state = 'active',
-               boundary_time = v_boundary,
-               activated_at = clock_timestamp()
-         WHERE generation_id = v_other_pending_generation;
-        RAISE EXCEPTION 'active backup generation without a boundary LSN was accepted';
-    EXCEPTION WHEN check_violation THEN
-        NULL;
-    END;
-
-    -- A verified full backup must begin/checkpoint strictly after its durable
-    -- tracking marker and carries immutable repository/cluster identity.
-    BEGIN
-        INSERT INTO flashback.backup_anchors (
-            tracking_id, helper_profile, repository_key, stanza, backup_label,
-            backup_type, database_system_identifier, timeline_id,
-            manifest_reference, manifest_sha256, tracking_marker_lsn,
-            backup_start_lsn, backup_stop_lsn, verified_at
-        ) VALUES (
-            v_other_tracking_id, 'it_helper', 'repo1', 'it_stanza',
-            '20260716-000000F-invalid', 'full', 123456789, 1,
-            'repo1/it_stanza/invalid/backup.manifest', repeat('a', 64),
-            v_backup_marker_lsn, v_backup_marker_lsn,
-            v_backup_stop_lsn, clock_timestamp()
-        );
-        RAISE EXCEPTION 'overlapping/pre-marker backup anchor was accepted';
-    EXCEPTION WHEN check_violation THEN
-        NULL;
-    END;
-
-    INSERT INTO flashback.backup_anchors (
-        tracking_id, helper_profile, repository_key, stanza, backup_label,
-        backup_type, database_system_identifier, timeline_id,
-        manifest_reference, manifest_sha256, tracking_marker_lsn,
-        backup_start_lsn, backup_stop_lsn, verified_at
-    ) VALUES (
-        v_other_tracking_id, 'it_helper', 'repo1', 'it_stanza',
-        '20260716-000000F', 'full', 123456789, 1,
-        'repo1/it_stanza/20260716-000000F/backup.manifest', repeat('b', 64),
-        v_backup_marker_lsn, v_backup_start_lsn,
-        v_backup_stop_lsn, clock_timestamp()
-    ) RETURNING backup_anchor_id INTO v_backup_anchor_id;
-
-    BEGIN
-        UPDATE flashback.backup_anchors
-           SET manifest_sha256 = repeat('c', 64)
-         WHERE backup_anchor_id = v_backup_anchor_id;
-        RAISE EXCEPTION 'verified backup anchor was mutable';
-    EXCEPTION WHEN integrity_constraint_violation THEN
-        NULL;
-    END;
-
-    BEGIN
-        INSERT INTO flashback.coverage_generations (
-            tracking_id, generation_no, recovery_profile, state,
-            boundary_kind, rel_oid_at_boundary, backup_anchor_id,
-            boundary_time, boundary_lsn, valid_through_lsn, activated_at
-        ) VALUES (
-            v_other_tracking_id, 97, 'backup', 'active',
-            'invalid-backup-stop', v_other_oid, v_backup_anchor_id,
-            v_boundary, '0/401'::pg_lsn, '0/401'::pg_lsn,
-            clock_timestamp()
-        );
-        SET CONSTRAINTS flashback.coverage_generations_backup_anchor_tracking_lsn_fk IMMEDIATE;
-        RAISE EXCEPTION 'backup generation accepted a stop LSN outside its anchor';
-    EXCEPTION WHEN foreign_key_violation THEN
-        SET CONSTRAINTS flashback.coverage_generations_backup_anchor_tracking_lsn_fk DEFERRED;
-    END;
+        v_other_oid, v_other_tracking_id, 'flashback.it_cov_snapshot_other', v_lsn,
+        '{}'::jsonb, 0, v_boundary
+    ) RETURNING snapshot_id INTO v_other_snapshot_id;
 
     INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, recovery_profile, state,
-        boundary_kind, rel_oid_at_boundary, backup_anchor_id,
-        boundary_time, boundary_lsn, valid_through_lsn, activated_at
+        tracking_id, generation_no, stream_id, recovery_profile, state,
+        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
+        boundary_time, boundary_lsn, valid_through_time, valid_through_lsn,
+        activated_at
     ) VALUES (
-        v_other_tracking_id, 1, 'backup', 'active',
-        'verified_full_backup', v_other_oid, v_backup_anchor_id,
-        v_boundary, v_backup_stop_lsn, v_backup_stop_lsn, clock_timestamp()
+        v_other_tracking_id, 1, v_stream_id, 'local_delta', 'active',
+        'track', v_other_oid, v_other_snapshot_id,
+        v_boundary, v_lsn, v_boundary + interval '30 seconds', v_lsn,
+        clock_timestamp()
     ) RETURNING generation_id INTO v_other_generation;
 
     IF (SELECT canonical_coordinate_kind
         FROM flashback.coverage_generations
-        WHERE generation_id = v_other_generation) <> 'physical_lsn'
-       OR (SELECT canonical_coordinate_kind
-           FROM flashback.coverage_generations
-           WHERE generation_id = v_generation_1) <> 'commit_lsn'
+        WHERE generation_id = v_generation_1) <> 'commit_lsn'
     THEN
-        RAISE EXCEPTION 'profile canonical coordinate kind is incorrect';
+        RAISE EXCEPTION 'local_delta canonical coordinate kind is incorrect';
     END IF;
 
     -- Payload identity is one tuple, not three independently trusted columns.
@@ -577,7 +493,7 @@ BEGIN
         WHERE n.nspname = 'flashback'
           AND c.relname IN (
               'tracking_lifecycles', 'capture_streams',
-              'backup_anchors', 'coverage_generations', 'coverage_gaps',
+              'coverage_generations', 'coverage_gaps',
               'pending_wal_events', 'generation_payload_retirements'
           )
           AND c.relpersistence <> 'p'
@@ -592,14 +508,6 @@ BEGIN
             ('tracking_lifecycles', 'recovery_profile'),
             ('tracking_lifecycles', 'retired_at'),
             ('tracking_lifecycles', 'retirement_reason'),
-            ('backup_anchors', 'backup_anchor_id'),
-            ('backup_anchors', 'backup_label'),
-            ('backup_anchors', 'database_system_identifier'),
-            ('backup_anchors', 'timeline_id'),
-            ('backup_anchors', 'manifest_sha256'),
-            ('backup_anchors', 'tracking_marker_lsn'),
-            ('backup_anchors', 'backup_start_lsn'),
-            ('backup_anchors', 'backup_stop_lsn'),
             ('capture_streams', 'timeline_id'),
             ('delta_log', 'tracking_id'),
             ('delta_log', 'generation_id'),
@@ -617,8 +525,6 @@ BEGIN
             ('schema_versions', 'source_xid'),
             ('schema_versions', 'committed_at'),
             ('schema_versions', 'commit_lsn'),
-            ('backup_restore_requests', 'tracking_id'),
-            ('backup_restore_requests', 'generation_id'),
             ('generation_payload_retirements', 'tracking_id'),
             ('generation_payload_retirements', 'generation_id'),
             ('generation_payload_retirements', 'snapshot_id'),
@@ -626,7 +532,6 @@ BEGIN
             ('generation_payload_retirements', 'state'),
             ('coverage_generations', 'boundary_xid'),
             ('coverage_generations', 'boundary_marker'),
-            ('coverage_generations', 'backup_anchor_id'),
             ('coverage_generations', 'canonical_coordinate_kind'),
             ('coverage_generations', 'superseded_before_time'),
             ('coverage_generations', 'superseded_before_lsn'),
@@ -654,16 +559,14 @@ BEGIN
               'flashback.delta_log'::regclass,
               'flashback.staging_events'::regclass,
               'flashback.snapshots'::regclass,
-              'flashback.backup_anchors'::regclass,
               'flashback.coverage_generations'::regclass,
               'flashback.coverage_gaps'::regclass,
-              'flashback.schema_versions'::regclass,
-              'flashback.backup_restore_requests'::regclass
+              'flashback.schema_versions'::regclass
           )
           AND contype = 'f'
           AND condeferrable
           AND condeferred
-    ) <> 9 THEN
+    ) <> 7 THEN
         RAISE EXCEPTION 'lifecycle children are not bound to immutable parent';
     END IF;
 
@@ -729,7 +632,6 @@ BEGIN
 
     IF NOT has_table_privilege('pg_monitor', 'flashback.tracking_lifecycles', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.capture_streams', 'SELECT')
-       OR NOT has_table_privilege('pg_monitor', 'flashback.backup_anchors', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.coverage_generations', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.coverage_gaps', 'SELECT')
        OR NOT has_table_privilege('pg_monitor', 'flashback.generation_payload_retirements', 'SELECT')

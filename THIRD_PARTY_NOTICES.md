@@ -13,33 +13,26 @@ linked into pg_flashback release binaries:
 | Program | Use | License |
 |---|---|---|
 | [PostgreSQL](https://www.postgresql.org/) | Extension host, native PITR and client tools | PostgreSQL License |
-| [pgBackRest](https://pgbackrest.org/) | Physical backup catalog, archive retrieval and classic restore | MIT |
-| `jq` | Reference controller JSON validation | MIT |
-| GNU coreutils (`cp`, `sha256sum`) | Reflink materialization and checksum verification | GPL-3.0-or-later |
-| util-linux `flock` | External repository coordination | GPL-2.0-or-later |
+| `jq` | CLI JSON output validation | MIT |
+| GNU coreutils (`cp`, `sha256sum`) | Package materialization and checksum verification | GPL-3.0-or-later |
 
 The GPL-licensed command-line programs above are optional system programs
 communicating through normal process and file interfaces; their source is not
-included in or linked with pg_flashback.
+included in or linked with pg_flashback. (The physical-backup recovery
+prototype that invoked pgBackRest is deferred; see
+[`docs/DEFERRED_BACKUP.md`](docs/DEFERRED_BACKUP.md).)
 
 ## Direct Rust dependencies
 
-The locked dependency trees include the following direct libraries. Their
-transitive dependencies and exact versions are recorded in `Cargo.lock` and
-`tools/pg_flashback_recovery/Cargo.lock`.
+The locked dependency tree includes the following direct libraries. Their
+transitive dependencies and exact versions are recorded in `Cargo.lock`.
 
 | Crate | Component | License |
 |---|---|---|
 | `pgrx`, `pgrx-tests` | PostgreSQL extension framework and tests | MIT |
-| `serde`, `serde_json` | JSON serialization | MIT OR Apache-2.0 |
-| `hmac` | HMAC proof authentication | MIT OR Apache-2.0 |
-| `sha1` | PostgreSQL WAL segment checksum compatibility | MIT OR Apache-2.0 |
+| `serde_json` | JSON serialization | MIT OR Apache-2.0 |
 | `sha2` | SHA-256 implementation | MIT OR Apache-2.0 |
-| `clap` | Helper command-line parser | MIT OR Apache-2.0 |
 | `fs2` | File locking | MIT OR Apache-2.0 |
-| `nix` | Unix process and signal handling | MIT |
-| `signal-hook` | Signal delivery | MIT OR Apache-2.0 |
-| `thiserror` | Error definitions | MIT OR Apache-2.0 |
 
 At the 0.1.0 release candidate, RustSec also reports two maintenance-only
 warnings in pgrx's locked transitive tree: `paste` (RUSTSEC-2024-0436, used by

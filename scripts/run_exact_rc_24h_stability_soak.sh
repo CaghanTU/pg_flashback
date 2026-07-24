@@ -2,8 +2,8 @@
 # shellcheck disable=SC2317,SC2329
 # Dedicated 24-hour exact-candidate bounded LOCAL-DELTA stability soak (Gate C).
 #
-# Gate C is a local_delta stability soak. Backup-backed qualification is a
-# separate gate (functional/chaos/helper/retained/advancement suites).
+# Gate C is a local_delta stability soak. Deferred physical-backup experiments
+# are outside this product qualification.
 #
 # HARD RULES:
 # - exact mode qualification_kind is exact_rc_24h_stability_soak
@@ -17,9 +17,6 @@
 #
 # Required:
 #   CANDIDATE_DIR
-#
-# Optional:
-#   PGBACKREST   unused by this local soak; retained only for wrapper compatibility
 #
 # Optional resource bounds (bytes):
 #   PG_FLASHBACK_SOAK_MIN_FREE_BYTES   default 2147483648 (2 GiB)
@@ -35,9 +32,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib/exact_candidate_identity.sh"
 
 CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
-# Local Gate C does not invoke pgBackRest. Keep the env optional so wrappers that
-# export it (for Gate B / backup suites) do not force a hard dependency here.
-PGBACKREST="${PGBACKREST:-}"
 KEEP="${PGFB_STABILITY_KEEP:-1}"
 WORKER_GRACE_SECONDS="${PG_FLASHBACK_SOAK_WORKER_GRACE_SECONDS:-90}"
 # Fail closed if an exact/accelerated soak is already active for this host tree.
@@ -538,7 +532,7 @@ mkdir -p "$RUN_ROOT" "$RESULT_DIR" "$RUN_ROOT/log"
 acquire_soak_lock
 require_executable "$(command -v jq)"
 require_executable "$(command -v python3)"
-# Gate C local soak does not require PGBACKREST.
+# Gate C qualifies only the local exact-WAL product.
 
 # Preflight free space before binding/install.
 START_FS_FREE="$(exact_candidate_free_bytes "$REPO_ROOT")"

@@ -6,7 +6,7 @@
 # rejected. Distinguishes:
 #   source_commit / source_tree  — what was actually tested
 #   evidence_summary_commit      — optional later docs-only commit
-#   qualification_artifact_sha256 / helper_binary_sha256 / package_sha256
+#   qualification_artifact_sha256 / extension_binary_sha256 / package_sha256
 #
 # Usage:
 #   ./scripts/verify_qualification_provenance.sh [evidence.json]
@@ -75,7 +75,7 @@ if [[ -n "$EVIDENCE_COMMIT" ]]; then
 fi
 
 # Optional binary digests: if present, must look like sha256 hex.
-for field in helper_binary_sha256 package_sha256 qualification_artifact_sha256 helper_debug_sha256; do
+for field in extension_binary_sha256 cli_binary_sha256 package_sha256 qualification_artifact_sha256; do
     val="$(jq -r --arg f "$field" '
         .provenance[$f] // .[$f] // empty
     ' "$EVIDENCE")"

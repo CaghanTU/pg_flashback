@@ -5,7 +5,6 @@
 # Output under target/candidate/<source_commit>/:
 #   pg_flashback-candidate-<commit>-src.tar.gz
 #   pg_flashback-candidate-<commit>-pg17-<arch>-linux.tar.gz
-#   pg-flashback-recovery-candidate-<commit>-<arch>-linux.tar.gz
 #   MANIFEST.json (source commit/tree + SHA-256 digests)
 #
 # Usage:
@@ -97,7 +96,7 @@ printf '%s\n' \
     > "$EXT_DIR/bin/INSTALL.txt"
 cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
 cp docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
-    docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md "$EXT_DIR/docs/"
+    docs/DEVELOPMENT.md docs/DEFERRED_BACKUP.md "$EXT_DIR/docs/"
 mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
@@ -119,45 +118,8 @@ else
     tar -C "$STAGE" -czf "$OUT_ROOT/${EXT_NAME}.tar.gz" "$EXT_NAME"
 fi
 
-# 3) Recovery helper release binary.
-cargo build --release --locked --manifest-path "$ROOT/tools/pg_flashback_recovery/Cargo.toml"
-HELPER_NAME="pg-flashback-recovery-candidate-${SHORT}-${ARCH_LABEL}-linux"
-HELPER_DIR="$STAGE/$HELPER_NAME"
-mkdir -p "$HELPER_DIR/bin" "$HELPER_DIR/examples" "$HELPER_DIR/docs" "$HELPER_DIR/scripts"
-install -m 0755 \
-    "$ROOT/tools/pg_flashback_recovery/target/release/pg-flashback-recovery" \
-    "$HELPER_DIR/bin/"
-install -m 0755 \
-    "$ROOT/scripts/pg_flashback_backup_restore.sh" \
-    "$ROOT/scripts/pgbackrest_with_flashback_lock.sh" \
-    "$HELPER_DIR/bin/"
-cp "$ROOT/tools/pg_flashback_recovery/examples/"*.json "$HELPER_DIR/examples/" 2>/dev/null || true
-cp "$ROOT/tools/pg_flashback_recovery/README.md" "$HELPER_DIR/README.md"
-cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$HELPER_DIR/"
-cp docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md \
-    docs/SUPPORT.md "$HELPER_DIR/docs/"
-mkdir -p "$HELPER_DIR/scripts/lib"
-install -m 0755 \
-    "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \
-    "$ROOT/scripts/run_exact_candidate_functional_suite.sh" \
-    "$ROOT/scripts/run_exact_candidate_drop_qualification.sh" \
-    "$ROOT/scripts/run_exact_rc_chaos_suite.sh" \
-    "$ROOT/scripts/run_exact_rc_24h_stability_soak.sh" \
-    "$ROOT/scripts/run_exact_rc_24h_soak.sh" \
-    "$ROOT/scripts/run_exact_rc_harness_selftest.sh" \
-    "$HELPER_DIR/scripts/"
-install -m 0644 "$ROOT/scripts/lib/exact_candidate_identity.sh" "$HELPER_DIR/scripts/lib/"
-if tar --help 2>&1 | grep -q -- '--mtime'; then
-    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-        -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
-else
-    tar -C "$STAGE" -czf "$OUT_ROOT/${HELPER_NAME}.tar.gz" "$HELPER_NAME"
-fi
-
 SRC_SHA="$(sha256sum "$OUT_ROOT/${SRC_NAME}.tar.gz" | awk '{print $1}')"
 EXT_SHA="$(sha256sum "$OUT_ROOT/${EXT_NAME}.tar.gz" | awk '{print $1}')"
-HELPER_PKG_SHA="$(sha256sum "$OUT_ROOT/${HELPER_NAME}.tar.gz" | awk '{print $1}')"
-HELPER_BIN_SHA="$(sha256sum "$HELPER_DIR/bin/pg-flashback-recovery" | awk '{print $1}')"
 EXT_BIN_SHA="$(sha256sum "$EXT_DIR/lib/pg_flashback.so" | awk '{print $1}')"
 CLI_BIN_SHA="$(sha256sum "$EXT_DIR/bin/pg_flashback" | awk '{print $1}')"
 [[ -x "$EXT_DIR/bin/pg_flashback" ]] || {
@@ -172,11 +134,8 @@ jq -n \
     --arg arch "$ARCH_LABEL" \
     --arg src_name "${SRC_NAME}.tar.gz" \
     --arg ext_name "${EXT_NAME}.tar.gz" \
-    --arg helper_name "${HELPER_NAME}.tar.gz" \
     --arg src_sha "$SRC_SHA" \
     --arg ext_sha "$EXT_SHA" \
-    --arg helper_pkg_sha "$HELPER_PKG_SHA" \
-    --arg helper_bin_sha "$HELPER_BIN_SHA" \
     --arg ext_bin_sha "$EXT_BIN_SHA" \
     --arg cli_bin_sha "$CLI_BIN_SHA" \
     --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -194,9 +153,7 @@ jq -n \
       artifacts: {
         source_archive: {name: $src_name, sha256: $src_sha},
         extension_archive: {name: $ext_name, sha256: $ext_sha},
-        helper_archive: {name: $helper_name, sha256: $helper_pkg_sha},
         extension_binary_sha256: $ext_bin_sha,
-        helper_binary_sha256: $helper_bin_sha,
         cli_binary_sha256: $cli_bin_sha,
         package_sha256: $ext_sha
       }
@@ -225,7 +182,6 @@ jq -n \
     --arg ext_version "$EXT_VERSION" \
     --arg ext_bin_sha "$EXT_BIN_SHA" \
     --arg cli_bin_sha "$CLI_BIN_SHA" \
-    --arg helper_bin_sha "$HELPER_BIN_SHA" \
     --arg package_sha "$EXT_SHA" \
     '{
       bomFormat: $bom_format,
@@ -248,7 +204,6 @@ jq -n \
           {name:"postgresql_version", value:$pg_version},
           {name:"extension_binary_sha256", value:$ext_bin_sha},
           {name:"cli_binary_sha256", value:$cli_bin_sha},
-          {name:"helper_binary_sha256", value:$helper_bin_sha},
           {name:"package_sha256", value:$package_sha}
         ]
       },
@@ -256,9 +211,7 @@ jq -n \
         {type:"library", name:"pg_flashback.so", version:$ext_version,
          hashes:[{alg:"SHA-256", content:$ext_bin_sha}]},
         {type:"application", name:"pg_flashback", version:$ext_version,
-         hashes:[{alg:"SHA-256", content:$cli_bin_sha}]},
-        {type:"application", name:"pg-flashback-recovery", version:$ext_version,
-         hashes:[{alg:"SHA-256", content:$helper_bin_sha}]}
+         hashes:[{alg:"SHA-256", content:$cli_bin_sha}]}
       ]
     }' > "$OUT_ROOT/SBOM.cdx.json"
 
@@ -287,7 +240,6 @@ jq -n \
     --arg package_sha256 "$EXT_SHA" \
     --arg extension_binary_sha256 "$EXT_BIN_SHA" \
     --arg cli_binary_sha256 "$CLI_BIN_SHA" \
-    --arg helper_binary_sha256 "$HELPER_BIN_SHA" \
     --arg rustc "$TOOLCHAIN_RUSTC" \
     '{
       kind: "reproducibility_report",
@@ -298,8 +250,7 @@ jq -n \
       digests: {
         package_sha256: $package_sha256,
         extension_binary_sha256: $extension_binary_sha256,
-        cli_binary_sha256: $cli_binary_sha256,
-        helper_binary_sha256: $helper_binary_sha256
+        cli_binary_sha256: $cli_binary_sha256
       },
       note: "Run a second build with the same SOURCE_DATE_EPOCH and compare digests; mismatch => refuse candidate claim."
     }' > "$OUT_ROOT/REPRODUCIBILITY_REPORT.json"

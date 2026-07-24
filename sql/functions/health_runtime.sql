@@ -132,7 +132,6 @@ DECLARE
     v_lag_warn bigint;
     v_lag_risk bigint;
     v_budget_exhausted boolean;
-    v_post_restore_gap boolean;
 BEGIN
     SELECT * INTO slot FROM flashback_slot_status_snapshot() LIMIT 1;
     SELECT * INTO STRICT workers FROM flashback_worker_readiness();
@@ -160,9 +159,6 @@ BEGIN
             cg.valid_through_time,
             cg.state_reason AS generation_state_reason,
             cg.details AS generation_details,
-            ba.backup_label,
-            ba.backup_stop_lsn,
-            ba.details AS anchor_details,
             pending.generation_id AS pending_generation_id,
             pending.state_reason AS pending_state_reason,
             pending.boundary_kind AS pending_boundary_kind,
@@ -179,9 +175,6 @@ BEGIN
             WHERE g.tracking_id = tt.tracking_id AND g.state = 'active'
             LIMIT 1
         ) cg ON true
-        LEFT JOIN flashback.backup_anchors ba
-          ON ba.backup_anchor_id = cg.backup_anchor_id
-         AND ba.tracking_id = cg.tracking_id
         LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         LEFT JOIN LATERAL (
             SELECT g.generation_id, g.state_reason, g.boundary_kind
@@ -290,31 +283,11 @@ BEGIN
             v_cap := NULL;
         END;
 
-        v_post_restore_gap := rec.post_restore_gap_count > 0
-            OR COALESCE(rec.pending_state_reason, '') = 'post_restore_unanchored';
-
         -- Durable coverage faults outrank transient worker-process absence so a
         -- stopped/unadmitted worker cannot hide slot loss, timeline freeze or
         -- repository/re-anchor blockers. Worker absence still outranks healthy
         -- and soft lag warnings: never project healthy without capture.
-        IF COALESCE(rec.generation_state_reason, '') = 'timeline_mismatch_frontier_frozen'
-           OR rec.timeline_gap_count > 0
-        THEN
-            v_health := 'timeline_mismatch';
-            v_action := 'take_new_verified_full_backup_anchor';
-            v_reason := COALESCE(
-                rec.invalidation_reason,
-                'backup frontier frozen after timeline mismatch; requires a new verified FULL anchor'
-            );
-        ELSIF COALESCE(rec.generation_state_reason, '') IN (
-                  'repository_verification_failed', 'anchor_missing'
-              )
-           OR rec.frozen_count > 0
-        THEN
-            v_health := 'repository_anchor_missing';
-            v_action := 'restore_repository_anchor_or_reanchor';
-            v_reason := 'backup repository proof is unavailable; restore admission is frozen';
-        ELSIF COALESCE(rec.generation_state_reason, '') = 'coverage_frozen_storage_exhausted'
+        IF COALESCE(rec.generation_state_reason, '') = 'coverage_frozen_storage_exhausted'
         THEN
             -- Outranks slot_lost/capture_worker_missing/local_budget_exhausted:
             -- a permanent storage-exhaustion gap (flashback_storage_freeze_lifecycle)
@@ -327,22 +300,7 @@ BEGIN
                 rec.generation_state_reason,
                 'local retained-payload storage budget was exhausted; coverage beyond the frozen watermark is a permanent gap'
             );
-        ELSIF v_post_restore_gap
-           OR (
-               rec.recovery_profile = 'backup'
-               AND rec.pending_generation_id IS NOT NULL
-               AND rec.generation_id IS NULL
-           )
-        THEN
-            v_health := 'backup_reanchor_required';
-            v_action := 'take_and_verify_fresh_full_after_marker';
-            v_reason := format(
-                'tracking_id %s is unanchored after production swap; a fresh FULL started after the swap marker is required (retained pre-swap FULLs are ineligible)',
-                rec.tracking_id
-            );
         ELSIF (
-               rec.recovery_profile = 'local_delta'
-               AND (
                    COALESCE(slot.wal_status, '') = 'lost'
                    OR (
                        COALESCE(slot.wal_status, '') = 'missing'
@@ -353,7 +311,6 @@ BEGIN
                        AND COALESCE(rec.invalidation_reason, '') ~*
                            '(slot|replication_slot|missing.slot|wal_status)'
                    )
-               )
            )
         THEN
             v_health := 'slot_lost';
@@ -414,7 +371,7 @@ BEGIN
             );
         ELSIF v_budget_exhausted THEN
             v_health := 'local_budget_exhausted';
-            v_action := 'raise_local_budgets_or_use_backup_profile';
+            v_action := 'raise_local_budgets_or_free_disk';
             v_reason := 'configured local capacity budgets cannot admit track/re-anchor/restore';
         ELSIF rec.stream_state = 'broken' OR rec.open_gap_count > 0 THEN
             v_health := 'reanchor_recommended';
@@ -429,67 +386,28 @@ BEGIN
         THEN
             v_health := 'maintenance_required';
             v_action := CASE
-                WHEN rec.pending_boundary_kind = 'full_reanchor'
-                    THEN 'run_reconcile_anchors_or_verify_anchor'
                 WHEN rec.pending_generation_id IS NOT NULL
                     THEN 'wait_for_boundary_commit_resolution'
                 WHEN rec.retention_blocked
-                    THEN 'run_reconcile_anchors_to_retire_predecessors'
+                    THEN 'wait_for_predecessor_retirement'
                 ELSE 'wait_for_payload_retirement'
             END;
             v_reason := COALESCE(
-                CASE WHEN rec.pending_boundary_kind = 'full_reanchor'
-                     THEN 'backup FULL re-anchor building; run helper reconcile-anchors (never creates a FULL)' END,
                 CASE WHEN rec.pending_generation_id IS NOT NULL
                      THEN 'generation boundary awaiting COMMIT LSN' END,
                 CASE WHEN rec.retiring_count > 0
                      THEN 'generation payload retirement in progress' END,
                 CASE WHEN rec.retention_blocked
-                     THEN 'sealed generation retention is blocked pending complete drain/new anchor; run reconcile-anchors to retire backup predecessors when eligible' END
+                     THEN 'sealed generation retention is blocked pending complete drain of a superseded predecessor' END
             );
         ELSIF rec.generation_id IS NULL THEN
-            IF rec.recovery_profile = 'backup' THEN
-                v_health := 'backup_reanchor_required';
-                v_action := 'activate_eligible_retained_or_fresh_full';
-                v_reason := 'no eligible coverage generation; activate a retained FULL with continuous WAL or verify a fresh FULL after the marker';
-            ELSE
-                v_health := 'reanchor_recommended';
-                v_action := 'flashback_reanchor';
-                v_reason := 'no eligible coverage generation';
-            END IF;
-        ELSIF rec.stream_state = 'active'
-           OR (rec.recovery_profile = 'backup' AND rec.generation_state = 'active')
-        THEN
-            IF rec.recovery_profile = 'backup'
-               AND COALESCE(rec.generation_details->>'activation_mode', '')
-                   = 'retained_full_plus_wal'
-               AND rec.backup_stop_lsn IS NOT NULL
-               AND rec.valid_through_lsn IS NOT NULL
-               AND (rec.valid_through_lsn - rec.backup_stop_lsn) > pg_size_bytes('1GB')
-            THEN
-                v_health := 'healthy';
-                v_action := 'consider_fresher_full_anchor';
-                v_reason := format(
-                    'active retained FULL %s; replay distance from backup_stop %s through %s may imply poor RTO',
-                    rec.backup_label, rec.backup_stop_lsn, rec.valid_through_lsn
-                );
-            ELSIF rec.recovery_profile = 'backup' AND rec.backup_label IS NOT NULL THEN
-                v_health := 'healthy';
-                v_action := 'none';
-                v_reason := format(
-                    'preferred FULL %s mode=%s valid_through=%s; schedule helper reconcile-anchors to discover newer FULLs (never creates backups)',
-                    rec.backup_label,
-                    COALESCE(
-                        rec.generation_details->>'activation_mode',
-                        'fresh_full_after_marker'
-                    ),
-                    rec.valid_through_lsn
-                );
-            ELSE
-                v_health := 'healthy';
-                v_action := 'none';
-                v_reason := NULL;
-            END IF;
+            v_health := 'reanchor_recommended';
+            v_action := 'flashback_reanchor';
+            v_reason := 'no eligible coverage generation';
+        ELSIF rec.stream_state = 'active' THEN
+            v_health := 'healthy';
+            v_action := 'none';
+            v_reason := NULL;
         ELSE
             v_health := 'maintenance_required';
             v_action := 'inspect_coverage_state';

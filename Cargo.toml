@@ -24,7 +24,6 @@ pg_test = []
 
 [dependencies]
 fs2 = "0.4"
-hmac = "0.12"
 pgrx = "=0.16.1"
 serde_json = "1"
 sha2 = "0.10"

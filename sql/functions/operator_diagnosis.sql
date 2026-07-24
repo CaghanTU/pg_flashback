@@ -1,6 +1,6 @@
 -- =================================================================
 -- Operator diagnosis: flashback_doctor() and local disaster-point discovery.
--- Read-only. Never mutates coverage, slots, settings, or backups.
+-- Read-only. Never mutates coverage, slots or settings.
 -- =================================================================
 
 CREATE OR REPLACE FUNCTION flashback_doctor()
@@ -33,7 +33,6 @@ DECLARE
     v_gaps bigint;
     v_pending bigint;
     v_pending_verify bigint;
-    v_backup_lifecycles bigint;
     v_slot_keep text;
 BEGIN
     v_mode := flashback_effective_capture_mode();
@@ -222,33 +221,6 @@ BEGIN
     ELSE
         status := 'warning';
         action := 'wait for maintenance finalizer or run: pg_flashback doctor --reconcile';
-    END IF;
-    RETURN NEXT;
-
-    SELECT count(*) INTO v_backup_lifecycles
-    FROM flashback.tracked_tables
-    WHERE is_active AND recovery_profile = 'backup';
-
-    scope := 'database'; check_name := 'backup_profile_prerequisites';
-    observed := format('active_backup_lifecycles=%s', v_backup_lifecycles);
-    expected := 'backup helper prerequisites only required when backup lifecycles exist';
-    IF v_backup_lifecycles = 0 THEN
-        status := 'ok'; action := 'none';
-    ELSE
-        -- Observational: require that every backup lifecycle has a healthy or
-        -- explicitly actionable health row rather than inventing helper state.
-        IF EXISTS (
-            SELECT 1 FROM flashback_health() h
-            WHERE h.recovery_profile = 'backup'
-              AND h.health IN ('repository_anchor_missing', 'timeline_mismatch',
-                               'slot_lost', 'capture_worker_missing')
-        ) THEN
-            status := 'error';
-            action := 'repair backup-profile health (anchor/slot/worker) before restore';
-        ELSE
-            status := 'ok';
-            action := 'none';
-        END IF;
     END IF;
     RETURN NEXT;
 END;

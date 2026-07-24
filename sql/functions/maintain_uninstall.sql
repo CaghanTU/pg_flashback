@@ -760,7 +760,7 @@ BEGIN
         'remaining_slots', to_jsonb(v_slots),
         'configured_databases', to_jsonb(v_dbs),
         'cluster_residue', jsonb_build_object(
-            'roles', jsonb_build_array('flashback_admin', 'flashback_recovery_agent'),
+            'roles', jsonb_build_array('flashback_admin'),
             'gucs', 'postgresql.conf pg_flashback.* and shared_preload_libraries still need manual cleanup after DROP EXTENSION',
             'note', 'DROP EXTENSION removes SQL objects in this database; repeat per configured database'
         ),

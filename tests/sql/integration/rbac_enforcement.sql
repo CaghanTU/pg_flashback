@@ -9,9 +9,6 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
         RAISE EXCEPTION 'flashback_admin role does not exist';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_recovery_agent') THEN
-        RAISE EXCEPTION 'flashback_recovery_agent role does not exist';
-    END IF;
 
     -- Default PostgreSQL routine ACLs include PUBLIC EXECUTE. The extension's
     -- finalize SQL must remove it from every production routine, including new
@@ -117,10 +114,6 @@ BEGIN
         'flashback_admin',
         'flashback.snap_987654321_987654321',
         'INSERT,UPDATE,DELETE,TRUNCATE'
-    ) OR has_table_privilege(
-        'flashback_recovery_agent',
-        'flashback.snap_987654321_987654321',
-        'INSERT,UPDATE,DELETE,TRUNCATE'
     ) THEN
         RAISE EXCEPTION 'runtime payload remains writable by a delegated role';
     END IF;
@@ -198,38 +191,7 @@ BEGIN
             ('flashback_admin', 'public.flashback_status_snapshot(text)'),
             ('flashback_admin', 'public.flashback_relation_filesystem_available_bytes(regclass)'),
             ('flashback_admin', 'public.flashback_tablespace_filesystem_available_bytes(oid)'),
-            ('flashback_admin', 'public.flashback_track_backup(text,text)'),
-            ('flashback_admin', 'public.flashback_set_backup_coverage(text,pg_lsn,pg_lsn)'),
-            ('flashback_admin', 'public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),
-            ('flashback_admin', 'public.flashback_advance_backup_frontier(text,pg_lsn,bigint)'),
-            ('flashback_admin', 'public.flashback_consume_verified_backup_proof(bigint)'),
-            ('flashback_admin', 'public.flashback_consume_verified_wal_frontier_proof(bigint)'),
-            ('flashback_admin', 'public.flashback_backup_disaster_points(text,interval)'),
-            ('flashback_admin', 'public.flashback_prepare_backup_restore(text,pg_lsn)'),
-            ('flashback_admin', 'public.flashback_finalize_backup_restore(text)'),
-            ('flashback_admin', 'public.flashback_fail_backup_restore(text,text,boolean)'),
             ('flashback_admin', 'public.flashback_adopt_existing_payload_tables()'),
-            ('flashback_recovery_agent', 'public.flashback_claim_backup_restore(text)'),
-            ('flashback_recovery_agent', 'public.flashback_accept_backup_restore(text,jsonb)'),
-            ('flashback_recovery_agent', 'public.flashback_fail_backup_restore(text,text,boolean)'),
-            ('flashback_recovery_agent', 'public.flashback_backup_anchor_verification_context(bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_backup_frontier_verification_context(bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_active_backup_labels()'),
-            ('flashback_recovery_agent', 'public.flashback_begin_backup_expire(text,text,text)'),
-            ('flashback_recovery_agent', 'public.flashback_complete_backup_expire(bigint,text,text,text)'),
-            ('flashback_recovery_agent', 'public.flashback_begin_backup_anchor_advancement(bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_retire_sealed_backup_generation(bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_active_backup_anchor_contexts()'),
-            ('flashback_recovery_agent', 'public.flashback_freeze_missing_backup_anchor(bigint,bigint,jsonb)'),
-            ('flashback_recovery_agent', 'public.flashback_freeze_backup_generation(bigint,text,jsonb)'),
-            ('flashback_recovery_agent', 'public.flashback_backup_proof_result(text,bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_frontier_proof_result(text,bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_install_verified_backup_proof(text,bigint,text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone,jsonb,text)'),
-            ('flashback_recovery_agent', 'public.flashback_install_verified_wal_frontier_proof(text,bigint,bigint,text,text,text,bigint,pg_lsn,text,timestamp with time zone,jsonb,text)'),
-            ('flashback_recovery_agent', 'public.flashback_backup_proof_attestation_payload(text,bigint,text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,text,pg_lsn)'),
-            ('flashback_recovery_agent', 'public.flashback_wal_frontier_attestation_payload(text,bigint,bigint,text,text,text,bigint,pg_lsn,text)'),
-            ('flashback_recovery_agent', 'public.flashback_consume_verified_backup_proof(bigint)'),
-            ('flashback_recovery_agent', 'public.flashback_consume_verified_wal_frontier_proof(bigint)'),
             ('pg_monitor', 'public.flashback_retention_status()'),
             ('pg_monitor', 'public.flashback_is_restore_in_progress(oid)'),
             ('pg_monitor', 'public.flashback_health()'),
@@ -264,7 +226,6 @@ BEGIN
           AND routine_acl.privilege_type = 'EXECUTE'
           AND routine_acl.grantee IN (
               'flashback_admin'::regrole,
-              'flashback_recovery_agent'::regrole,
               'pg_monitor'::regrole
           )
     ), acl_diff AS (
@@ -309,10 +270,6 @@ BEGIN
             ('public.flashback_health()'),
             ('public.flashback_advise(regclass)'),
             ('public.flashback_history(text,interval)'),
-            ('public.flashback_track_backup(text,text)'),
-            ('public.flashback_activate_backup_anchor(text,text,text,text,numeric,bigint,text,text,pg_lsn,pg_lsn,timestamp with time zone)'),
-            ('public.flashback_prepare_backup_restore(text,pg_lsn)'),
-            ('public.flashback_finalize_backup_restore(text)'),
             ('public.flashback_adopt_existing_payload_tables()')
         ) AS expected(signature)
     LOOP
@@ -322,18 +279,6 @@ BEGIN
             RAISE EXCEPTION 'flashback_admin lacks EXECUTE on %', v_api.signature;
         END IF;
     END LOOP;
-
-    IF NOT has_function_privilege(
-        'flashback_recovery_agent',
-        'public.flashback_claim_backup_restore(text)',
-        'EXECUTE'
-    ) OR NOT has_function_privilege(
-        'flashback_recovery_agent',
-        'public.flashback_accept_backup_restore(text,jsonb)',
-        'EXECUTE'
-    ) THEN
-        RAISE EXCEPTION 'flashback_recovery_agent lacks its helper API allowlist';
-    END IF;
 
     IF has_function_privilege(
         'flashback_admin',
@@ -350,14 +295,6 @@ BEGIN
     ) THEN
         RAISE EXCEPTION
             'flashback_admin can execute capture-bypass internals';
-    END IF;
-
-    IF has_function_privilege(
-        'flashback_recovery_agent',
-        'public.flashback_restore(text,timestamp with time zone)',
-        'EXECUTE'
-    ) THEN
-        RAISE EXCEPTION 'flashback_recovery_agent can execute production restore';
     END IF;
 
     -- pg_monitor must NOT execute payload-bearing flashback_history().

@@ -34,16 +34,6 @@ qualification_provenance_init() {
     QUALIFICATION_EXTENSION_SHA256="$(
         qualification_sha256_or_null "$("$pg_config" --pkglibdir)/pg_flashback.so"
     )"
-    QUALIFICATION_HELPER_SHA256="$(
-        qualification_sha256_or_null \
-            "$root/tools/pg_flashback_recovery/target/release/pg-flashback-recovery"
-    )"
-    if [[ "$QUALIFICATION_HELPER_SHA256" == "null" ]]; then
-        QUALIFICATION_HELPER_SHA256="$(
-            qualification_sha256_or_null \
-                "$root/tools/pg_flashback_recovery/target/debug/pg-flashback-recovery"
-        )"
-    fi
 }
 
 qualification_provenance_json() {
@@ -61,8 +51,6 @@ qualification_provenance_json() {
     "exact_tag": "$QUALIFICATION_EXACT_TAG",
     "postgresql_version": "$QUALIFICATION_POSTGRES_VERSION",
     "extension_binary_sha256": $QUALIFICATION_EXTENSION_SHA256,
-    "helper_binary_sha256": $QUALIFICATION_HELPER_SHA256,
-    "helper_release_binary_sha256": $QUALIFICATION_HELPER_SHA256,
     "run_started_at": "$QUALIFICATION_STARTED_AT",
     "run_completed_at": "$finished_at",
     "started_at": "$QUALIFICATION_STARTED_AT",

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Canonical local_delta package builder (extension + CLI).
-# Does not include the experimental pg_flashback_recovery helper.
+# The experimental physical-backup recovery prototype is not part of the
+# supported tree; see docs/DEFERRED_BACKUP.md.
 #
 # Usage:
 #   PG_MAJOR=17 ./scripts/build_local_package.sh
@@ -136,8 +137,7 @@ jq -n \
         shared_object_sha256:$so,
         cli_binary_sha256:$cli
       },
-      excludes:["pg_flashback_recovery","pgBackRest helper scripts"],
-      notes:["Experimental backup helper is packaged separately and is not part of the local product."]
+      notes:["Supported product is local_delta/exact-WAL DROP recovery only; the physical-backup recovery prototype is deferred (docs/DEFERRED_BACKUP.md)."]
     }' > "$STAGE/$ARCHIVE_ROOT/MANIFEST.json"
 
 # Minimal SPDX-ish SBOM stub (file inventory).

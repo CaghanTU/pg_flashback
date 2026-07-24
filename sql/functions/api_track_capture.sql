@@ -735,15 +735,6 @@ BEGIN
     -- the broader feature-by-feature compatibility surface.
     PERFORM flashback_require_local_compatibility(v_rel_oid);
 
-    IF EXISTS (
-        SELECT 1 FROM flashback.tracked_tables
-        WHERE rel_oid = v_rel_oid
-          AND is_active
-          AND recovery_profile = 'backup'
-    ) THEN
-        RAISE EXCEPTION 'flashback_track: table is already tracked with the backup profile; untrack it first';
-    END IF;
-
     -- Fail closed when this database has no admitted, running capture worker.
     -- Membership in target_databases is not enough: max_workers truncation or a
     -- missing process would otherwise create a lifecycle that never consumes WAL.
@@ -1337,7 +1328,7 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Decode OIDs belonging to active local_delta/backup lifecycles. Historical
+    -- Decode OIDs belonging to active local_delta lifecycles. Historical
     -- local_delta generation OIDs are retained because a restore swaps the
     -- physical relation while the slot may still contain pre-swap WAL.
     SELECT COALESCE(string_agg(rel_oid::text, ',' ORDER BY rel_oid), '')
@@ -1346,7 +1337,7 @@ BEGIN
         SELECT tt.rel_oid
         FROM flashback.tracked_tables tt
         WHERE tt.is_active
-          AND tt.recovery_profile IN ('local_delta', 'backup')
+          AND tt.recovery_profile = 'local_delta'
         UNION
         SELECT cg.rel_oid_at_boundary
         FROM flashback.coverage_generations cg
@@ -1473,7 +1464,7 @@ BEGIN
         FROM _fb_wal_peek p
         JOIN flashback.tracked_tables tt
           ON tt.is_active
-         AND tt.recovery_profile IN ('local_delta', 'backup')
+         AND tt.recovery_profile = 'local_delta'
          AND tt.rel_oid = (p.data->>'oid')::oid
         WHERE (p.data->>'op') IN (
             'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'DROP', 'ALTER'
@@ -1499,13 +1490,7 @@ BEGIN
         SELECT cg.tracking_id
         FROM flashback.coverage_generations cg
         WHERE cg.state = 'building'
-          AND (
-              cg.stream_id = v_stream_id
-              OR (
-                  cg.recovery_profile = 'backup'
-                  AND cg.stream_id IS NULL
-              )
-          )
+          AND cg.stream_id = v_stream_id
           AND EXISTS (
               SELECT 1
               FROM _fb_wal_peek p
@@ -1805,8 +1790,8 @@ BEGIN
         END IF;
     END IF;
 
-    -- The backup profile never changes replica identity or installs DML
-    -- triggers, so only local_delta needs capture teardown.
+    -- Only a local_delta lifecycle installs capture (replica identity or a DML
+    -- trigger), so only it needs capture teardown here.
     IF v_recovery_profile = 'local_delta' AND flashback_effective_capture_mode() = 'trigger' THEN
         IF to_regclass(format('%I.%I', v_schema_name, v_table_name)) IS NOT NULL THEN
             PERFORM flashback_detach_capture_trigger(v_schema_name, v_table_name);
@@ -1901,56 +1886,6 @@ BEGIN
     DELETE FROM flashback.tracked_tables WHERE rel_oid = v_rel_oid;
 
     RETURN true;
-END;
-$$;
-
--- Capture the recovery boundary before ALTER runs. Local-delta tracking keeps
--- its existing post-ALTER event; backup tracking needs this separate pre-DDL
--- LSN because physical recovery cannot undo an ALTER that has already replayed.
-CREATE OR REPLACE FUNCTION flashback_capture_backup_ddl_marker(
-    event_type text,
-    input_schema text,
-    input_table text
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, flashback, public
-AS $$
-DECLARE
-    v_target text;
-    v_rel_oid oid;
-    v_tracked record;
-BEGIN
-    IF upper(event_type) <> 'ALTER' THEN
-        RETURN;
-    END IF;
-    v_target := CASE
-        WHEN input_schema IS NULL OR input_schema = '' THEN format('%I', input_table)
-        ELSE format('%I.%I', input_schema, input_table)
-    END;
-    v_rel_oid := flashback_resolve_tracked_backup(v_target);
-    IF v_rel_oid IS NULL THEN
-        RETURN;
-    END IF;
-
-    SELECT rel_oid, schema_name, table_name, schema_version
-      INTO v_tracked
-    FROM flashback.tracked_tables
-    WHERE rel_oid = v_rel_oid
-      AND is_active
-      AND recovery_profile = 'backup';
-
-    INSERT INTO flashback.delta_log (
-        event_time, event_type, table_name, rel_oid, source_xid,
-        committed_at, lsn, schema_version, old_data, new_data, ddl_info
-    ) VALUES (
-        clock_timestamp(), 'ALTER',
-        format('%I.%I', v_tracked.schema_name, v_tracked.table_name),
-        v_tracked.rel_oid, (txid_current() % 4294967296)::bigint,
-        clock_timestamp(), pg_current_wal_insert_lsn(), v_tracked.schema_version,
-        NULL, NULL, COALESCE(flashback_collect_schema_def(v_tracked.rel_oid), '{}'::jsonb)
-    );
 END;
 $$;
 
@@ -2153,19 +2088,9 @@ BEGIN
         new_version := COALESCE(tracked.schema_version, 1);
     END IF;
 
-    -- Backup ALTER already has a pre-execution disaster marker. The post hook
-    -- is still required to store the new schema version, but a second ALTER
-    -- row here would expose an unsafe post-DDL LSN to operators.
-    IF tracked.recovery_profile = 'backup' AND upper(event_type) = 'ALTER' THEN
-        RETURN;
-    END IF;
-
-    IF tracked.recovery_profile = 'backup' THEN
-        row_snapshot := NULL;
-    ELSE
-        DECLARE
-            v_row_count bigint;
-        BEGIN
+    DECLARE
+        v_row_count bigint;
+    BEGIN
         EXECUTE format(
             'SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 100001) q',
             tracked.schema_name, tracked.table_name
@@ -2180,8 +2105,7 @@ BEGIN
                 tracked.schema_name, tracked.table_name
             ) INTO row_snapshot;
         END IF;
-        END;
-    END IF;
+    END;
 
     INSERT INTO flashback.delta_log (
         event_time, event_type, table_name, rel_oid, source_xid,

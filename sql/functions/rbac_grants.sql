@@ -8,9 +8,6 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
         EXECUTE 'CREATE ROLE flashback_admin NOLOGIN';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_recovery_agent') THEN
-        EXECUTE 'CREATE ROLE flashback_recovery_agent NOLOGIN';
-    END IF;
 END
 $$;
 
@@ -44,7 +41,7 @@ BEGIN
           AND d.deptype = 'e'
     LOOP
         EXECUTE format(
-            'REVOKE ALL ON ROUTINE %I.%I(%s) FROM PUBLIC, flashback_admin, flashback_recovery_agent, pg_monitor',
+            'REVOKE ALL ON ROUTINE %I.%I(%s) FROM PUBLIC, flashback_admin, pg_monitor',
             v_routine.nspname,
             v_routine.proname,
             v_routine.identity_args
@@ -71,10 +68,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
     REVOKE ALL PRIVILEGES ON TABLES FROM flashback_admin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA flashback
     REVOKE ALL PRIVILEGES ON SEQUENCES FROM flashback_admin;
-REVOKE ALL ON SCHEMA flashback_import FROM PUBLIC;
-GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_admin;
-GRANT USAGE, CREATE ON SCHEMA flashback_import TO flashback_recovery_agent;
-
 -- Public API (for flashback_admin only)
 GRANT EXECUTE ON FUNCTION flashback_track(text)                       TO flashback_admin;
 -- flashback_require_supported_local_table / flashback_require_local_compatibility
@@ -158,67 +151,7 @@ GRANT EXECUTE ON FUNCTION flashback_maintenance_worker_pid()         TO flashbac
 GRANT EXECUTE ON FUNCTION flashback_history(text, interval)           TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_retention_status()                TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_is_restore_in_progress(oid)       TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_track_backup(text, text)          TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_set_backup_coverage(text, pg_lsn, pg_lsn) TO flashback_admin;
--- Raw activate/advance remain present only as fail-closed stubs.
-GRANT EXECUTE ON FUNCTION flashback_activate_backup_anchor(
-    text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz
-) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_advance_backup_frontier(text, pg_lsn, bigint)
-    TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_consume_verified_backup_proof(bigint) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_consume_verified_wal_frontier_proof(bigint)
-    TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_backup_disaster_points(text, interval) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_prepare_backup_restore(text, pg_lsn) TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_finalize_backup_restore(text)     TO flashback_admin;
-GRANT EXECUTE ON FUNCTION flashback_fail_backup_restore(text, text, boolean) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_adopt_existing_payload_tables()          TO flashback_admin;
-
-GRANT EXECUTE ON FUNCTION flashback_claim_backup_restore(text)        TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_accept_backup_restore(text, jsonb) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_fail_backup_restore(text, text, boolean) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_backup_anchor_verification_context(bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_backup_frontier_verification_context(bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_active_backup_labels()
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_begin_backup_expire(text, text, text)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_complete_backup_expire(bigint, text, text, text)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_begin_backup_anchor_advancement(bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_retire_sealed_backup_generation(bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_active_backup_anchor_contexts()
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_freeze_missing_backup_anchor(bigint, bigint, jsonb)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_freeze_backup_generation(bigint, text, jsonb)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_backup_proof_result(text, bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_frontier_proof_result(text, bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_install_verified_backup_proof(
-    text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn, timestamptz, jsonb, text
-) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_install_verified_wal_frontier_proof(
-    text, bigint, bigint, text, text, text, bigint, pg_lsn, text, timestamptz, jsonb, text
-) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_backup_proof_attestation_payload(
-    text, bigint, text, text, text, text, numeric, bigint, text, text, pg_lsn, pg_lsn,
-    text, pg_lsn
-) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_wal_frontier_attestation_payload(
-    text, bigint, bigint, text, text, text, bigint, pg_lsn, text
-) TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_consume_verified_backup_proof(bigint)
-    TO flashback_recovery_agent;
-GRANT EXECUTE ON FUNCTION flashback_consume_verified_wal_frontier_proof(bigint)
-    TO flashback_recovery_agent;
 
 -- NOTE: Internal helpers (build_predicate, build_insert_parts,
 -- collect_schema_def, recreate_table_from_ddl, finalize_shadow_swap)
@@ -234,11 +167,9 @@ GRANT SELECT ON flashback.tracking_lifecycles TO pg_monitor;
 GRANT SELECT ON flashback.tracked_tables TO pg_monitor;
 GRANT SELECT ON flashback.capture_streams TO pg_monitor;
 GRANT SELECT ON flashback.capture_commits TO pg_monitor;
-GRANT SELECT ON flashback.backup_anchors TO pg_monitor;
 GRANT SELECT ON flashback.coverage_generations TO pg_monitor;
 GRANT SELECT ON flashback.coverage_gaps TO pg_monitor;
 GRANT SELECT ON flashback.generation_payload_retirements TO pg_monitor;
-GRANT SELECT ON flashback.backup_restore_requests TO pg_monitor;
 -- Intentionally NOT granted: flashback_history() returns old_data/new_data
 -- row payloads. Monitoring roles may see health/metadata only.
 GRANT EXECUTE ON FUNCTION flashback_retention_status()              TO pg_monitor;
@@ -310,10 +241,6 @@ COMMENT ON FUNCTION flashback_flush_staging(integer)
     IS 'Manually flush staging_events to delta_log. Normally done by the background worker. Useful when the worker is not running (e.g. testing or recovery). Returns number of events promoted.';
 COMMENT ON FUNCTION flashback_consume_wal(integer)
     IS 'Consume decoded changes from this database''s logical replication slot into delta_log, stamped with real commit time and LSN. Normally called by the background worker. Returns number of events inserted.';
-COMMENT ON FUNCTION flashback_backup_disaster_points(text, interval)
-    IS 'List backup-profile DDL markers and safe pre-DDL target LSNs for operator-selected recovery.';
-COMMENT ON FUNCTION flashback_capture_backup_ddl_marker(text, text, text)
-    IS 'Internal ProcessUtility hook entry point that records a backup-profile pre-ALTER recovery LSN.';
 COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)
     IS 'Record a DDL event (ALTER/DROP/TRUNCATE) with a full schema snapshot into delta_log.';
 COMMENT ON FUNCTION flashback_collect_schema_def(oid)

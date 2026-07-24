@@ -23,7 +23,7 @@ jobs:
       - name: Match tag to package version
         run: |
           package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          # Local product version is independent of the experimental recovery helper.
+          # Version comes from Cargo.toml.
           if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
             test "${GITHUB_REF_NAME%-rc.*}" = "v${package_version}"
           else
@@ -119,50 +119,9 @@ jobs:
           name: pg-flashback-pg${{ matrix.pg }}
           path: dist/*.tar.gz
           if-no-files-found: error
-
-  helper-package:
-    name: Experimental recovery helper package
-    needs: verify-version
-    runs-on: ubuntu-22.04
-    # Experimental backup helper is intentionally separate from the local product.
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
-
-      - name: Build helper
-        run: cargo build --release --locked --manifest-path tools/pg_flashback_recovery/Cargo.toml
-
-      - name: Create helper archive
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          archive_root="pg-flashback-recovery-${version}-x86_64-linux"
-          mkdir -p "dist/${archive_root}/bin" "dist/${archive_root}/examples" \
-            "dist/${archive_root}/docs"
-          install -m 0755 tools/pg_flashback_recovery/target/release/pg-flashback-recovery \
-            "dist/${archive_root}/bin/"
-          install -m 0755 scripts/pg_flashback_backup_restore.sh \
-            scripts/pgbackrest_with_flashback_lock.sh "dist/${archive_root}/bin/"
-          cp tools/pg_flashback_recovery/examples/*.json "dist/${archive_root}/examples/"
-          cp tools/pg_flashback_recovery/README.md "dist/${archive_root}/README.md"
-          cp LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md \
-            "dist/${archive_root}/"
-          cp docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md \
-            docs/SUPPORT.md "dist/${archive_root}/docs/"
-          tar -C dist -czf "dist/${archive_root}.tar.gz" "$archive_root"
-
-      - name: Upload helper archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: pg-flashback-recovery
-          path: dist/*.tar.gz
-          if-no-files-found: error
-
   draft-release:
     name: Assemble draft release
-    needs: [extension-package, helper-package]
+    needs: [extension-package]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

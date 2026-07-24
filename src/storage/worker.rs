@@ -61,19 +61,9 @@ static SLOT_LAG_WARNING_BYTES_GUC: GucSetting<Option<CString>> =
 /// Slot retained-WAL at-risk threshold for health projection.
 static SLOT_LAG_AT_RISK_BYTES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
-/// Root-owned/shared secret used to authenticate repository-derived proofs.
-static PROOF_HMAC_KEY_FILE_GUC: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
 
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
-}
-
-pub fn proof_hmac_key_file() -> Option<String> {
-    PROOF_HMAC_KEY_FILE_GUC
-        .get()
-        .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
-        .filter(|value| !value.trim().is_empty())
 }
 
 /// SQL expression yielding the effective replication slot name for the
@@ -342,15 +332,6 @@ pub fn register_worker_and_guc() {
         c"Accepted by pg_size_bytes(). Default when unset: 1GB. Also compared with safe_wal_size when PostgreSQL provides it.",
         &SLOT_LAG_AT_RISK_BYTES_GUC,
         GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_flashback.proof_hmac_key_file",
-        c"Server-side HMAC key file for verified backup proofs",
-        c"Path to a regular 0600 file containing exactly 32 bytes as 64 hexadecimal characters. Required for non-superuser recovery-agent proof installation.",
-        &PROOF_HMAC_KEY_FILE_GUC,
-        GucContext::Sighup,
         GucFlags::default(),
     );
 

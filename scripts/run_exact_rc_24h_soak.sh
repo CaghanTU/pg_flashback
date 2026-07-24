@@ -24,7 +24,6 @@ CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
 [[ -f "$CANDIDATE_DIR/MANIFEST.json" ]] || { echo "FAIL: MANIFEST.json missing" >&2; exit 2; }
 
 export CANDIDATE_DIR
-export PGBACKREST="${PGBACKREST:-/usr/local/bin/pgbackrest}"
 export PG_FLASHBACK_REQUIRE_CLEAN_TREE="${PG_FLASHBACK_REQUIRE_CLEAN_TREE:-1}"
 
 CHAOS_SUITE="${PG_FLASHBACK_CHAOS_SUITE:-once}"

@@ -45,7 +45,6 @@ Results are written under `target/bench/` and are host/config specific.
 git diff --check
 cargo fmt --all -- --check
 cargo clippy --no-default-features --features pg17 -- -D warnings
-cargo test --manifest-path tools/pg_flashback_recovery/Cargo.toml
 shellcheck scripts/pg_flashback scripts/*.sh
 ```
 
@@ -102,7 +101,6 @@ The `scripts/` directory contains isolated-cluster suites for:
 - upgrade from 0.1.0 to 0.2.0;
 - HA promotion and timeline refusal;
 - capacity admission;
-- backup-provider experiments;
 - clean-host package installation.
 
 The most important local-product commands are:

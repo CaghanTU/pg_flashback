@@ -1,15 +1,15 @@
 # Quickstart
 
 This guide configures the local_delta product profile, protects an ordinary
-table, and recovers it after an accidental DROP. It does not install or
-configure pgBackRest.
+table, and recovers it after an accidental DROP. It needs no external backup
+product.
 
 ## Product boundary
 
 Protection cost is driven by **table size**, **change rate**, and **free disk**,
 not by total database size. The supported path is local base image + logical
-WAL capture. Backup/pgBackRest helpers that may exist in the tree are
-experimental and are not part of this quickstart.
+WAL capture. Physical-backup recovery is deferred and not part of the tree
+(see [deferred backup](DEFERRED_BACKUP.md)).
 
 ## Prerequisites
 

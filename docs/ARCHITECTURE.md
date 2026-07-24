@@ -115,9 +115,9 @@ Internal functions use fixed `search_path` values. Row-change payloads are
 more sensitive than health metadata and are not exposed through the monitoring
 role.
 
-## Experimental backup provider
+## Physical-backup recovery (deferred)
 
-The external recovery helper uses a different materialization source:
-pgBackRest FULL backups plus archived WAL. It shares some recovery and
-generation concepts but is not required for local recovery and is not part of
-the current supported product contract.
+A prototype that materialized a table from an existing physical backup plus
+archived WAL used to live here. It has been removed from the supported tree
+and its redesign is deferred; see [deferred backup](DEFERRED_BACKUP.md). The
+architecture above describes the local product in full.

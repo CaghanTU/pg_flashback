@@ -142,44 +142,36 @@ fi
 # than being inferred from Gate C's DML counters.
 if rg -n 'PGFB_DROP_REPEAT_COUNT:-100' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
    && rg -n 'perform_local_drop_restore repeated_same_lifecycle' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
-   && rg -n 'record_case backup retained_full_plus_wal' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
+   && rg -n 'perform_local_drop_restore medium_indexed' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
+   && rg -n 'perform_local_drop_restore quoted_toast' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null \
    && rg -n 'cumulative_rows_at_drop' "$REPO_ROOT/scripts/run_exact_candidate_drop_qualification.sh" >/dev/null; then
-    pass "dedicated DROP gate measures repeated local and backup-backed destruction"
+    pass "dedicated DROP gate measures repeated, concurrent and quoted/TOAST local destruction"
 else
     fail "dedicated DROP claim gate is missing or under-specified"
 fi
 
-# 13) The retained-FULL PoC must not fail after writing successful evidence by
-# referencing the removed, formerly tracked design-note output path.
-if ! rg -n 'DESIGN_NOTE' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null \
-   && rg -n 'RUN_COMPLETE=1' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null \
-   && rg -n 'ALL REQUIRED PoC ASSERTIONS PASSED' "$REPO_ROOT/scripts/run_retained_full_wal_poc.sh" >/dev/null; then
-    pass "retained-FULL PoC exits from its machine-readable result without stale design-note state"
+# 13) The active product must not silently regain the deferred physical-backup
+# implementation or its former helper.
+if "$REPO_ROOT/scripts/check_core_no_backup_surface.sh" >/dev/null; then
+    pass "active core and qualification surfaces remain local-only"
 else
-    fail "retained-FULL PoC can fail after successful evidence generation"
+    fail "deferred physical-backup code leaked into the active product"
 fi
 
-# 14) Candidate archives must carry the legal/security notices and the
-# operator-facing recovery contract that the release checklist promises.
+# 14) The candidate archive must carry legal/security notices and the
+# operator-facing local recovery contract.
 EXT_ARCHIVE="$(jq -r '.artifacts.extension_archive.name' "$ORIG_CANDIDATE_DIR/MANIFEST.json")"
-HELPER_ARCHIVE="$(jq -r '.artifacts.helper_archive.name' "$ORIG_CANDIDATE_DIR/MANIFEST.json")"
 EXT_LIST="$(mktemp)"
-HELPER_LIST="$(mktemp)"
 tar -tzf "$ORIG_CANDIDATE_DIR/$EXT_ARCHIVE" > "$EXT_LIST"
-tar -tzf "$ORIG_CANDIDATE_DIR/$HELPER_ARCHIVE" > "$HELPER_LIST"
 ARCHIVE_CONTENT_OK=1
 for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
     docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
-    docs/DEVELOPMENT.md docs/EXPERIMENTAL_BACKUP.md; do
+    docs/DEVELOPMENT.md docs/DEFERRED_BACKUP.md; do
     rg -F "/$required" "$EXT_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
 done
-for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
-    docs/EXPERIMENTAL_BACKUP.md docs/ARCHITECTURE.md docs/SUPPORT.md; do
-    rg -F "/$required" "$HELPER_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
-done
-rm -f "$EXT_LIST" "$HELPER_LIST"
+rm -f "$EXT_LIST"
 if [[ "$ARCHIVE_CONTENT_OK" == "1" ]]; then
-    pass "candidate archives contain required notices and recovery documentation"
+    pass "candidate archive contains required notices and local recovery documentation"
 else
     fail "candidate archive legal/security/operator content is incomplete"
 fi
@@ -266,13 +258,12 @@ else
     fail "soak lacks a single-instance lock guard"
 fi
 
-# 23) Local Gate C does not require PGBACKREST; chaos remains a separate suite.
-if ! rg -n 'require_executable "\$PGBACKREST"' "$SOAK" >/dev/null \
-   && rg -n 'gate_profile: "local_delta"' "$SOAK" >/dev/null \
+# 23) Local Gate C declares the supported profile and keeps chaos separate.
+if rg -n 'gate_profile: "local_delta"' "$SOAK" >/dev/null \
    && rg -n 'PG_FLASHBACK_CHAOS_SUITE' "$REPO_ROOT/scripts/run_exact_rc_24h_soak.sh" >/dev/null; then
-    pass "Gate C local soak is decoupled from PGBACKREST; chaos stays on the orchestrator"
+    pass "Gate C qualifies local_delta; chaos stays on the orchestrator"
 else
-    fail "Gate C start contract still confuses local soak with backup/chaos deps"
+    fail "Gate C start contract does not isolate the local stability claim"
 fi
 
 # 24) Negative proof: a mutated soak copy that reintroduces manual consume is detected.

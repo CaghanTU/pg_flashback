@@ -27,8 +27,8 @@ Recover public.orders? [y/N]
 > pg_flashback is under active development. The primary product is local
 > recovery (`local_delta` + WAL) for small and medium ordinary PostgreSQL
 > tables. Capacity is sized by protected table size, change rate, and free
-> disk — not by whole-database size. Backup/pgBackRest paths are experimental
-> and are not required for the local product. Test in staging before
+> disk — not by whole-database size. Physical-backup recovery is deferred and
+> not part of the supported product. Test in staging before
 > production use.
 
 ## Why pg_flashback?
@@ -43,8 +43,8 @@ pg_flashback provides a narrower recovery path for a common incident:
   owner, and ACLs;
 - refuse recovery when the available evidence is incomplete or ambiguous.
 
-Local protection does not require pgBackRest or another backup product. It does
-consume additional database storage for the base image and retained changes.
+Local protection does not require any external backup product. It does consume
+additional database storage for the base image and retained changes.
 
 ## Supported scope
 
@@ -254,14 +254,12 @@ psql -c "SELECT * FROM flashback_retention_status();"
 lifecycle only when its recovery evidence is no longer needed. Cleanup is
 explicit and supports a dry run.
 
-## Backup-backed recovery
+## Physical-backup recovery (deferred)
 
-The repository contains an experimental pgBackRest recovery provider for
-research into larger tables. It is not required by the local product, does not
-automatically create backups, and is not the default recovery path.
-
-See [experimental backup recovery](docs/EXPERIMENTAL_BACKUP.md) if you are
-working on that subsystem.
+An experimental physical-backup recovery prototype (for larger tables, via an
+existing backup plus archived WAL) used to live here. It has been removed from
+the supported tree and its redesign is deferred; the supported product is
+local DROP recovery only. See [deferred backup](docs/DEFERRED_BACKUP.md).
 
 ## Documentation
 
@@ -269,7 +267,7 @@ working on that subsystem.
 - [Support matrix](docs/SUPPORT.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Testing and development](docs/DEVELOPMENT.md)
-- [Experimental backup recovery](docs/EXPERIMENTAL_BACKUP.md)
+- [Deferred backup recovery](docs/DEFERRED_BACKUP.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 

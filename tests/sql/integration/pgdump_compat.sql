@@ -56,13 +56,13 @@ BEGIN
       AND n.nspname = 'flashback'
       AND c.relname IN (
           'tracking_lifecycles', 'tracked_tables', 'delta_log', 'snapshots', 'restore_log',
-          'staging_events', 'schema_versions', 'capture_streams', 'capture_commits', 'backup_anchors',
+          'staging_events', 'schema_versions', 'capture_streams', 'capture_commits',
           'coverage_generations', 'coverage_gaps', 'pending_wal_events',
-          'generation_payload_retirements', 'backup_restore_requests'
+          'generation_payload_retirements'
       );
 
-    IF v_cnt <> 15 THEN
-        RAISE EXCEPTION 'expected 15 core/coverage tables owned by extension, got %', v_cnt;
+    IF v_cnt <> 13 THEN
+        RAISE EXCEPTION 'expected 13 core/coverage tables owned by extension, got %', v_cnt;
     END IF;
 END;
 $tv2$;
@@ -71,7 +71,6 @@ $tv2$;
 -- members.  Exercise both automatic adoption and the idempotent upgrade path.
 CREATE TABLE flashback.base_snapshot_990001 AS TABLE public.it_pgdump_tracking_seq;
 CREATE TABLE flashback.snap_990001_990001 AS TABLE public.it_pgdump_tracking_seq;
-CREATE TABLE flashback_import.r_0123456789abcdef AS TABLE public.it_pgdump_tracking_seq;
 SELECT flashback__create_range_partition(
     'delta_log_2099_01',
     '2099-01-01 00:00:00+00'::timestamptz,
@@ -84,8 +83,8 @@ DECLARE
     v_orphans text;
 BEGIN
     SELECT flashback_adopt_existing_payload_tables() INTO v_adopted;
-    IF v_adopted <> 3 THEN
-        RAISE EXCEPTION 'expected migration to adopt 3 legacy payloads, got %',
+    IF v_adopted <> 2 THEN
+        RAISE EXCEPTION 'expected migration to adopt 2 legacy payloads, got %',
             v_adopted;
     END IF;
     IF flashback_adopt_existing_payload_tables() <> 0 THEN
@@ -114,6 +113,5 @@ BEGIN
     PERFORM flashback_drop_payload_table('flashback.base_snapshot_990001'::regclass);
     PERFORM flashback_drop_payload_table('flashback.snap_990001_990001'::regclass);
     PERFORM flashback_drop_payload_table('flashback.delta_log_2099_01'::regclass);
-    PERFORM flashback_drop_payload_table('flashback_import.r_0123456789abcdef'::regclass);
 END;
 $payload$;

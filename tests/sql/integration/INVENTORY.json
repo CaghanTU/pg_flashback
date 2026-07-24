@@ -9,14 +9,6 @@
       "class": "supported-core",
       "reason": "ACL restore via seam"
     },
-    "backup_profile_contract.sql": {
-      "class": "infra",
-      "reason": "backup profile contract"
-    },
-    "backup_proof_trust_boundary.sql": {
-      "class": "infra",
-      "reason": "backup proof trust boundary"
-    },
     "batch_replay_mixed_ops.sql": {
       "class": "supported-core",
       "reason": "batch replay mixed ops via seam"
@@ -233,14 +225,6 @@
       "class": "infra",
       "reason": "restore verify helpers"
     },
-    "retained_full_activation.sql": {
-      "class": "infra",
-      "reason": "retained activation scaffolding"
-    },
-    "retained_target_routing.sql": {
-      "class": "infra",
-      "reason": "retained target routing scaffolding"
-    },
     "retention_active_partition_survives.sql": {
       "class": "supported-core",
       "reason": "retention keeps fresh seam deltas"
@@ -320,7 +304,7 @@
     },
     "exact_drop_identity_propagation.sql": {
       "class": "supported-core",
-      "reason": "exact DROP disaster_event_id propagation lock_phase\u2192core\u2192expected_proof"
+      "reason": "exact DROP disaster_event_id propagation lock_phase→core→expected_proof"
     }
   },
   "schema_version": 1

@@ -28,7 +28,6 @@ extension_sql_file!(
         "flashback_monitoring_cache",
         "flashback_worker_admission",
         "flashback_retention_runtime",
-        "flashback_backup_restore_api",
         "flashback_restore_planner_api",
         "flashback_restore_lsn_api",
         "flashback_restore_replay_helpers",

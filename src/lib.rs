@@ -3,7 +3,6 @@ use pgrx::prelude::*;
 
 mod api;
 mod capture;
-mod proof_attestation;
 mod restore;
 mod runtime_guard;
 mod storage;
@@ -327,14 +326,6 @@ mod tests {
         "../tests/sql/integration/trigger_pipeline_restore.sql"
     );
     sql_test!(
-        it_backup_profile_contract,
-        "../tests/sql/integration/backup_profile_contract.sql"
-    );
-    sql_test!(
-        it_backup_proof_trust_boundary,
-        "../tests/sql/integration/backup_proof_trust_boundary.sql"
-    );
-    sql_test!(
         it_coverage_schema_contract,
         "../tests/sql/integration/coverage_schema_contract.sql"
     );
@@ -349,14 +340,6 @@ mod tests {
     sql_test!(
         it_local_capacity_admission,
         "../tests/sql/integration/local_capacity_admission.sql"
-    );
-    sql_test!(
-        it_retained_full_activation,
-        "../tests/sql/integration/retained_full_activation.sql"
-    );
-    sql_test!(
-        it_retained_target_routing,
-        "../tests/sql/integration/retained_target_routing.sql"
     );
     sql_test!(
         it_slot_health_actions,

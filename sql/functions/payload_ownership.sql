@@ -7,10 +7,6 @@
 -- export them as application tables while deliberately omitting the tracking
 -- metadata that gives them meaning.  These helpers make membership explicit.
 --
--- Imported recovery artifacts are also temporary extension payload while a
--- request is artifact_ready.  They are adopted on acceptance and released in
--- the same transaction immediately before the validated shadow swap.
-
 CREATE OR REPLACE FUNCTION flashback_payload_kind(p_relation regclass)
 RETURNS text
 LANGUAGE plpgsql
@@ -58,10 +54,6 @@ BEGIN
     THEN
         RETURN 'delta_partition';
     END IF;
-    IF v_schema = 'flashback_import' AND v_name ~ '^r_[0-9a-f]{16}$' THEN
-        RETURN 'restore_artifact';
-    END IF;
-
     RETURN NULL;
 END;
 $$;
@@ -188,7 +180,7 @@ BEGIN
         v_schema, v_name, v_extension_owner
     );
     EXECUTE format(
-        'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC, flashback_admin, flashback_recovery_agent, pg_monitor',
+        'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM PUBLIC, flashback_admin, pg_monitor',
         v_schema, v_name
     );
 
@@ -377,9 +369,6 @@ BEGIN
                     )
                 )
               ))
-              OR
-              (n.nspname = 'flashback_import'
-               AND c.relname ~ '^r_[0-9a-f]{16}$')
           )
         ORDER BY c.oid
     LOOP

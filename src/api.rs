@@ -55,7 +55,8 @@ extension_sql_file!(
         "flashback_storage_schema_bootstrap",
         "flashback_payload_ownership_helpers",
         "flashback_local_capacity",
-        "flashback_local_compatibility"
+        "flashback_local_compatibility",
+        flashback_sha256
     ],
 );
 
@@ -209,17 +210,5 @@ extension_sql_file!(
         "flashback_payload_ownership_helpers",
         "flashback_api_track_capture",
         "flashback_coverage_runtime"
-    ],
-);
-
-extension_sql_file!(
-    "../sql/functions/backup_restore_api.sql",
-    name = "flashback_backup_restore_api",
-    requires = [
-        "flashback_storage_schema_bootstrap",
-        "flashback_payload_ownership_helpers",
-        "flashback_restore_replay_helpers",
-        "flashback_worker_admission",
-        flashback_sha256
     ],
 );

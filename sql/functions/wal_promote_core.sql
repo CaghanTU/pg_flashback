@@ -15,7 +15,6 @@ AS $$
 DECLARE
     v_inserted bigint := 0;
     v_missing_commits bigint := 0;
-    v_gap_inserted bigint := 0;
     pending record;
     lock_rec record;
     v_frontier_lsn pg_lsn;
@@ -138,14 +137,6 @@ BEGIN
     )
        OR EXISTS (
         SELECT 1
-        FROM flashback.coverage_generations cg
-        WHERE cg.recovery_profile = 'backup'
-          AND cg.stream_id IS NULL
-          AND cg.state = 'building'
-          AND cg.boundary_xid = c.source_xid
-    )
-       OR EXISTS (
-        SELECT 1
         FROM flashback.tracked_tables tt
         WHERE COALESCE(tt.protection_state, 'active') = 'stopping'
           AND tt.stop_marker_xid = c.source_xid
@@ -162,23 +153,15 @@ BEGIN
     -- Resolve exact boundaries only after their transaction's COMMIT record is
     -- durably present in this same transaction. Initial tracking activates one
     -- generation; a post-restore successor atomically seals its parent.
-    -- Backup markers resolve COMMIT coordinates without activating until a
-    -- verified FULL backup anchor is installed.
     FOR pending IN
         SELECT
             cg.generation_id, cg.tracking_id, cg.parent_generation_id,
-            cg.boundary_snapshot_id, cg.boundary_kind, cg.recovery_profile,
+            cg.boundary_snapshot_id, cg.boundary_kind,
             c.commit_lsn, c.committed_at
         FROM flashback.coverage_generations cg
         JOIN _fb_wal_commits c ON c.source_xid = cg.boundary_xid
         WHERE cg.state = 'building'
-          AND (
-              cg.stream_id = p_stream_id
-              OR (
-                  cg.recovery_profile = 'backup'
-                  AND cg.stream_id IS NULL
-              )
-          )
+          AND cg.stream_id = p_stream_id
         ORDER BY cg.generation_id
         FOR UPDATE OF cg
     LOOP
@@ -198,80 +181,6 @@ BEGIN
                SELECT boundary_xid FROM flashback.coverage_generations
                WHERE generation_id = pending.generation_id
            );
-
-        IF pending.recovery_profile = 'backup' THEN
-            IF pending.parent_generation_id IS NOT NULL THEN
-                UPDATE flashback.coverage_generations
-                   SET state = 'sealed',
-                       superseded_before_lsn = pending.commit_lsn,
-                       superseded_before_time = pending.committed_at,
-                       sealed_at = clock_timestamp(),
-                       state_reason = 'successor_boundary_resolved'
-                 WHERE generation_id = pending.parent_generation_id
-                   AND tracking_id = pending.tracking_id
-                   AND state = 'active';
-
-                UPDATE flashback.coverage_generations
-                   SET state_reason = 'post_restore_unanchored',
-                       details = COALESCE(details, '{}'::jsonb)
-                           || jsonb_build_object('tracking_marker_lsn', pending.commit_lsn)
-                 WHERE generation_id = pending.generation_id
-                   AND state = 'building';
-
-                INSERT INTO flashback.coverage_gaps (
-                    tracking_id, source_generation_id, reason,
-                    gap_start_lsn, gap_start_time, lower_bound_inclusive,
-                    source_xid, details
-                )
-                SELECT
-                    pending.tracking_id, pending.parent_generation_id,
-                    'post_restore_unanchored',
-                    pending.commit_lsn, pending.committed_at, false,
-                    (
-                        SELECT boundary_xid FROM flashback.coverage_generations
-                        WHERE generation_id = pending.generation_id
-                    ),
-                    jsonb_build_object(
-                        'successor_generation_id', pending.generation_id,
-                        'required_next_full_backup', true
-                    )
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM flashback.coverage_gaps g
-                    WHERE g.tracking_id = pending.tracking_id
-                      AND g.source_generation_id = pending.parent_generation_id
-                      AND g.reason = 'post_restore_unanchored'
-                      AND g.reanchored_by_generation_id IS NULL
-                );
-                GET DIAGNOSTICS v_gap_inserted = ROW_COUNT;
-                IF v_gap_inserted > 0 THEN
-                    RAISE WARNING
-                        'pg_flashback: tracking_id % requires action backup_reanchor_required after production swap; take a new qualifying FULL backup',
-                        pending.tracking_id;
-                    -- Transactional NOTIFY: delivered only if this consume
-                    -- transaction commits. Health metadata remains authoritative
-                    -- if the notification is lost.
-                    PERFORM pg_notify(
-                        'pg_flashback_action_required',
-                        jsonb_build_object(
-                            'tracking_id', pending.tracking_id,
-                            'generation_id', pending.generation_id,
-                            'action', 'backup_reanchor_required',
-                            'reason', 'post_restore_unanchored',
-                            'marker_lsn', pending.commit_lsn
-                        )::text
-                    );
-                END IF;
-            ELSE
-                -- Keep boundary_lsn NULL until activate binds the FULL stop LSN.
-                UPDATE flashback.coverage_generations
-                   SET state_reason = 'marker_commit_observed',
-                       details = COALESCE(details, '{}'::jsonb)
-                           || jsonb_build_object('tracking_marker_lsn', pending.commit_lsn)
-                 WHERE generation_id = pending.generation_id
-                   AND state = 'building';
-            END IF;
-            CONTINUE;
-        END IF;
 
         IF pending.parent_generation_id IS NOT NULL THEN
             UPDATE flashback.coverage_generations
@@ -331,8 +240,7 @@ BEGIN
     WITH qualified AS (
         SELECT
             e.*, c.commit_lsn, c.committed_at,
-            tt.tracking_id, cg.generation_id, cg.stream_id,
-            tt.recovery_profile
+            tt.tracking_id, cg.generation_id, cg.stream_id
         FROM _fb_wal_events e
         JOIN _fb_wal_commits c USING (source_xid)
         JOIN flashback.coverage_generations cg
@@ -349,20 +257,6 @@ BEGIN
           ON tt.tracking_id = cg.tracking_id
          AND tt.is_active
          AND tt.recovery_profile = 'local_delta'
-
-        UNION ALL
-
-        SELECT
-            e.*, c.commit_lsn, c.committed_at,
-            tt.tracking_id, NULL::bigint, NULL::bigint,
-            tt.recovery_profile
-        FROM _fb_wal_events e
-        JOIN _fb_wal_commits c USING (source_xid)
-        JOIN flashback.tracked_tables tt
-          ON tt.rel_oid = e.rel_oid
-         AND tt.is_active
-         AND tt.recovery_profile = 'backup'
-        WHERE e.event_type IN ('TRUNCATE', 'DROP', 'ALTER')
     ), ins AS (
         INSERT INTO flashback.delta_log (
             event_time, event_type, table_name, rel_oid, source_xid,
@@ -372,9 +266,7 @@ BEGIN
         )
         SELECT
             q.committed_at, q.event_type, q.table_name, q.rel_oid, q.source_xid,
-            CASE WHEN q.recovery_profile = 'local_delta' THEN q.tracking_id END,
-            CASE WHEN q.recovery_profile = 'local_delta' THEN q.generation_id END,
-            CASE WHEN q.recovery_profile = 'local_delta' THEN q.stream_id END,
+            q.tracking_id, q.generation_id, q.stream_id,
             q.committed_at,
             q.commit_lsn,
             COALESCE(q.msg_schema_version, (

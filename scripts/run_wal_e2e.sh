@@ -372,27 +372,9 @@ assert_eq "building generation kalmadı" "0" \
 
 echo "━━━ 1a. Filtered WAL prefix slot'u bounded sürede ilerletiyor ━━━"
 SLOT_NAME="pg_flashback_${DB}"
-# A backup generation legitimately remains building after its tracking marker
-# is resolved while the controller waits for a later FULL backup.  That wait
-# must not pin unrelated filtered WAL in the database-wide logical slot.
-q "CREATE TABLE backup_wait(id integer PRIMARY KEY, payload text NOT NULL)" > /dev/null
-q "SELECT flashback_track_backup('backup_wait', 'wal_e2e_profile')" > /dev/null
-for _ in $(seq 1 100); do
-    [[ "$(q "SELECT count(*) FROM flashback.coverage_generations cg
-               JOIN flashback.tracked_tables tt USING (tracking_id)
-               WHERE tt.table_name='backup_wait'
-                 AND cg.state='building'
-                 AND cg.state_reason='marker_commit_observed'
-                 AND cg.details ? 'tracking_marker_lsn'")" == "1" ]] && break
-    sleep 0.1
-done
-assert_eq "backup FULL beklerken marker COMMIT LSN çözüldü" "1" \
-    "$(q "SELECT count(*) FROM flashback.coverage_generations cg
-           JOIN flashback.tracked_tables tt USING (tracking_id)
-           WHERE tt.table_name='backup_wait'
-             AND cg.state='building'
-             AND cg.state_reason='marker_commit_observed'
-             AND cg.details ? 'tracking_marker_lsn'")"
+# Untracked writes produce WAL the decoder filters out (no tracked-table rows),
+# but the slot's confirmed_flush must still advance past them so a busy
+# unrelated workload cannot pin the database-wide logical slot.
 FILTERED_DELTA_BEFORE=$(q "SELECT count(*) FROM flashback.delta_log")
 FILTERED_START_FLUSH=$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
                            WHERE slot_name='$SLOT_NAME'")
@@ -432,10 +414,6 @@ assert_eq "bounded empty-prefix kendi slot ilerlemesini external saymadı" "0" \
     "$(q "SELECT count(*) FROM flashback.capture_streams
            WHERE state='broken'
              AND invalidation_reason='replication_slot_advanced_externally'")"
-assert_eq "building backup generation filtered WAL ilerlemesini engellemedi" "building" \
-    "$(q "SELECT cg.state FROM flashback.coverage_generations cg
-           JOIN flashback.tracked_tables tt USING (tracking_id)
-           WHERE tt.table_name='backup_wait'")"
 echo "  ok: filtered_bytes=$FILTERED_GENERATED_BYTES target=$FILTERED_TARGET_LSN confirmed=$FILTERED_CONFIRMED"
 
 q "INSERT INTO filtered_relevant VALUES (1, 'after-filtered-prefix')" > /dev/null

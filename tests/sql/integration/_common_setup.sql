@@ -4,11 +4,8 @@
 TRUNCATE
     flashback.pending_wal_events,
     flashback.generation_payload_retirements,
-    flashback.verified_wal_frontier_proofs,
-    flashback.verified_backup_proofs,
     flashback.coverage_gaps,
     flashback.coverage_generations,
-    flashback.backup_anchors,
     flashback.capture_commits,
     flashback.capture_streams,
     flashback.delta_log,
@@ -16,7 +13,6 @@ TRUNCATE
     flashback.tracked_tables,
     flashback.tracking_lifecycles,
     flashback.schema_versions,
-    flashback.backup_restore_requests,
     flashback.staging_events,
     flashback.restore_log
 RESTART IDENTITY;

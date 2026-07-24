@@ -363,7 +363,7 @@ BEGIN
                 'pg_flashback: local % capacity admission failed: %',
                 p_operation, array_to_string(v_reasons, '; ')
                 USING ERRCODE = 'disk_full',
-                      HINT = 'Raise the configured local budgets, free filesystem space, use the backup profile, or set pg_flashback.local_capacity_override only as an explicit privileged escape hatch.';
+                      HINT = 'Raise the configured local budgets, free filesystem space, or set pg_flashback.local_capacity_override only as an explicit privileged escape hatch.';
         END IF;
     END IF;
 
@@ -452,7 +452,7 @@ BEGIN
        OR m.estimated_copy_ms > m.configured_write_stall_ms
        OR (2 * m.estimated_copy_ms) > m.configured_write_stall_ms
     THEN
-        v_rec := 'reject local profile; use backup profile or raise configured budgets';
+        v_rec := 'reject local profile; raise configured budgets or free filesystem space';
     ELSE
         v_rec := 'local profile admission is currently within configured budgets';
     END IF;

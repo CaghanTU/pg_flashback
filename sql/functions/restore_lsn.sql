@@ -570,7 +570,7 @@ BEGIN
         EXCEPTION WHEN lock_not_available THEN
             RAISE EXCEPTION 'pg_flashback: local restore lock wait exceeded local_boundary_write_stall_ms'
                 USING ERRCODE = 'lock_not_available',
-                      HINT = 'Retry when the table is idle, raise the write-stall budget, or use the backup profile.';
+                      HINT = 'Retry when the table is idle or raise the write-stall budget.';
         END;
     END IF;
 

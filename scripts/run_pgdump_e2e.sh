@@ -107,14 +107,13 @@ SELECT flashback_flush_staging(1000);
 -- Simulate payload created by a pre-fix installation, then run the explicit
 -- upgrade helper. The second call proves idempotency.
 CREATE TABLE flashback.snap_999999_999999 AS TABLE public.orders;
-CREATE TABLE flashback_import.r_0123456789abcdef AS TABLE public.orders;
 DO $verify_adoption$
 DECLARE
     v_adopted integer;
 BEGIN
     v_adopted := flashback_adopt_existing_payload_tables();
-    IF v_adopted <> 2 THEN
-        RAISE EXCEPTION 'expected 2 legacy payload adoptions, got %', v_adopted;
+    IF v_adopted <> 1 THEN
+        RAISE EXCEPTION 'expected 1 legacy payload adoption, got %', v_adopted;
     END IF;
     IF flashback_adopt_existing_payload_tables() <> 0 THEN
         RAISE EXCEPTION 'payload adoption is not idempotent';
@@ -142,7 +141,7 @@ BEGIN
     ) member ON member.objid = c.oid
     WHERE flashback_payload_kind(c.oid::regclass) IS NOT NULL;
 
-    IF v_payloads < 5 THEN
+    IF v_payloads < 4 THEN
         RAISE EXCEPTION 'source payload exercise is incomplete: only % relations', v_payloads;
     END IF;
     IF v_orphans <> 0 THEN
@@ -164,7 +163,6 @@ DECLARE
     v_extconfig integer;
     v_state_rows bigint;
     v_payloads integer;
-    v_import_relations integer;
 BEGIN
     SELECT count(*) INTO v_extconfig
     FROM pg_extension e
@@ -179,7 +177,6 @@ BEGIN
         + (SELECT count(*) FROM flashback.tracked_tables)
         + (SELECT count(*) FROM flashback.capture_streams)
         + (SELECT count(*) FROM flashback.capture_commits)
-        + (SELECT count(*) FROM flashback.backup_anchors)
         + (SELECT count(*) FROM flashback.coverage_generations)
         + (SELECT count(*) FROM flashback.coverage_gaps)
         + (SELECT count(*) FROM flashback.pending_wal_events)
@@ -188,7 +185,6 @@ BEGIN
         + (SELECT count(*) FROM flashback.staging_events)
         + (SELECT count(*) FROM flashback.schema_versions)
         + (SELECT count(*) FROM flashback.restore_log)
-        + (SELECT count(*) FROM flashback.backup_restore_requests)
       INTO v_state_rows;
     IF v_state_rows <> 0 THEN
         RAISE EXCEPTION 'logical restore imported % tracking/recovery rows', v_state_rows;
@@ -199,16 +195,6 @@ BEGIN
     WHERE flashback_payload_kind(c.oid::regclass) IS NOT NULL;
     IF v_payloads <> 0 THEN
         RAISE EXCEPTION 'logical restore contains % orphan runtime payload relations', v_payloads;
-    END IF;
-
-    SELECT count(*) INTO v_import_relations
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'flashback_import'
-      AND c.relkind IN ('r', 'p');
-    IF v_import_relations <> 0 THEN
-        RAISE EXCEPTION 'logical restore contains % flashback_import relations',
-            v_import_relations;
     END IF;
 
     IF (SELECT count(*) FROM public.orders) <> 4
