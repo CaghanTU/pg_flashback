@@ -118,6 +118,14 @@ jobs:
       - name: cargo pgrx test
         run: cargo pgrx test pg${{ matrix.pg }}
 
+      - name: Generated SQL duplicate-definition check
+        run: |
+          cargo pgrx schema pg${{ matrix.pg }} \
+            --no-default-features --features pg${{ matrix.pg }} \
+            -o target/generated-pg${{ matrix.pg }}.sql
+          scripts/check_generated_sql_duplicates.sh \
+            target/generated-pg${{ matrix.pg }}.sql
+
   audit:
     name: Security audit
     runs-on: ubuntu-22.04
