@@ -94,7 +94,8 @@ qe() {
 export PATH="$WORK_ROOT/bin:$PG_BIN:$PATH"
 mkdir -p "$WORK_ROOT/bin"
 install -m 0755 "$CLI_SRC" "$WORK_ROOT/bin/pg_flashback"
-export PGHOST="$SOCKET" PGPORT="$PORT" PGUSER="$(id -un)"
+PGUSER="$(id -un)"
+export PGHOST="$SOCKET" PGPORT="$PORT" PGUSER
 
 restart_pg() {
     "$PG_BIN/pg_ctl" -D "$DATA" restart -w -t 60 -l "$LOG" >/dev/null
@@ -201,7 +202,7 @@ pass "f1 before_materialize durable failed"
 # Retry succeeds with a NEW operation
 DB=postgres q "ALTER SYSTEM RESET pg_flashback.test_restore_failpoint;" >/dev/null
 DB=postgres q "SELECT pg_reload_conf();" >/dev/null
-TOKEN2=$(q "SELECT flashback_recover_plan('public.dba_fail')->>'plan_token';")
+q "SELECT flashback_recover_plan('public.dba_fail')->>'plan_token';" >/dev/null
 OP2=$(recover_begin_execute public.dba_fail)
 [[ "$OP2" != "$OP" ]] || die "f1 retry reused operation_id"
 wait_health public.dba_fail healthy || die "f1 retry health"
@@ -225,7 +226,7 @@ set -e
 [[ $RC3 -ne 0 ]] || die "f1 after_swap_before_commit did not fail"
 # Aborted TX rolls back swap → table remains dropped
 [[ "$(q "SELECT to_regclass('public.dba_fail2') IS NULL;")" == "t" ]] || die "f1 after_swap left live table"
-q "SELECT flashback_recover_mark_failed($OP3, 'P0001', 'after_swap_before_commit', 'failpoint', '{}'::jsonb);" >/dev/null
+q "SELECT flashback_recover_mark_failed($OP3, 'P0001', 'after_swap_before_commit', left(replace('$ERR3', '''', ''''''),200), '{}'::jsonb);" >/dev/null
 [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP3;")" == "failed" ]] \
     || die "f1 after_swap mark_failed"
 DB=postgres q "ALTER SYSTEM RESET pg_flashback.test_restore_failpoint;" >/dev/null
@@ -234,7 +235,7 @@ recover_begin_execute public.dba_fail2 >/dev/null
 wait_health public.dba_fail2 healthy || die "f1 after_swap retry"
 [[ "$(q "SELECT count(*) FROM public.dba_fail2;")" == "$FP_BEFORE" ]] || die "f1 after_swap fingerprint"
 # Crash-after-begin leaves reconcilable started state
-TOKEN4=$(q "SELECT flashback_recover_plan('public.dba_fail2')->>'plan_token';" || true)
+q "SELECT flashback_recover_plan('public.dba_fail2')->>'plan_token';" >/dev/null || true
 # Use a fresh DROP cycle for abandoned
 q "CREATE TABLE public.dba_abandon(id int PRIMARY KEY);"
 q "SELECT flashback_track('public.dba_abandon');" >/dev/null
@@ -390,8 +391,6 @@ wait_drop public.dba_id_coll || die "f4 coll drop"
 # Occupy original sequence name with unrelated sequence before recover
 q "CREATE SEQUENCE $COLL_SEQ;" >/dev/null || true
 # If DROP removed the sequence, create a blocker with that name
-OWNER_SCHEMA=$(q "SELECT split_part('$COLL_SEQ', '.', 1);")
-OWNER_NAME=$(q "SELECT split_part('$COLL_SEQ', '.', 2);")
 q "DO \$\$ BEGIN
   IF to_regclass('$COLL_SEQ') IS NULL THEN
     EXECUTE format('CREATE SEQUENCE %s', '$COLL_SEQ');
@@ -435,6 +434,10 @@ ERR5=$(qe "SELECT flashback_require_supported_drop_manifest(
 RC5=$?
 set -e
 [[ $RC5 -ne 0 ]] || die "f5 require_supported did not refuse"
+# A bare non-zero exit also covers typos and connection faults, so require the
+# refusal to be the extension's own fail-closed message.
+[[ "$ERR5" == *"restore refused"* ]] \
+    || die "f5 require_supported refused for the wrong reason: $ERR5"
 # Identity-less call must also fail closed (no latest-manifest fallback).
 set +e
 ERR5b=$(qe "SELECT flashback_require_supported_drop_manifest(
@@ -442,6 +445,8 @@ ERR5b=$(qe "SELECT flashback_require_supported_drop_manifest(
 RC5b=$?
 set -e
 [[ $RC5b -ne 0 ]] || die "f5 identity-less require_supported unexpectedly succeeded"
+[[ "$ERR5b" == *"exact DROP identity required"* ]] \
+    || die "f5 identity-less refusal did not demand the exact DROP identity: $ERR5b"
 pass "f5 CASCADE plan=execute non_restorable"
 
 echo "== Finding 6: multi-database CLI =="

@@ -188,7 +188,7 @@ SQL
     token2=$(psqlq -c "SELECT flashback_recover_plan('public.$table', interval '1 day')->>'plan_token';")
     op2=$(psqlq -c "SELECT flashback_recover_begin('public.$table', '$token2', interval '1 day')->>'operation_id';")
     psqlq -c "SELECT flashback_recover_execute('public.$table', '$token2', interval '1 day', NULL, NULL, NULL, $op2);" >/dev/null
-    for i in $(seq 1 240); do
+    for _ in $(seq 1 240); do
         st2=$(psqlq -c "SELECT COALESCE(flashback_operation_state($op2),'missing');")
         [[ "$st2" == "verified" || "$st2" == "failed" ]] && break
         sleep 0.5

@@ -52,8 +52,8 @@ cleanup() {
 trap cleanup EXIT
 
 wait_healthy() {
-    local table=$1 h="" i
-    for i in $(seq 1 240); do
+    local table=$1 h=""
+    for _ in $(seq 1 240); do
         h=$(q "SELECT flashback_lifecycle_health('$table')")
         [[ "$h" == "healthy" ]] && return 0
         sleep 0.25
@@ -104,7 +104,7 @@ NEWGEN=$(printf '%s' "$BEGIN_JSON" | jq -r '.new_generation_id')
 [[ "$NEWGEN" != "$PRED_GEN" ]] || { echo "FAIL: maintain_begin did not create a new generation"; exit 1; }
 
 FSTATE=""
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
     FINAL_JSON=$(q "SELECT flashback_maintain_finalize($OP)")
     FSTATE=$(printf '%s' "$FINAL_JSON" | jq -r '.status')
     [[ "$FSTATE" == "sealed" ]] && break
@@ -148,7 +148,7 @@ sleep 0.2
 # Poll flashback_lifecycle_storage_metrics()'s frozen flag (true whichever
 # caller froze it) instead of asserting on one explicit scan's return count.
 FROZEN_OK=0
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
     q "SELECT flashback_storage_freeze_scan()" >/dev/null
     if [[ "$(q "SELECT flashback_lifecycle_storage_metrics('public.ml_main')" | jq -r '.frozen')" == "true" ]]; then
         FROZEN_OK=1
@@ -172,7 +172,7 @@ echo "  ok: ml_main storage=blocked, health=coverage_frozen_storage_exhausted, m
 echo "-- recover targeting beyond the freeze point is rejected --"
 q "DROP TABLE public.ml_main"
 DROP_RESTORABLE=""
-for i in $(seq 1 120); do
+for _ in $(seq 1 120); do
     DROP_RESTORABLE=$(q "SELECT status FROM flashback_disaster_points('public.ml_main', interval '1 day') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1")
     [[ -n "$DROP_RESTORABLE" ]] && break
     sleep 0.25
