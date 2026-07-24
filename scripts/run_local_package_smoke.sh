@@ -110,7 +110,17 @@ test "$fp" = "2"
 
 tid="$(psql -v ON_ERROR_STOP=1 -qAtc "SELECT (flashback_list_lifecycles()->0->>'tracking_id');")"
 pg_flashback unprotect public.package_smoke --yes
+# Cleanup requires sealed unprotected state after stop-marker finalization.
 if [[ -n "$tid" && "$tid" != "null" ]]; then
+  st=""
+  for _ in $(seq 1 120); do
+    psql -v ON_ERROR_STOP=1 -qAtc "SELECT flashback_finalize_unprotect_operations();" >/dev/null 2>&1 || true
+    st="$(psql -v ON_ERROR_STOP=1 -qAtc "SELECT COALESCE((SELECT protection_state FROM flashback.tracked_tables WHERE tracking_id = ${tid}::bigint), 'gone');")"
+    [[ "$st" == "unprotected" || "$st" == "gone" || "$st" == "cleaned" || "$st" == "inactive" ]] && break
+    sleep 0.25
+  done
+  [[ "$st" == "unprotected" || "$st" == "gone" || "$st" == "cleaned" || "$st" == "inactive" ]] \
+    || { echo "FAIL: unprotect did not finalize (state=$st)" >&2; exit 1; }
   pg_flashback cleanup --tracking-id "$tid" --yes
 fi
 pg_flashback prepare-uninstall --yes
