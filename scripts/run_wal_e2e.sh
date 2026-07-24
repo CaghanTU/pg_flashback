@@ -52,9 +52,7 @@ PSQL="$BINDIR/psql -h $SOCKDIR -p $PORT -v ON_ERROR_STOP=on"
 DB="wal_e2e"
 UNCOV_DB="wal_e2e_uncov"
 
-OLD_TARGETS=""
-OLD_MODE=""
-OLD_ENABLED=""
+SAVED_GUCS=()
 GUCS_MODIFIED=0
 CLEANED=0
 RETENTION_PAUSE_PID=""
@@ -67,6 +65,54 @@ CONSUME_LOCK_PID=""
 
 q()  { $PSQL -d "$DB" -qAtc "$1"; }
 qp() { $PSQL -d postgres -qAtc "$1"; }
+
+# Record every pg_flashback GUC this instance has explicitly set through ALTER
+# SYSTEM. Reading postgresql.auto.conf through pg_settings.sourcefile, rather
+# than current_setting(), is deliberate: current_setting() also reports built-in
+# defaults, so restoring one of those would write an explicit entry that did not
+# exist beforehand and silently pin a value the operator never chose.
+snapshot_gucs() {
+    mapfile -t SAVED_GUCS < <(qp "SELECT name || '=' || setting
+        FROM pg_settings
+        WHERE name LIKE 'pg_flashback.%'
+          AND sourcefile LIKE '%postgresql.auto.conf'
+        ORDER BY name")
+}
+
+# Leave the instance exactly as snapshot_gucs() found it: reset whatever this run
+# added, then put the recorded values back. This is generic on purpose — a hand
+# maintained list is how allow_unaudited_restore and the five local_* budgets
+# escaped cleanup before, and every GUC added later would have escaped too.
+restore_gucs() {
+    local current name value saved keep
+    mapfile -t current < <(qp "SELECT name
+        FROM pg_settings
+        WHERE name LIKE 'pg_flashback.%'
+          AND sourcefile LIKE '%postgresql.auto.conf'
+        ORDER BY name")
+    for name in "${current[@]}"; do
+        [[ -z "$name" ]] && continue
+        keep=0
+        for saved in "${SAVED_GUCS[@]}"; do
+            [[ "${saved%%=*}" == "$name" ]] && { keep=1; break; }
+        done
+        [[ "$keep" == "0" ]] && qp "ALTER SYSTEM RESET $name" > /dev/null 2>&1
+    done
+    for saved in "${SAVED_GUCS[@]}"; do
+        [[ -z "$saved" ]] && continue
+        name="${saved%%=*}"
+        value="${saved#*=}"
+        # Guard: an ABORTED earlier run may have left our own test database in
+        # target_databases; restoring that would strand the workers on a
+        # database this cleanup is about to drop.
+        if [[ "$name" == "pg_flashback.target_databases" ]] \
+           && [[ "$value" == "$DB" || "$value" == "$UNCOV_DB" ]]; then
+            qp "ALTER SYSTEM RESET $name" > /dev/null 2>&1
+            continue
+        fi
+        qp "ALTER SYSTEM SET $name = '${value//\'/\'\'}'" > /dev/null 2>&1
+    done
+}
 
 stop_idle_worker() {
     local pid=""
@@ -130,28 +176,7 @@ cleanup() {
        WHERE application_name LIKE 'pgfb_%' AND pid <> pg_backend_pid()" > /dev/null 2>&1
     echo "━━━ Temizlik: GUC'ları geri al, restart, test DB/slot'larını düşür ━━━"
     if [[ "$GUCS_MODIFIED" == "1" ]]; then
-        # Guard: a previous ABORTED run may have left our own test DB name in
-        # target_databases; "restoring" that poisoned value would strand the
-        # workers on a database this cleanup is about to drop.
-        if [[ -n "$OLD_TARGETS" && "$OLD_TARGETS" != "$DB" && "$OLD_TARGETS" != "$UNCOV_DB" ]]; then
-            qp "ALTER SYSTEM SET pg_flashback.target_databases = '$OLD_TARGETS'" > /dev/null 2>&1
-        else
-            qp "ALTER SYSTEM RESET pg_flashback.target_databases" > /dev/null 2>&1
-        fi
-        # Lab-only GUC that relaxes the restore audit requirement. It must not
-        # survive the run: leaving it enabled would silently weaken every later
-        # restore on this instance.
-        qp "ALTER SYSTEM RESET pg_flashback.allow_unaudited_restore" > /dev/null 2>&1
-        if [[ -n "$OLD_MODE" ]]; then
-            qp "ALTER SYSTEM SET pg_flashback.capture_mode = '$OLD_MODE'" > /dev/null 2>&1
-        else
-            qp "ALTER SYSTEM RESET pg_flashback.capture_mode" > /dev/null 2>&1
-        fi
-        if [[ -n "$OLD_ENABLED" ]]; then
-            qp "ALTER SYSTEM SET pg_flashback.enabled = '$OLD_ENABLED'" > /dev/null 2>&1
-        else
-            qp "ALTER SYSTEM RESET pg_flashback.enabled" > /dev/null 2>&1
-        fi
+        restore_gucs
         restart_pg || echo "  uyarı: instance yeniden başlatılamadı — elle kontrol edin"
     fi
     qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
@@ -191,9 +216,7 @@ trap 'exit 143' TERM
 trap 'echo "FAIL: hata (satır $LINENO)"' ERR
 
 echo "━━━ 0. Ortam hazırlığı (GUC kaydet, DB + slot temizle, restart) ━━━"
-OLD_TARGETS=$(qp "SELECT current_setting('pg_flashback.target_databases', true)")
-OLD_MODE=$(qp "SELECT current_setting('pg_flashback.capture_mode', true)")
-OLD_ENABLED=$(qp "SELECT current_setting('pg_flashback.enabled', true)")
+snapshot_gucs
 
 qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
     WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}')" > /dev/null || true
