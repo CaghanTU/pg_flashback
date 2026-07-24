@@ -1,48 +1,61 @@
--- Regression test: flashback_restore on a previously DROP TABLE'd table
--- Verifies that a table dropped without flashback_untrack can be
--- recovered by calling flashback_restore() with a target_time before the drop.
 DO $tv$
 DECLARE
-    t_before  timestamptz;
-    v_count   bigint;
+    v_boot jsonb;
+    v_tracking_id bigint;
+    v_point_lsn pg_lsn := '0/2000'::pg_lsn;
+    v_xid bigint;
+    v_count bigint;
 BEGIN
-    -- Setup: create and track a table
     DROP TABLE IF EXISTS public.it_restore_dropped CASCADE;
     CREATE TABLE public.it_restore_dropped (
         id   SERIAL PRIMARY KEY,
         name TEXT NOT NULL
     );
-    PERFORM flashback_track('public.it_restore_dropped');
-    PERFORM flashback_test_attach_capture_trigger('public.it_restore_dropped'::regclass);
 
-    INSERT INTO public.it_restore_dropped (name) VALUES ('alice'), ('bob'), ('carol');
+    SELECT flashback_test_bootstrap_lifecycle('public.it_restore_dropped') INTO v_boot;
+    v_tracking_id := (v_boot->>'tracking_id')::bigint;
 
-    -- Capture a restore point before the drop
-    t_before := clock_timestamp();
+    INSERT INTO public.it_restore_dropped (id, name)
+    VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
+    PERFORM setval(pg_get_serial_sequence('public.it_restore_dropped', 'id'), 3, true);
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        v_point_lsn,
+        clock_timestamp(),
+        941001,
+        jsonb_build_array(
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":1,"name":"alice"}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":2,"name":"bob"}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":3,"name":"carol"}'::jsonb)
+        )
+    );
 
-    -- Simulate accident: DROP TABLE without flashback_untrack
+    PERFORM flashback_capture_drop_dependency_manifest(
+        'public', 'it_restore_dropped', false
+    );
+    v_xid := (txid_current() % 4294967296)::bigint;
     DROP TABLE public.it_restore_dropped CASCADE;
+    PERFORM flashback_test_inject_ddl_commit(
+        v_tracking_id,
+        '0/3000'::pg_lsn,
+        clock_timestamp(),
+        v_xid,
+        'DROP'
+    );
+    PERFORM flashback_bind_drop_dependency_manifests();
 
-    -- Confirm table is gone and worker would have set is_active = false
-    UPDATE flashback.tracked_tables
-       SET is_active = false
-     WHERE schema_name = 'public' AND table_name = 'it_restore_dropped';
+    PERFORM flashback_restore_lsn('public.it_restore_dropped', v_point_lsn);
+    PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_id, '0/3500'::pg_lsn);
 
-    -- ── Exercise: restore a dropped table ──────────────────────
-    PERFORM flashback_restore('public.it_restore_dropped', t_before);
-
-    -- 1. Table must exist again
     IF to_regclass('public.it_restore_dropped') IS NULL THEN
         RAISE EXCEPTION 'Table should exist after restore, but does not';
     END IF;
 
-    -- 2. Data must be back
     SELECT count(*) INTO v_count FROM public.it_restore_dropped;
     IF v_count <> 3 THEN
         RAISE EXCEPTION 'Expected 3 rows after restore, got %', v_count;
     END IF;
 
-    -- 3. Tracking must be re-activated (is_active = true)
     SELECT count(*) INTO v_count
     FROM flashback.tracked_tables
     WHERE schema_name = 'public' AND table_name = 'it_restore_dropped' AND is_active;
@@ -50,7 +63,6 @@ BEGIN
         RAISE EXCEPTION 'Tracking should be re-activated after restore, but is not';
     END IF;
 
-    -- Cleanup
     PERFORM flashback_untrack('public.it_restore_dropped');
     DROP TABLE IF EXISTS public.it_restore_dropped CASCADE;
 END;

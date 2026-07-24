@@ -1,11 +1,11 @@
--- Test: Row-Level Security policies survive flashback_restore().
--- After restore the table must still have RLS enabled and the same policies
--- so that role-based row visibility is not accidentally widened.
+-- Test: Row-Level Security policies survive flashback_restore_lsn().
 DO $tv$
 DECLARE
-    t_before  timestamptz;
-    v_cnt     bigint;
-    v_rls_on  bool;
+    v_boot jsonb;
+    v_tracking_id bigint;
+    v_point_lsn pg_lsn := '0/2000'::pg_lsn;
+    v_cnt bigint;
+    v_rls_on bool;
     v_pol_cnt bigint;
 BEGIN
     DROP ROLE IF EXISTS it_rls_alice;
@@ -20,35 +20,51 @@ BEGIN
         secret  text
     );
 
-    -- Enable RLS
     ALTER TABLE public.it_rls ENABLE ROW LEVEL SECURITY;
     ALTER TABLE public.it_rls FORCE ROW LEVEL SECURITY;
 
-    -- Policy: each role sees only their own rows
     CREATE POLICY it_rls_owner_policy ON public.it_rls
         USING (owner = current_user);
 
-    PERFORM flashback_track('public.it_rls');
-    PERFORM flashback_test_attach_capture_trigger('public.it_rls'::regclass);
+    SELECT flashback_test_bootstrap_lifecycle('public.it_rls') INTO v_boot;
+    v_tracking_id := (v_boot->>'tracking_id')::bigint;
 
     INSERT INTO public.it_rls VALUES
         (1, 'it_rls_alice', 'alice_secret'),
         (2, 'it_rls_bob',   'bob_secret'),
         (3, 'it_rls_alice', 'alice_secret2');
-
-    t_before := clock_timestamp();
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        v_point_lsn,
+        clock_timestamp(),
+        952001,
+        jsonb_build_array(
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":1,"owner":"it_rls_alice","secret":"alice_secret"}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":2,"owner":"it_rls_bob","secret":"bob_secret"}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":3,"owner":"it_rls_alice","secret":"alice_secret2"}'::jsonb)
+        )
+    );
 
     DELETE FROM public.it_rls;
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        '0/3000'::pg_lsn,
+        clock_timestamp(),
+        952002,
+        jsonb_build_array(
+            jsonb_build_object('op', 'DELETE', 'old', '{"id":1,"owner":"it_rls_alice","secret":"alice_secret"}'::jsonb),
+            jsonb_build_object('op', 'DELETE', 'old', '{"id":2,"owner":"it_rls_bob","secret":"bob_secret"}'::jsonb),
+            jsonb_build_object('op', 'DELETE', 'old', '{"id":3,"owner":"it_rls_alice","secret":"alice_secret2"}'::jsonb)
+        )
+    );
 
-    PERFORM flashback_restore('public.it_rls', t_before);
+    PERFORM flashback_restore_lsn('public.it_rls', v_point_lsn);
 
-    -- Verify data restored
     SELECT count(*) INTO v_cnt FROM public.it_rls;
     IF v_cnt <> 3 THEN
         RAISE EXCEPTION 'expected 3 rows after restore, got %', v_cnt;
     END IF;
 
-    -- Verify RLS is still enabled
     SELECT relrowsecurity INTO v_rls_on
     FROM pg_class WHERE oid = 'public.it_rls'::regclass;
 
@@ -56,7 +72,6 @@ BEGIN
         RAISE EXCEPTION 'RLS was disabled after restore';
     END IF;
 
-    -- Verify the policy still exists
     SELECT count(*) INTO v_pol_cnt
     FROM pg_policies
     WHERE schemaname = 'public'

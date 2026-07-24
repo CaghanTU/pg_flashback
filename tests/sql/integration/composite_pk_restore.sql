@@ -2,7 +2,9 @@
 -- Composite PKs use batch net-effect replay path just like single-column PKs.
 DO $tv$
 DECLARE
-    t_before timestamptz;
+    v_boot jsonb;
+    v_tracking_id bigint;
+    v_point_lsn pg_lsn := '0/3000'::pg_lsn;
     v_cnt    bigint;
     v_qty    int;
 BEGIN
@@ -14,35 +16,64 @@ BEGIN
         PRIMARY KEY (warehouse_id, product_sku)
     );
 
-    PERFORM flashback_track('public.it_cpk');
-    PERFORM flashback_test_attach_capture_trigger('public.it_cpk'::regclass);
+    SELECT flashback_test_bootstrap_lifecycle('public.it_cpk') INTO v_boot;
+    v_tracking_id := (v_boot->>'tracking_id')::bigint;
 
     INSERT INTO public.it_cpk VALUES
         (1, 'SKU-A', 100),
         (1, 'SKU-B', 200),
         (2, 'SKU-A', 50),
         (2, 'SKU-C', 75);
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        '0/2000'::pg_lsn,
+        clock_timestamp(),
+        939001,
+        jsonb_build_array(
+            jsonb_build_object('op', 'INSERT', 'new', '{"warehouse_id":1,"product_sku":"SKU-A","qty":100}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"warehouse_id":1,"product_sku":"SKU-B","qty":200}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"warehouse_id":2,"product_sku":"SKU-A","qty":50}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"warehouse_id":2,"product_sku":"SKU-C","qty":75}'::jsonb)
+        )
+    );
 
-    -- Several updates before the checkpoint time
     UPDATE public.it_cpk SET qty = 999 WHERE warehouse_id = 1 AND product_sku = 'SKU-A';
     UPDATE public.it_cpk SET qty = 888 WHERE warehouse_id = 2 AND product_sku = 'SKU-A';
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        v_point_lsn,
+        clock_timestamp(),
+        939002,
+        jsonb_build_array(
+            jsonb_build_object('op', 'UPDATE', 'old', '{"warehouse_id":1,"product_sku":"SKU-A","qty":100}'::jsonb, 'new', '{"warehouse_id":1,"product_sku":"SKU-A","qty":999}'::jsonb),
+            jsonb_build_object('op', 'UPDATE', 'old', '{"warehouse_id":2,"product_sku":"SKU-A","qty":50}'::jsonb, 'new', '{"warehouse_id":2,"product_sku":"SKU-A","qty":888}'::jsonb)
+        )
+    );
 
-    t_before := clock_timestamp();
-
-    -- Post-snapshot mutations we want undone
     DELETE FROM public.it_cpk WHERE warehouse_id = 1;
     UPDATE public.it_cpk SET qty = 0 WHERE warehouse_id = 2;
     INSERT INTO public.it_cpk VALUES (3, 'SKU-X', 1);
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        '0/4000'::pg_lsn,
+        clock_timestamp(),
+        939003,
+        jsonb_build_array(
+            jsonb_build_object('op', 'DELETE', 'old', '{"warehouse_id":1,"product_sku":"SKU-A","qty":999}'::jsonb),
+            jsonb_build_object('op', 'DELETE', 'old', '{"warehouse_id":1,"product_sku":"SKU-B","qty":200}'::jsonb),
+            jsonb_build_object('op', 'UPDATE', 'old', '{"warehouse_id":2,"product_sku":"SKU-A","qty":888}'::jsonb, 'new', '{"warehouse_id":2,"product_sku":"SKU-A","qty":0}'::jsonb),
+            jsonb_build_object('op', 'UPDATE', 'old', '{"warehouse_id":2,"product_sku":"SKU-C","qty":75}'::jsonb, 'new', '{"warehouse_id":2,"product_sku":"SKU-C","qty":0}'::jsonb),
+            jsonb_build_object('op', 'INSERT', 'new', '{"warehouse_id":3,"product_sku":"SKU-X","qty":1}'::jsonb)
+        )
+    );
 
-    PERFORM flashback_restore('public.it_cpk', t_before);
+    PERFORM flashback_restore_lsn('public.it_cpk', v_point_lsn);
 
-    -- Expect exactly the 4 rows that existed at t_before
     SELECT count(*) INTO v_cnt FROM public.it_cpk;
     IF v_cnt <> 4 THEN
         RAISE EXCEPTION 'expected 4 rows, got %', v_cnt;
     END IF;
 
-    -- Verify specific composite PK row
     SELECT qty INTO v_qty
     FROM public.it_cpk WHERE warehouse_id = 1 AND product_sku = 'SKU-A';
     IF v_qty <> 999 THEN
@@ -55,7 +86,6 @@ BEGIN
         RAISE EXCEPTION 'composite PK row (2, SKU-A) wrong qty: expected 888, got %', v_qty;
     END IF;
 
-    -- (3, SKU-X) must NOT exist (it was inserted after t_before)
     IF EXISTS (SELECT 1 FROM public.it_cpk WHERE warehouse_id = 3) THEN
         RAISE EXCEPTION 'post-snapshot row (3, SKU-X) should not exist after restore';
     END IF;

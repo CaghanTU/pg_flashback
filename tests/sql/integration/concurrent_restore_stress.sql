@@ -1,14 +1,16 @@
 -- Test: concurrent restore stress — verify advisory lock prevents conflicts
--- We simulate concurrency within a single session by verifying:
--- 1. Advisory lock is acquired during restore
--- 2. Multiple sequential restores on different tables work correctly
--- 3. Restore audit log records all restores
 DO $tv$
-DECLARE t1 timestamptz;
-        v_cnt bigint;
-        v_lock_exists boolean;
+DECLARE
+    v_boot_a jsonb;
+    v_boot_b jsonb;
+    v_boot_c jsonb;
+    v_tracking_a bigint;
+    v_tracking_b bigint;
+    v_tracking_c bigint;
+    v_point_lsn pg_lsn := '0/2000'::pg_lsn;
+    v_mid_lsn pg_lsn := '0/5000'::pg_lsn;
+    v_cnt bigint;
 BEGIN
-    -- Setup 3 independent tables
     DROP TABLE IF EXISTS public.it_conc_a CASCADE;
     DROP TABLE IF EXISTS public.it_conc_b CASCADE;
     DROP TABLE IF EXISTS public.it_conc_c CASCADE;
@@ -17,71 +19,90 @@ BEGIN
     CREATE TABLE public.it_conc_b (id int PRIMARY KEY, val text);
     CREATE TABLE public.it_conc_c (id int PRIMARY KEY, val text);
 
-    PERFORM flashback_track('public.it_conc_a');
-    PERFORM flashback_track('public.it_conc_b');
-    PERFORM flashback_track('public.it_conc_c');
+    SELECT flashback_test_bootstrap_lifecycle('public.it_conc_a') INTO v_boot_a;
+    v_tracking_a := (v_boot_a->>'tracking_id')::bigint;
+    SELECT flashback_test_bootstrap_lifecycle('public.it_conc_b') INTO v_boot_b;
+    v_tracking_b := (v_boot_b->>'tracking_id')::bigint;
+    SELECT flashback_test_bootstrap_lifecycle('public.it_conc_c') INTO v_boot_c;
+    v_tracking_c := (v_boot_c->>'tracking_id')::bigint;
 
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_a'::regclass);
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_b'::regclass);
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_c'::regclass);
-
-    -- Phase 1: insert data
     INSERT INTO public.it_conc_a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3');
     INSERT INTO public.it_conc_b VALUES (10, 'b1'), (20, 'b2');
     INSERT INTO public.it_conc_c VALUES (100, 'c1'), (200, 'c2'), (300, 'c3'), (400, 'c4');
 
-    t1 := clock_timestamp();
+    PERFORM flashback_test_inject_commit(
+        v_tracking_a, v_point_lsn, clock_timestamp(), 959001,
+        jsonb_build_array(
+            jsonb_build_object('op','INSERT','new','{"id":1,"val":"a1"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":2,"val":"a2"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":3,"val":"a3"}'::jsonb)
+        )
+    );
+    PERFORM flashback_test_inject_commit(
+        v_tracking_b, '0/3000'::pg_lsn, clock_timestamp(), 959002,
+        jsonb_build_array(
+            jsonb_build_object('op','INSERT','new','{"id":10,"val":"b1"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":20,"val":"b2"}'::jsonb)
+        )
+    );
+    PERFORM flashback_test_inject_commit(
+        v_tracking_c, '0/4000'::pg_lsn, clock_timestamp(), 959003,
+        jsonb_build_array(
+            jsonb_build_object('op','INSERT','new','{"id":100,"val":"c1"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":200,"val":"c2"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":300,"val":"c3"}'::jsonb),
+            jsonb_build_object('op','INSERT','new','{"id":400,"val":"c4"}'::jsonb)
+        )
+    );
 
-    -- Phase 2: destructive changes
     DELETE FROM public.it_conc_a;
     DELETE FROM public.it_conc_b;
     UPDATE public.it_conc_c SET val = 'DESTROYED';
 
-    -- Verify no advisory lock before restore
-    SELECT EXISTS(
-        SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = 358944 AND granted
-    ) INTO v_lock_exists;
-    -- May or may not exist (worker could be running), just store it
-
-    -- Restore table A
-    PERFORM flashback_restore('public.it_conc_a', t1);
+    PERFORM flashback_restore_lsn('public.it_conc_a', '0/2000'::pg_lsn);
+    PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_a, '0/4500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_a;
     IF v_cnt <> 3 THEN
         RAISE EXCEPTION 'conc_a: expected 3 rows, got %', v_cnt;
     END IF;
 
-    -- Restore table B
-    PERFORM flashback_restore('public.it_conc_b', t1);
+    PERFORM flashback_restore_lsn('public.it_conc_b', '0/3000'::pg_lsn);
+    PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_b, '0/5500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_b;
     IF v_cnt <> 2 THEN
         RAISE EXCEPTION 'conc_b: expected 2 rows, got %', v_cnt;
     END IF;
 
-    -- Restore table C
-    PERFORM flashback_restore('public.it_conc_c', t1);
+    PERFORM flashback_restore_lsn('public.it_conc_c', '0/4000'::pg_lsn);
+    PERFORM flashback_test_resolve_post_restore_boundary(v_tracking_c, '0/6500'::pg_lsn);
     SELECT count(*) INTO v_cnt FROM public.it_conc_c WHERE val <> 'DESTROYED';
     IF v_cnt <> 4 THEN
         RAISE EXCEPTION 'conc_c: expected 4 non-DESTROYED rows, got %', v_cnt;
     END IF;
 
-    -- Multi-table restore: verify flashback_restore(text[], timestamptz) works
-    -- Re-attach triggers after individual restores (table was dropped+created)
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_a'::regclass);
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_b'::regclass);
-    PERFORM flashback_test_attach_capture_trigger('public.it_conc_c'::regclass);
-
     DELETE FROM public.it_conc_a WHERE id = 1;
     DELETE FROM public.it_conc_b WHERE id = 10;
     DELETE FROM public.it_conc_c WHERE id = 100;
-
-    t1 := clock_timestamp();
+    PERFORM flashback_test_inject_commit(
+        v_tracking_a, v_mid_lsn, clock_timestamp(), 959004,
+        jsonb_build_array(jsonb_build_object('op','DELETE','old','{"id":1,"val":"a1"}'::jsonb))
+    );
+    PERFORM flashback_test_inject_commit(
+        v_tracking_b, '0/6000'::pg_lsn, clock_timestamp(), 959005,
+        jsonb_build_array(jsonb_build_object('op','DELETE','old','{"id":10,"val":"b1"}'::jsonb))
+    );
+    PERFORM flashback_test_inject_commit(
+        v_tracking_c, '0/7000'::pg_lsn, clock_timestamp(), 959006,
+        jsonb_build_array(jsonb_build_object('op','DELETE','old','{"id":100,"val":"c1"}'::jsonb))
+    );
 
     DELETE FROM public.it_conc_a;
     DELETE FROM public.it_conc_b;
     DELETE FROM public.it_conc_c;
 
-    -- Multi-table restore
-    PERFORM flashback_restore(ARRAY['public.it_conc_a', 'public.it_conc_b', 'public.it_conc_c'], t1);
+    PERFORM flashback_restore_lsn('public.it_conc_a', v_mid_lsn);
+    PERFORM flashback_restore_lsn('public.it_conc_b', '0/6000'::pg_lsn);
+    PERFORM flashback_restore_lsn('public.it_conc_c', '0/7000'::pg_lsn);
 
     SELECT count(*) INTO v_cnt FROM public.it_conc_a;
     IF v_cnt <> 2 THEN
@@ -98,7 +119,6 @@ BEGIN
         RAISE EXCEPTION 'multi-restore conc_c: expected 3, got %', v_cnt;
     END IF;
 
-    -- Verify restore_log has entries (if table exists)
     IF to_regclass('flashback.restore_log') IS NOT NULL THEN
         SELECT count(*) INTO v_cnt FROM flashback.restore_log WHERE success;
         IF v_cnt < 3 THEN

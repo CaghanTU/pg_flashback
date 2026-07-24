@@ -366,6 +366,10 @@ mod tests {
         it_restore_verify_regression,
         "../tests/sql/integration/restore_verify_regression.sql"
     );
+    sql_test!(
+        it_disaster_points_ambiguous_generation,
+        "../tests/sql/integration/disaster_points_ambiguous_generation.sql"
+    );
 }
 
 /// This module is required by `cargo pgrx test` invocations.

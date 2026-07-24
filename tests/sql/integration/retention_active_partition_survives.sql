@@ -6,31 +6,33 @@
 -- day-of-month exceeded the retention interval.
 DO $tv$
 DECLARE
+    v_boot jsonb;
+    v_tracking_id bigint;
     v_active_part text := 'delta_log_' || to_char(CURRENT_DATE, 'YYYY_MM');
     v_delta_count bigint;
 BEGIN
     DROP TABLE IF EXISTS public.it_ret_guard;
     CREATE TABLE public.it_ret_guard (id int primary key, val text);
-    PERFORM flashback_track('public.it_ret_guard');
 
-    -- Partition covering today (what the worker's ensure-partitions step creates)
+    SELECT flashback_test_bootstrap_lifecycle('public.it_ret_guard') INTO v_boot;
+    v_tracking_id := (v_boot->>'tracking_id')::bigint;
+
     PERFORM flashback_ensure_delta_partition(CURRENT_DATE);
     IF to_regclass(format('flashback.%I', v_active_part)) IS NULL THEN
         RAISE EXCEPTION 'expected active partition % to exist', v_active_part;
     END IF;
 
-    -- A fresh captured event inside the retention window
-    INSERT INTO flashback.delta_log (
-        event_time, event_type, table_name, rel_oid, source_xid,
-        committed_at, schema_version, old_data, new_data
-    )
-    VALUES (
-        clock_timestamp(), 'INSERT', 'public.it_ret_guard',
-        'public.it_ret_guard'::regclass::oid, 1,
-        clock_timestamp(), 1, NULL, '{"id": 1, "val": "fresh"}'
+    INSERT INTO public.it_ret_guard VALUES (1, 'fresh');
+    PERFORM flashback_test_inject_commit(
+        v_tracking_id,
+        '0/2000'::pg_lsn,
+        clock_timestamp(),
+        950001,
+        jsonb_build_array(
+            jsonb_build_object('op', 'INSERT', 'new', '{"id":1,"val":"fresh"}'::jsonb)
+        )
     );
 
-    -- An obsolete partition entirely outside any retention window
     PERFORM flashback__create_range_partition(
         'delta_log_it_ret_old',
         '2020-01-01'::timestamptz,
@@ -39,7 +41,6 @@ BEGIN
 
     PERFORM flashback_apply_retention();
 
-    -- The active partition and its fresh delta must survive
     IF to_regclass(format('flashback.%I', v_active_part)) IS NULL THEN
         RAISE EXCEPTION 'retention dropped the active partition %', v_active_part;
     END IF;
@@ -51,7 +52,6 @@ BEGIN
         RAISE EXCEPTION 'retention destroyed fresh deltas (expected 1 event, found %)', v_delta_count;
     END IF;
 
-    -- The obsolete partition must be gone
     IF to_regclass('flashback.delta_log_it_ret_old') IS NOT NULL THEN
         RAISE EXCEPTION 'retention failed to drop the obsolete partition';
     END IF;
