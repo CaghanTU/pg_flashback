@@ -7,9 +7,12 @@ set -Eeuo pipefail
 CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
 PG_BIN="${PG_BIN:?PG_BIN is required}"
 KEEP="${KEEP:-0}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 WORK="${CLEAN_HOST_WORK:-/tmp/pgfb-clean-host-$RUN_ID}"
-RESULT_JSON="${CLEAN_HOST_RESULT:-$WORK/result.json}"
+# Persistent by default: transient WORK is removed on a completed, non-KEEP
+# run, so the evidence file itself must not live under WORK.
+RESULT_JSON="${CLEAN_HOST_RESULT:-$ROOT/target/qualification/clean-host-smoke-$RUN_ID.json}"
 MANIFEST="$CANDIDATE_DIR/MANIFEST.json"
 PORT=$((36000 + ($$ % 20000)))
 SOCKET="/tmp/pgfb-ch-$RUN_ID"
@@ -32,6 +35,9 @@ command -v jq >/dev/null || die "jq is required"
 [[ -f "$MANIFEST" ]] || die "MANIFEST.json missing"
 
 SOURCE_COMMIT="$(jq -r '.provenance.source_commit' "$MANIFEST")"
+SOURCE_TREE="$(jq -r '.provenance.source_tree' "$MANIFEST")"
+ARCH="$(jq -r '.provenance.arch' "$MANIFEST")"
+PG_MAJOR="$(jq -r '.provenance.pg_major' "$MANIFEST")"
 EXT_ARCHIVE="$(jq -r '.artifacts.extension_archive.name' "$MANIFEST")"
 PACKAGE_SHA="$(jq -r '.artifacts.package_sha256' "$MANIFEST")"
 EXT_SHA="$(jq -r '.artifacts.extension_binary_sha256' "$MANIFEST")"
@@ -84,15 +90,24 @@ write_result() {
     jq -n \
         --arg status "$status" \
         --arg source_commit "$SOURCE_COMMIT" \
+        --arg source_tree "$SOURCE_TREE" \
         --arg package_sha256 "$PACKAGE_SHA" \
         --arg extension_sha256 "$EXT_SHA" \
+        --arg cli_sha256 "$CLI_SHA" \
+        --arg arch "$ARCH" \
+        --arg pg_major "$PG_MAJOR" \
         --argjson assertions "$PASSED" \
         '{
           qualification_kind:"clean_host_local_delta",
           status:$status,
           source_commit:$source_commit,
+          source_tree:$source_tree,
           package_sha256:$package_sha256,
           extension_binary_sha256:$extension_sha256,
+          cli_binary_sha256:$cli_sha256,
+          arch:$arch,
+          pg_major:$pg_major,
+          install_source:"candidate_archives_only",
           assertions_passed:$assertions,
           external_backup_dependency:false
         }' >"$RESULT_JSON"
@@ -152,7 +167,7 @@ unix_socket_directories = '$SOCKET'
 port = $PORT
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
-pg_flashback.worker_interval_ms = 25
+pg_flashback.worker_interval_ms = 50
 pg_flashback.target_databases = 'postgres'
 pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB

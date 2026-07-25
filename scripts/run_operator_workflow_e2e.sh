@@ -1,32 +1,80 @@
 #!/usr/bin/env bash
 # Real-session E2E for the supported local operator CLI workflow:
 # doctor → protect → healthy → DROP → recover → healthy
+#
+# Runs entirely against an exact release-candidate archive: the extracted
+# candidate's own CLI (bin/pg_flashback) and the candidate's own extension
+# .so installed into the target PostgreSQL prefix. Never cargo-builds.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 [[ -n "${CANDIDATE_DIR:-}" ]] || { echo "FAIL: CANDIDATE_DIR is mandatory" >&2; exit 2; }
+# shellcheck source=scripts/lib/exact_candidate_identity.sh
 source "$ROOT/scripts/lib/exact_candidate_identity.sh"
-EXACT_CANDIDATE_FORCE_PREFIX=1 exact_candidate_bind_dir "$CANDIDATE_DIR"
-EXACT_CANDIDATE_FORCE_PREFIX=1 exact_candidate_install_into_prefix
+
+if [[ -n "${PG_BIN:-}" ]]; then
+    :
+elif [[ -n "${PG_CONFIG:-}" ]]; then
+    PG_BIN="$("$PG_CONFIG" --bindir)"
+fi
+
+exact_candidate_bind_dir "$CANDIDATE_DIR" || exit 1
+exact_candidate_install_into_prefix || exit 1
 
 CTL="$EC_EXT_ROOT/bin/pg_flashback"
+[[ -x "$CTL" ]] || { echo "FAIL: candidate CLI missing/executable at $CTL" >&2; exit 2; }
 CLI_SHA="$(exact_candidate_sha256 "$CTL")"
 MANIFEST_CLI_SHA="$(jq -r '.artifacts.cli_binary_sha256' "$MANIFEST")"
-[[ "$CLI_SHA" == "$MANIFEST_CLI_SHA" ]] || { echo "FAIL: CLI hash $CLI_SHA != MANIFEST $MANIFEST_CLI_SHA" >&2; exit 1; }
+[[ "$CLI_SHA" == "$MANIFEST_CLI_SHA" ]] || {
+    echo "FAIL: candidate CLI hash $CLI_SHA != MANIFEST cli_binary_sha256 $MANIFEST_CLI_SHA" >&2
+    exit 1
+}
+[[ "$EC_INSTALLED_SO_SHA" == "$EC_EXT_BIN_SHA" ]] || {
+    echo "FAIL: installed .so SHA $EC_INSTALLED_SO_SHA != candidate extension_binary_sha256 $EC_EXT_BIN_SHA" >&2
+    exit 1
+}
 
-# Verify installed .so explicitly to satisfy the requirement
-[[ "$EC_INSTALLED_SO_SHA" == "$EC_EXT_BIN_SHA" ]] || { echo "FAIL: installed .so SHA mismatch" >&2; exit 1; }
-
-PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
-# shellcheck source=scripts/qualification_provenance.sh
-source "$ROOT/scripts/qualification_provenance.sh"
-qualification_provenance_init "$ROOT" "$PG_CONFIG"
-PG_BIN="$("$PG_CONFIG" --bindir)"
+PG_CONFIG="$PG_BIN/pg_config"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-PORT="${PG_FLASHBACK_OPERATOR_PORT:-28947}"
+
+port_is_free() {
+    local p=$1
+    if command -v ss >/dev/null 2>&1; then
+        if ss -ltnH 2>/dev/null | awk -v p=":$p" '
+            $4 ~ p"$" || $4 ~ p"]$" { found=1; exit }
+            END { exit found ? 0 : 1 }
+        '; then
+            return 1
+        fi
+        return 0
+    fi
+    if (echo >/dev/tcp/127.0.0.1/"$p") 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+choose_port() {
+    local p="${PG_FLASHBACK_OPERATOR_PORT:-28947}"
+    if port_is_free "$p"; then
+        echo "$p"
+        return 0
+    fi
+    local _
+    for _ in $(seq 1 50); do
+        p=$((41000 + RANDOM % 20000))
+        if port_is_free "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo "FAIL: could not find a free TCP port" >&2
+    return 1
+}
+PORT="$(choose_port)" || exit 1
+
 WORK_ROOT="${PG_FLASHBACK_OPERATOR_WORK_ROOT:-$ROOT/target/operator-workflow-e2e/$RUN_ID}"
 DATA="$WORK_ROOT/data"
 SOCKET="/tmp/pgfb-op-$RUN_ID"
@@ -37,16 +85,23 @@ export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE="$DB"
 export PSQL_BIN="$PSQL"
 export PATH="$PG_BIN:$PATH"
 
+STATUS=FAIL
 cleanup() {
     local rc=$?
     set +e
-    "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
-    rm -rf "$DATA" "$SOCKET"
+    if [[ -f "$DATA/postmaster.pid" ]]; then
+        "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
+    fi
+    if [[ "$STATUS" == "PASS" ]]; then
+        rm -rf "$DATA" "$SOCKET"
+    else
+        echo "Evidence retained at $WORK_ROOT (status=$STATUS)" >&2
+    fi
+    exact_candidate_restore_prefix 2>/dev/null || echo "WARN: prefix restore failed" >&2
     exit "$rc"
 }
 trap cleanup EXIT
 
-[[ -x "$CTL" ]] || { echo "FAIL: $CTL missing/executable" >&2; exit 2; }
 [[ -f "$SHARE_DIR/extension/pg_flashback.control" ]] || {
     echo "FAIL: install extension first" >&2; exit 2; }
 
@@ -216,14 +271,23 @@ q "SELECT pg_reload_conf();" >/dev/null
 [[ "$(q "SELECT count(*) FROM pg_replication_slots WHERE database=current_database();")" == "0" ]] \
     || q "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database=current_database();" >/dev/null || true
 
-status=PASS
-cat >"$RESULT_JSON" <<EOF
-{
-  "run_id": "$RUN_ID",
-$(qualification_provenance_json "$(date -u +%Y-%m-%dT%H:%M:%SZ)"),
-  "status": "$status",
-  "workflow": ["doctor","protect","healthy","drop","recover","successor_healthy"]
-}
-EOF
-echo "Operator workflow E2E: $status ($RESULT_JSON)"
-[[ "$status" == "PASS" ]]
+exact_candidate_verify_end_state || { echo "FAIL: candidate end-state verification failed" >&2; exit 1; }
+
+STATUS=PASS
+identity_json="$(exact_candidate_identity_json)"
+jq -n \
+    --arg run_id "$RUN_ID" \
+    --arg status "$STATUS" \
+    --arg cli_path "$CTL" \
+    --arg cli_sha "$CLI_SHA" \
+    --argjson identity "$identity_json" \
+    --argjson workflow '["doctor","protect","healthy","drop","recover","successor_healthy"]' \
+    '{
+      run_id: $run_id,
+      status: $status,
+      workflow: $workflow,
+      cli_path: $cli_path,
+      cli_binary_sha256: $cli_sha
+    } + $identity' >"$RESULT_JSON"
+echo "Operator workflow E2E: $STATUS ($RESULT_JSON)"
+[[ "$STATUS" == "PASS" ]]
