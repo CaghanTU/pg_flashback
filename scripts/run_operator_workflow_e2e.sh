@@ -140,7 +140,7 @@ done
 
 # recover without --yes must refuse in non-interactive mode
 restore_rc=0
-"$CTL" recover public.op_flow --latest-drop >/tmp/pgfb-restore-deny.out 2>&1 || restore_rc=$?
+"$CTL" recover public.op_flow --latest-drop </dev/null >/tmp/pgfb-restore-deny.out 2>&1 || restore_rc=$?
 [[ "$restore_rc" != "0" ]] || { echo "FAIL: recover without --yes succeeded" >&2; exit 1; }
 
 "$CTL" recover public.op_flow --latest-drop --yes
