@@ -4,6 +4,20 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+[[ -n "${CANDIDATE_DIR:-}" ]] || { echo "FAIL: CANDIDATE_DIR is mandatory" >&2; exit 2; }
+source "$ROOT/scripts/lib/exact_candidate_identity.sh"
+EXACT_CANDIDATE_FORCE_PREFIX=1 exact_candidate_bind_dir "$CANDIDATE_DIR"
+EXACT_CANDIDATE_FORCE_PREFIX=1 exact_candidate_install_into_prefix
+
+CTL="$EC_EXT_ROOT/bin/pg_flashback"
+CLI_SHA="$(exact_candidate_sha256 "$CTL")"
+MANIFEST_CLI_SHA="$(jq -r '.artifacts.cli_binary_sha256' "$MANIFEST")"
+[[ "$CLI_SHA" == "$MANIFEST_CLI_SHA" ]] || { echo "FAIL: CLI hash $CLI_SHA != MANIFEST $MANIFEST_CLI_SHA" >&2; exit 1; }
+
+# Verify installed .so explicitly to satisfy the requirement
+[[ "$EC_INSTALLED_SO_SHA" == "$EC_EXT_BIN_SHA" ]] || { echo "FAIL: installed .so SHA mismatch" >&2; exit 1; }
+
 PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
 # shellcheck source=scripts/qualification_provenance.sh
 source "$ROOT/scripts/qualification_provenance.sh"
@@ -11,7 +25,6 @@ qualification_provenance_init "$ROOT" "$PG_CONFIG"
 PG_BIN="$("$PG_CONFIG" --bindir)"
 SHARE_DIR="$("$PG_CONFIG" --sharedir)"
 PSQL="$PG_BIN/psql"
-CTL="$ROOT/scripts/pg_flashback"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 PORT="${PG_FLASHBACK_OPERATOR_PORT:-28947}"
 WORK_ROOT="${PG_FLASHBACK_OPERATOR_WORK_ROOT:-$ROOT/target/operator-workflow-e2e/$RUN_ID}"
