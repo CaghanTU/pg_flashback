@@ -238,11 +238,11 @@ COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)
     IS 'Record a DDL event (ALTER/DROP/TRUNCATE) with a full schema snapshot into delta_log.';
 COMMENT ON FUNCTION flashback_collect_schema_def(oid)
     IS '[Internal] Collect full schema definition for a table OID as JSONB. Not callable by users.';
-COMMENT ON FUNCTION flashback_build_predicate(oid, jsonb)
+COMMENT ON FUNCTION flashback_build_predicate(jsonb, jsonb)
     IS '[Internal] Build a WHERE-clause predicate from a JSONB row payload.';
-COMMENT ON FUNCTION flashback_build_insert_parts(oid, jsonb)
+COMMENT ON FUNCTION flashback_build_insert_parts(jsonb, jsonb)
     IS '[Internal] Build column-list and values-list from a JSONB payload for INSERT.';
-COMMENT ON FUNCTION flashback_build_update_set(oid, jsonb)
+COMMENT ON FUNCTION flashback_build_update_set(jsonb, jsonb, text[])
     IS '[Internal] Build SET clause and PK WHERE clause for UPDATE replay from JSONB new_data.';
 COMMENT ON FUNCTION flashback_replay_batch_pk(text, text, oid, oid, timestamptz, timestamptz, text)
     IS '[Internal] Batch replay for PK tables — net-effect computation with bulk DELETE/UPSERT/UPDATE.';

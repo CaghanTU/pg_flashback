@@ -127,6 +127,8 @@ DECLARE
     v_pk_pred text;
     v_identity_override text := '';
     v_applied bigint := 0;
+    v_col_meta jsonb;
+    v_pk_cols text[];
 BEGIN
     IF p_destination_schema NOT IN ('flashback', 'pg_temp') THEN
         RAISE EXCEPTION 'flashback_materialize_lsn: destination schema % is not allowed',
@@ -206,6 +208,26 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: materialized schema has no insertable columns';
     END IF;
 
+    SELECT jsonb_object_agg(
+        a.attname,
+        jsonb_build_object(
+            'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
+            'is_array', (a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0),
+            'is_json', t.typname IN ('jsonb', 'json'),
+            'attnum', a.attnum
+        )
+    ) INTO v_col_meta
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = v_dest_oid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attgenerated = '';
+
+    SELECT ARRAY(
+        SELECT jsonb_array_elements_text(COALESCE(v_schema_def->'primary_key', '[]'::jsonb))
+    ) INTO v_pk_cols;
+
     SELECT CASE WHEN EXISTS (
                SELECT 1 FROM pg_attribute
                WHERE attrelid = v_dest_oid
@@ -235,8 +257,6 @@ BEGIN
           AND d.commit_lsn <= p_target_lsn
         ORDER BY d.commit_lsn, d.event_id
     LOOP
-        v_dest_oid := to_regclass(format('%I.%I', p_destination_schema, p_destination_table));
-
         IF rec.event_type = 'ALTER' THEN
             -- The destination was created directly from the target schema.
             CONTINUE;
@@ -244,14 +264,14 @@ BEGIN
             EXECUTE format('TRUNCATE TABLE %I.%I', p_destination_schema, p_destination_table);
         ELSIF rec.event_type = 'INSERT' THEN
             SELECT col_list, val_list INTO v_cols, v_vals
-            FROM flashback_build_insert_parts(v_dest_oid, rec.new_data);
+            FROM flashback_build_insert_parts(v_col_meta, rec.new_data);
             IF v_cols IS NOT NULL AND v_cols <> '' THEN
                 EXECUTE format('INSERT INTO %I.%I (%s)%s VALUES (%s)',
                                p_destination_schema, p_destination_table,
                                v_cols, v_identity_override, v_vals);
             END IF;
         ELSIF rec.event_type = 'DELETE' THEN
-            v_pred := flashback_build_predicate(v_dest_oid, rec.old_data);
+            v_pred := flashback_build_predicate(v_col_meta, rec.old_data);
             IF v_pred IS NOT NULL AND v_pred <> '' THEN
                 EXECUTE format(
                     'DELETE FROM %I.%I WHERE (tableoid, ctid) IN '
@@ -263,7 +283,7 @@ BEGIN
         ELSIF rec.event_type = 'UPDATE' THEN
             SELECT us.set_clause, us.pk_predicate
               INTO v_set_clause, v_pk_pred
-            FROM flashback_build_update_set(v_dest_oid, rec.new_data) us;
+            FROM flashback_build_update_set(v_col_meta, rec.new_data, v_pk_cols) us;
             IF v_set_clause IS NOT NULL AND v_set_clause <> ''
                AND v_pk_pred IS NOT NULL AND v_pk_pred <> ''
             THEN
@@ -271,7 +291,7 @@ BEGIN
                                p_destination_schema, p_destination_table,
                                v_set_clause, v_pk_pred);
             ELSE
-                v_pred := flashback_build_predicate(v_dest_oid, rec.old_data);
+                v_pred := flashback_build_predicate(v_col_meta, rec.old_data);
                 IF v_pred IS NOT NULL AND v_pred <> '' THEN
                     EXECUTE format(
                         'DELETE FROM %I.%I WHERE (tableoid, ctid) IN '
@@ -281,7 +301,7 @@ BEGIN
                     );
                 END IF;
                 SELECT col_list, val_list INTO v_cols, v_vals
-                FROM flashback_build_insert_parts(v_dest_oid, rec.new_data);
+                FROM flashback_build_insert_parts(v_col_meta, rec.new_data);
                 IF v_cols IS NOT NULL AND v_cols <> '' THEN
                     EXECUTE format('INSERT INTO %I.%I (%s)%s VALUES (%s)',
                                    p_destination_schema, p_destination_table,

@@ -33,51 +33,41 @@ BEGIN
 END
 $$;
 
-CREATE OR REPLACE FUNCTION flashback_build_predicate(target_rel oid, payload jsonb)
+CREATE OR REPLACE FUNCTION flashback_build_predicate(col_meta jsonb, payload jsonb)
 RETURNS text
 LANGUAGE sql
 AS $$
     SELECT string_agg(
         CASE
-            WHEN kv.value = 'null'::jsonb THEN format('%I IS NULL', a.attname)
-            -- For array columns: JSON [1,2,3] → PG '{1,2,3}'
-            WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
-                format('%I IS NOT DISTINCT FROM %L::%s', a.attname,
+            WHEN kv.value = 'null'::jsonb THEN format('%I IS NULL', kv.key)
+            WHEN (col_meta->kv.key->>'is_array')::boolean THEN
+                format('%I IS NOT DISTINCT FROM %L::%s', kv.key,
                     CASE WHEN jsonb_typeof(kv.value) = 'string'
                          THEN kv.value #>> '{}'
                          ELSE translate(kv.value::text, '[]', '{}') END,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod))
-            -- WAL decoding uses PostgreSQL's text output inside a JSON string;
-            -- trigger payloads carry a nested JSON value. Accept both without
-            -- turning a JSON object into a JSON string during replay.
-            WHEN t.typname IN ('jsonb', 'json') THEN
-                format('%I IS NOT DISTINCT FROM %L::%s', a.attname,
+                    col_meta->kv.key->>'type')
+            WHEN (col_meta->kv.key->>'is_json')::boolean THEN
+                format('%I IS NOT DISTINCT FROM %L::%s', kv.key,
                     CASE WHEN jsonb_typeof(kv.value) = 'string'
                          THEN kv.value #>> '{}'
                          ELSE kv.value::text END,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod))
+                    col_meta->kv.key->>'type')
             ELSE format(
                 '%I IS NOT DISTINCT FROM %L::%s',
-                a.attname,
+                kv.key,
                 kv.value #>> '{}',
-                pg_catalog.format_type(a.atttypid, a.atttypmod)
+                col_meta->kv.key->>'type'
             )
         END,
         ' AND '
-        ORDER BY a.attnum
+        ORDER BY (col_meta->kv.key->>'attnum')::int
     )
-    FROM pg_attribute a
-    JOIN pg_type t ON t.oid = a.atttypid
-    JOIN LATERAL jsonb_each(payload) kv(key, value)
-      ON kv.key = a.attname
-    WHERE a.attrelid = target_rel
-      AND a.attnum > 0
-      AND NOT a.attisdropped
-      AND a.attgenerated = '';
+    FROM jsonb_each(payload) kv(key, value)
+    WHERE col_meta ? kv.key;
 $$;
 
 CREATE OR REPLACE FUNCTION flashback_build_insert_parts(
-    target_rel oid,
+    col_meta jsonb,
     payload jsonb,
     OUT col_list text,
     OUT val_list text
@@ -85,41 +75,33 @@ CREATE OR REPLACE FUNCTION flashback_build_insert_parts(
 LANGUAGE sql
 AS $$
     SELECT
-        string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum),
+        string_agg(format('%I', kv.key), ', ' ORDER BY (col_meta->kv.key->>'attnum')::int),
         string_agg(
             CASE
                 WHEN kv.value = 'null'::jsonb THEN 'NULL'
-                -- For array columns: JSON [1,2,3] → PG '{1,2,3}'
-                WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
+                WHEN (col_meta->kv.key->>'is_array')::boolean THEN
                     format('%L::%s',
                         CASE WHEN jsonb_typeof(kv.value) = 'string'
                              THEN kv.value #>> '{}'
                              ELSE translate(kv.value::text, '[]', '{}') END,
-                        pg_catalog.format_type(a.atttypid, a.atttypmod))
-                -- Accept both nested trigger JSON and string-encoded WAL text.
-                WHEN t.typname IN ('jsonb', 'json') THEN
+                        col_meta->kv.key->>'type')
+                WHEN (col_meta->kv.key->>'is_json')::boolean THEN
                     format('%L::%s',
                         CASE WHEN jsonb_typeof(kv.value) = 'string'
                              THEN kv.value #>> '{}'
                              ELSE kv.value::text END,
-                        pg_catalog.format_type(a.atttypid, a.atttypmod))
+                        col_meta->kv.key->>'type')
                 ELSE format(
                     '%L::%s',
                     kv.value #>> '{}',
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    col_meta->kv.key->>'type'
                 )
             END,
             ', '
-            ORDER BY a.attnum
+            ORDER BY (col_meta->kv.key->>'attnum')::int
         )
-    FROM pg_attribute a
-    JOIN pg_type t ON t.oid = a.atttypid
-    JOIN LATERAL jsonb_each(payload) kv(key, value)
-      ON kv.key = a.attname
-    WHERE a.attrelid = target_rel
-      AND a.attnum > 0
-      AND NOT a.attisdropped
-      AND a.attgenerated = '';
+    FROM jsonb_each(payload) kv(key, value)
+    WHERE col_meta ? kv.key;
 $$;
 
 -- ----------------------------------------------------------------
@@ -128,83 +110,63 @@ $$;
 -- Excludes PK columns from the SET clause (they don't change).
 -- ----------------------------------------------------------------
 CREATE OR REPLACE FUNCTION flashback_build_update_set(
-    target_rel oid,
-    new_data   jsonb,
+    col_meta jsonb,
+    new_data jsonb,
+    pk_cols  text[],
     OUT set_clause text,
     OUT pk_predicate text
 )
 LANGUAGE sql
 AS $$
-    WITH pk_cols AS (
-        SELECT att.attname
-        FROM pg_index i
-        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-        JOIN pg_attribute att ON att.attrelid = i.indrelid AND att.attnum = k.attnum
-        WHERE i.indrelid = target_rel
-          AND i.indisprimary
-    )
     SELECT
-        -- SET clause: non-PK columns from new_data
         (SELECT string_agg(
             format(
                 '%I = %s',
-                a.attname,
+                kv.key,
                 CASE
                     WHEN kv.value = 'null'::jsonb THEN 'NULL'
-                    WHEN a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0 THEN
+                    WHEN (col_meta->kv.key->>'is_array')::boolean THEN
                         format('%L::%s',
                             CASE WHEN jsonb_typeof(kv.value) = 'string'
                                  THEN kv.value #>> '{}'
                                  ELSE translate(kv.value::text, '[]', '{}') END,
-                            pg_catalog.format_type(a.atttypid, a.atttypmod))
-                    WHEN t.typname IN ('jsonb', 'json') THEN
+                            col_meta->kv.key->>'type')
+                    WHEN (col_meta->kv.key->>'is_json')::boolean THEN
                         format('%L::%s',
                             CASE WHEN jsonb_typeof(kv.value) = 'string'
                                  THEN kv.value #>> '{}'
                                  ELSE kv.value::text END,
-                            pg_catalog.format_type(a.atttypid, a.atttypmod))
+                            col_meta->kv.key->>'type')
                     ELSE format(
                         '%L::%s',
                         kv.value #>> '{}',
-                        pg_catalog.format_type(a.atttypid, a.atttypmod)
+                        col_meta->kv.key->>'type'
                     )
                 END
             ),
             ', '
-            ORDER BY a.attnum
+            ORDER BY (col_meta->kv.key->>'attnum')::int
         )
-        FROM pg_attribute a
-        JOIN pg_type t ON t.oid = a.atttypid
-        JOIN LATERAL jsonb_each(new_data) kv(key, value)
-          ON kv.key = a.attname
-        WHERE a.attrelid = target_rel
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-          AND a.attgenerated = ''
-          AND a.attname NOT IN (SELECT attname FROM pk_cols)
+        FROM jsonb_each(new_data) kv(key, value)
+        WHERE col_meta ? kv.key
+          AND NOT (kv.key = ANY(pk_cols))
         ),
-        -- PK predicate: WHERE pk_col1 = val1 AND pk_col2 = val2
         (SELECT string_agg(
             CASE
-                WHEN kv.value = 'null'::jsonb THEN format('%I IS NULL', a.attname)
+                WHEN kv.value = 'null'::jsonb THEN format('%I IS NULL', kv.key)
                 ELSE format(
                     '%I = %L::%s',
-                    a.attname,
+                    kv.key,
                     kv.value #>> '{}',
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    col_meta->kv.key->>'type'
                 )
             END,
             ' AND '
-            ORDER BY a.attnum
+            ORDER BY (col_meta->kv.key->>'attnum')::int
         )
-        FROM pg_attribute a
-        JOIN pg_type t ON t.oid = a.atttypid
-        JOIN LATERAL jsonb_each(new_data) kv(key, value)
-          ON kv.key = a.attname
-        WHERE a.attrelid = target_rel
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-          AND a.attname IN (SELECT attname FROM pk_cols)
+        FROM jsonb_each(new_data) kv(key, value)
+        WHERE col_meta ? kv.key
+          AND kv.key = ANY(pk_cols)
         );
 $$;
 
