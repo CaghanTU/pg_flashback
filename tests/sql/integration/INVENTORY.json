@@ -241,6 +241,18 @@
       "class": "supported-core",
       "reason": "parallel restore via seam"
     },
+    "restore_metadata_enum_type.sql": {
+      "class": "supported-core",
+      "reason": "enum column metadata cache coverage via seam"
+    },
+    "restore_metadata_domain_type.sql": {
+      "class": "supported-core",
+      "reason": "domain column metadata cache coverage via seam"
+    },
+    "restore_metadata_no_pk_table.sql": {
+      "class": "supported-core",
+      "reason": "primary-key-less table metadata cache coverage via seam"
+    },
     "restore_verify_regression.sql": {
       "class": "infra",
       "reason": "restore verify helpers"

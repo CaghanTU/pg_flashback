@@ -270,6 +270,18 @@ mod tests {
         "../tests/sql/integration/composite_pk_restore.sql"
     );
     sql_test!(
+        it_restore_metadata_enum_type,
+        "../tests/sql/integration/restore_metadata_enum_type.sql"
+    );
+    sql_test!(
+        it_restore_metadata_domain_type,
+        "../tests/sql/integration/restore_metadata_domain_type.sql"
+    );
+    sql_test!(
+        it_restore_metadata_no_pk_table,
+        "../tests/sql/integration/restore_metadata_no_pk_table.sql"
+    );
+    sql_test!(
         it_sequence_restore,
         "../tests/sql/integration/sequence_restore.sql"
     );

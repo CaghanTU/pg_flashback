@@ -7,6 +7,8 @@ DECLARE
     v_vals text;
     v_set text;
     v_pred text;
+    v_col_meta jsonb;
+    v_pk_cols text[] := ARRAY['id'];
 BEGIN
     CREATE TEMP TABLE it_payload_types (
         id bigint PRIMARY KEY,
@@ -14,9 +16,27 @@ BEGIN
         nums integer[] NOT NULL
     );
 
+    -- Same collection query flashback_materialize_lsn uses to build col_meta
+    -- once per restore instead of re-probing the catalog per delta_log event.
+    SELECT jsonb_object_agg(
+        a.attname,
+        jsonb_build_object(
+            'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
+            'is_array', (a.attndims > 0 OR t.typlen = -1 AND t.typelem <> 0),
+            'is_json', t.typname IN ('jsonb', 'json'),
+            'attnum', a.attnum
+        )
+    ) INTO v_col_meta
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = 'pg_temp.it_payload_types'::regclass
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attgenerated = '';
+
     SELECT col_list, val_list INTO v_cols, v_vals
     FROM flashback_build_insert_parts(
-        'pg_temp.it_payload_types'::regclass,
+        v_col_meta,
         jsonb_build_object(
             'id', '1',
             'meta', '{"kind":"wal","nested":{"ok":true}}'::text,
@@ -33,12 +53,13 @@ BEGIN
 
     SELECT set_clause, pk_predicate INTO v_set, v_pred
     FROM flashback_build_update_set(
-        'pg_temp.it_payload_types'::regclass,
+        v_col_meta,
         jsonb_build_object(
             'id', 1,
             'meta', jsonb_build_object('kind','trigger','nested',jsonb_build_object('ok',true)),
             'nums', to_jsonb(ARRAY[4,5])
-        )
+        ),
+        v_pk_cols
     );
     EXECUTE format('UPDATE pg_temp.it_payload_types SET %s WHERE %s', v_set, v_pred);
     IF (SELECT jsonb_typeof(meta) FROM pg_temp.it_payload_types WHERE id=1) <> 'object'
@@ -49,7 +70,7 @@ BEGIN
     END IF;
 
     v_pred := flashback_build_predicate(
-        'pg_temp.it_payload_types'::regclass,
+        v_col_meta,
         jsonb_build_object(
             'id', '1',
             'meta', '{"kind":"trigger","nested":{"ok":true}}'::text,
