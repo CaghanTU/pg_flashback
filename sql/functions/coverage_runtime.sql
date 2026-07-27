@@ -490,20 +490,24 @@ BEGIN
 END;
 $$;
 
--- Resolve a caller-supplied table identifier to its active local_delta
--- lifecycle from flashback.tracked_tables metadata alone. Deliberately does
--- NOT call to_regclass(): DROP recovery must resolve a table whose physical
--- relation no longer exists, and tracked_tables is the authoritative source.
+-- Shared core for every tracked-table name resolution in the codebase. Both
+-- flashback_internal_resolve_tracked_table (active lifecycle only) and
+-- flashback_internal_resolve_tracked_table_any (active, falling back to
+-- historical/inactive -- see below) call this; no caller re-implements the
+-- identifier parsing or matching logic itself. Deliberately does NOT call
+-- to_regclass(): DROP recovery must resolve a table whose physical relation
+-- no longer exists, and tracked_tables is the authoritative source.
 -- pg_catalog.parse_ident() is the only identifier parser used (strict mode:
 -- trailing garbage after the identifier is rejected, not silently ignored),
 -- so this never builds dynamic SQL from an untrusted string and never calls
 -- an unqualified function that a same-named object in public could shadow.
 --   1 part  (table)        -> match tracked_tables.table_name; more than one
---                              active match across schemas fails closed.
+--                              matching row across schemas fails closed.
 --   2 parts (schema.table) -> exact schema_name + table_name match.
 -- Anything else (0 parts, or 3+ for a database-qualified name) fails closed.
-CREATE OR REPLACE FUNCTION flashback_internal_resolve_tracked_table(
-    p_target_table text
+CREATE OR REPLACE FUNCTION flashback_internal_resolve_tracked_table_tier(
+    p_target_table text,
+    p_active_only boolean
 )
 RETURNS TABLE (
     tracking_id bigint,
@@ -551,7 +555,7 @@ BEGIN
         WITH matches AS MATERIALIZED (
             SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
             FROM flashback.tracked_tables tt
-            WHERE tt.is_active
+            WHERE (NOT p_active_only OR tt.is_active)
               AND tt.recovery_profile = 'local_delta'
               AND tt.schema_name = v_schema
               AND tt.table_name = v_table
@@ -589,7 +593,7 @@ BEGIN
         WITH matches AS MATERIALIZED (
             SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name
             FROM flashback.tracked_tables tt
-            WHERE tt.is_active
+            WHERE (NOT p_active_only OR tt.is_active)
               AND tt.recovery_profile = 'local_delta'
               AND tt.table_name = v_table
         )
@@ -618,16 +622,77 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM PUBLIC;
+-- Active-lifecycle mode: the resolver used by every destructive/locking
+-- workflow (recover plan/begin/execute, unprotect, untrack, ...).
+CREATE OR REPLACE FUNCTION flashback_internal_resolve_tracked_table(
+    p_target_table text
+)
+RETURNS TABLE (
+    tracking_id bigint,
+    rel_oid oid,
+    schema_name text,
+    table_name text
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+    SELECT * FROM public.flashback_internal_resolve_tracked_table_tier(p_target_table, true);
+$$;
+
+-- Historical-fallback mode for read-only display/diagnostic callers
+-- (flashback_resolve_lifecycle_name, flashback_disaster_points) that must
+-- still be able to name a lifecycle that was unprotected and never
+-- retracked. Two independently ambiguity-safe tiers, never a single query
+-- that silently prefers "most recently active" among a mixed active+
+-- inactive candidate set: try the active-only tier first (fails closed if
+-- more than one active lifecycle matches); only if that tier found zero
+-- rows does it fall back to the unrestricted tier (active or inactive),
+-- which itself fails closed if more than one row -- of any activity state
+-- -- matches. A currently active lifecycle is therefore always preferred
+-- over a same-named historical one (matching the retrack-after-unprotect
+-- case), and an ambiguous historical name is rejected exactly like an
+-- ambiguous active one, never resolved by recency.
+CREATE OR REPLACE FUNCTION flashback_internal_resolve_tracked_table_any(
+    p_target_table text
+)
+RETURNS TABLE (
+    tracking_id bigint,
+    rel_oid oid,
+    schema_name text,
+    table_name text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+BEGIN
+    RETURN QUERY SELECT * FROM public.flashback_internal_resolve_tracked_table_tier(p_target_table, true);
+    IF FOUND THEN
+        RETURN;
+    END IF;
+    RETURN QUERY SELECT * FROM public.flashback_internal_resolve_tracked_table_tier(p_target_table, false);
+END;
+$$;
 
 DO $$
+DECLARE
+    v_fn text;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
-        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM flashback_admin';
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
-        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_resolve_tracked_table(text) FROM pg_monitor';
-    END IF;
+    FOREACH v_fn IN ARRAY ARRAY[
+        'public.flashback_internal_resolve_tracked_table_tier(text, boolean)',
+        'public.flashback_internal_resolve_tracked_table(text)',
+        'public.flashback_internal_resolve_tracked_table_any(text)'
+    ]
+    LOOP
+        EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM flashback_admin', v_fn);
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM pg_monitor', v_fn);
+        END IF;
+    END LOOP;
 END
 $$;
 

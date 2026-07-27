@@ -268,13 +268,16 @@ BEGIN
         RAISE EXCEPTION 'flashback_disaster_points: lookback must be positive';
     END IF;
 
-    -- Resolve via the single canonical, ambiguity-safe resolver so post-DROP
-    -- discovery still works when the live OID is gone but the tracking
-    -- lifecycle row remains, and an ambiguous unqualified name fails closed
-    -- instead of silently picking one schema's table.
+    -- Historical-fallback mode of the single canonical resolver: post-DROP
+    -- discovery works when the live OID is gone but the tracking lifecycle
+    -- row remains (is_active stays true across a DROP -- only unprotect
+    -- clears it), and this diagnostic must also still be able to report a
+    -- lifecycle's disaster history after it was unprotected and never
+    -- retracked. An ambiguous unqualified name (active or historical) fails
+    -- closed instead of silently picking one schema's table.
     SELECT r.tracking_id, r.schema_name, r.table_name
       INTO v_tracking_id, v_schema, v_table
-    FROM public.flashback_internal_resolve_tracked_table(target_table) r;
+    FROM public.flashback_internal_resolve_tracked_table_any(target_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_disaster_points: no local_delta tracking lifecycle for %',

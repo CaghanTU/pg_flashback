@@ -162,3 +162,76 @@ BEGIN
     END IF;
 END;
 $test2$;
+
+-- A1 follow-up: flashback_resolve_lifecycle_name and flashback_disaster_points
+-- use the resolver's historical-fallback mode (flashback_internal_resolve_tracked_table_any),
+-- not the active-only mode -- they must still be able to name/report on a
+-- lifecycle that was unprotected and never retracked, while staying fail-closed
+-- on ambiguity within each tier and preferring an active match over a
+-- same-named historical one.
+DO $test3$
+DECLARE
+    v_tid_hist bigint;
+    v_tid_hist2 bigint;
+    v_resolved text;
+    v_failed boolean;
+BEGIN
+    DROP TABLE IF EXISTS it_amb_s1.hist_only CASCADE;
+    CREATE TABLE it_amb_s1.hist_only (id int PRIMARY KEY);
+    v_tid_hist := (flashback_test_bootstrap_lifecycle('it_amb_s1.hist_only')->>'tracking_id')::bigint;
+    UPDATE flashback.tracked_tables
+       SET is_active = false, protection_state = 'unprotected', unprotected_at = clock_timestamp()
+     WHERE tracking_id = v_tid_hist;
+
+    -- Only a historical (inactive) lifecycle exists for this name: display
+    -- resolution must still find it, not fall back to the raw input.
+    v_resolved := flashback_resolve_lifecycle_name('hist_only');
+    IF v_resolved <> 'it_amb_s1.hist_only' THEN
+        RAISE EXCEPTION 'flashback_resolve_lifecycle_name lost historical resolution: got %', v_resolved;
+    END IF;
+    -- Must not raise "no tracking lifecycle" for a historical-only name.
+    PERFORM 1 FROM flashback_disaster_points('hist_only', interval '1 hour');
+
+    -- A second, unrelated historical lifecycle with the SAME unqualified
+    -- name in a different schema: now two inactive candidates, zero active
+    -- -- must fail closed, never pick the most recently unprotected one.
+    DROP TABLE IF EXISTS it_amb_s2.hist_only CASCADE;
+    CREATE TABLE it_amb_s2.hist_only (id int PRIMARY KEY);
+    v_tid_hist2 := (flashback_test_bootstrap_lifecycle('it_amb_s2.hist_only')->>'tracking_id')::bigint;
+    UPDATE flashback.tracked_tables
+       SET is_active = false, protection_state = 'unprotected', unprotected_at = clock_timestamp()
+     WHERE tracking_id = v_tid_hist2;
+
+    v_failed := false;
+    BEGIN
+        PERFORM flashback_resolve_lifecycle_name('hist_only');
+    EXCEPTION WHEN OTHERS THEN
+        v_failed := true;
+    END;
+    IF NOT v_failed THEN
+        RAISE EXCEPTION 'flashback_resolve_lifecycle_name did not fail closed on ambiguous historical name';
+    END IF;
+
+    v_failed := false;
+    BEGIN
+        PERFORM 1 FROM flashback_disaster_points('hist_only', interval '1 hour');
+    EXCEPTION WHEN OTHERS THEN
+        v_failed := true;
+    END;
+    IF NOT v_failed THEN
+        RAISE EXCEPTION 'flashback_disaster_points did not fail closed on ambiguous historical name';
+    END IF;
+
+    -- Retrack one of them: an active match must now be preferred over the
+    -- still-ambiguous historical pair, not itself treated as a third
+    -- candidate in one flat ambiguity check.
+    DROP TABLE it_amb_s1.hist_only;
+    CREATE TABLE it_amb_s1.hist_only (id int PRIMARY KEY);
+    PERFORM flashback_test_bootstrap_lifecycle('it_amb_s1.hist_only');
+
+    v_resolved := flashback_resolve_lifecycle_name('hist_only');
+    IF v_resolved <> 'it_amb_s1.hist_only' THEN
+        RAISE EXCEPTION 'active lifecycle should be preferred over ambiguous historical pair: got %', v_resolved;
+    END IF;
+END;
+$test3$;

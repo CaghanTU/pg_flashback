@@ -25,13 +25,16 @@ BEGIN
         END IF;
     END IF;
 
-    -- Single canonical, ambiguity-safe resolver: an ambiguous unqualified
-    -- name must be rejected here too, not silently resolved to one of
-    -- several same-named lifecycles across schemas. A not-found name is not
-    -- an error for this display helper -- it falls back to the raw input.
+    -- Historical-fallback mode of the single canonical resolver: this is a
+    -- display helper, so a table that was tracked, later unprotected, and
+    -- never retracked must still resolve to its canonical name -- but an
+    -- ambiguous unqualified name (active or historical) must still be
+    -- rejected here too, never silently resolved to one of several
+    -- same-named lifecycles across schemas. A not-found name is not an
+    -- error for this display helper -- it falls back to the raw input.
     SELECT format('%I.%I', r.schema_name, r.table_name)
       INTO v_name
-    FROM public.flashback_internal_resolve_tracked_table(p_table) r;
+    FROM public.flashback_internal_resolve_tracked_table_any(p_table) r;
 
     RETURN COALESCE(v_name, p_table);
 END;
