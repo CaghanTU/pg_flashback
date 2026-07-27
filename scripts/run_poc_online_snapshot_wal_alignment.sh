@@ -417,6 +417,26 @@ install_oracle_sql() {
         shadow_table text,
         created_at timestamptz NOT NULL DEFAULT clock_timestamp()
     );
+    -- PoC-only, deliberately per-row-costly probe used ONLY to make a real
+    -- CREATE TABLE AS SELECT take deterministic, host-load-tolerant wall
+    -- clock time so an external poller can reliably observe it genuinely
+    -- 'active' in pg_stat_activity before a test crashes the cluster or lets
+    -- a concurrent writer run. VOLATILE prevents the planner from constant-
+    -- folding or hoisting it out of the per-row evaluation; referencing the
+    -- row's own id keeps it correlated. Two separate statements, not
+    -- 'pg_sleep($2) IS NULL OR $1 IS NOT NULL': the planner reorders OR
+    -- disjuncts by estimated cost and short-circuits once one is true, so a
+    -- single-expression version with a cheap escape hatch let pg_sleep
+    -- never actually run (verified empirically -- a 5-row CTAS with a
+    -- 0.5s/row sleep completed in under a millisecond). Two statements in
+    -- the function body forces the first (the sleep) to always execute;
+    -- only the second's result becomes the return value. Always returns
+    -- true, so it never changes which rows are selected, only how long
+    -- each row costs.
+    CREATE OR REPLACE FUNCTION poc_slowdown(bigint, numeric) RETURNS boolean AS \$sd\$
+        SELECT pg_sleep(\$2);
+        SELECT \$1 IS NOT NULL;
+    \$sd\$ LANGUAGE sql VOLATILE;
 
     -- Moves every currently-staged decoded_events row into the durable logs
     -- (commit_log / marker_log / change_log), then clears decoded_events.
@@ -840,6 +860,87 @@ SQL
 # validating this harness) a bash coproc/backgrounded process does not
 # survive across separate tool invocations -- everything here runs inside
 # one shell process tree, matching the coproc constraint for Protocol A too.
+
+# Same row-count formulas make_ordinary_table/make_toast_table use, without
+# an extra live COUNT(*) query (expensive at 1 GiB scale, and not needed
+# there anyway -- see compute_slowdown_per_row).
+estimate_table_rows() {
+    local size_mib=$1 profile=$2
+    if [[ "$profile" == "toast" ]]; then
+        echo $(( size_mib * 1024 * 1024 / 8200 ))
+    else
+        echo $(( size_mib * 1024 * 1024 / 120 ))
+    fi
+}
+
+# Per-row poc_slowdown() delay targeting ~target_s total CTAS duration,
+# clamped to a sane range. Only meant for small/dev-scale tables where a
+# real CTAS would otherwise finish faster than an external poller can
+# reliably observe it 'active' in pg_stat_activity; at 1 GiB scale a real
+# CTAS already takes several seconds on its own, so callers skip this.
+compute_slowdown_per_row() {
+    local rows=$1 target_s=${2:-2.0}
+    awk -v r="$rows" -v t="$target_s" \
+        'BEGIN{ if (r<1) r=1; d=t/r; if(d>0.02) d=0.02; if(d<0.0000005) d=0.0000005; printf "%.7f", d }'
+}
+
+# Polls pg_stat_activity for a backend tagged with application_name=$1
+# genuinely executing a CREATE TABLE ... AS SELECT (state=active, matching
+# query text) -- the deterministic 'copy-active' signal, not a guessed
+# sleep. Returns 1 (and the caller must treat that as an explicit FAIL, not
+# a silent pass) if never observed within timeout_s.
+poll_ctas_active() {
+    local app_name=$1 timeout_s=$2
+    local deadline=$(( $(date +%s) + timeout_s ))
+    local found
+    while true; do
+        found="$(q "$DB" "SELECT count(*) FROM pg_stat_activity
+            WHERE application_name = '$app_name' AND state = 'active'
+              AND query ILIKE 'CREATE TABLE%AS%SELECT%';")"
+        [[ "$found" -gt 0 ]] && return 0
+        (( $(date +%s) < deadline )) || return 1
+        sleep 0.01
+    done
+}
+
+run_protocol_b_writer_loop() {
+    local tbl=$1 profile=$2 stop_file=$3 ready_file=$4 counter_file=$5
+    local i=0 commits=0
+    while [[ ! -f "$stop_file" ]]; do
+        i=$((i+1))
+        if [[ "$profile" == "toast" ]]; then
+            q "$DB" "INSERT INTO $tbl VALUES (-$i, decode(repeat('00',200),'hex'));" >/dev/null 2>&1 \
+                && commits=$((commits+1))
+            # Large/incompressible TOAST mutation on an existing seed row.
+            q "$DB" "UPDATE $tbl SET blob = (SELECT decode(string_agg(md5((g||'-$i')::text), ''), 'hex')
+                       FROM generate_series(1,64) g) WHERE id = 1;" >/dev/null 2>&1 \
+                && commits=$((commits+1))
+        else
+            q "$DB" "INSERT INTO $tbl VALUES (-$i, 'writer-'||$i, $i, clock_timestamp());" >/dev/null 2>&1 \
+                && commits=$((commits+1))
+            q "$DB" "UPDATE $tbl SET payload = 'updated-'||$i WHERE id = 1;" >/dev/null 2>&1 \
+                && commits=$((commits+1))
+        fi
+        if (( i > 2 )); then
+            q "$DB" "DELETE FROM $tbl WHERE id = $(( -(i-2) ));" >/dev/null 2>&1 && commits=$((commits+1))
+        fi
+        if (( i % 5 == 0 )); then
+            # Genuinely multi-row: one commit touching several existing rows.
+            if [[ "$profile" == "toast" ]]; then
+                q "$DB" "BEGIN; UPDATE $tbl SET blob = decode(repeat('ff',80),'hex') WHERE id IN (1,2,3); COMMIT;" \
+                    >/dev/null 2>&1 && commits=$((commits+1))
+            else
+                q "$DB" "BEGIN; UPDATE $tbl SET payload = payload || '-multi' WHERE id IN (1,2,3); COMMIT;" \
+                    >/dev/null 2>&1 && commits=$((commits+1))
+            fi
+        fi
+        echo "$commits" >"$counter_file"
+        touch "$ready_file"
+        [[ -f "$stop_file" ]] && break
+        sleep 0.02
+    done
+}
+
 run_protocol_b() {
     local tbl=$1 slot=$2 size_mib=$3 profile=$4
     if [[ "$profile" == "toast" ]]; then make_toast_table "$tbl" "$size_mib"; else make_ordinary_table "$tbl" "$size_mib"; fi
@@ -853,7 +954,26 @@ run_protocol_b() {
     local go_file="$WORK_ROOT/${tbl}_copier_go"
     local done_file="$WORK_ROOT/${tbl}_copier_done"
     local copy_ms_file="$WORK_ROOT/${tbl}_copy_ms"
-    rm -f "$txn_started_file" "$lock_acquired_file" "$snapshot_fixed_file" "$go_file" "$done_file" "$copy_ms_file"
+    local ctas_done_file="$WORK_ROOT/${tbl}_ctas_done"
+    local writer_ready_file="$WORK_ROOT/${tbl}_writer_ready"
+    local writer_counter_file="$WORK_ROOT/${tbl}_writer_counter"
+    rm -f "$txn_started_file" "$lock_acquired_file" "$snapshot_fixed_file" "$go_file" "$done_file" \
+          "$copy_ms_file" "$ctas_done_file" "$writer_ready_file" "$writer_counter_file"
+
+    # At dev scale a real CTAS can finish faster than an external poller can
+    # reliably catch it 'active'; poc_slowdown() forces deterministic wall
+    # time so the copy-active proof below is real, not a race. At 1 GiB
+    # scale a real CTAS already takes several seconds on its own (measured:
+    # 4-5s), so the artificial cost is skipped there to avoid roughly
+    # doubling an already-substantial copy time.
+    local ctas_select="SELECT * FROM $tbl"
+    if (( size_mib <= 100 )); then
+        local est_rows slowdown_per_row
+        est_rows="$(estimate_table_rows "$size_mib" "$profile")"
+        slowdown_per_row="$(compute_slowdown_per_row "$est_rows" 2.0)"
+        ctas_select="SELECT * FROM $tbl WHERE poc_slowdown(id, $slowdown_per_row)"
+    fi
+    local app_name="poc_copier_${tbl}_$$"
 
     # Correct ordering per protocol B step 4: the copier's REPEATABLE READ
     # snapshot must be fixed (its first real read) WHILE the coordinator
@@ -875,7 +995,8 @@ run_protocol_b() {
     # O(1) instead of a full scan, which matters once the coordinator lock
     # is held for the whole duration of this read.
     (
-        "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt >"$WORK_ROOT/${tbl}_copier.out" 2>&1 <<SQL
+        PGAPPNAME="$app_name" "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt \
+            >"$WORK_ROOT/${tbl}_copier.out" 2>&1 <<SQL
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 \! touch "$txn_started_file"
 \! while [ ! -f "$lock_acquired_file" ]; do sleep 0.02; done
@@ -883,8 +1004,9 @@ SELECT 1 FROM $tbl LIMIT 1;
 \! touch "$snapshot_fixed_file"
 \! while [ ! -f "$go_file" ]; do sleep 0.02; done
 \! date +%s%3N > "${copy_ms_file}.start"
-CREATE TABLE ${tbl}_shadow_b AS SELECT * FROM $tbl;
+CREATE TABLE ${tbl}_shadow_b AS $ctas_select;
 \! date +%s%3N > "${copy_ms_file}.end"
+\! touch "$ctas_done_file"
 COMMIT;
 SQL
         touch "$done_file"
@@ -909,7 +1031,38 @@ SELECT pg_logical_emit_message(true, 'pg_flashback', '$marker_uuid');
 COMMIT;
 SQL
     t_lock1=$(now_ms)
+    # Marker committed and the coordinator lock released -- now let the
+    # copier proceed to its CTAS.
     touch "$go_file"
+
+    # Deterministic 'copy-active' signal: poll pg_stat_activity for the
+    # copier's tagged backend genuinely executing CREATE TABLE ... AS
+    # SELECT, not a guessed sleep. Explicit FAIL, never a silent PASS, if
+    # never observed.
+    local copy_active_observed="false"
+    if poll_ctas_active "$app_name" 20; then
+        copy_active_observed="true"
+    else
+        die "protocol B[$tbl]: never observed the copier's CTAS active in pg_stat_activity within timeout"
+    fi
+
+    # Concurrent writer: starts ONLY once CTAS is confirmed genuinely
+    # active (this line runs strictly after poll_ctas_active succeeded
+    # above), stops the moment CTAS itself finishes (ctas_done_file), so
+    # every one of its commits is provably inside the copy window.
+    run_protocol_b_writer_loop "$tbl" "$profile" "$ctas_done_file" \
+        "$writer_ready_file" "$writer_counter_file" &
+    local writer_pid=$!
+
+    deadline=$(( $(date +%s) + 20 ))
+    local writer_active_during_copy="false"
+    while [[ ! -f "$writer_ready_file" ]]; do
+        if [[ -f "$ctas_done_file" ]]; then break; fi
+        (( $(date +%s) < deadline )) || die "protocol B[$tbl]: concurrent writer produced no commit within timeout while CTAS was active"
+        sleep 0.02
+    done
+    [[ -f "$writer_ready_file" ]] && writer_active_during_copy="true"
+    [[ "$writer_active_during_copy" == "true" ]] || die "protocol B[$tbl]: writer never produced a proven commit during the copy window"
 
     deadline=$(( $(date +%s) + 120 ))
     while [[ ! -f "$done_file" ]]; do
@@ -917,7 +1070,11 @@ SQL
         sleep 0.1
     done
     wait "$copier_pid" 2>/dev/null || true
+    wait "$writer_pid" 2>/dev/null || true
     grep -qi "error" "$WORK_ROOT/${tbl}_copier.out" && die "protocol B: copier session error: $(cat "$WORK_ROOT/${tbl}_copier.out")"
+
+    local copy_window_commits; copy_window_commits="$(cat "$writer_counter_file" 2>/dev/null || echo 0)"
+    (( copy_window_commits > 0 )) || die "protocol B[$tbl]: copy_window_commits is 0 -- no proven concurrent churn during CTAS"
 
     local lock_granted_ms; lock_granted_ms="$(cat "$WORK_ROOT/${tbl}_lockgranted.ms" 2>/dev/null || echo "$t_lock1")"
     local copy_start copy_end
@@ -925,6 +1082,9 @@ SQL
     copy_end="$(cat "${copy_ms_file}.end" 2>/dev/null || echo 0)"
     record_metric "protocol_b.${tbl}.lock_hold_ms" "$((t_lock1-t_lock0))" "ms"
     record_metric "protocol_b.${tbl}.copy_ms" "$((copy_end-copy_start))" "ms"
+    record_metric "protocol_b.${tbl}.copy_active_observed" "$copy_active_observed" "bool"
+    record_metric "protocol_b.${tbl}.writer_active_during_copy" "$writer_active_during_copy" "bool"
+    record_metric "protocol_b.${tbl}.copy_window_commits" "$copy_window_commits" "count"
 
     # Resolve the marker's real COMMIT LSN from the shared slot itself, not
     # from client-side timing: consume once (also picking up the marker's
@@ -938,9 +1098,12 @@ SQL
     [[ -n "$boundary_lsn" ]] || die "protocol B: could not resolve marker $marker_xid's commit LSN from decoded WAL"
 
     local apply_out
-    apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$boundary_lsn'::pg_lsn);")"
+    apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$boundary_lsn'::pg_lsn, $oid);")"
     IFS='|' read -r b_commits b_ins b_upd b_del b_mark b_dup b_ooo <<<"$apply_out"
     [[ "$b_dup" == "0" && "$b_ooo" == "0" ]] || die "protocol B[$tbl]: duplicate_commits=$b_dup out_of_order=$b_ooo"
+    [[ "$b_ins" -gt 0 ]] || die "protocol B[$tbl]: inserts_replayed is 0, expected concurrent-writer inserts to replay"
+    [[ "$b_upd" -gt 0 ]] || die "protocol B[$tbl]: updates_replayed is 0, expected concurrent-writer updates to replay"
+    [[ "$b_del" -gt 0 ]] || die "protocol B[$tbl]: deletes_replayed is 0, expected concurrent-writer deletes to replay"
     record_metric "protocol_b.${tbl}.commits_replayed" "$b_commits" "count"
     record_metric "protocol_b.${tbl}.inserts_replayed" "$b_ins" "count"
     record_metric "protocol_b.${tbl}.updates_replayed" "$b_upd" "count"
@@ -962,6 +1125,11 @@ SQL
             SELECT 1 FROM $tbl t JOIN ${tbl}_shadow_b s USING (id)
             WHERE t.blob IS DISTINCT FROM s.blob OR octet_length(t.blob) IS DISTINCT FROM octet_length(s.blob));")"
         [[ "$toast_ok" == "t" ]] || die "protocol B[$tbl]: TOAST byte mismatch between live and shadow"
+        local toast_hash_live toast_hash_shadow
+        toast_hash_live="$(q "$DB" "SELECT md5(string_agg(md5(blob),'|' ORDER BY id)) FROM $tbl;")"
+        toast_hash_shadow="$(q "$DB" "SELECT md5(string_agg(md5(blob),'|' ORDER BY id)) FROM ${tbl}_shadow_b;")"
+        [[ "$toast_hash_live" == "$toast_hash_shadow" ]] || die "protocol B[$tbl]: aggregate TOAST hash mismatch"
+        record_metric "protocol_b.${tbl}.toast_hash" "$toast_hash_live" "hash"
     fi
 
     LAST_PROTOCOL_B_TABLE="$tbl"
@@ -969,7 +1137,7 @@ SQL
     LAST_PROTOCOL_B_BOUNDARY_LSN="$boundary_lsn"
     record_metric "protocol_b.${tbl}.table_oid" "$LAST_PROTOCOL_B_OID" "oid"
     record_metric "protocol_b.${tbl}.boundary_lsn" "$LAST_PROTOCOL_B_BOUNDARY_LSN" "lsn"
-    echo "protocol_b[$tbl]: OK rows=$rc_live lock_hold_ms=$((t_lock1-t_lock0)) commits_replayed=$b_commits" >&2
+    echo "protocol_b[$tbl]: OK rows=$rc_live lock_hold_ms=$((t_lock1-t_lock0)) commits_replayed=$b_commits copy_window_commits=$copy_window_commits ins=$b_ins upd=$b_upd del=$b_del" >&2
 }
 
 all_tracked_oids() { q "$DB" "SELECT string_agg(oid::text, ',') FROM poc_table_map;"; }
@@ -1654,14 +1822,15 @@ poc_cleanup_orphaned_artifacts() {
 run_restart_crash_scenarios() {
     local slot=$1
 
-    # A: marker committed, copy in flight (transaction open, has not yet
-    # even reached its CREATE TABLE), immediate crash. The in-flight
-    # transaction must vanish entirely; the marker (already committed
-    # before the crash) must remain durable and decodable; retry from a
-    # clean artifact must succeed with no lost/duplicate commit.
+    # A: marker committed, copy genuinely in flight -- crash is applied
+    # while a real CREATE TABLE ... AS SELECT is provably executing (not a
+    # client-side shell sleep that runs before the real query even starts).
+    # The in-flight transaction must vanish entirely; the marker (already
+    # committed before the crash) must remain durable and decodable; retry
+    # from a clean artifact must succeed with no lost/duplicate commit.
     local tbl=poc_restart_a
     q "$DB" "CREATE TABLE $tbl (id bigint PRIMARY KEY, v text); ALTER TABLE $tbl REPLICA IDENTITY FULL;
-             INSERT INTO $tbl SELECT g,'v'||g FROM generate_series(1,200) g;" >/dev/null
+             INSERT INTO $tbl SELECT g,'v'||g FROM generate_series(1,500) g;" >/dev/null
     local oid; oid="$(table_oid "$tbl")"
     q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_shadow_restart', 'id')
              ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;" >/dev/null
@@ -1669,26 +1838,48 @@ run_restart_crash_scenarios() {
 
     local marker_a_lsn; marker_a_lsn="$(named_txn_boundary "$slot" "restart-a-marker")"
 
+    # poc_slowdown() forces deterministic per-row wall-clock cost on the
+    # real CTAS below (500 rows targeting ~4s total) so pg_stat_activity can
+    # reliably catch it 'active' before the crash -- controlled slowdown for
+    # timing determinism, but the query executing and being crashed mid-run
+    # is real, not simulated.
+    local slowdown_a app_name_a
+    slowdown_a="$(compute_slowdown_per_row 500 4.0)"
+    app_name_a="poc_restart_a_$$"
     local ready_a="$WORK_ROOT/${tbl}_inflight_ready"
     rm -f "$ready_a"
-    "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -qAt >/dev/null 2>&1 <<SQL &
+    PGAPPNAME="$app_name_a" "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -qAt >/dev/null 2>&1 <<SQL &
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) FROM $tbl;
 \! touch "$ready_a"
-\! sleep 3
-CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl;
+CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl WHERE poc_slowdown(id, $slowdown_a);
 COMMIT;
 SQL
     local inflight_pid=$!
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$ready_a" ]]; do (( $(date +%s) < deadline )) || die "restart-a: in-flight copy did not start in time"; sleep 0.05; done
 
+    # Deterministic proof the CTAS is genuinely 'active' before the crash --
+    # never a guessed sleep. Explicit FAIL (never a silent proceed) if this
+    # cannot be confirmed.
+    local ctas_active_observed_before_crash="false"
+    if poll_ctas_active "$app_name_a" 15; then
+        ctas_active_observed_before_crash="true"
+    else
+        die "restart-a: never observed the in-flight CTAS active in pg_stat_activity before crash -- refusing to claim a mid-copy crash"
+    fi
+
     crash_restart_cluster || die "restart-a: cluster did not come back up after simulated crash"
+    local crash_applied_while_ctas_active="true"
     kill -KILL "$inflight_pid" 2>/dev/null || true
     wait "$inflight_pid" 2>/dev/null || true
+    record_metric "restart_15a.ctas_active_observed_before_crash" "$ctas_active_observed_before_crash" "bool"
+    record_metric "restart_15a.crash_applied_while_ctas_active" "$crash_applied_while_ctas_active" "bool"
 
     local orphan_exists; orphan_exists="$(q "$DB" "SELECT to_regclass('${tbl}_shadow_restart') IS NOT NULL;")"
     [[ "$orphan_exists" == "f" ]] || die "restart-a: an in-flight (uncommitted) copy left a visible artifact after crash recovery"
+    local partial_artifact_absent_after_restart="true"
+    record_metric "restart_15a.partial_artifact_absent_after_restart" "$partial_artifact_absent_after_restart" "bool"
 
     local slot_ok; slot_ok="$(q "$DB" "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$slot';")"
     [[ "$slot_ok" == "1" ]] || die "restart-a: shared slot did not survive crash recovery"
@@ -1716,9 +1907,13 @@ SQL
     retry_apply="$(q "$DB" "SELECT duplicate_commits,out_of_order FROM poc_apply_shadow(NULL, $oid);")"
     IFS='|' read -r retry_dup retry_ooo <<<"$retry_apply"
     [[ "$retry_ooo" == "0" ]] || die "restart-a: out-of-order commits after crash retry"
-    local fp_live fp_shadow
+    local fp_live fp_shadow rc_live_a rc_shadow_a
     fp_live="$(fingerprint_table "$tbl")"; fp_shadow="$(fingerprint_table "${tbl}_shadow_restart")"
-    [[ "$fp_live" == "$fp_shadow" ]] || die "restart-a: retry artifact does not match live table"
+    rc_live_a="$(row_count "$tbl")"; rc_shadow_a="$(row_count "${tbl}_shadow_restart")"
+    [[ "$fp_live" == "$fp_shadow" && "$rc_live_a" == "$rc_shadow_a" ]] \
+        || die "restart-a: retry artifact does not match live table (rows live=$rc_live_a shadow=$rc_shadow_a)"
+    local retry_passed="true"
+    record_metric "restart_15a.retry_passed" "$retry_passed" "bool"
     echo "restart-15a: in-flight copy crash-recovers to no artifact; marker durable; clean retry succeeded (redelivery dup handling exercised, retry_dup=$retry_dup)" >&2
 
     # B: copy commits fully, crash happens BEFORE a separate metadata-
