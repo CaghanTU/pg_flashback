@@ -1172,8 +1172,13 @@ named_txn_verify() {
     IFS='|' read -r _commits ins upd del _mark dup ooo <<<"$apply_out"
     [[ "$dup" == "0" && "$ooo" == "0" ]] || die "$case_name: duplicate_commits=$dup out_of_order=$ooo"
 
+    # Scoped to commits after before_lsn: change_log for this oid also holds
+    # the table's own seed-data inserts from named_txn_setup (decoded during
+    # this same boundary's ingest, since it is the first consume since the
+    # table was created), which must not be counted as scenario ops.
     local op_count
-    op_count="$(q "$DB" "SELECT count(*) FROM change_log WHERE oid=$oid;")"
+    op_count="$(q "$DB" "SELECT count(*) FROM change_log cl JOIN commit_log co ON co.xid = cl.xid
+                          WHERE cl.oid = $oid AND co.lsn > '$before_lsn'::pg_lsn;")"
     [[ "$op_count" == "$expect_ops" ]] || die "$case_name: decoded op count $op_count != expected $expect_ops"
 
     local fp_live fp_shadow rc_live rc_shadow
