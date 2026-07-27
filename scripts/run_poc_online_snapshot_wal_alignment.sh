@@ -75,11 +75,22 @@ DB=poc_align
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 
+# PIDs of every backgrounded psql/bash job this run spawns directly (Protocol
+# A/B copiers and writer loops, the export-snapshot connection, in-flight
+# crash-scenario copies, ...). cleanup()'s reap_run_children below bounds-
+# TERMs then KILLs every one of these on exit -- whatever the exit path:
+# normal completion, an early die() (e.g. a stuck CTAS blowing a timeout),
+# or a trapped signal -- so a slow/stuck child from THIS run never survives
+# past the run itself.
+declare -ag RUN_CHILD_PIDS=()
+register_child_pid() { RUN_CHILD_PIDS+=("$1"); }
+
 # ── Step lists per mode ──────────────────────────────────────────────────
 case "$MODE" in
     selftest)
         SIZE_MIB=1
-        qst_init dirty_tree_rejected candidate_mismatch_rejected missing_step_cannot_pass interrupt_yields_fail
+        qst_init dirty_tree_rejected candidate_mismatch_rejected missing_step_cannot_pass interrupt_yields_fail \
+            protocol_b_child_lifecycle_failsafe
         ;;
     dev)
         SIZE_MIB="${2:-64}"
@@ -101,6 +112,16 @@ case "$MODE" in
         # Handled entirely by the dedicated blocks below, which qst_init
         # their own step lists and exit before the shared cluster machinery.
         ;;
+    __selftest_child_protocol_b_failure)
+        # Deliberately falls through the SHARED build/cluster-bootstrap
+        # machinery below (unlike the two modes above) so it gets a real
+        # candidate build and a real cluster, then dispatches at the very
+        # bottom of the script. No qst_init here: run_protocol_b's own
+        # die() on the deliberately broken copier guarantees exit_code=1,
+        # which alone is sufficient for qst_compute_summary_json to report
+        # FAIL, so per-step tracking isn't needed for this synthetic mode.
+        SIZE_MIB=8
+        ;;
     *)
         die "unknown mode $MODE (use selftest|dev|scale)"
         ;;
@@ -114,10 +135,48 @@ trap 'qst_on_signal TERM' TERM
 EXTRA_JSON='{}'
 POSTGRES_STARTED=0
 
+# Bounded TERM-then-KILL reap of every directly-tracked child (RUN_CHILD_PIDS),
+# then a path-scoped sweep for grandchildren that were never directly
+# reapable by PID at all: a psql session's `\!` shell-escape (e.g. the
+# lock/snapshot-fix/copy-active file-wait polling loops used throughout this
+# harness) forks a real child process of THAT psql session, not of this
+# script, so SIGKILLing the psql PID alone (e.g. kill_export_connection)
+# orphans it. Every one of those grandchildren has this run's unique
+# WORK_ROOT baked into its own command line (the exact file path it polls
+# for), so `pkill -f "$WORK_ROOT"` reliably catches them without any risk of
+# matching another run's processes or an unrelated dev PostgreSQL cluster.
+reap_run_children() {
+    local pid
+    for pid in "${RUN_CHILD_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+    done
+    local waited=0 any_alive
+    while (( waited < 20 )); do
+        any_alive=0
+        for pid in "${RUN_CHILD_PIDS[@]:-}"; do
+            [[ -n "$pid" ]] || continue
+            kill -0 "$pid" 2>/dev/null && any_alive=1
+        done
+        (( any_alive == 0 )) && break
+        sleep 0.1
+        waited=$((waited+1))
+    done
+    for pid in "${RUN_CHILD_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null
+    done
+    [[ -n "${WORK_ROOT:-}" ]] && pkill -KILL -f "$WORK_ROOT" 2>/dev/null
+    return 0
+}
+
 cleanup() {
     local rc=$?
     set +e
     mkdir -p "$WORK_ROOT"
+
+    reap_run_children
 
     local summary_json
     summary_json="$(qst_compute_summary_json "$RUN_ID" "$MODE" "$rc" "$EXTRA_JSON")"
@@ -233,6 +292,7 @@ run_selftest() {
         "$ROOT/scripts/run_poc_online_snapshot_wal_alignment.sh" __selftest_child_interrupt_target \
             > "$WORK_ROOT/interrupt_child.out" 2>&1 &
         local child_pid=$!
+        register_child_pid "$child_pid"
         sleep 2
         kill -TERM "$child_pid" 2>/dev/null || true
         wait "$child_pid" 2>/dev/null || true
@@ -251,6 +311,24 @@ run_selftest() {
         rm -rf "$interrupt_result_dir" 2>/dev/null || true
     else
         qst_mark_step "interrupt_yields_fail" "fail" "no result.json found for interrupted child"
+        QST_FAILED=$((QST_FAILED + 1))
+    fi
+
+    # 4) Protocol B's copier failing deliberately (a broken CTAS) must not
+    #    leave its writer loop, or any \!-spawned file-wait grandchild,
+    #    running past the run: ctas_done_file alone cannot be the writer's
+    #    only stop signal (it never appears if the CTAS itself errors), so
+    #    this proves the separate writer_stop_file fail-safe path -- not
+    #    just the happy path already exercised by dev-mode runs.
+    local cf_out cf_run_id
+    cf_out="$("$ROOT/scripts/run_poc_online_snapshot_wal_alignment.sh" __selftest_child_protocol_b_failure 2>&1)" || true
+    cf_run_id="$(echo "$cf_out" | grep -oE '== PoC run [^ ]+' | head -1 | awk '{print $4}')"
+    if [[ -n "$cf_run_id" ]] \
+        && echo "$cf_out" | grep -q "PoC run $cf_run_id: FAIL" \
+        && ! pgrep -f "$cf_run_id" >/dev/null 2>&1; then
+        qst_mark_step "protocol_b_child_lifecycle_failsafe" "pass" "deliberate copier failure -> FAIL with zero leftover processes (run_id=$cf_run_id)"
+    else
+        qst_mark_step "protocol_b_child_lifecycle_failsafe" "fail" "run_id=$cf_run_id leftover=$(pgrep -af "${cf_run_id:-__none__}" 2>/dev/null | tr '\n' ';') output_tail=$(echo "$cf_out" | tail -5 | tr '\n' ';')"
         QST_FAILED=$((QST_FAILED + 1))
     fi
 }
@@ -417,26 +495,42 @@ install_oracle_sql() {
         shadow_table text,
         created_at timestamptz NOT NULL DEFAULT clock_timestamp()
     );
-    -- PoC-only, deliberately per-row-costly probe used ONLY to make a real
-    -- CREATE TABLE AS SELECT take deterministic, host-load-tolerant wall
-    -- clock time so an external poller can reliably observe it genuinely
-    -- 'active' in pg_stat_activity before a test crashes the cluster or lets
-    -- a concurrent writer run. VOLATILE prevents the planner from constant-
-    -- folding or hoisting it out of the per-row evaluation; referencing the
-    -- row's own id keeps it correlated. Two separate statements, not
-    -- 'pg_sleep(\$2) IS NULL OR \$1 IS NOT NULL': the planner reorders OR
-    -- disjuncts by estimated cost and short-circuits once one is true, so a
-    -- single-expression version with a cheap escape hatch let pg_sleep
-    -- never actually run (verified empirically -- a 5-row CTAS with a
-    -- 0.5s/row sleep completed in under a millisecond). Two statements in
-    -- the function body forces the first (the sleep) to always execute;
-    -- only the second's result becomes the return value. Always returns
-    -- true, so it never changes which rows are selected, only how long
-    -- each row costs.
-    CREATE OR REPLACE FUNCTION poc_slowdown(bigint, numeric) RETURNS boolean AS \$sd\$
-        SELECT pg_sleep(\$2);
-        SELECT \$1 IS NOT NULL;
+    -- PoC-only probe used ONLY to make a real CREATE TABLE AS SELECT take
+    -- deterministic, host-load-tolerant wall clock time so an external
+    -- poller can reliably observe it genuinely 'active' in pg_stat_activity
+    -- before a test crashes the cluster or lets a concurrent writer run.
+    -- Sleeps only on rows where abs(id) % \$2 = 0 (bounded to roughly
+    -- rows/stride calls -- see compute_slowdown_stride), NOT on every row:
+    -- a per-row micro-sleep was tried first and was NOT reliable, since
+    -- pg_sleep()'s own per-call overhead dominates once invoked hundreds of
+    -- thousands of times, ballooning a real CTAS from an intended ~2s to
+    -- minutes. CASE WHEN...THEN is a guaranteed-order SQL construct (unlike
+    -- an OR disjunct, which the planner may reorder/short-circuit by
+    -- estimated cost -- verified empirically with an earlier single-
+    -- expression OR version that let pg_sleep never actually run), so the
+    -- sleep branch is skipped entirely, not just made cheap, on every row
+    -- that doesn't match the stride. VOLATILE prevents the planner from
+    -- constant-folding or hoisting it out of the per-row evaluation.
+    -- Always returns true, so it never changes which rows are selected,
+    -- only how long the selected stride-boundary rows cost.
+    CREATE OR REPLACE FUNCTION poc_slowdown(bigint, bigint, numeric) RETURNS boolean AS \$sd\$
+        SELECT CASE WHEN abs(\$1) % \$2 = 0 THEN pg_sleep(\$3 / 1000.0) END;
+        SELECT true;
     \$sd\$ LANGUAGE sql VOLATILE;
+
+    -- Selftest-only: deliberately raises once id passes a threshold, so a
+    -- real CTAS can be made to fail PARTWAY THROUGH execution (after it has
+    -- already been genuinely 'active' for a while, not before or after) --
+    -- exercising the harness's own fail-safe child-process lifecycle (see
+    -- POC_FORCE_COPIER_ERROR in run_protocol_b) rather than any WAL-
+    -- alignment behavior. VOLATILE, and PostgreSQL does not reorder
+    -- VOLATILE function calls within one boolean expression relative to
+    -- each other, so this reliably fires only after poc_slowdown() has
+    -- already run for the same row when both appear ANDed together in one
+    -- WHERE clause, textually in that order.
+    CREATE OR REPLACE FUNCTION poc_selftest_force_fail(bigint, bigint) RETURNS boolean AS \$ff\$
+        SELECT CASE WHEN \$1 > \$2 THEN (1/0 = 1) ELSE true END;
+    \$ff\$ LANGUAGE sql VOLATILE;
 
     -- Moves every currently-staged decoded_events row into the durable logs
     -- (commit_log / marker_log / change_log), then clears decoded_events.
@@ -608,6 +702,7 @@ CREATE_REPLICATION_SLOT $slot LOGICAL pg_flashback EXPORT_SNAPSHOT;
 \! while [ ! -f "$EXPORT_GO" ]; do sleep 0.02; done
 SQL
     EXPORT_PID=$!
+    register_child_pid "$EXPORT_PID"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$EXPORT_READY" ]]; do
         if ! kill -0 "$EXPORT_PID" 2>/dev/null; then
@@ -697,6 +792,7 @@ run_protocol_a() {
         sleep 0.02
       done ) &
     local writer_pid=$!
+    register_child_pid "$writer_pid"
     sleep 0.3
 
     # Import and copy MUST be the same transaction: once SET TRANSACTION
@@ -721,6 +817,7 @@ COMMIT;
 \! touch "$copy_done"
 SQL
     local copier_a_pid=$!
+    register_child_pid "$copier_a_pid"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$copy_ready" ]]; do
         if ! kill -0 "$copier_a_pid" 2>/dev/null; then
@@ -832,6 +929,7 @@ COMMIT;
 \! touch "$life_done"
 SQL
     local life_pid=$!
+    register_child_pid "$life_pid"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$life_ready" ]]; do
         (( $(date +%s) < deadline )) || die "adversarial 14b: import did not confirm in time"
@@ -863,7 +961,7 @@ SQL
 
 # Same row-count formulas make_ordinary_table/make_toast_table use, without
 # an extra live COUNT(*) query (expensive at 1 GiB scale, and not needed
-# there anyway -- see compute_slowdown_per_row).
+# there anyway -- see compute_slowdown_stride).
 estimate_table_rows() {
     local size_mib=$1 profile=$2
     if [[ "$profile" == "toast" ]]; then
@@ -873,15 +971,29 @@ estimate_table_rows() {
     fi
 }
 
-# Per-row poc_slowdown() delay targeting ~target_s total CTAS duration,
-# clamped to a sane range. Only meant for small/dev-scale tables where a
-# real CTAS would otherwise finish faster than an external poller can
-# reliably observe it 'active' in pg_stat_activity; at 1 GiB scale a real
-# CTAS already takes several seconds on its own, so callers skip this.
-compute_slowdown_per_row() {
-    local rows=$1 target_s=${2:-2.0}
-    awk -v r="$rows" -v t="$target_s" \
-        'BEGIN{ if (r<1) r=1; d=t/r; if(d>0.02) d=0.02; if(d<0.0000005) d=0.0000005; printf "%.7f", d }'
+# Fixed per-triggered-row sleep for poc_slowdown(). A per-row micro-sleep
+# (e.g. 0.0000072s at ~280K rows) is NOT reliable: pg_sleep()'s own syscall
+# and function-call overhead dominates once it's invoked hundreds of
+# thousands of times, ballooning a real CTAS from an intended ~2s to
+# minutes -- exactly what a first version of this mechanism did in
+# practice. Sleeping ~20ms on a bounded, small number of rows instead
+# (see compute_slowdown_stride) keeps per-call overhead negligible relative
+# to the sleep itself while still producing a deterministic total delay.
+readonly SLOWDOWN_SLEEP_MS=20
+
+# Stride so that roughly target_calls rows (out of the full estimated row
+# count) trigger a SLOWDOWN_SLEEP_MS sleep in poc_slowdown()'s WHERE clause,
+# for a total artificial delay of roughly target_calls * SLOWDOWN_SLEEP_MS
+# (~100 * 20ms = ~2s by default). All other rows never call pg_sleep() at
+# all -- poc_slowdown()'s CASE WHEN only evaluates the sleep branch when
+# abs(id) % stride = 0, and CASE (unlike an OR-disjunct the planner can
+# reorder) is a guaranteed-order SQL construct, so this does not repeat the
+# short-circuit-defeat bug the single-expression OR version had. Same
+# stride/sleep_ms logic is used for both ordinary and TOAST profiles.
+compute_slowdown_stride() {
+    local rows=$1 target_calls=${2:-100}
+    awk -v r="$rows" -v c="$target_calls" \
+        'BEGIN{ if (r<1) r=1; if (c<1) c=1; s=int(r/c); if (s<1) s=1; print s }'
 }
 
 # Polls pg_stat_activity for a backend tagged with application_name=$1
@@ -952,13 +1064,53 @@ run_protocol_b() {
     local lock_acquired_file="$WORK_ROOT/${tbl}_lock_acquired"
     local snapshot_fixed_file="$WORK_ROOT/${tbl}_snapshot_fixed"
     local go_file="$WORK_ROOT/${tbl}_copier_go"
-    local done_file="$WORK_ROOT/${tbl}_copier_done"
+    local copier_finished_file="$WORK_ROOT/${tbl}_copier_finished"
+    local copier_exit_code_file="$WORK_ROOT/${tbl}_copier_exit_code"
     local copy_ms_file="$WORK_ROOT/${tbl}_copy_ms"
     local ctas_done_file="$WORK_ROOT/${tbl}_ctas_done"
+    # Separate from ctas_done_file: the writer's ONLY authoritative stop
+    # signal. ctas_done_file is touched only when the CTAS itself succeeds,
+    # so if the CTAS (or any later statement in the same transaction)
+    # errors, ctas_done_file never appears and a writer keyed on it alone
+    # would run forever. writer_stop_file is instead guaranteed by the
+    # copier subshell's own EXIT trap below, on every exit path.
+    local writer_stop_file="$WORK_ROOT/${tbl}_writer_stop"
     local writer_ready_file="$WORK_ROOT/${tbl}_writer_ready"
     local writer_counter_file="$WORK_ROOT/${tbl}_writer_counter"
-    rm -f "$txn_started_file" "$lock_acquired_file" "$snapshot_fixed_file" "$go_file" "$done_file" \
-          "$copy_ms_file" "$ctas_done_file" "$writer_ready_file" "$writer_counter_file"
+    rm -f "$txn_started_file" "$lock_acquired_file" "$snapshot_fixed_file" "$go_file" \
+          "$copier_finished_file" "$copier_exit_code_file" "$copy_ms_file" "$ctas_done_file" \
+          "$writer_stop_file" "$writer_ready_file" "$writer_counter_file"
+
+    local copier_pid="" writer_pid="" stop_children_called=0
+    # Bounded TERM-then-KILL of THIS call's copier/writer, called explicitly
+    # right before every die() below so both stop promptly at the exact
+    # point of failure, rather than only whenever the global EXIT-trap
+    # reaper (reap_run_children in cleanup()) eventually gets to them.
+    # Idempotent: safe to call more than once (e.g. a die() from inside
+    # here, then the global reaper again on the way out).
+    stop_protocol_b_children() {
+        (( stop_children_called == 1 )) && return 0
+        stop_children_called=1
+        touch "$writer_stop_file" 2>/dev/null
+        local pid
+        for pid in "$copier_pid" "$writer_pid"; do
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+        done
+        local waited=0 alive
+        while (( waited < 20 )); do
+            alive=0
+            for pid in "$copier_pid" "$writer_pid"; do
+                [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && alive=1
+            done
+            (( alive == 0 )) && break
+            sleep 0.1; waited=$((waited+1))
+        done
+        for pid in "$copier_pid" "$writer_pid"; do
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+            [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
+        done
+        return 0
+    }
 
     # At dev scale a real CTAS can finish faster than an external poller can
     # reliably catch it 'active'; poc_slowdown() forces deterministic wall
@@ -968,10 +1120,27 @@ run_protocol_b() {
     # doubling an already-substantial copy time.
     local ctas_select="SELECT * FROM $tbl"
     if (( size_mib <= 100 )); then
-        local est_rows slowdown_per_row
+        local est_rows stride calls_expected expected_total_ms
         est_rows="$(estimate_table_rows "$size_mib" "$profile")"
-        slowdown_per_row="$(compute_slowdown_per_row "$est_rows" 2.0)"
-        ctas_select="SELECT * FROM $tbl WHERE poc_slowdown(id, $slowdown_per_row)"
+        stride="$(compute_slowdown_stride "$est_rows" 100)"
+        calls_expected=$(( est_rows / stride )); (( calls_expected < 1 )) && calls_expected=1
+        expected_total_ms=$(( calls_expected * SLOWDOWN_SLEEP_MS ))
+        ctas_select="SELECT * FROM $tbl WHERE poc_slowdown(id, $stride, $SLOWDOWN_SLEEP_MS)"
+        record_metric "protocol_b.${tbl}.slowdown_stride" "$stride" "count"
+        record_metric "protocol_b.${tbl}.slowdown_calls_expected" "$calls_expected" "count"
+        record_metric "protocol_b.${tbl}.slowdown_sleep_ms" "$SLOWDOWN_SLEEP_MS" "ms"
+        record_metric "protocol_b.${tbl}.slowdown_expected_total_ms" "$expected_total_ms" "ms"
+        # Selftest-only fault injection (see run_selftest's
+        # protocol_b_child_lifecycle_failsafe gate): forces the CTAS to fail
+        # partway through -- after it has genuinely been 'active' for a
+        # while via poc_slowdown() above, not before or after -- so
+        # ctas_done_file never appears and the fail-safe writer_stop_file
+        # path (not the ctas_done_file happy path) is what's actually
+        # exercised.
+        if [[ "${POC_FORCE_COPIER_ERROR:-0}" == "1" ]]; then
+            local mid_id=$(( est_rows / 2 )); (( mid_id < 1 )) && mid_id=1
+            ctas_select="$ctas_select AND poc_selftest_force_fail(id, $mid_id)"
+        fi
     fi
     local app_name="poc_copier_${tbl}_$$"
 
@@ -995,6 +1164,18 @@ run_protocol_b() {
     # O(1) instead of a full scan, which matters once the coordinator lock
     # is held for the whole duration of this read.
     (
+        # Guaranteed on EVERY exit from this subshell -- success, a SQL
+        # error under ON_ERROR_STOP=1 (set -e is inherited into this
+        # subshell), or an external TERM/KILL -- so copier_finished_file and
+        # writer_stop_file are NEVER conditional on the CTAS itself having
+        # succeeded. Without this, a copier that errors partway through
+        # (e.g. the FORCE_COPIER_ERROR selftest fault, or any real crash)
+        # would never touch ctas_done_file, and a writer keyed on that alone
+        # would spin forever.
+        # shellcheck disable=SC2154  # ec is assigned by this same trap string at fire time
+        trap 'ec=$?; echo "$ec" >"'"$copier_exit_code_file"'" 2>/dev/null
+              touch "'"$writer_stop_file"'" "'"$copier_finished_file"'" 2>/dev/null
+              exit $ec' EXIT
         PGAPPNAME="$app_name" "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt \
             >"$WORK_ROOT/${tbl}_copier.out" 2>&1 <<SQL
 BEGIN ISOLATION LEVEL REPEATABLE READ;
@@ -1009,13 +1190,13 @@ CREATE TABLE ${tbl}_shadow_b AS $ctas_select;
 \! touch "$ctas_done_file"
 COMMIT;
 SQL
-        touch "$done_file"
     ) &
-    local copier_pid=$!
+    copier_pid=$!
+    register_child_pid "$copier_pid"
 
     local deadline=$(( $(date +%s) + 30 ))
     while [[ ! -f "$txn_started_file" ]]; do
-        (( $(date +%s) < deadline )) || die "protocol B: copier transaction did not start in time"
+        if (( $(date +%s) >= deadline )); then stop_protocol_b_children; die "protocol B: copier transaction did not start in time"; fi
         sleep 0.05
     done
 
@@ -1043,35 +1224,49 @@ SQL
     if poll_ctas_active "$app_name" 20; then
         copy_active_observed="true"
     else
+        stop_protocol_b_children
         die "protocol B[$tbl]: never observed the copier's CTAS active in pg_stat_activity within timeout"
     fi
 
-    # Concurrent writer: starts ONLY once CTAS is confirmed genuinely
-    # active (this line runs strictly after poll_ctas_active succeeded
-    # above), stops the moment CTAS itself finishes (ctas_done_file), so
-    # every one of its commits is provably inside the copy window.
-    run_protocol_b_writer_loop "$tbl" "$profile" "$ctas_done_file" \
+    # Concurrent writer: starts ONLY once CTAS is confirmed genuinely active
+    # (this line runs strictly after poll_ctas_active succeeded above),
+    # stops on writer_stop_file -- the copier subshell's own trap guarantees
+    # that file appears on ANY copier exit, success or failure, so the
+    # writer can never spin past the copier's own lifetime.
+    run_protocol_b_writer_loop "$tbl" "$profile" "$writer_stop_file" \
         "$writer_ready_file" "$writer_counter_file" &
-    local writer_pid=$!
+    writer_pid=$!
+    register_child_pid "$writer_pid"
 
     deadline=$(( $(date +%s) + 20 ))
     local writer_active_during_copy="false"
     while [[ ! -f "$writer_ready_file" ]]; do
-        if [[ -f "$ctas_done_file" ]]; then break; fi
-        (( $(date +%s) < deadline )) || die "protocol B[$tbl]: concurrent writer produced no commit within timeout while CTAS was active"
+        if [[ -f "$writer_stop_file" ]]; then break; fi
+        if (( $(date +%s) >= deadline )); then
+            stop_protocol_b_children
+            die "protocol B[$tbl]: concurrent writer produced no commit within timeout while CTAS was active"
+        fi
         sleep 0.02
     done
     [[ -f "$writer_ready_file" ]] && writer_active_during_copy="true"
-    [[ "$writer_active_during_copy" == "true" ]] || die "protocol B[$tbl]: writer never produced a proven commit during the copy window"
+    if [[ "$writer_active_during_copy" != "true" ]]; then
+        stop_protocol_b_children
+        die "protocol B[$tbl]: writer never produced a proven commit during the copy window"
+    fi
 
     deadline=$(( $(date +%s) + 120 ))
-    while [[ ! -f "$done_file" ]]; do
-        (( $(date +%s) < deadline )) || die "protocol B: copier did not finish in time"
+    while [[ ! -f "$copier_finished_file" ]]; do
+        if (( $(date +%s) >= deadline )); then stop_protocol_b_children; die "protocol B: copier did not finish in time"; fi
         sleep 0.1
     done
+    stop_protocol_b_children
     wait "$copier_pid" 2>/dev/null || true
     wait "$writer_pid" 2>/dev/null || true
-    grep -qi "error" "$WORK_ROOT/${tbl}_copier.out" && die "protocol B: copier session error: $(cat "$WORK_ROOT/${tbl}_copier.out")"
+
+    local copier_exit_code; copier_exit_code="$(cat "$copier_exit_code_file" 2>/dev/null || echo 1)"
+    if [[ "$copier_exit_code" != "0" ]] || grep -qi "error" "$WORK_ROOT/${tbl}_copier.out" 2>/dev/null; then
+        die "protocol B: copier session error (exit=$copier_exit_code): $(cat "$WORK_ROOT/${tbl}_copier.out" 2>/dev/null)"
+    fi
 
     local copy_window_commits; copy_window_commits="$(cat "$writer_counter_file" 2>/dev/null || echo 0)"
     (( copy_window_commits > 0 )) || die "protocol B[$tbl]: copy_window_commits is 0 -- no proven concurrent churn during CTAS"
@@ -1164,6 +1359,7 @@ SELECT pg_sleep(1);
 COMMIT;
 SQL
     local s1_writer_pid=$!
+    register_child_pid "$s1_writer_pid"
     sleep 0.2  # ensure the UPDATE's row lock is held before we try SHARE ROW EXCLUSIVE
 
     # Copier's snapshot-fixing read must happen WHILE the coordinator holds
@@ -1187,6 +1383,7 @@ SQL
         touch "$done_file"
     ) &
     local copier_pid=$!
+    register_child_pid "$copier_pid"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$txn_started_file" ]]; do (( $(date +%s) < deadline )) || die "s1: copier txn start timeout"; sleep 0.05; done
 
@@ -1261,6 +1458,7 @@ SQL
         touch "$done_file"
     ) &
     copier_pid=$!
+    register_child_pid "$copier_pid"
     deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$txn_started_file" ]]; do (( $(date +%s) < deadline )) || die "s2/3: copier txn start timeout"; sleep 0.05; done
     "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
@@ -1484,10 +1682,12 @@ UPDATE $tbl SET v = 'session1' WHERE id = 1;
 COMMIT;
 SQL
     local session1_pid=$!
+    register_child_pid "$session1_pid"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$ready1" ]]; do (( $(date +%s) < deadline )) || die "concurrent_pk_update: session1 did not reach ready"; sleep 0.05; done
     "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt -c "BEGIN; UPDATE $tbl SET v = 'session2' WHERE id = 1; COMMIT;" >/dev/null &
     local session2_pid=$!
+    register_child_pid "$session2_pid"
     sleep 0.3
     touch "$go1"
     wait "$session1_pid" 2>/dev/null || true
@@ -1553,6 +1753,7 @@ COMMIT;
 SQL
     ) &
     local p2_pid=$!
+    register_child_pid "$p2_pid"
     sleep 0.1  # let the copier's BEGIN + first SELECT actually acquire its ACCESS SHARE lock
 
     # Simulate the DDL request that policy 2 is trying to unblock quickly.
@@ -1561,6 +1762,7 @@ SQL
     # time out.
     "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt -c "ALTER TABLE $tbl ADD COLUMN extra2 int;" >/dev/null &
     local ddl_pid=$!
+    register_child_pid "$ddl_pid"
     local waited=0
     while true; do
         local waiting; waiting="$(q "$DB" "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
@@ -1601,6 +1803,7 @@ run_xmin_vacuum_measurement() {
         q "$DB" "UPDATE $churn SET v = v || 'x' WHERE id = (random()*9999+1)::int;" >/dev/null 2>&1 || true
       done ) &
     local churn_pid=$!
+    register_child_pid "$churn_pid"
 
     local copy_done="$WORK_ROOT/xmin_copy_done"
     rm -f "$copy_done"
@@ -1673,6 +1876,7 @@ SELECT 1 FROM $tbl LIMIT 1;
 COMMIT;
 SQL
         local copier_pid=$!
+        register_child_pid "$copier_pid"
         local deadline=$(( $(date +%s) + 10 ))
         while [[ ! -f "$txn_started" ]]; do (( $(date +%s) < deadline )) || die "write-stall dist: sample $i copier did not start"; sleep 0.02; done
 
@@ -1748,6 +1952,7 @@ SELECT pg_logical_emit_message(true, 'pg_flashback', '13-before');
 COMMIT;
 SQL
     local coord_pid=$!
+    register_child_pid "$coord_pid"
     sleep 0.5
     kill -KILL "$coord_pid" 2>/dev/null || true
     wait "$coord_pid" 2>/dev/null || true
@@ -1838,13 +2043,20 @@ run_restart_crash_scenarios() {
 
     local marker_a_lsn; marker_a_lsn="$(named_txn_boundary "$slot" "restart-a-marker")"
 
-    # poc_slowdown() forces deterministic per-row wall-clock cost on the
-    # real CTAS below (500 rows targeting ~4s total) so pg_stat_activity can
+    # poc_slowdown() forces deterministic wall-clock cost on the real CTAS
+    # below (500 rows, ~100 stride-boundary rows sleeping ~20ms each -- see
+    # compute_slowdown_stride -- for ~2s total) so pg_stat_activity can
     # reliably catch it 'active' before the crash -- controlled slowdown for
     # timing determinism, but the query executing and being crashed mid-run
     # is real, not simulated.
-    local slowdown_a app_name_a
-    slowdown_a="$(compute_slowdown_per_row 500 4.0)"
+    local stride_a calls_expected_a expected_total_ms_a app_name_a
+    stride_a="$(compute_slowdown_stride 500 100)"
+    calls_expected_a=$(( 500 / stride_a )); (( calls_expected_a < 1 )) && calls_expected_a=1
+    expected_total_ms_a=$(( calls_expected_a * SLOWDOWN_SLEEP_MS ))
+    record_metric "restart_15a.slowdown_stride" "$stride_a" "count"
+    record_metric "restart_15a.slowdown_calls_expected" "$calls_expected_a" "count"
+    record_metric "restart_15a.slowdown_sleep_ms" "$SLOWDOWN_SLEEP_MS" "ms"
+    record_metric "restart_15a.slowdown_expected_total_ms" "$expected_total_ms_a" "ms"
     app_name_a="poc_restart_a_$$"
     local ready_a="$WORK_ROOT/${tbl}_inflight_ready"
     rm -f "$ready_a"
@@ -1852,10 +2064,11 @@ run_restart_crash_scenarios() {
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) FROM $tbl;
 \! touch "$ready_a"
-CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl WHERE poc_slowdown(id, $slowdown_a);
+CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl WHERE poc_slowdown(id, $stride_a, $SLOWDOWN_SLEEP_MS);
 COMMIT;
 SQL
     local inflight_pid=$!
+    register_child_pid "$inflight_pid"
     local deadline=$(( $(date +%s) + 20 ))
     while [[ ! -f "$ready_a" ]]; do (( $(date +%s) < deadline )) || die "restart-a: in-flight copy did not start in time"; sleep 0.05; done
 
@@ -2067,6 +2280,12 @@ if [[ "$MODE" == "dev" ]]; then
     run_mode_dev
 elif [[ "$MODE" == "scale" ]]; then
     run_mode_scale
+elif [[ "$MODE" == "__selftest_child_protocol_b_failure" ]]; then
+    q "$DB" "SELECT pg_create_logical_replication_slot('poc_cf_slot','pg_flashback');" >/dev/null
+    POC_FORCE_COPIER_ERROR=1 run_protocol_b "poc_cf_tbl" "poc_cf_slot" "$SIZE_MIB" "ordinary"
+    # Unreachable: run_protocol_b must die() once the deliberately broken
+    # copier surfaces an error, so a real run never falls through to here.
+    die "protocol_b_failure selftest child: run_protocol_b did not fail on a deliberately broken copier"
 fi
 
 METRICS_ARR="$(jq -s '.' "$METRICS_JSON" 2>/dev/null || echo '[]')"
