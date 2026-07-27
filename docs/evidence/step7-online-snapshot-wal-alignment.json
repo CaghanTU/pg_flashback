@@ -1,0 +1,819 @@
+{
+  "generated_at": "2026-07-27T06:36:46Z",
+  "source_commit": "2423914a5ee16b67b63c3e0e5717c90f732bf14f",
+  "source_tree": "2a3ef5542d58146445f2464a3dba1a38c729b066",
+  "source_tree_dirty": false,
+  "extension_binary_sha256": "5657e332355acd1135faea819f90ffc9306078b5d5eddce717c6562210690c05",
+  "pg_major": "17",
+  "arch": "aarch64",
+  "candidate_archive_dir": "target/candidate/2423914a5ee16b67b63c3e0e5717c90f732bf14f",
+  "production_code_changed": false,
+  "runs": {
+    "dev_pass_1": {
+      "result_json_sha256": "9f40d93802d7ab7defc3aeced718d57c8428ec993353142ce51679a8ce969080",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_a.poc_a_tbl.import_ms",
+          "value": 54,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.copy_ms",
+          "value": 113,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.base_rows",
+          "value": 279620,
+          "unit": "rows"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.commits_replayed",
+          "value": 17,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.inserts_replayed",
+          "value": 17,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.slot_name",
+          "value": "poc_slot_a",
+          "unit": "identity"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.lock_hold_ms",
+          "value": 28,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.copy_ms",
+          "value": 111,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.table_oid",
+          "value": 16457,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.boundary_lsn",
+          "value": "0/A9AF008",
+          "unit": "lsn"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.lock_hold_ms",
+          "value": 29,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.copy_ms",
+          "value": 16,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.table_oid",
+          "value": 16469,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.boundary_lsn",
+          "value": "0/1AC5FA68",
+          "unit": "lsn"
+        },
+        {
+          "name": "adversarial.s1.lock_wait_ms",
+          "value": 806,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.lock_hold_ms",
+          "value": 26,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.copy_ms",
+          "value": 120,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.table_oid",
+          "value": 16570,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.boundary_lsn",
+          "value": "0/1EF72F80",
+          "unit": "lsn"
+        },
+        {
+          "name": "ddl_queue.policy1.ddl_wait_ms",
+          "value": 1798,
+          "unit": "ms"
+        },
+        {
+          "name": "ddl_queue.policy2.abort_cleanup_ms",
+          "value": 1,
+          "unit": "ms"
+        },
+        {
+          "name": "xmin.snapshot_hold_xmin_age",
+          "value": 353,
+          "unit": "xids"
+        },
+        {
+          "name": "xmin.churn_dead_tuples_during_hold",
+          "value": 538,
+          "unit": "tuples"
+        },
+        {
+          "name": "xmin.churn_dead_tuples_after_vacuum",
+          "value": 0,
+          "unit": "tuples"
+        },
+        {
+          "name": "xmin.active_backends_holding_xmin_after_release",
+          "value": 1,
+          "unit": "count"
+        },
+        {
+          "name": "write_stall_distribution.64mib.samples",
+          "value": 20,
+          "unit": "count"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p50_ms",
+          "value": 19,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p95_ms",
+          "value": 29,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p99_ms",
+          "value": 29,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.max_ms",
+          "value": 29,
+          "unit": "ms"
+        }
+      ]
+    },
+    "dev_pass_2": {
+      "result_json_sha256": "c1c79dbf9a3948e7e50552046f3bdb1cfdba6e68259eeceeaf9100c8dec2fc0c",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_a.poc_a_tbl.import_ms",
+          "value": 54,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.copy_ms",
+          "value": 126,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.base_rows",
+          "value": 279620,
+          "unit": "rows"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.commits_replayed",
+          "value": 19,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.inserts_replayed",
+          "value": 19,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.slot_name",
+          "value": "poc_slot_a",
+          "unit": "identity"
+        },
+        {
+          "name": "protocol_a.poc_a_tbl.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.lock_hold_ms",
+          "value": 30,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.copy_ms",
+          "value": 113,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.table_oid",
+          "value": 16457,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl1.boundary_lsn",
+          "value": "0/A9AFE18",
+          "unit": "lsn"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.lock_hold_ms",
+          "value": 30,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.copy_ms",
+          "value": 15,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.table_oid",
+          "value": 16469,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_tbl2.boundary_lsn",
+          "value": "0/1AC60A88",
+          "unit": "lsn"
+        },
+        {
+          "name": "adversarial.s1.lock_wait_ms",
+          "value": 779,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.lock_hold_ms",
+          "value": 29,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.copy_ms",
+          "value": 126,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.table_oid",
+          "value": 16570,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_b_toast.boundary_lsn",
+          "value": "0/1EF73E38",
+          "unit": "lsn"
+        },
+        {
+          "name": "ddl_queue.policy1.ddl_wait_ms",
+          "value": 1795,
+          "unit": "ms"
+        },
+        {
+          "name": "ddl_queue.policy2.abort_cleanup_ms",
+          "value": 0,
+          "unit": "ms"
+        },
+        {
+          "name": "xmin.snapshot_hold_xmin_age",
+          "value": 288,
+          "unit": "xids"
+        },
+        {
+          "name": "xmin.churn_dead_tuples_during_hold",
+          "value": 425,
+          "unit": "tuples"
+        },
+        {
+          "name": "xmin.churn_dead_tuples_after_vacuum",
+          "value": 0,
+          "unit": "tuples"
+        },
+        {
+          "name": "xmin.active_backends_holding_xmin_after_release",
+          "value": 1,
+          "unit": "count"
+        },
+        {
+          "name": "write_stall_distribution.64mib.samples",
+          "value": 20,
+          "unit": "count"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p50_ms",
+          "value": 21,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p95_ms",
+          "value": 32,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.p99_ms",
+          "value": 35,
+          "unit": "ms"
+        },
+        {
+          "name": "write_stall_distribution.64mib.max_ms",
+          "value": 35,
+          "unit": "ms"
+        }
+      ]
+    },
+    "scale_a_ordinary_1gib": {
+      "result_json_sha256": "374f626b866c0ed8394567116d62ab4f7c2042601f37707a39c3bec324e27076",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.import_ms",
+          "value": 53,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.copy_ms",
+          "value": 4388,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.base_rows",
+          "value": 8947848,
+          "unit": "rows"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.commits_replayed",
+          "value": 148,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.inserts_replayed",
+          "value": 148,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.slot_name",
+          "value": "poc_scale_slot_a",
+          "unit": "identity"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_ordinary.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "scale.a.ordinary.table_total_bytes",
+          "value": 1178591232,
+          "unit": "bytes"
+        },
+        {
+          "name": "scale.a.ordinary.logical_payload_bytes",
+          "value": 930554959,
+          "unit": "bytes"
+        }
+      ]
+    },
+    "scale_a_toast_1gib": {
+      "result_json_sha256": "123b36cc9e44c8b9abfe31881cd8a0fe14630536ca0095574b97446c5512627d",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_a.poc_scale_a_toast.import_ms",
+          "value": 53,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.copy_ms",
+          "value": 4314,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.base_rows",
+          "value": 130944,
+          "unit": "rows"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.commits_replayed",
+          "value": 150,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.inserts_replayed",
+          "value": 150,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.slot_name",
+          "value": "poc_scale_slot_a",
+          "unit": "identity"
+        },
+        {
+          "name": "protocol_a.poc_scale_a_toast.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "scale.a.toast.table_total_bytes",
+          "value": 1133346816,
+          "unit": "bytes"
+        },
+        {
+          "name": "scale.a.toast.logical_payload_bytes",
+          "value": 1077442632,
+          "unit": "bytes"
+        }
+      ]
+    },
+    "scale_b_ordinary_1gib": {
+      "result_json_sha256": "e31c7f53da77c84662809f12eeb2f09f5b953857b5b324e9d807408cf0269074",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.lock_hold_ms",
+          "value": 30,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.copy_ms",
+          "value": 5270,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_ordinary.boundary_lsn",
+          "value": "0/6DADAB78",
+          "unit": "lsn"
+        },
+        {
+          "name": "scale.b.ordinary.table_total_bytes",
+          "value": 1178615808,
+          "unit": "bytes"
+        },
+        {
+          "name": "scale.b.ordinary.logical_payload_bytes",
+          "value": 930545487,
+          "unit": "bytes"
+        }
+      ]
+    },
+    "scale_b_toast_1gib": {
+      "result_json_sha256": "7236cf1a343e2b36399406fd52c3069739f71f2750718a7fc5f644e518571e50",
+      "status": "PASS",
+      "metrics": [
+        {
+          "name": "protocol_b.poc_scale_b_toast.lock_hold_ms",
+          "value": 27,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.copy_ms",
+          "value": 4884,
+          "unit": "ms"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.commits_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.inserts_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.updates_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.deletes_replayed",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.markers_seen",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.duplicate_commits",
+          "value": 0,
+          "unit": "count"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.table_oid",
+          "value": 16433,
+          "unit": "oid"
+        },
+        {
+          "name": "protocol_b.poc_scale_b_toast.boundary_lsn",
+          "value": "0/487D87F0",
+          "unit": "lsn"
+        },
+        {
+          "name": "scale.b.toast.table_total_bytes",
+          "value": 1133338624,
+          "unit": "bytes"
+        },
+        {
+          "name": "scale.b.toast.logical_payload_bytes",
+          "value": 1077407232,
+          "unit": "bytes"
+        }
+      ]
+    }
+  },
+  "production_oracle_validation": {
+    "exact_wal_transaction_schema_matrix": {
+      "status": "passed",
+      "result": "target/exact-wal-matrix/results/exact-wal-matrix-20260727T063158Z-3529838.json"
+    },
+    "clean_host_candidate_smoke": {
+      "status": "PASS"
+    }
+  },
+  "overall_status": "PASS"
+}
