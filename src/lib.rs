@@ -391,6 +391,10 @@ mod tests {
         "../tests/sql/integration/capture_stream_authority_invariants.sql"
     );
     sql_test!(
+        it_operation_journal_restore_log_authority,
+        "../tests/sql/integration/operation_journal_restore_log_authority.sql"
+    );
+    sql_test!(
         it_exact_drop_identity_propagation,
         "../tests/sql/integration/exact_drop_identity_propagation.sql"
     );

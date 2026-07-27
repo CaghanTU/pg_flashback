@@ -1065,11 +1065,28 @@ BEGIN
            is_active = true
      WHERE tracking_id = admission.tracking_id;
 
-    INSERT INTO flashback.restore_log(
-        table_name, target_time, target_lsn, rows_affected, success
-    ) VALUES (
-        p_target_table, NULL, p_target_lsn, materialized.events_applied, true
-    );
+    -- A7: restore_log is a compatibility projection, not a second authority.
+    -- For an audited recover, the real outcome is decided later by the
+    -- operation journal (flashback_finalize_recover_operations/
+    -- flashback_recover_mark_failed/flashback_reconcile_recover_operations),
+    -- which alone writes this table's row once that outcome is known --
+    -- writing success=true here unconditionally would let this table claim
+    -- a restore succeeded before its coverage was ever verified healthy, and
+    -- since nothing here ever runs on a verification failure (this whole
+    -- function raises and rolls back instead), success would never be able
+    -- to read false either. The unaudited escape-hatch path has no journal
+    -- entry and no later re-verification at all, so this synchronous,
+    -- already-passed data-verification IS the only and final truth for it.
+    -- Fetched here (not reused from below): this is a pure backend-local
+    -- read with no side effects, and the point of this specific check is
+    -- "is this call audited," decided once, right where it gates the write.
+    IF flashback_internal_get_audited_recover_context() IS NULL THEN
+        INSERT INTO flashback.restore_log(
+            table_name, target_time, target_lsn, rows_affected, success
+        ) VALUES (
+            p_target_table, NULL, p_target_lsn, materialized.events_applied, true
+        );
+    END IF;
 
     -- The restore transaction swaps the user relation while capture is
     -- suppressed, so its post-restore generation also needs an explicit WAL

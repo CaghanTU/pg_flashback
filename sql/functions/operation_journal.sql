@@ -331,8 +331,10 @@ SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_state text;
+    v_table_name text;
+    v_target_lsn pg_lsn;
 BEGIN
-    SELECT state INTO v_state
+    SELECT state, table_name, target_lsn INTO v_state, v_table_name, v_target_lsn
     FROM flashback.operation_current_state
     WHERE operation_id = p_operation_id;
 
@@ -356,6 +358,16 @@ BEGIN
         COALESCE(p_error_code, 'restore_failed'),
         COALESCE(p_message, 'recover execute failed'),
         COALESCE(p_payload, '{}'::jsonb) || jsonb_build_object('phase', 'mark_failed')
+    );
+
+    -- A7: restore_log is a projection of this single authority, populated
+    -- exactly where the journal decides the terminal outcome -- the only
+    -- way this table can ever honestly record a failed restore.
+    INSERT INTO flashback.restore_log(
+        table_name, target_time, target_lsn, rows_affected, success, error_message
+    ) VALUES (
+        v_table_name, NULL, v_target_lsn, 0, false,
+        COALESCE(p_message, 'recover execute failed')
     );
 END;
 $$;
@@ -388,6 +400,12 @@ BEGIN
                 'finalizer', 'flashback_reconcile_recover_operations',
                 'stale_after', p_stale_after::text
             )
+        );
+        INSERT INTO flashback.restore_log(
+            table_name, target_time, target_lsn, rows_affected, success, error_message
+        ) VALUES (
+            r.table_name, NULL, r.target_lsn, 0, false,
+            'recover begin committed but execute never reached applied_coverage_pending'
         );
         v_n := v_n + 1;
     END LOOP;
@@ -442,6 +460,13 @@ BEGIN
                 r.operation_id, 'failed', NULL, 'restore_verification_failed',
                 'restore verification proof marked failed',
                 COALESCE(v_restore_verification, '{}'::jsonb)
+            );
+            INSERT INTO flashback.restore_log(
+                table_name, target_time, target_lsn, rows_affected, success, error_message
+            ) VALUES (
+                r.table_name, NULL, r.target_lsn,
+                COALESCE((v_payload->>'rows_affected')::bigint, 0), false,
+                'restore verification proof marked failed'
             );
             CONTINUE;
         END IF;
@@ -549,6 +574,12 @@ BEGIN
                 'boundary_lsn', v_cg.boundary_lsn,
                 'stream_id', v_cg.stream_id
             )
+        );
+        INSERT INTO flashback.restore_log(
+            table_name, target_time, target_lsn, rows_affected, success
+        ) VALUES (
+            r.table_name, NULL, r.target_lsn,
+            COALESCE((v_payload->>'rows_affected')::bigint, 0), true
         );
         v_n := v_n + 1;
     END LOOP;

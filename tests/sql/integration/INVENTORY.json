@@ -212,6 +212,10 @@
       "class": "supported-core",
       "reason": "non-public schema restore via seam"
     },
+    "operation_journal_restore_log_authority.sql": {
+      "class": "infra",
+      "reason": "restore_log must be populated only from the operation journal's own terminal transition (failed/abandoned), never eagerly written before the outcome is known"
+    },
     "partitioned_table_restore.sql": {
       "class": "infra",
       "reason": "partitioned parent track rejection"
