@@ -133,7 +133,6 @@ trap 'qst_on_signal TERM' TERM
 
 # ── Cleanup / evidence write (always runs) ───────────────────────────────
 EXTRA_JSON='{}'
-POSTGRES_STARTED=0
 
 # Bounded TERM-then-KILL reap of every directly-tracked child (RUN_CHILD_PIDS),
 # then a path-scoped sweep for grandchildren that were never directly
@@ -167,16 +166,31 @@ reap_run_children() {
         kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
     done
-    [[ -n "${WORK_ROOT:-}" ]] && pkill -KILL -f "$WORK_ROOT" 2>/dev/null
     return 0
 }
 
 cleanup() {
-    local rc=$?
+    local rc=$? effective_rc cleanup_failed=0
     set +e
     mkdir -p "$WORK_ROOT"
 
-    reap_run_children
+    reap_run_children || cleanup_failed=1
+
+    # bootstrap_cluster may run through qst_run_child (a subshell), so a
+    # shell flag set there is not reliable in the parent EXIT trap.  The
+    # cluster's own postmaster.pid is the authoritative ownership proof.
+    if [[ -f "$DATA/postmaster.pid" ]]; then
+        if ! "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1; then
+            "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 \
+                || cleanup_failed=1
+        fi
+    fi
+    # Only after the owned postmaster has stopped: its command line contains
+    # WORK_ROOT too, so sweeping earlier would SIGKILL the cluster and make a
+    # successful run look like a cleanup failure.  This sweep is solely for
+    # orphaned psql `\!` grandchildren that direct PID reaping cannot own.
+    [[ -n "${WORK_ROOT:-}" ]] && pkill -KILL -f "$WORK_ROOT" 2>/dev/null
+    rm -rf "$SOCKET" 2>/dev/null || cleanup_failed=1
 
     # Measured BEFORE any deletion, and folded into EXTRA_JSON before the
     # summary is computed/written, so result.json always carries how much
@@ -190,19 +204,6 @@ cleanup() {
         ephemeral_disk_bytes="$(du -sb "$DATA" 2>/dev/null | awk '{print $1}')"
         [[ "$ephemeral_disk_bytes" =~ ^[0-9]+$ ]] || ephemeral_disk_bytes=0
     fi
-    EXTRA_JSON="$(echo "$EXTRA_JSON" | jq --argjson b "$ephemeral_disk_bytes" '. + {ephemeral_disk_bytes: $b}')"
-
-    local summary_json
-    summary_json="$(qst_compute_summary_json "$RUN_ID" "$MODE" "$rc" "$EXTRA_JSON")"
-    qst_write_summary_atomic "$RESULT_JSON" "$summary_json"
-    local overall
-    overall="$(jq -r '.status' "$RESULT_JSON" 2>/dev/null || echo FAIL)"
-
-    if [[ "$POSTGRES_STARTED" == "1" && -f "$DATA/postmaster.pid" ]]; then
-        "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 \
-            || "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
-    fi
-    rm -rf "$SOCKET" 2>/dev/null || true
 
     # $DATA and the copied $PGLIB_DIR are ephemeral cluster bytes, cleaned
     # by default regardless of PASS/FAIL -- they can be tens of GiB at scale
@@ -212,7 +213,11 @@ cleanup() {
     # touched here. Keeping a full failed cluster is opt-in only
     # (POC_KEEP_FAILED_DATA=1, FAIL only); POC_KEEP=1 keeps everything
     # regardless of status, for interactive debugging.
-    local keep_data=0
+    effective_rc=$rc
+    (( cleanup_failed == 0 )) || effective_rc=1
+    local preliminary overall keep_data=0
+    preliminary="$(qst_compute_summary_json "$RUN_ID" "$MODE" "$effective_rc" "$EXTRA_JSON")"
+    overall="$(jq -r '.status' <<<"$preliminary" 2>/dev/null || echo FAIL)"
     if [[ "${POC_KEEP:-0}" == "1" ]]; then
         keep_data=1
     elif [[ "$overall" != "PASS" && "${POC_KEEP_FAILED_DATA:-0}" == "1" ]]; then
@@ -221,12 +226,30 @@ cleanup() {
     if [[ "$keep_data" == "1" ]]; then
         echo "Evidence retained at $WORK_ROOT (status=$overall, DATA/PGLIB kept, ephemeral_disk_bytes=$ephemeral_disk_bytes)" >&2
     else
-        rm -rf "$DATA" "$PGLIB_DIR"
+        rm -rf "$DATA" "$PGLIB_DIR" || cleanup_failed=1
         echo "Evidence retained at $WORK_ROOT (status=$overall; ephemeral cluster data cleaned, ephemeral_disk_bytes=$ephemeral_disk_bytes)" >&2
     fi
 
     local leftover; leftover="$(pgrep -af "$WORK_ROOT" 2>/dev/null || true)"
-    [[ -z "$leftover" ]] || echo "WARNING: processes still reference $WORK_ROOT after cleanup: $leftover" >&2
+    if [[ -n "$leftover" ]]; then
+        echo "ERROR: processes still reference $WORK_ROOT after cleanup: $leftover" >&2
+        cleanup_failed=1
+    fi
+
+    effective_rc=$rc
+    (( cleanup_failed == 0 )) || effective_rc=1
+    EXTRA_JSON="$(echo "$EXTRA_JSON" | jq \
+        --argjson b "$ephemeral_disk_bytes" \
+        --argjson cleanup_ok "$([[ $cleanup_failed -eq 0 ]] && echo true || echo false)" \
+        '. + {ephemeral_disk_bytes: $b, cleanup_ok: $cleanup_ok}')"
+
+    # PASS is written only after child reaping, postmaster shutdown, socket
+    # removal, ephemeral-data cleanup, and the leftover-process audit have
+    # all completed successfully.
+    local summary_json
+    summary_json="$(qst_compute_summary_json "$RUN_ID" "$MODE" "$effective_rc" "$EXTRA_JSON")"
+    qst_write_summary_atomic "$RESULT_JSON" "$summary_json"
+    overall="$(jq -r '.status' "$RESULT_JSON" 2>/dev/null || echo FAIL)"
 
     echo "PoC run $RUN_ID: $overall ($RESULT_JSON)" >&2
     [[ "$overall" == "PASS" ]] && exit 0
@@ -433,7 +456,6 @@ listen_addresses = ''
 log_min_messages = warning
 EOF
     "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w >/dev/null
-    POSTGRES_STARTED=1
     PSQL=("$PG_BIN/psql" -h "$SOCKET" -p "$PORT" -v ON_ERROR_STOP=1)
     q() { local db=$1; shift; "${PSQL[@]}" -d "$db" -qAt -c "$*"; }
     "${PSQL[@]}" -d postgres -c "CREATE DATABASE $DB;" >/dev/null
@@ -456,7 +478,8 @@ restart_cluster() {
 # restart mid-copy" is meant to test -- a clean restart would just be an
 # orderly transaction abort, not a crash.
 crash_restart_cluster() {
-    "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w -t 30 >/dev/null 2>&1 || true
+    "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w -t 30 >/dev/null 2>&1 \
+        || return 1
     "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w -t 60 >/dev/null
     local _
     for _ in $(seq 1 120); do
@@ -505,6 +528,13 @@ install_oracle_sql() {
     CREATE TABLE decoded_events (seq bigserial PRIMARY KEY, data text);
     CREATE TABLE commit_log (xid bigint PRIMARY KEY, lsn pg_lsn, commit_time bigint);
     CREATE TABLE marker_log (xid bigint PRIMARY KEY, lsn pg_lsn);
+    -- Exact marker identity is recorded transactionally by the coordinator.
+    -- The output plugin deliberately emits only the xid, so selecting the
+    -- numerically latest marker would be a race under concurrent traffic.
+    CREATE TABLE marker_identity (
+        marker_text text PRIMARY KEY,
+        xid bigint NOT NULL UNIQUE
+    );
     CREATE TABLE change_log (seq bigserial PRIMARY KEY, xid bigint, oid bigint, op text,
                               old jsonb, new jsonb, applied boolean NOT NULL DEFAULT false);
     -- change_log/commit_log accumulate for the whole harness run (many
@@ -1147,11 +1177,12 @@ run_protocol_b() {
     record_metric "protocol_b.${tbl}.pre_protection_confirmed_flush_before" "$pre_protection_confirmed_flush_before" "lsn"
     record_metric "protocol_b.${tbl}.pre_protection_confirmed_flush_after" "$pre_protection_confirmed_flush_after" "lsn"
     record_metric "protocol_b.${tbl}.historical_prefix_advanced" "$historical_prefix_advanced" "bool"
-    # Structurally guaranteed, not measured: this table's historical bulk-
-    # load WAL was skip-advanced past above and physically never decoded, so
-    # it is by construction impossible for any of those events to appear in
-    # the replay set counted later in this function.
-    record_metric "protocol_b.${tbl}.historical_payload_events_replayed" "0" "count"
+    local historical_payload_events_replayed
+    historical_payload_events_replayed="$(q "$DB" "SELECT count(*) FROM change_log WHERE oid=$oid;")"
+    [[ "$historical_payload_events_replayed" == "0" ]] \
+        || die "protocol B[$tbl]: historical payload was decoded before protection ($historical_payload_events_replayed events)"
+    record_metric "protocol_b.${tbl}.historical_payload_events_replayed" \
+        "$historical_payload_events_replayed" "count"
 
     # Only NOW does this table enter the shared slot's protected/tracked
     # set -- no WAL from this point forward may ever be skipped.
@@ -1205,7 +1236,9 @@ run_protocol_b() {
         done
         for pid in "$copier_pid" "$writer_pid"; do
             [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
-            [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
+            # A child deliberately terminated above normally yields 143/137;
+            # that is successful cleanup, not the PoC scenario's exit status.
+            [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
         done
         return 0
     }
@@ -1306,6 +1339,8 @@ LOCK TABLE $tbl IN SHARE ROW EXCLUSIVE MODE;
 \! date +%s%3N > "$WORK_ROOT/${tbl}_lockgranted.ms"
 \! touch "$lock_acquired_file"
 \! while [ ! -f "$snapshot_fixed_file" ]; do sleep 0.02; done
+INSERT INTO marker_identity(marker_text, xid)
+VALUES ('$marker_uuid', txid_current()::text::bigint);
 SELECT pg_logical_emit_message(true, 'pg_flashback', '$marker_uuid');
 COMMIT;
 SQL
@@ -1385,8 +1420,11 @@ SQL
     consume_slot_to_events "$slot" "$(all_tracked_oids)"
     q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
     local marker_xid boundary_lsn
-    marker_xid="$(q "$DB" "SELECT xid FROM marker_log ORDER BY xid DESC LIMIT 1;")"
-    [[ -n "$marker_xid" ]] || die "protocol B: no marker found in decoded WAL"
+    marker_xid="$(q "$DB" "SELECT ml.xid
+        FROM marker_identity mi
+        JOIN marker_log ml USING (xid)
+        WHERE mi.marker_text = '$marker_uuid';")"
+    [[ -n "$marker_xid" ]] || die "protocol B: exact marker $marker_uuid not found in decoded WAL"
     boundary_lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid = $marker_xid;")"
     [[ -n "$boundary_lsn" ]] || die "protocol B: could not resolve marker $marker_xid's commit LSN from decoded WAL"
 
@@ -1503,6 +1541,8 @@ BEGIN;
 LOCK TABLE $tbl IN SHARE ROW EXCLUSIVE MODE;
 \! touch "$lock_acquired_file"
 \! while [ ! -f "$snapshot_fixed_file" ]; do sleep 0.02; done
+INSERT INTO marker_identity(marker_text, xid)
+VALUES ('s1-marker', txid_current()::text::bigint);
 SELECT pg_logical_emit_message(true, 'pg_flashback', 's1-marker');
 COMMIT;
 SQL
@@ -1529,7 +1569,7 @@ SQL
     consume_slot_to_events "$slot" "$oid"
     q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
     local s1_marker_xid s1_boundary_lsn s1_apply_out s1_dup s1_ooo
-    s1_marker_xid="$(q "$DB" "SELECT xid FROM marker_log ORDER BY xid DESC LIMIT 1;")"
+    s1_marker_xid="$(q "$DB" "SELECT ml.xid FROM marker_identity mi JOIN marker_log ml USING (xid) WHERE mi.marker_text='s1-marker';")"
     [[ -n "$s1_marker_xid" ]] || die "s1: no marker found in decoded WAL"
     s1_boundary_lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid = $s1_marker_xid;")"
     [[ -n "$s1_boundary_lsn" ]] || die "s1: could not resolve marker commit LSN"
@@ -1575,6 +1615,8 @@ BEGIN;
 LOCK TABLE $tbl IN SHARE ROW EXCLUSIVE MODE;
 \! touch "$lock_acquired_file"
 \! while [ ! -f "$snapshot_fixed_file" ]; do sleep 0.02; done
+INSERT INTO marker_identity(marker_text, xid)
+VALUES ('s2-marker', txid_current()::text::bigint);
 SELECT pg_logical_emit_message(true, 'pg_flashback', 's2-marker');
 COMMIT;
 SQL
@@ -1601,7 +1643,7 @@ SQL
     consume_slot_to_events "$slot" "$oid"
     q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
     local s2_marker_xid s2_boundary_lsn s2_apply_out s2_dup s2_ooo
-    s2_marker_xid="$(q "$DB" "SELECT xid FROM marker_log ORDER BY xid DESC LIMIT 1;")"
+    s2_marker_xid="$(q "$DB" "SELECT ml.xid FROM marker_identity mi JOIN marker_log ml USING (xid) WHERE mi.marker_text='s2-marker';")"
     [[ -n "$s2_marker_xid" ]] || die "s2/3: no marker found in decoded WAL"
     s2_boundary_lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid = $s2_marker_xid;")"
     [[ -n "$s2_boundary_lsn" ]] || die "s2/3: could not resolve s2-marker's commit LSN"
@@ -1639,11 +1681,15 @@ named_txn_setup() {
 
 named_txn_boundary() {
     local slot=$1 marker_text=$2
-    q "$DB" "SELECT pg_logical_emit_message(true, 'pg_flashback', '$marker_text');" >/dev/null
+    q "$DB" "BEGIN;
+        INSERT INTO marker_identity(marker_text, xid)
+        VALUES ('$marker_text', txid_current()::text::bigint);
+        SELECT pg_logical_emit_message(true, 'pg_flashback', '$marker_text');
+        COMMIT;" >/dev/null
     consume_slot_to_events "$slot" "$(all_tracked_oids)"
     q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
     local xid lsn
-    xid="$(q "$DB" "SELECT xid FROM marker_log ORDER BY xid DESC LIMIT 1;")"
+    xid="$(q "$DB" "SELECT ml.xid FROM marker_identity mi JOIN marker_log ml USING (xid) WHERE mi.marker_text='$marker_text';")"
     [[ -n "$xid" ]] || die "named-txn: no marker found for boundary '$marker_text'"
     lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid=$xid;")"
     [[ -n "$lsn" ]] || die "named-txn: could not resolve boundary lsn for '$marker_text'"
