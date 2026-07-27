@@ -1304,6 +1304,10 @@ BEGIN
         EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
             p_orig_schema, p_orig_table);
     END IF;
+    IF COALESCE((ddl_info->>'force_rls')::boolean, false) THEN
+        EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY',
+            p_orig_schema, p_orig_table);
+    END IF;
 
     FOR v_pol IN
         SELECT pol->>'name' AS name,
@@ -1394,6 +1398,37 @@ BEGIN
                     RAISE EXCEPTION 'flashback: GRANT % on %.% to % from schema_def failed: %',
                         v_acl_json.privilege, p_orig_schema, p_orig_table,
                         v_acl_json.grantee, SQLERRM;
+                END;
+            END LOOP;
+        END;
+    END IF;
+
+    -- Restore table/column comments captured in schema_def. DROP removes
+    -- pg_description rows with the relation, so this is the only source once
+    -- the live relation is gone.
+    IF jsonb_typeof(ddl_info->'comments') = 'array'
+       AND jsonb_array_length(ddl_info->'comments') > 0
+    THEN
+        DECLARE
+            v_comment_json record;
+        BEGIN
+            FOR v_comment_json IN
+                SELECT c->>'target' AS target,
+                       c->>'column' AS col,
+                       c->>'text' AS txt
+                FROM jsonb_array_elements(ddl_info->'comments') c
+            LOOP
+                BEGIN
+                    IF v_comment_json.target = 'column' THEN
+                        EXECUTE format('COMMENT ON COLUMN %I.%I.%I IS %L',
+                            p_orig_schema, p_orig_table, v_comment_json.col, v_comment_json.txt);
+                    ELSE
+                        EXECUTE format('COMMENT ON TABLE %I.%I IS %L',
+                            p_orig_schema, p_orig_table, v_comment_json.txt);
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    RAISE EXCEPTION 'flashback: COMMENT on %.% (target %, column %) from schema_def failed: %',
+                        p_orig_schema, p_orig_table, v_comment_json.target, v_comment_json.col, SQLERRM;
                 END;
             END LOOP;
         END;

@@ -265,6 +265,10 @@
       "class": "supported-core",
       "reason": "primary-key-less table metadata cache coverage via seam"
     },
+    "restore_verify_adversarial_metadata.sql": {
+      "class": "infra",
+      "reason": "post-swap catalog corruption (missing index, revoked ACL) must fail verification, proving the actual-proof digest is derived from the live catalog not re-derived from schema_def"
+    },
     "restore_verify_regression.sql": {
       "class": "infra",
       "reason": "restore verify helpers"

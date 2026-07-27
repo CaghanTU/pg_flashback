@@ -152,7 +152,8 @@ BEGIN
                'partitions', sv.constraints -> 'partitions',
                'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
                'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
-               'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false)
+               'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false),
+               'force_rls', COALESCE((sv.constraints -> 'force_rls')::boolean, false)
            )
       INTO v_schema_def
     FROM flashback.schema_versions sv
@@ -169,11 +170,14 @@ BEGIN
         WHERE snap.snapshot_id = admission.boundary_snapshot_id
           AND snap.tracking_id = admission.tracking_id;
     ELSE
-        -- schema_versions stores structural pieces only; ownership metadata for
-        -- dropped-table reconstruct lives on the boundary snapshot schema_def.
+        -- schema_versions stores structural pieces only; ownership/ACL/comment
+        -- metadata for dropped-table reconstruct lives on the boundary
+        -- snapshot schema_def.
         SELECT v_schema_def || jsonb_strip_nulls(jsonb_build_object(
                    'owner', snap.schema_def->>'owner',
-                   'acl', snap.schema_def->'acl'
+                   'acl', snap.schema_def->'acl',
+                   'comments', snap.schema_def->'comments',
+                   'force_rls', snap.schema_def->'force_rls'
                ))
           INTO v_schema_def
         FROM flashback.snapshots snap
@@ -961,6 +965,33 @@ BEGIN
         EXECUTE format(
             'DELETE FROM %I.%I WHERE ctid = (SELECT ctid FROM %I.%I LIMIT 1)',
             materialized.source_schema_name, materialized.source_table_name,
+            materialized.source_schema_name, materialized.source_table_name
+        );
+    END IF;
+
+    -- A3 adversarial coverage: corrupt catalog-level metadata (not row data)
+    -- on the just-swapped-in relation, proving flashback_verify_restored_relation
+    -- catches drift from the live catalog rather than tautologically
+    -- recomputing the same schema_def-derived value on both sides.
+    IF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_drop_index' THEN
+        EXECUTE format(
+            'DROP INDEX %I.%I',
+            materialized.source_schema_name,
+            (SELECT idx.relname
+               FROM pg_index i
+               JOIN pg_class idx ON idx.oid = i.indexrelid
+              WHERE i.indrelid = v_restored_rel
+                AND NOT i.indisprimary
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid
+                )
+              LIMIT 1)
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_revoke_acl' THEN
+        EXECUTE format(
+            'REVOKE ALL ON %I.%I FROM PUBLIC',
             materialized.source_schema_name, materialized.source_table_name
         );
     END IF;

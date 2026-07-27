@@ -111,7 +111,7 @@ AS $$
                 jsonb_build_object(
                     'name', con.conname,
                     'type', con.contype,
-                    'def', pg_get_constraintdef(con.oid)
+                    'def', pg_get_constraintdef(con.oid, true)
                 )
                 ORDER BY con.conname
             )
@@ -196,6 +196,7 @@ AS $$
             WHERE pol.polrelid = c.oid
         ), '[]'::jsonb),
         'rls_enabled', c.relrowsecurity,
+        'force_rls', c.relforcerowsecurity,
         -- Ownership metadata is required for flashback_restore_lsn after a
         -- real DROP TABLE, when the live relation is gone and cannot donate
         -- owner/ACL during finalize_shadow_swap.
@@ -213,6 +214,22 @@ AS $$
                 ORDER BY ae.grantee, ae.privilege_type
             )
             FROM aclexplode(c.relacl) AS ae(grantor, grantee, privilege_type, is_grantable)
+        ), '[]'::jsonb),
+        'comments', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'target', CASE WHEN d.objsubid = 0 THEN 'table' ELSE 'column' END,
+                    'column', CASE
+                        WHEN d.objsubid = 0 THEN NULL
+                        ELSE (SELECT a.attname FROM pg_attribute a
+                              WHERE a.attrelid = c.oid AND a.attnum = d.objsubid)
+                    END,
+                    'text', d.description
+                )
+                ORDER BY d.objsubid, d.description
+            )
+            FROM pg_description d
+            WHERE d.objoid = c.oid AND d.classoid = 'pg_class'::regclass
         ), '[]'::jsonb)
     )
     FROM pg_class c

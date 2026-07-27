@@ -125,7 +125,7 @@ BEGIN
                     'not_null', COALESCE((elem->>'not_null')::boolean, false),
                     'identity', COALESCE(elem->>'identity', ''),
                     'generated', COALESCE(elem->>'generated', ''),
-                    'default', COALESCE(elem->>'default', '')
+                    'default', COALESCE(elem->>'default_expr', '')
                 )
                 ORDER BY COALESCE((elem->>'attnum')::int, 0), elem->>'name'
             )
@@ -189,7 +189,7 @@ BEGIN
                     'not_null', a.attnotnull,
                     'identity', a.attidentity::text,
                     'generated', a.attgenerated::text,
-                    'default', pg_get_expr(ad.adbin, ad.adrelid)
+                    'default', COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '')
                 )
                 ORDER BY a.attnum
             )
@@ -211,7 +211,7 @@ BEGIN
             )
             FROM pg_constraint con
             WHERE con.conrelid = v_oid
-              AND con.contype IN ('p', 'u', 'c', 'f')
+              AND con.contype IN ('u', 'c', 'f')
         ), '[]'::jsonb),
         'indexes', COALESCE((
             SELECT jsonb_agg(
@@ -225,6 +225,10 @@ BEGIN
             JOIN pg_class idx ON idx.oid = i.indexrelid
             WHERE i.indrelid = v_oid
               AND NOT i.indisprimary
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_constraint con
+                  WHERE con.conindid = i.indexrelid
+              )
         ), '[]'::jsonb),
         'triggers', COALESCE((
             SELECT jsonb_agg(
@@ -292,7 +296,14 @@ BEGIN
                     END,
                     'text', d.description
                 )
-                ORDER BY d.objsubid, d.description
+                -- Match flashback_canonical_inventory_from_schema_def's
+                -- ordering exactly (target, column, text) so an identical
+                -- comment set produces an identical digest regardless of
+                -- which side computed it.
+                ORDER BY CASE WHEN d.objsubid = 0 THEN 'table' ELSE 'column' END,
+                         COALESCE((SELECT a.attname FROM pg_attribute a
+                                   WHERE a.attrelid = v_oid AND a.attnum = d.objsubid), ''),
+                         d.description
             )
             FROM pg_description d
             WHERE d.objoid = v_oid
@@ -540,6 +551,16 @@ BEGIN
     END IF;
 
     v_inventory := public.flashback_canonical_inventory_from_schema_def(p_schema_def);
+    -- schema_def never records the pre-drop replica identity (nothing
+    -- captures it), and it would be the wrong expectation even if it did:
+    -- flashback_internal_restore_lsn_core unconditionally sets REPLICA
+    -- IDENTITY FULL on every local_delta restore (needed for this
+    -- lifecycle's own ongoing old-row-image WAL capture; the pre-drop
+    -- original is remembered and restored only on flashback_untrack, a
+    -- different operation). The expected proof must assert what restore
+    -- actually and deliberately produces, not schema_def's unpopulated
+    -- default.
+    v_inventory := v_inventory || jsonb_build_object('replica_identity', 'f');
     v_seq_states := public.flashback_expected_sequence_states(p_shadow, p_schema_def);
     v_inventory := v_inventory || jsonb_build_object('sequence_states', v_seq_states);
 
@@ -552,7 +573,13 @@ BEGIN
         'row_count', v_shadow_count,
         'data_fingerprint', v_data_fp,
         'inventory', v_inventory,
-        'inventory_digest', public.flashback_inventory_digest(v_inventory),
+        -- 'sequences' is excluded from the digest: its shape here (static
+        -- identity/increment/start from schema_def) deliberately differs
+        -- from the live side's shape (last_value/is_called), and live
+        -- sequence correctness is already independently compared via the
+        -- 'sequence_states' key below (flashback_compare_restore_proofs
+        -- checks it directly, not through this digest).
+        'inventory_digest', public.flashback_inventory_digest(v_inventory - 'sequences'),
         'manifest', COALESCE(p_manifest, '{}'::jsonb),
         'binding', p_binding,
         'captured_at', clock_timestamp()
@@ -607,11 +634,20 @@ BEGIN
         'row_count', v_row_count,
         'data_fingerprint', v_data_fp,
         'inventory', v_inventory,
-        'inventory_digest', public.flashback_inventory_digest(
-            -- Compare semantic subset aligned with expected schema_def inventory.
-            public.flashback_canonical_inventory_from_schema_def(p_schema_def)
-            || jsonb_build_object('sequence_states', v_seq_states)
-        ),
+        -- A3: the digest actually compared by flashback_compare_restore_proofs
+        -- must be computed from this function's OWN live-catalog inventory
+        -- (v_inventory, from flashback_canonical_inventory_from_relation
+        -- against the just-restored relation p_live), never recomputed from
+        -- p_schema_def -- that would make the "actual" proof a pure function
+        -- of the same stored metadata the expected side already derives from,
+        -- so any drift between the live relation and schema_def (a dropped
+        -- constraint/index/policy/trigger, a changed ACL/owner/comment/
+        -- tablespace/reloptions/FORCE RLS) would never fail verification.
+        -- 'sequences' is excluded for the same shape-parity reason as the
+        -- expected side; 'sequence_states' (already merged into v_inventory
+        -- above) is what flashback_compare_restore_proofs actually checks
+        -- for sequence correctness.
+        'inventory_digest', public.flashback_inventory_digest(v_inventory - 'sequences'),
         'binding', p_binding,
         'captured_at', clock_timestamp()
     );

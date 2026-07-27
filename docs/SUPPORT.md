@@ -50,13 +50,13 @@ epoch being recovered to is outside it.
 | Primary key, `UNIQUE`, `CHECK` constraints | Preserved |
 | Outgoing foreign keys | Preserved |
 | Plain btree indexes | Preserved |
-| Owner and table/column ACL | Preserved |
+| Owner and table-level ACL | Preserved |
 | TOAST / large values | Preserved |
-| Replica identity | Preserved |
+| Replica identity | Preserved; forced to `FULL` while actively tracked, restored to the original setting on untrack |
 | Basic row-level security policies | Preserved |
+| `FORCE ROW LEVEL SECURITY` | Preserved |
 | Ordinary (non-internal) triggers | Preserved |
-| Comments | Preserved |
-| Tablespace and storage `reloptions` | Preserved |
+| Comments (table and column) | Preserved |
 | Owned sequences | Preserved |
 | Quoted names and non-`public` schemas | Supported |
 
@@ -77,6 +77,9 @@ epoch being recovered to is outside it.
 | Incoming foreign keys | Rejected |
 | Non-btree, expression, or partial indexes | Rejected |
 | Generated columns | Rejected (reconstruction is not proven; rejected even for "simple" cases) |
+| Column-level ACL | Rejected (only table-level ACL is captured/restored) |
+| Non-default tablespace | Rejected |
+| Non-empty storage `reloptions` | Rejected |
 
 ## Incidents
 

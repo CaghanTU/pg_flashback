@@ -72,6 +72,8 @@ DECLARE
     v_replident "char";
     v_tablespace text;
     v_reloptions text[];
+    v_force_rls boolean;
+    v_column_acl_count integer;
 BEGIN
     IF v_oid IS NULL THEN
         RETURN jsonb_build_object(
@@ -88,10 +90,10 @@ BEGIN
 
     SELECT c.relkind, c.relpersistence, n.nspname, c.relname,
            r.rolname, (c.reltoastrelid <> 0), c.relreplident,
-           NULLIF(ts.spcname, ''), c.reloptions
+           NULLIF(ts.spcname, ''), c.reloptions, c.relforcerowsecurity
       INTO v_relkind, v_persistence, v_schema, v_name,
            v_owner, v_toast, v_replident,
-           v_tablespace, v_reloptions
+           v_tablespace, v_reloptions, v_force_rls
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_roles r ON r.oid = c.relowner
@@ -293,13 +295,37 @@ BEGIN
         v_preserved := v_preserved || ARRAY['owned_sequences'];
     END IF;
 
+    -- Column-level ACL is never captured or restored (only the table-level
+    -- ACL is); a table with any column GRANT cannot honestly be tracked.
+    SELECT count(*) INTO v_column_acl_count
+    FROM pg_attribute a
+    WHERE a.attrelid = v_oid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attacl IS NOT NULL;
+    IF v_column_acl_count > 0 THEN
+        v_rejected := v_rejected || ARRAY['column_acl'];
+    END IF;
+
+    -- A non-default tablespace or non-empty storage reloptions are never
+    -- captured or the base table recreated with them (only dependent-view
+    -- reloptions are handled) -- reject rather than silently drop them.
+    IF v_tablespace IS NOT NULL THEN
+        v_rejected := v_rejected || ARRAY['non_default_tablespace'];
+    END IF;
+    IF v_reloptions IS NOT NULL AND array_length(v_reloptions, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['storage_reloptions'];
+    END IF;
+
     IF v_toast THEN
         v_preserved := v_preserved || ARRAY['toast'];
     END IF;
     v_preserved := v_preserved || ARRAY['replica_identity'];
     v_preserved := v_preserved || ARRAY['owner_and_acl'];
-    v_preserved := v_preserved || ARRAY['tablespace_and_reloptions'];
     v_preserved := v_preserved || ARRAY['ordinary_columns'];
+    IF v_force_rls THEN
+        v_preserved := v_preserved || ARRAY['force_row_level_security'];
+    END IF;
 
     v_detected := jsonb_build_object(
         'schema', v_schema,
@@ -334,7 +360,9 @@ BEGIN
         'toast', v_toast,
         'replica_identity', v_replident,
         'tablespace', v_tablespace,
-        'reloptions', to_jsonb(v_reloptions)
+        'reloptions', to_jsonb(v_reloptions),
+        'force_rls', COALESCE(v_force_rls, false),
+        'column_acl_count', v_column_acl_count
     );
 
     RETURN jsonb_build_object(
