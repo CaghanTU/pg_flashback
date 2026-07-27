@@ -245,6 +245,22 @@ unsafe extern "C-unwind" fn fb_decode_change(
 
     let xid = unsafe { (*txn).xid };
     mark_transaction_emitted(xid);
+
+    // pg_flashback.max_row_size's documented contract ("rows larger than this
+    // are skipped during capture to prevent OOM") must not mean "silently
+    // decoded and applied as if old/new were empty" -- that would let a
+    // restore replay a DELETE/UPDATE with no row to act on and diverge from
+    // the source table without ever raising. Oversized rows are instead
+    // reported as a distinct marker with no payload; the SQL consumer
+    // (flashback_apply_decoded_wal_batch) detects it and freezes the stream
+    // the same way it already does for a missing COMMIT record, so recovery
+    // never silently continues past a row it could not honestly capture.
+    let captured_len =
+        old_json.as_deref().map_or(0, str::len) + new_json.as_deref().map_or(0, str::len);
+    let oversized = !metadata_only
+        && (op == "INSERT" || op == "UPDATE" || op == "DELETE")
+        && captured_len > crate::storage::worker::max_row_size_bytes().max(0) as usize;
+
     let mut json = std::string::String::with_capacity(256);
     json.push_str("{\"op\":\"");
     json.push_str(op);
@@ -253,13 +269,19 @@ unsafe extern "C-unwind" fn fb_decode_change(
     json.push_str("\",\"table\":\"");
     json_escape_into(&mut json, &table);
     json.push_str(&format!("\",\"oid\":{oid},\"xid\":{xid}"));
-    if let Some(ref old) = old_json {
-        json.push_str(",\"old\":");
-        json.push_str(old);
-    }
-    if let Some(ref new) = new_json {
-        json.push_str(",\"new\":");
-        json.push_str(new);
+    if oversized {
+        json.push_str(&format!(
+            ",\"oversized\":true,\"captured_len\":{captured_len}"
+        ));
+    } else {
+        if let Some(ref old) = old_json {
+            json.push_str(",\"old\":");
+            json.push_str(old);
+        }
+        if let Some(ref new) = new_json {
+            json.push_str(",\"new\":");
+            json.push_str(new);
+        }
     }
     json.push('}');
 

@@ -1352,13 +1352,6 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     tracked record;
-    ddl_info jsonb;
-    row_snapshot jsonb;
-    new_version bigint;
-    ddl_event_time timestamptz;
-    ddl_event_lsn pg_lsn;
-    v_actual_schema text;
-    v_actual_table  text;
     v_generation_id bigint;
     v_stream_id bigint;
     v_stream_state text;
@@ -1426,7 +1419,8 @@ BEGIN
         -- An existing qualified lifecycle is routed by its durable generation
         -- binding, never by a caller's session-local capture_mode GUC. This
         -- prevents `SET capture_mode=trigger` from silently sending DDL around
-        -- the protected WAL path.
+        -- the protected WAL path: correctness-critical routing must not
+        -- depend on a forgeable SUSET GUC, only on durable lifecycle state.
         SELECT cg.generation_id, cg.stream_id, cs.state
           INTO v_generation_id, v_stream_id, v_stream_state
         FROM flashback.coverage_generations cg
@@ -1435,134 +1429,30 @@ BEGIN
           AND cg.state = 'active'
         LIMIT 1;
 
-        IF v_generation_id IS NULL AND (
-            EXISTS (
-                SELECT 1 FROM flashback.coverage_generations cg
-                WHERE cg.tracking_id = tracked.tracking_id
-            )
-            OR COALESCE(
-                   NULLIF(btrim(COALESCE(current_setting('pg_flashback.capture_mode', true), '')), ''),
-                   'wal'
-               ) = 'wal'
-        ) THEN
+        IF v_generation_id IS NULL THEN
             RAISE EXCEPTION 'pg_flashback: DDL capture refused because tracking lifecycle % has no active WAL generation',
                 tracked.tracking_id;
         END IF;
-        IF v_generation_id IS NOT NULL AND v_stream_state <> 'active' THEN
+        IF v_stream_state <> 'active' THEN
             RAISE EXCEPTION 'pg_flashback: DDL capture refused because WAL stream % is %',
                 v_stream_id, v_stream_state
                 USING HINT = 'Restore pg_flashback.enabled/capture_mode, then establish a new exact boundary with flashback_reanchor().';
         END IF;
     END IF;
 
-    -- Qualified local_delta DDL uses the shared staging core so production
-    -- hooks and the pg_test seam cannot diverge on metadata writes.
-    IF tracked.recovery_profile = 'local_delta' AND v_generation_id IS NOT NULL THEN
-        PERFORM flashback_stage_local_delta_ddl_event(
-            tracked.tracking_id,
-            event_type,
-            (txid_current() % 4294967296)::bigint,
-            NULL,   -- event_lsn: core uses pg_current_wal_insert_lsn()
-            NULL,   -- ddl_info: core collects from live relation
-            true,   -- collect_row_snapshot
-            true    -- emit logical commit marker
-        );
-        RETURN;
-    END IF;
-
-    -- Resolve current (post-DDL) actual name from catalog
-    SELECT n.nspname, c.relname
-      INTO v_actual_schema, v_actual_table
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.oid = tracked.rel_oid;
-
-    -- RENAME TABLE / SET SCHEMA: update tracked_tables with the new name
-    IF v_actual_schema IS NOT NULL AND v_actual_table IS NOT NULL
-       AND (v_actual_schema <> tracked.schema_name OR v_actual_table <> tracked.table_name)
-    THEN
-        UPDATE flashback.tracked_tables
-           SET schema_name = v_actual_schema,
-               table_name  = v_actual_table
-         WHERE rel_oid = tracked.rel_oid;
-
-        RAISE NOTICE 'pg_flashback: table renamed/moved from %.% to %.% — tracking updated',
-            tracked.schema_name, tracked.table_name, v_actual_schema, v_actual_table;
-
-        tracked.schema_name := v_actual_schema;
-        tracked.table_name  := v_actual_table;
-    END IF;
-
-    ddl_event_time := clock_timestamp();
-    ddl_event_lsn := pg_current_wal_insert_lsn();
-
-    IF upper(event_type) = 'ALTER' THEN
-        ddl_info := COALESCE(flashback_collect_schema_def(tracked.rel_oid), '{}'::jsonb);
-        new_version := COALESCE(tracked.schema_version, 1) + 1;
-
-        UPDATE flashback.tracked_tables
-        SET schema_version = new_version
-        WHERE rel_oid = tracked.rel_oid;
-
-        INSERT INTO flashback.schema_versions (
-            rel_oid, tracking_id, generation_id, stream_id, source_xid,
-            schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
-            columns, primary_key, constraints, helper_schema_sha256
-        )
-        SELECT
-            tracked.rel_oid,
-            NULL,
-            NULL, NULL,
-            NULL,
-            new_version, ddl_event_time, ddl_event_lsn,
-            clock_timestamp(),
-            NULL,
-            COALESCE(ddl_info -> 'columns', '[]'::jsonb),
-            COALESCE(ddl_info -> 'primary_key', '[]'::jsonb),
-            jsonb_build_object(
-                'check_unique_fk', COALESCE(ddl_info -> 'constraints', '[]'::jsonb),
-                'indexes', COALESCE(ddl_info -> 'indexes', '[]'::jsonb),
-                'partition_by', ddl_info -> 'partition_by',
-                'partitions', ddl_info -> 'partitions',
-                'triggers', COALESCE(ddl_info -> 'triggers', '[]'::jsonb),
-                'rls_policies', COALESCE(ddl_info -> 'rls_policies', '[]'::jsonb),
-                'rls_enabled', COALESCE((ddl_info -> 'rls_enabled')::boolean, false)
-            ),
-            flashback_helper_schema_sha256(tracked.rel_oid);
-    ELSE
-        ddl_info := COALESCE(flashback_collect_schema_def(tracked.rel_oid), '{}'::jsonb);
-        new_version := COALESCE(tracked.schema_version, 1);
-    END IF;
-
-    DECLARE
-        v_row_count bigint;
-    BEGIN
-        EXECUTE format(
-            'SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 100001) q',
-            tracked.schema_name, tracked.table_name
-        ) INTO v_row_count;
-        IF v_row_count > 100000 THEN
-            RAISE WARNING 'pg_flashback: table %.% has % rows — skipping inline DDL snapshot (checkpoint data preserved)',
-                tracked.schema_name, tracked.table_name, v_row_count;
-            row_snapshot := NULL;
-        ELSE
-            EXECUTE format(
-                'SELECT COALESCE(jsonb_agg(to_jsonb(t)), ''[]''::jsonb) FROM %I.%I t',
-                tracked.schema_name, tracked.table_name
-            ) INTO row_snapshot;
-        END IF;
-    END;
-
-    INSERT INTO flashback.delta_log (
-        event_time, event_type, table_name, rel_oid, source_xid,
-        committed_at, lsn, schema_version, old_data, new_data, ddl_info
-    )
-    VALUES (
-        ddl_event_time, upper(event_type),
-        format('%I.%I', tracked.schema_name, tracked.table_name),
-        tracked.rel_oid, (txid_current() % 4294967296)::bigint,
-        clock_timestamp(), ddl_event_lsn,
-        new_version, row_snapshot, NULL, ddl_info
+    -- recovery_profile is CHECK-constrained to 'local_delta' only (no other
+    -- value can exist in flashback.tracked_tables), and the guard above
+    -- always raises when this lifecycle has no active WAL generation. Every
+    -- DDL event that reaches this point is therefore qualified local_delta
+    -- DDL, staged through the shared core so production hooks and the
+    -- pg_test seam cannot diverge on metadata writes.
+    PERFORM flashback_stage_local_delta_ddl_event(
+        tracked.tracking_id,
+        event_type,
+        (txid_current() % 4294967296)::bigint,
+        NULL,   -- event_lsn: core uses pg_current_wal_insert_lsn()
+        NULL,   -- ddl_info: core collects from live relation
+        true    -- emit logical commit marker
     );
 END;
 $$;

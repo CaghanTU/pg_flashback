@@ -436,7 +436,6 @@ BEGIN
         p_source_xid,
         p_commit_lsn,
         p_ddl_info,
-        false,  -- row snapshot: table may already be gone for DROP
         false   -- commit marker: inject_commit supplies the COMMIT record
     );
 

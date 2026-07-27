@@ -147,7 +147,7 @@ BEGIN
        )
        OR has_function_privilege(
            'public',
-           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)',
+           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean)',
            'EXECUTE'
        )
     THEN

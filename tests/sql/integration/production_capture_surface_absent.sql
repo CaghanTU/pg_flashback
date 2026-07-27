@@ -28,7 +28,7 @@ BEGIN
 
     -- DDL staging core / pending_wal_events remain part of the WAL product.
     IF to_regprocedure(
-           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)'
+           'flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean)'
        ) IS NULL
     THEN
         RAISE EXCEPTION 'DDL staging core must still exist';

@@ -159,6 +159,10 @@
       "class": "infra",
       "reason": "proves pre-generation legacy snapshot APIs fail closed under WAL coverage"
     },
+    "large_row_capture_honesty.sql": {
+      "class": "infra",
+      "reason": "a decoded row too large to capture (pg_flashback.max_row_size) must freeze the stream, not be silently promoted as a data-less delta"
+    },
     "lifecycle_resolver_ambiguity_failclosed.sql": {
       "class": "infra",
       "reason": "ambiguous unqualified table name must fail closed across every public/operator resolver call site"

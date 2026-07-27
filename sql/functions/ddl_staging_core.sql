@@ -1,13 +1,16 @@
 -- Internal local_delta DDL staging shared by flashback_capture_ddl_event() and
 -- the pg_test DDL injection seam. Not a public API: no EXECUTE grants.
 
+DROP FUNCTION IF EXISTS flashback_stage_local_delta_ddl_event(
+    bigint, text, bigint, pg_lsn, jsonb, boolean, boolean
+);
+
 CREATE OR REPLACE FUNCTION flashback_stage_local_delta_ddl_event(
     p_tracking_id bigint,
     p_event_type text,
     p_source_xid bigint DEFAULT NULL,
     p_event_lsn pg_lsn DEFAULT NULL,
     p_ddl_info jsonb DEFAULT NULL,
-    p_collect_row_snapshot boolean DEFAULT true,
     p_emit_logical_marker boolean DEFAULT true
 )
 RETURNS jsonb
@@ -24,12 +27,10 @@ DECLARE
     v_actual_schema text;
     v_actual_table text;
     v_ddl_info jsonb;
-    v_row_snapshot jsonb;
     v_new_version bigint;
     v_event_time timestamptz := clock_timestamp();
     v_event_lsn pg_lsn;
     v_source_xid bigint;
-    v_row_count bigint;
 BEGIN
     IF p_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_stage_local_delta_ddl_event: tracking_id required';
@@ -146,27 +147,13 @@ BEGIN
         v_new_version := COALESCE(tracked.schema_version, 1);
     END IF;
 
-    IF p_collect_row_snapshot
-       AND to_regclass(format('%I.%I', tracked.schema_name, tracked.table_name)) IS NOT NULL
-    THEN
-        EXECUTE format(
-            'SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 100001) q',
-            tracked.schema_name, tracked.table_name
-        ) INTO v_row_count;
-        IF v_row_count > 100000 THEN
-            RAISE WARNING 'pg_flashback: table %.% has % rows — skipping inline DDL snapshot (checkpoint data preserved)',
-                tracked.schema_name, tracked.table_name, v_row_count;
-            v_row_snapshot := NULL;
-        ELSE
-            EXECUTE format(
-                'SELECT COALESCE(jsonb_agg(to_jsonb(t)), ''[]''::jsonb) FROM %I.%I t',
-                tracked.schema_name, tracked.table_name
-            ) INTO v_row_snapshot;
-        END IF;
-    ELSE
-        v_row_snapshot := NULL;
-    END IF;
-
+    -- No inline full-table row snapshot is captured here. Restore never reads
+    -- old_data/new_data for a DROP/TRUNCATE/ALTER delta_log row (it truncates
+    -- and replays from the boundary snapshot plus per-row DML deltas
+    -- instead), so an inline jsonb_agg() of the whole table -- unbounded by
+    -- row width and previously capped only by row *count* (100000), not
+    -- captured byte size -- was pure OOM/latency risk on the DDL statement's
+    -- own transaction with no corresponding recovery benefit.
     INSERT INTO flashback.pending_wal_events (
         tracking_id, generation_id, stream_id, source_xid,
         event_type, table_name, rel_oid, event_lsn, schema_version,
@@ -176,7 +163,7 @@ BEGIN
         v_event_type,
         format('%I.%I', tracked.schema_name, tracked.table_name),
         tracked.rel_oid, v_event_lsn, v_new_version,
-        v_row_snapshot, NULL, v_ddl_info
+        NULL, NULL, v_ddl_info
     );
 
     IF p_emit_logical_marker THEN
@@ -206,5 +193,5 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION flashback_stage_local_delta_ddl_event(
-    bigint, text, bigint, pg_lsn, jsonb, boolean, boolean
+    bigint, text, bigint, pg_lsn, jsonb, boolean
 ) FROM PUBLIC;

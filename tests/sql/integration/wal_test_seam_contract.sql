@@ -256,7 +256,7 @@ BEGIN
     END IF;
     IF has_function_privilege(
            'public',
-           'public.flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean,boolean)',
+           'public.flashback_stage_local_delta_ddl_event(bigint,text,bigint,pg_lsn,jsonb,boolean)',
            'EXECUTE'
        )
     THEN

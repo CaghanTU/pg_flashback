@@ -69,6 +69,14 @@ pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
 }
 
+/// Rows whose captured old+new JSON exceeds this many bytes are not decoded
+/// inline; the output plugin emits an oversized marker instead and the SQL
+/// consumer freezes the stream rather than silently applying a delta with no
+/// row data (see fb_decode_change / flashback_apply_decoded_wal_batch).
+pub fn max_row_size_bytes() -> i32 {
+    MAX_ROW_SIZE_GUC.get()
+}
+
 /// SQL expression yielding the effective replication slot name for the
 /// connected database. Mirrors flashback_effective_slot_name() but works
 /// even before the extension is installed in this database.
@@ -153,7 +161,7 @@ pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.max_row_size",
         c"pg_flashback maximum captured row size in bytes",
-        c"Rows larger than this (in bytes) are skipped during capture to prevent OOM. Default 65536 (64KB).",
+        c"A changed row whose captured old+new data exceeds this many bytes cannot be decoded inline; capture freezes and opens a durable gap instead of silently dropping the row. Default 65536 (64KB).",
         &MAX_ROW_SIZE_GUC,
         512,
         104_857_600, // 100MB hard ceiling

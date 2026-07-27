@@ -383,6 +383,10 @@ mod tests {
         "../tests/sql/integration/restore_verify_adversarial_metadata.sql"
     );
     sql_test!(
+        it_large_row_capture_honesty,
+        "../tests/sql/integration/large_row_capture_honesty.sql"
+    );
+    sql_test!(
         it_exact_drop_identity_propagation,
         "../tests/sql/integration/exact_drop_identity_propagation.sql"
     );

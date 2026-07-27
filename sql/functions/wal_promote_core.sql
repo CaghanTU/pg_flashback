@@ -15,6 +15,7 @@ AS $$
 DECLARE
     v_inserted bigint := 0;
     v_missing_commits bigint := 0;
+    v_oversized_events bigint := 0;
     pending record;
     lock_rec record;
     gen_rec record;
@@ -108,6 +109,40 @@ BEGIN
           WHERE c.source_xid = p.source_xid
       )
     ORDER BY p.pending_event_id;
+
+    -- pg_flashback.max_row_size is documented as skipping oversized rows
+    -- "during capture to prevent OOM"; honoring that without silent data
+    -- loss means a row too large to decode can never be applied as a
+    -- data-less delta (old/new both NULL would still satisfy every
+    -- downstream join). Freeze the stream the same way a missing COMMIT
+    -- record is handled, before any event from this batch is inserted.
+    SELECT count(*) INTO v_oversized_events
+    FROM _fb_wal_batch b
+    WHERE b.data ? 'oversized';
+
+    IF v_oversized_events > 0 THEN
+        PERFORM flashback_mark_capture_stream_broken(
+            p_stream_id,
+            'row_exceeds_max_row_size',
+            (
+                SELECT jsonb_build_object(
+                    'event_count', v_oversized_events,
+                    'sample', jsonb_agg(
+                        jsonb_build_object(
+                            'oid', b.data->>'oid',
+                            'xid', b.data->>'xid',
+                            'captured_len', b.data->>'captured_len'
+                        )
+                    )
+                )
+                FROM _fb_wal_batch b
+                WHERE b.data ? 'oversized'
+            )
+        );
+        RAISE WARNING 'pg_flashback: % decoded row(s) exceeded pg_flashback.max_row_size; stream % was frozen and a durable gap was opened',
+            v_oversized_events, p_stream_id;
+        RETURN 0;
+    END IF;
 
     SELECT count(*) INTO v_missing_commits
     FROM _fb_wal_events e
