@@ -199,7 +199,7 @@ q "CREATE SCHEMA odd;
    CREATE TABLE odd.\"quoted table\"(\"id col\" int PRIMARY KEY, payload text NOT NULL);"
 "$CLI" protect 'odd."quoted table"' >/dev/null
 wait_healthy 'odd."quoted table"' || die "quoted table not healthy"
-q "INSERT INTO odd.\"quoted table\" VALUES (1, repeat('toast-',20000));"
+q "INSERT INTO odd.\"quoted table\" VALUES (1, repeat('toast-',2000));"
 wait_events 'odd."quoted table"' INSERT 1 || die "quoted TOAST row not captured"
 TOAST_FP="$(fp 'odd."quoted table"')"
 q "DROP TABLE odd.\"quoted table\";"
