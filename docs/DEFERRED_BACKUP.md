@@ -34,7 +34,7 @@ creeping back into the core install SQL, Rust, or packaging scripts.
 ## Where the last implementation lives
 
 The last fully integrated implementation of the experimental backup subsystem
-is preserved in git history at commit **`b6aa654`** (`fix: preserve exact DROP
+is preserved in git history at commit **`76da24b`** (`fix: preserve exact DROP
 identity across restore phases`), before the local-core separation began. A
 future redesign should start from a fresh, companion-owned generation model
 rather than restoring that code as-is.
