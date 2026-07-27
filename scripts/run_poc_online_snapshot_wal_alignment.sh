@@ -488,7 +488,17 @@ install_oracle_sql() {
         IF rec.op = 'INSERT' THEN
           SELECT string_agg(quote_ident(key), ','), string_agg(format('%L', value), ',')
             INTO cols, vals FROM jsonb_each_text(rec.new);
-          EXECUTE format('INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING', shadow, cols, vals);
+          -- WHERE NOT EXISTS, not ON CONFLICT DO NOTHING: shadow tables are
+          -- created via CREATE TABLE AS SELECT, which never copies the
+          -- source's PRIMARY KEY, so a bare ON CONFLICT DO NOTHING has no
+          -- constraint to match and silently becomes a no-op guard (every
+          -- insert just succeeds, duplicates and all). A duplicate/
+          -- redelivered commit -- e.g. after a crash rewinds the slot's
+          -- confirmed position -- must not double the row regardless of
+          -- whether the shadow table happens to have a real constraint.
+          EXECUTE format(
+            'INSERT INTO %s (%s) SELECT %s WHERE NOT EXISTS (SELECT 1 FROM %s WHERE %I = %L)',
+            shadow, cols, vals, shadow, pk, rec.new->>pk);
           n_ins := n_ins + 1;
         ELSIF rec.op = 'UPDATE' THEN
           SELECT string_agg(format('%I = %L', key, value), ',') INTO set_clause FROM jsonb_each_text(rec.new);
