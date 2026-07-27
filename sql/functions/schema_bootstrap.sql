@@ -2048,6 +2048,144 @@ CREATE TRIGGER coverage_generations_guard
 BEFORE INSERT OR UPDATE OR DELETE ON flashback.coverage_generations
 FOR EACH ROW EXECUTE FUNCTION flashback_guard_coverage_generation();
 
+-- Same defense-in-depth as coverage_generations_guard, for the other half of
+-- the state authority: a capture stream's identity (database/epoch/slot/
+-- plugin) is immutable once created, only the exact CAS graph in
+-- state_authority.sql's flashback_internal_transition_capture_stream is a
+-- legal state change, and progress fields may only move monotonically. Before
+-- this trigger existed, capture_streams had a row-shape CHECK but nothing
+-- enforcing transitions or identity across an UPDATE, unlike
+-- coverage_generations -- any future direct UPDATE bug on this table would
+-- have had no independent backstop.
+CREATE OR REPLACE FUNCTION flashback_guard_capture_stream()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, flashback
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % is immutable', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state NOT IN ('initializing', 'active') THEN
+            RAISE EXCEPTION 'pg_flashback: a capture stream must be created as initializing or active'
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.state = 'retired' THEN
+        RAISE EXCEPTION 'pg_flashback: terminal capture stream % is immutable', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NOT (
+        NEW.state = OLD.state
+        OR (OLD.state = 'initializing' AND NEW.state = 'active')
+        OR (OLD.state = 'initializing' AND NEW.state = 'broken')
+        OR (OLD.state = 'active' AND NEW.state = 'broken')
+        OR (OLD.state = 'active' AND NEW.state = 'retired')
+        OR (OLD.state = 'broken' AND NEW.state = 'retired')
+        OR (OLD.state = 'initializing' AND NEW.state = 'retired')
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: invalid capture stream transition % -> %',
+            OLD.state, NEW.state
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NEW.stream_id IS DISTINCT FROM OLD.stream_id
+       OR NEW.database_oid IS DISTINCT FROM OLD.database_oid
+       OR NEW.database_name IS DISTINCT FROM OLD.database_name
+       OR NEW.epoch_no IS DISTINCT FROM OLD.epoch_no
+       OR NEW.capture_mode IS DISTINCT FROM OLD.capture_mode
+       OR NEW.timeline_id IS DISTINCT FROM OLD.timeline_id
+       OR NEW.slot_name IS DISTINCT FROM OLD.slot_name
+       OR NEW.plugin_name IS DISTINCT FROM OLD.plugin_name
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % identity is immutable', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF OLD.invalidation_reason IS NOT NULL
+       AND NEW.invalidation_reason IS DISTINCT FROM OLD.invalidation_reason
+    THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % invalidation reason is immutable', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF NEW.activated_at IS DISTINCT FROM OLD.activated_at
+       AND NOT (OLD.state = 'initializing' AND NEW.state = 'active'
+                AND OLD.activated_at IS NULL AND NEW.activated_at IS NOT NULL)
+    THEN
+        RAISE EXCEPTION 'pg_flashback: invalid capture stream activation audit change'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF NEW.invalidated_at IS DISTINCT FROM OLD.invalidated_at
+       AND NOT (NEW.state = 'broken'
+                AND OLD.invalidated_at IS NULL AND NEW.invalidated_at IS NOT NULL)
+    THEN
+        RAISE EXCEPTION 'pg_flashback: invalid capture stream invalidation audit change'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF NEW.retired_at IS DISTINCT FROM OLD.retired_at
+       AND NOT (NEW.state = 'retired'
+                AND OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL)
+    THEN
+        RAISE EXCEPTION 'pg_flashback: invalid capture stream retirement audit change'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    IF OLD.valid_through_lsn IS NOT NULL
+       AND NEW.valid_through_lsn IS NOT NULL
+       AND NEW.valid_through_lsn < OLD.valid_through_lsn
+    THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % valid_through_lsn cannot move backward', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF OLD.confirmed_flush_lsn IS NOT NULL
+       AND NEW.confirmed_flush_lsn IS NOT NULL
+       AND NEW.confirmed_flush_lsn < OLD.confirmed_flush_lsn
+    THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % confirmed_flush_lsn cannot move backward', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    IF OLD.restart_lsn IS NOT NULL
+       AND NEW.restart_lsn IS NOT NULL
+       AND NEW.restart_lsn < OLD.restart_lsn
+    THEN
+        RAISE EXCEPTION 'pg_flashback: capture stream % restart_lsn cannot move backward', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    -- Mirrors coverage_generations_guard's "details frozen once qualified":
+    -- mutable while the stream is still pre-terminal (initializing/active,
+    -- which covers flashback_internal_advance_capture_stream_progress's
+    -- frequent same-state merge), or whenever this row is genuinely
+    -- transitioning (state_authority's CAS function only ever issues an
+    -- UPDATE when NEW.state <> OLD.state, so a real transition is always
+    -- free to attach new details the same way coverage_generations' abort
+    -- transition does).
+    IF NEW.details IS DISTINCT FROM OLD.details
+       AND NEW.state = OLD.state
+       AND OLD.state NOT IN ('initializing', 'active')
+    THEN
+        RAISE EXCEPTION 'pg_flashback: qualified capture stream % details are immutable', OLD.stream_id
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS capture_streams_guard
+    ON flashback.capture_streams;
+CREATE TRIGGER capture_streams_guard
+BEFORE INSERT OR UPDATE OR DELETE ON flashback.capture_streams
+FOR EACH ROW EXECUTE FUNCTION flashback_guard_capture_stream();
+
 CREATE UNIQUE INDEX IF NOT EXISTS capture_streams_one_active_idx
     ON flashback.capture_streams (database_oid)
     WHERE state = 'active';

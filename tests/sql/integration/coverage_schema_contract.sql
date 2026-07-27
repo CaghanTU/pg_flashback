@@ -127,12 +127,17 @@ BEGIN
     )
     RETURNING stream_id INTO v_stream_id;
 
+    -- A second, distinct stream row is all this needs (used below only as
+    -- an unrelated stream_id for the cross-stream FK rejection check); it
+    -- must be created via a legal initial state (flashback_guard_capture_stream
+    -- rejects a row inserted already-terminal, matching how
+    -- flashback_internal_create_capture_stream itself never creates one).
     INSERT INTO flashback.capture_streams (
-        database_oid, database_name, epoch_no, capture_mode, state, retired_at,
+        database_oid, database_name, epoch_no, capture_mode, state,
         timeline_id, slot_name, plugin_name
     ) VALUES (
         (SELECT oid FROM pg_database WHERE datname = current_database()),
-        current_database(), 97, 'wal', 'retired', clock_timestamp(),
+        current_database(), 97, 'wal', 'initializing',
         1, 'it_cov_slot_retired', 'pg_flashback'
     ) RETURNING stream_id INTO v_other_stream_id;
 

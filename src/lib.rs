@@ -387,6 +387,10 @@ mod tests {
         "../tests/sql/integration/large_row_capture_honesty.sql"
     );
     sql_test!(
+        it_capture_stream_authority_invariants,
+        "../tests/sql/integration/capture_stream_authority_invariants.sql"
+    );
+    sql_test!(
         it_exact_drop_identity_propagation,
         "../tests/sql/integration/exact_drop_identity_propagation.sql"
     );

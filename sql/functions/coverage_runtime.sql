@@ -63,12 +63,30 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Counted before the transition (and before anything is deleted) so both
+    -- figures can ride in the same details payload as the CAS transition
+    -- itself, rather than a separate same-state UPDATE afterward: capture_streams
+    -- rows are state-authority-owned the same as coverage_generations, and a
+    -- bare details-only UPDATE on an already-broken row is indistinguishable
+    -- from a state-authority bypass once a transition guard trigger exists.
+    SELECT count(*) INTO v_discarded_pending
+    FROM flashback.pending_wal_events
+    WHERE stream_id = p_stream_id;
+
+    SELECT count(*) INTO v_discarded_building
+    FROM flashback.coverage_generations
+    WHERE stream_id = p_stream_id
+      AND state = 'building';
+
     IF NOT public.flashback_internal_transition_capture_stream(
         p_stream_id,
         ARRAY['active'],
         'broken',
         p_reason,
-        COALESCE(p_details, '{}'::jsonb)
+        COALESCE(p_details, '{}'::jsonb) || jsonb_build_object(
+            'discarded_pending_wal_events', v_discarded_pending,
+            'discarded_building_generations', v_discarded_building
+        )
     ) THEN
         -- Idempotent: already broken between the check and the transition.
         RETURN;
@@ -80,14 +98,6 @@ BEGIN
     -- storage forever.
     DELETE FROM flashback.pending_wal_events
     WHERE stream_id = p_stream_id;
-    GET DIAGNOSTICS v_discarded_pending = ROW_COUNT;
-    IF v_discarded_pending > 0 THEN
-        UPDATE flashback.capture_streams
-           SET details = details || jsonb_build_object(
-               'discarded_pending_wal_events', v_discarded_pending
-           )
-         WHERE stream_id = p_stream_id;
-    END IF;
 
     -- A committed post-restore/re-anchor draft has no canonical boundary yet.
     -- Keeping it as `building` after its stream is broken would block every
@@ -143,16 +153,7 @@ BEGIN
                 'aborted_stream_id', p_stream_id
             )
         );
-        v_discarded_building := v_discarded_building + 1;
     END LOOP;
-
-    IF v_discarded_building > 0 THEN
-        UPDATE flashback.capture_streams
-           SET details = details || jsonb_build_object(
-               'discarded_building_generations', v_discarded_building
-           )
-         WHERE stream_id = p_stream_id;
-    END IF;
 
     INSERT INTO flashback.coverage_gaps (
         tracking_id, source_generation_id, reason,

@@ -12,8 +12,13 @@ BEGIN
     CREATE TABLE public.it_failclosed_synth (id int PRIMARY KEY);
     PERFORM set_config('pg_flashback.capture_mode', 'wal', true);
 
-    -- 1) Configured physical slot missing + differently-named active stream:
-    --    drain must fail closed.
+    -- 1) Configured physical slot missing + a pg_flashback_test_*-named active
+    --    stream: drain must fail closed regardless of naming. Under wal,
+    --    names never relax the gate -- a single row combines what were
+    --    previously two scenarios (a differently-named stream, then the same
+    --    stream renamed to a test-marker name) since flashback_guard_capture_stream
+    --    now makes slot_name identity immutable after creation, the same way
+    --    coverage_generations' own identity fields already were.
     INSERT INTO flashback.capture_streams (
         database_oid, database_name, epoch_no, capture_mode, timeline_id,
         slot_name, plugin_name, state, valid_through_lsn,
@@ -21,7 +26,7 @@ BEGIN
     ) VALUES (
         (SELECT oid FROM pg_database WHERE datname = current_database()),
         current_database(), 1, 'wal', 1,
-        'not_the_configured_slot', 'pg_flashback', 'active', '0/1'::pg_lsn,
+        'pg_flashback_test_adversarial', 'pg_flashback', 'active', '0/1'::pg_lsn,
         '0/1'::pg_lsn, '0/1'::pg_lsn, clock_timestamp()
     ) RETURNING stream_id INTO v_stream_id;
 
@@ -41,10 +46,6 @@ BEGIN
     --    the gate. configuration_guard is mode/state based (returns true while
     --    enabled+wal+active), but drain must still fail closed without a
     --    physical slot — no synthetic-name bypass into drained admission.
-    UPDATE flashback.capture_streams
-       SET slot_name = 'pg_flashback_test_adversarial'
-     WHERE stream_id = v_stream_id;
-
     INSERT INTO flashback.tracked_tables (
         rel_oid, schema_name, table_name, base_snapshot_table,
         recovery_profile, is_active

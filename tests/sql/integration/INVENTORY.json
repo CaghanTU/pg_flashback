@@ -16,6 +16,10 @@
       "class": "supported-core",
       "reason": "batch replay mixed ops via seam"
     },
+    "capture_stream_authority_invariants.sql": {
+      "class": "infra",
+      "reason": "flashback_guard_capture_stream trigger rejects direct identity mutation, illegal transitions, backward LSN moves, and post-terminal details edits"
+    },
     "checkpoint_after_restore.sql": {
       "class": "supported-core",
       "reason": "checkpoint after restore via seam"
