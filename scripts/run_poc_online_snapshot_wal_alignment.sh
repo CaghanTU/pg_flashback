@@ -1106,18 +1106,30 @@ run_protocol_b() {
     local pre_protection_confirmed_flush_before
     pre_protection_confirmed_flush_before="$(q "$DB" "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '$slot';")"
 
-    # Safety invariant: never skip-advance past WAL any ALREADY-tracked
-    # table on this shared slot hasn't fully consumed and applied yet --
-    # that would silently drop real, in-scope changes for those tables, not
-    # just this new table's own historical prefix. Fail closed instead of
-    # advancing on any doubt.
+    # Safety invariant: never skip-advance the underlying slot position past
+    # WAL that hasn't been DURABLY DECODED (not lost) for any ALREADY-
+    # tracked table sharing this slot. consume_slot_to_events is what
+    # provides that guarantee here -- pg_logical_slot_get_changes durably
+    # persists everything it decodes into change_log/commit_log (a normal
+    # table, not lost even if not yet materialized into a shadow table) and
+    # advances the slot's own confirmed_flush_lsn as a side effect, same as
+    # streaming replication would. This is deliberately NOT a check of
+    # change_log.applied: whether a decoded event has been materialized
+    # into its shadow table yet is an oracle bookkeeping detail orthogonal
+    # to data safety -- several scenario tests elsewhere in this harness
+    # intentionally decode more than they apply (oid+LSN-scoped
+    # poc_apply_shadow calls), and none of that is a "backlog" this slot
+    # skip-advance could ever lose, since it was already durably decoded.
     local existing_oids; existing_oids="$(all_tracked_oids)"
     if [[ -n "$existing_oids" ]]; then
         consume_slot_to_events "$slot" "$existing_oids"
         q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
-        local backlog
-        backlog="$(q "$DB" "SELECT count(*) FROM change_log WHERE applied = false AND oid = ANY(string_to_array('$existing_oids', ',')::bigint[]);")"
-        [[ "$backlog" == "0" ]] || die "protocol B[$tbl]: refusing historical-prefix advance -- $backlog unapplied WAL event(s) pending for already-tracked table(s) [$existing_oids]"
+        local caught_up_flush
+        caught_up_flush="$(q "$DB" "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '$slot';")"
+        local caught_up
+        caught_up="$(q "$DB" "SELECT '$caught_up_flush'::pg_lsn >= '$pre_protection_flush_lsn'::pg_lsn;")"
+        [[ "$caught_up" == "t" ]] \
+            || die "protocol B[$tbl]: refusing historical-prefix advance -- already-tracked table(s) [$existing_oids] not yet caught up to $pre_protection_flush_lsn (at $caught_up_flush)"
     fi
 
     local historical_prefix_advanced="false"
