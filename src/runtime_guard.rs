@@ -42,13 +42,28 @@ pub fn audited_recover_operation() -> Option<i64> {
 }
 
 /// Permanent (whole-backend-lifetime) transaction-end callback: unconditionally
-/// clears the audited-recover context on every commit/abort, independent of
-/// whether flashback_recover_execute's own plpgsql exception handling ran.
-/// This is the actual leak-proof guarantee -- a bug, a statement_timeout, a
-/// client-initiated cancel, or connection reuse for an unrelated later
-/// transaction in the same backend can never observe a stale operation_id.
+/// clears BOTH backend-local execution-context flags -- the audited-recover
+/// operation id and restore-in-progress -- on every commit/abort, independent
+/// of whether the owning SQL function's own plpgsql exception handling ran.
+///
+/// This is the actual leak-proof guarantee, and it matters for a reason
+/// PL/pgSQL's `EXCEPTION WHEN OTHERS` cannot cover: PostgreSQL explicitly
+/// excludes QUERY_CANCELED (and ASSERT_FAILURE) from `OTHERS` (see the
+/// PL/pgSQL docs on exception handling), so a statement_timeout,
+/// idle-in-transaction timeout, or an operator's `pg_cancel_backend()`
+/// firing while flashback_restore_lsn/flashback_unprotect/flashback_untrack's
+/// core body is between `flashback_set_restore_in_progress(true)` and its own
+/// `EXCEPTION` block's `false` never reaches that handler at all -- the whole
+/// top-level transaction aborts directly. Without this callback,
+/// RESTORE_IN_PROGRESS would then stay `true` for the rest of that backend's
+/// life (a pooled or simply still-open connection), silently treating every
+/// later, completely unrelated user DDL statement in that same backend as
+/// internal restore DDL and bypassing capture for it. XACT_EVENT_ABORT fires
+/// for exactly this case regardless of *why* the transaction aborted, so
+/// this callback closes the gap a plpgsql exception handler structurally
+/// cannot.
 #[pg_guard]
-unsafe extern "C-unwind" fn audited_recover_context_xact_callback(
+unsafe extern "C-unwind" fn backend_local_execution_context_xact_callback(
     event: pg_sys::XactEvent::Type,
     _arg: *mut c_void,
 ) {
@@ -61,13 +76,14 @@ unsafe extern "C-unwind" fn audited_recover_context_xact_callback(
             | XACT_EVENT_PARALLEL_ABORT
     ) {
         clear_audited_recover_operation();
+        set_restore_in_progress(false);
     }
 }
 
-pub fn install_audited_recover_context_xact_callback() {
+pub fn install_backend_local_execution_context_xact_callback() {
     unsafe {
         pg_sys::RegisterXactCallback(
-            Some(audited_recover_context_xact_callback),
+            Some(backend_local_execution_context_xact_callback),
             std::ptr::null_mut(),
         );
     }
@@ -143,4 +159,87 @@ fn flashback_set_restore_in_progress(val: bool) -> bool {
 #[pg_extern]
 fn flashback_is_restore_in_progress(_rel_oid: Option<pgrx::pg_sys::Oid>) -> bool {
     is_restore_in_progress()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use super::*;
+
+    // A2: this is the specific regression a live-cluster test (statement_timeout
+    // cancelling a query while restore_in_progress was set, in one backend)
+    // cannot express inside pg_test's one-fresh-backend-per-test harness, but
+    // the actual code under test IS this exact callback function -- calling it
+    // directly, unit-style, with each XactEvent it's registered for, proves the
+    // reset happens unconditionally on abort/commit regardless of *why* the
+    // transaction ended, which is the whole point: PL/pgSQL's `EXCEPTION WHEN
+    // OTHERS` cannot see QUERY_CANCELED at all, so nothing upstream of this
+    // callback can be relied on to have already cleared the flag.
+    #[pg_test]
+    fn xact_callback_clears_both_backend_local_contexts_on_abort() {
+        set_restore_in_progress(true);
+        set_audited_recover_operation(42);
+        assert!(is_restore_in_progress());
+        assert_eq!(audited_recover_operation(), Some(42));
+
+        unsafe {
+            backend_local_execution_context_xact_callback(
+                pg_sys::XactEvent::XACT_EVENT_ABORT,
+                std::ptr::null_mut(),
+            );
+        }
+
+        assert!(
+            !is_restore_in_progress(),
+            "restore_in_progress must be cleared on XACT_EVENT_ABORT even though \
+             no plpgsql EXCEPTION handler ran -- this is exactly the path a \
+             statement_timeout/query-cancel takes, since QUERY_CANCELED is not \
+             matched by WHEN OTHERS"
+        );
+        assert_eq!(
+            audited_recover_operation(),
+            None,
+            "audited recover context must be cleared on XACT_EVENT_ABORT"
+        );
+    }
+
+    #[pg_test]
+    fn xact_callback_clears_both_backend_local_contexts_on_commit() {
+        set_restore_in_progress(true);
+        set_audited_recover_operation(7);
+
+        unsafe {
+            backend_local_execution_context_xact_callback(
+                pg_sys::XactEvent::XACT_EVENT_COMMIT,
+                std::ptr::null_mut(),
+            );
+        }
+
+        assert!(!is_restore_in_progress());
+        assert_eq!(audited_recover_operation(), None);
+    }
+
+    #[pg_test]
+    fn xact_callback_ignores_unrelated_events() {
+        // A pre-commit/pre-prepare style event must not clear state early --
+        // only the four terminal events this callback matches on should ever
+        // reset these flags.
+        set_restore_in_progress(true);
+
+        unsafe {
+            backend_local_execution_context_xact_callback(
+                pg_sys::XactEvent::XACT_EVENT_PRE_COMMIT,
+                std::ptr::null_mut(),
+            );
+        }
+
+        assert!(
+            is_restore_in_progress(),
+            "a non-terminal XactEvent must not clear restore_in_progress early"
+        );
+
+        // Clean up so this doesn't leak into whatever the test harness runs
+        // next in this same backend.
+        set_restore_in_progress(false);
+    }
 }

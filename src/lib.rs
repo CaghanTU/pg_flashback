@@ -22,7 +22,7 @@ pub use capture::wal_decoder::_PG_output_plugin_init;
 pub extern "C-unwind" fn _PG_init() {
     capture::ddl_hook::install_process_utility_hook();
     storage::worker::register_worker_and_guc();
-    runtime_guard::install_audited_recover_context_xact_callback();
+    runtime_guard::install_backend_local_execution_context_xact_callback();
 }
 
 #[pg_guard]
