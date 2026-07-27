@@ -29,17 +29,33 @@ correction. It does not change pg_flashback itself.
 
 Machine-readable aggregate:
 `docs/evidence/step7-online-snapshot-wal-alignment.json` — source commit
-`2423914a5ee16b67b63c3e0e5717c90f732bf14f`, source tree
-`2a3ef5542d58146445f2464a3dba1a38c729b066`, `source_tree_dirty: false`,
+`cfd7eb2f6acca3c77285edf55b6e8fe5b1eb0923`, source tree
+`801a4d51a01856724ef77ac7d988f928a12faf70`, `source_tree_dirty: false`,
 extension binary sha256
 `5657e332355acd1135faea819f90ffc9306078b5d5eddce717c6562210690c05`
-(identical across every rebuild in this session — production Rust/SQL never
-changed). It embeds the sha256 of each run's own `result.json` and every
-recorded metric for six harness runs (two consecutive clean 64 MiB dev
-passes, four 1 GiB scale combinations) plus the production-oracle
-validation results below. Raw PostgreSQL data/log directories are not
-committed; each run's `target/poc/online-snapshot-wal-alignment/<run-id>/`
-was stripped to `result.json` + `metrics.jsonl` after the run.
+(identical across every rebuild across all three correction rounds —
+production Rust/SQL never changed). It embeds the sha256 of each run's own
+`result.json` and every recorded metric for: a selftest run (now including a
+gate that deliberately breaks a Protocol B copier and proves zero leftover
+processes), one clean 64 MiB dev pass, a small targeted 16 MiB Protocol B
+check, the two 1 GiB Protocol B combinations (re-run this round), the two
+1 GiB Protocol A combinations (**reused** from the prior evidence commit —
+justification below), plus the production-oracle validation results.
+
+**Protocol A 1 GiB reuse:** `run_protocol_a` and
+`run_protocol_a_conn_lifecycle_adversarial` were not touched by any commit in
+this round — verified by inspecting every diff hunk location against every
+commit landed this round (only `install_oracle_sql` additions,
+`run_protocol_b`, `run_protocol_b_writer_loop`, three new bash helpers,
+`run_restart_crash_scenarios`'s scenario 15A block, and
+`cleanup()`/`reap_run_children` were touched). Protocol A's 1 GiB
+ordinary/TOAST evidence is therefore carried forward verbatim rather than
+re-run, per the explicit reuse allowance in this round's task brief. Raw
+PostgreSQL data/log directories are not committed; each run's
+`target/poc/online-snapshot-wal-alignment/<run-id>/` retains `result.json` +
+`metrics.jsonl` + small diagnostic files (the postgres data directory itself
+is now cleaned by default regardless of PASS/FAIL — see "Disk hygiene"
+below).
 
 ## What was built
 
@@ -152,6 +168,47 @@ Verified: two tables reanchored onto **one** existing slot in sequence
 unaffected; ordinary, TOAST, and quoted-identifier (`"Weird Table"`, columns
 with spaces) profiles all round-trip correctly.
 
+**Real concurrent DML during the copy, proven via a deterministic handshake
+(added this round).** Earlier evidence for Protocol B had zero replayed
+commits/inserts/updates/deletes — no writer ran during the copy at all. Now:
+the copier's backend is tagged with a unique `application_name` and its CTAS
+is (at dev scale) deliberately slowed via a `poc_slowdown()` SQL function so
+the window is observable; the harness polls `pg_stat_activity` for that
+backend genuinely `state='active'` running the `CREATE TABLE ... AS SELECT`
+itself (`copy_active_observed`) — an explicit `die()`, never a silent
+proceed, if that's never confirmed. Only after that observation does a
+concurrent writer loop start, producing real committed `INSERT`/`UPDATE`/
+`DELETE` transactions (including at least one genuinely multi-row
+transaction, and — TOAST profile — periodic large-incompressible-value
+mutations) until the CTAS itself finishes; the writer's own first proven
+commit is `writer_active_during_copy`. Both `copy_window_commits` (the
+writer's own ground-truth count) and `commits_replayed`/`post_marker_*`
+(the WAL-derived replay count) are recorded separately. At 1 GiB scale the
+real CTAS already takes 4–5 s on its own, so the artificial slowdown is
+skipped there.
+
+**Shared-slot historical-prefix skip-advance (added this round).** A real
+already-running production capture slot has already caught up past a
+table's pre-existing history before DROP-protection for that specific table
+turns on — it does not decode everything that ever happened to the table the
+moment protection starts. `run_protocol_b` now models that: the table is
+created and loaded with its initial data *before* it joins the shared
+slot's tracked set, a `pre_protection_flush_lsn` is captured right after,
+and `pg_replication_slot_advance()` skip-advances the slot past it without
+ever decoding that payload. A fail-closed safety check runs first:
+`consume_slot_to_events` for every already-tracked table sharing the slot,
+then a hard assertion that the slot's own `confirmed_flush_lsn` reached
+`pre_protection_flush_lsn` — proving nothing already-tracked was skipped
+without being durably decoded first (decoded into `change_log`/`commit_log`,
+not necessarily yet *applied* to a shadow table, which is a separate, safe-
+to-defer bookkeeping concern). Only after the advance succeeds does the
+table join the tracked set; every replayed event from that point on is
+therefore provably post-marker by construction
+(`historical_payload_events_replayed=0`, structurally guaranteed, not
+measured). Left unfixed, this made a real 1 GiB Protocol B run blow a 590 s
+timeout decoding a table's own ~9M-row initial bulk load before it ever
+reached the boundary marker, and left ~20 GiB of retained `pg_wal` on disk.
+
 ## What went wrong while building this (and why it matters)
 
 Several bugs found while building and correcting the harness are themselves
@@ -207,6 +264,50 @@ mistakes:
    above, replay stays idempotent through it. Step 8 must not assume
    at-most-once delivery from a logical slot across a crash — only
    at-least-once, with idempotent apply as the actual guarantee.
+6. **A per-row micro-sleep is not a reliable way to make a query take
+   deterministic wall-clock time.** The first version of the deterministic
+   copy-active mechanism called `pg_sleep()` once per row with a tiny
+   duration (e.g. 0.0000072 s at ~280K rows, targeting ~2 s total). In
+   practice `pg_sleep()`'s own per-call/syscall overhead dominates once
+   invoked hundreds of thousands of times, so the intended ~2 s CTAS took
+   minutes, blew the harness's own timeout, and left the writer and psql's
+   `\!`-spawned file-wait grandchildren running as orphans when the harness
+   killed the cluster mid-copy. Fixed by sleeping a fixed ~20 ms on only
+   ~100 evenly-spaced (stride-based) rows via a `CASE WHEN` — a guaranteed-
+   order SQL construct, unlike an `OR` disjunct the planner may reorder —
+   for the same bounded total delay regardless of row count.
+7. **A child process's stop signal must be guaranteed by its own exit path,
+   not inferred from one specific outcome.** The concurrent writer originally
+   stopped only when it saw `ctas_done_file`, which is touched only if the
+   CTAS itself *succeeds*. A copier that errors partway through (the deliberate
+   fault-injection selftest gate, or any real crash) never touches that file,
+   so a writer keyed on it alone would run forever. Fixed with a separate
+   `writer_stop_file` guaranteed by the copier subshell's own `EXIT` trap on
+   every exit path — success, a SQL error, or being killed — plus a global
+   `WORK_ROOT`-path-scoped process sweep in `cleanup()` for the class of
+   grandchild that a killed parent (e.g. a psql session's `\!` shell-escape)
+   orphans and that is never directly reapable by PID at all, since
+   PostgreSQL's own `setproctitle` rewrite erases any trace of the spawning
+   path from a bgworker's visible command line. A full sweep of this
+   session's accumulated orphans (spanning all three correction rounds, not
+   just this one) found 40 leftover processes, including several
+   `pg_flashback maintenance worker`/`delta worker` bgworkers that survived
+   their own postmaster's `pg_ctl stop` because an earlier external kill (a
+   timeout firing while a stuck decode was in progress, before this round's
+   historical-prefix fix) cut off the harness's own graceful shutdown before
+   it completed.
+8. **"Decoded" and "applied" are different safety properties.** An early
+   version of the historical-prefix safety check (item above) required
+   `change_log.applied=true` for every already-tracked table before allowing
+   a slot skip-advance — but several scenario tests in this harness
+   intentionally decode more than they apply (oid+LSN-scoped
+   `poc_apply_shadow` calls, by design, to isolate a specific boundary
+   window), so the check correctly-but-wrongly refused to advance on data
+   that was never actually at risk of being lost. The real safety property
+   is durable *decode* (persisted in `change_log`/`commit_log`, safe
+   regardless of what happens to the slot afterward) — whether something has
+   been *materialized* into a shadow table yet is an orthogonal oracle
+   bookkeeping detail.
 
 ## Correctness oracle
 
@@ -266,7 +367,7 @@ each shape.
 | 13b | Marker that does commit | B | Durable/visible by definition of `COMMIT` |
 | 14a | Export connection dies before import | A | Import fails closed |
 | 14b | Export connection dies after import succeeds | A | Already-pinned copy unaffected |
-| 15a | Real crash (`pg_ctl -m immediate`) while copy is in flight, after marker commit | B | In-flight (uncommitted) copy vanishes entirely on recovery; marker stays durable/decodable; clean retry succeeds with no lost/duplicate commit |
+| 15a | Real crash (`pg_ctl -m immediate`) while a genuinely active, in-flight CTAS is confirmed running via `pg_stat_activity` (not a client-side sleep before the query even starts), after marker commit | B | `pg_stat_activity` confirms `state='active'` running the real `CREATE TABLE ... AS SELECT` before the crash is ever applied (`ctas_active_observed_before_crash`, `crash_applied_while_ctas_active`); in-flight (uncommitted) copy vanishes entirely on recovery (`partial_artifact_absent_after_restart`); marker stays durable/decodable; clean retry succeeds with matching row count/fingerprint and no lost/duplicate commit (`retry_passed`) |
 | 15b | Real crash after copy commits, before a separate metadata-finalize step | B | Physically-committed orphan correctly not treated as available; deterministic cleanup drops it; idempotent retry reaches `available` |
 | 15c | Coordinator's marker commits, copier independently fails (never runs) | B | Marker alone never produces an active artifact; shared slot stays healthy for a later clean attempt |
 | 16 | Slot loss (dropped mid-use) | — | Consuming a dropped slot errors; never silently returns data |
@@ -317,24 +418,54 @@ consistent with this distribution, not a separate claim.
 
 ## 1 GiB final runs
 
-| Run | Rows | Table physical bytes | Logical payload bytes | Copy time | Lock hold (B only) |
-|---|---|---|---|---|---|
-| A, ordinary | 8,947,848 | 1,178,591,232 (1.10 GiB) | 930,554,959 (887 MiB) | 4.39 s | — (lock-free) |
-| A, TOAST | 130,944 | 1,133,346,816 (1.06 GiB) | 1,077,442,632 (1.00 GiB) | 4.31 s | — (lock-free) |
-| B, ordinary | 8,947,848 | 1,178,615,808 (1.10 GiB) | 930,545,487 (887 MiB) | 5.27 s | **30 ms** |
-| B, TOAST | 130,944 | 1,133,338,624 (1.06 GiB) | 1,077,407,232 (1.00 GiB) | 4.88 s | **27 ms** |
+| Run | Rows | Table physical bytes | Logical payload bytes | Copy time | Lock hold (B only) | Post-marker commits/ins/upd/del |
+|---|---|---|---|---|---|---|
+| A, ordinary (reused) | 8,947,848 | 1,178,591,232 (1.10 GiB) | 930,554,959 (887 MiB) | 4.39 s | — (lock-free) | 148/148/0/0 (import-only workload) |
+| A, TOAST (reused) | 130,944 | 1,133,346,816 (1.06 GiB) | 1,077,442,632 (1.00 GiB) | 4.31 s | — (lock-free) | 150/150/0/0 (import-only workload) |
+| B, ordinary (this round) | 8,947,850 | 1,178,648,576 (1.10 GiB) | 930,545,831 (887 MiB) | 4.47 s | **27 ms** | 334/105/168/103 |
+| B, TOAST (this round) | 130,946 | 1,133,453,312 (1.06 GiB) | 1,077,384,306 (1.00 GiB) | 4.01 s | **27 ms** | 321/101/161/99 |
 
 All four passed every oracle layer (row count, fingerprint, commit-LSN
 sequencing, TOAST byte equality where applicable, zero duplicate/out-of-order
-commits). Protocol B's 1 GiB lock-hold times (27–30 ms) dropped by roughly
-30x from the pre-correction measurement (49–920 ms) once the snapshot-fixing
-probe changed from `SELECT count(*)` to `SELECT 1 ... LIMIT 1` — the
-higher earlier number was an artifact of the probe, not the protocol.
+commits). Protocol A's reused runs predate the concurrent-writer mechanism
+built this round (Protocol A's own copy is lock-free, so it was never the
+gap Protocol B had) and only ever exercised an import-time INSERT workload;
+Protocol B's two runs above are re-measured this round and are the first
+1 GiB evidence with genuine concurrent INSERT/UPDATE/DELETE churn proven
+during the copy window, replayed post-marker with zero duplicates.
+Protocol B's 1 GiB lock-hold time (27 ms both runs) is consistent with the
+20-sample 64 MiB distribution below and with the prior round's measurement
+(27–30 ms) — the historical-prefix fix changed *what* gets decoded before
+the marker, not the lock-hold window itself.
+
+## Disk hygiene (added this round)
+
+The 1 GiB Protocol B ordinary run that first exposed the historical-prefix
+bug left **~20 GiB** of retained `pg_wal` on disk (a shared slot that cannot
+advance past WAL nothing has consumed yet), and — because that run's own
+external timeout fired while the cluster was busy, cutting off the
+harness's own graceful `pg_ctl stop` before it finished — left the cluster's
+`pg_flashback` background workers running as orphans afterward, undetectable
+by a `WORK_ROOT`-path-scoped process sweep since PostgreSQL rewrites a
+bgworker's visible command line via `setproctitle`. After the fix:
+
+- Peak ephemeral disk for the corrected 1 GiB Protocol B ordinary run: **5.26
+  GB** (`ephemeral_disk_bytes` in `result.json`, measured before cleanup).
+- Peak ephemeral disk for the corrected 1 GiB Protocol B TOAST run: **4.91
+  GB**.
+- `$DATA`/`$PGLIB_DIR` are now cleaned by default regardless of PASS/FAIL
+  (previously only on PASS, meaning a FAIL kept the entire cluster forever);
+  a full failed cluster is now opt-in only via `POC_KEEP_FAILED_DATA=1`.
+  Disk after cleanup for every run in this round's evidence: back to the
+  pre-run baseline, verified via `df`.
+- Orphan process count after every run in this round's required sequence:
+  **0**, verified via `pgrep -af "$WORK_ROOT"` after each run and a broader
+  sweep across the whole session.
 
 ## Production oracle validation
 
 Run separately against a real candidate archive built from this same commit
-(`scripts/build_candidate_archive.sh`, `CANDIDATE_DIR=target/candidate/2423914a5ee16b67b63c3e0e5717c90f732bf14f`),
+(`scripts/build_candidate_archive.sh`, `CANDIDATE_DIR=target/candidate/cfd7eb2f6acca3c77285edf55b6e8fe5b1eb0923`),
 proving the *actual* production correctness oracle and packaging path, not
 just this harness's own independent check:
 
@@ -395,11 +526,12 @@ independent of any existing slot emerges.
 ## Not production-wired
 
 Nothing in this ADR changes `flashback_track`, `SnapshotStore`, the public
-SQL API, GUCs, or generated SQL. Across every commit in this session, `git
-status` shows only `scripts/run_poc_online_snapshot_wal_alignment.sh`,
+SQL API, GUCs, or generated SQL. Across every commit in all three
+correction rounds, `git status` shows only
+`scripts/run_poc_online_snapshot_wal_alignment.sh`,
 `docs/adr/0003-online-snapshot-wal-alignment-poc.md`, and
 `docs/evidence/step7-online-snapshot-wal-alignment.json`. The extension
-binary sha256 (`5657e332...0690c05`) is identical across every rebuild this
-session, confirming production Rust/SQL never changed. Step 8 is where any
-of this gets wired into production, and that decision (which storage/lock
-seam actually changes) is explicitly out of scope here.
+binary sha256 (`5657e332...0690c05`) is identical across every rebuild
+across all three rounds, confirming production Rust/SQL never changed.
+Step 8 is where any of this gets wired into production, and that decision
+(which storage/lock seam actually changes) is explicitly out of scope here.
