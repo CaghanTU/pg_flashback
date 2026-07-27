@@ -397,6 +397,13 @@ install_oracle_sql() {
     CREATE TABLE marker_log (xid bigint PRIMARY KEY, lsn pg_lsn);
     CREATE TABLE change_log (seq bigserial PRIMARY KEY, xid bigint, oid bigint, op text,
                               old jsonb, new jsonb, applied boolean NOT NULL DEFAULT false);
+    -- change_log/commit_log accumulate for the whole harness run (many
+    -- tables across many scenarios); without this, poc_apply_shadow's
+    -- WHERE cl.applied = false scan degrades from 'a handful of new rows'
+    -- to a full-table scan that gets slower every scenario, since the
+    -- unapplied backlog only ever shrinks for the specific oid a given
+    -- call is scoped to (see p_oid_filter below), not globally.
+    CREATE INDEX change_log_unapplied_idx ON change_log (oid) WHERE applied = false;
     CREATE TABLE poc_table_map (oid bigint PRIMARY KEY, shadow_regclass text, pk_col text);
     -- PoC-only artifact lifecycle model for the restart/crash scenarios
     -- below (creating -> available | aborted). This is NOT the production
@@ -457,11 +464,16 @@ install_oracle_sql() {
 
     -- Ingests any pending decoded_events, then applies every not-yet-applied
     -- change_log row whose owning transaction's commit LSN is strictly
-    -- after p_since_lsn (NULL = apply everything, for Protocol A's
-    -- consistent-point boundary). Re-applying an already-applied row is not
-    -- possible (the applied flag gates it), so calling this repeatedly is
-    -- safe and only ever processes genuinely new work.
-    CREATE OR REPLACE FUNCTION poc_apply_shadow(p_since_lsn pg_lsn DEFAULT NULL)
+    -- after p_since_lsn (NULL = apply everything matching p_oid_filter, for
+    -- Protocol A's consistent-point boundary). p_oid_filter scopes the
+    -- apply pass to one table's oid when given (NULL = every table
+    -- currently in poc_table_map): change_log/poc_table_map accumulate
+    -- across the whole harness run, so an unscoped NULL/NULL call late in
+    -- a long run reprocesses every earlier scenario's leftover backlog, not
+    -- just the caller's own table. Re-applying an already-applied row is
+    -- not possible (the applied flag gates it), so calling this repeatedly
+    -- is safe and only ever processes genuinely new work.
+    CREATE OR REPLACE FUNCTION poc_apply_shadow(p_since_lsn pg_lsn DEFAULT NULL, p_oid_filter bigint DEFAULT NULL)
     RETURNS TABLE(commits bigint, inserts bigint, updates bigint, deletes bigint,
                   markers bigint, duplicate_commits bigint, out_of_order bigint) AS \$fn\$
     DECLARE
@@ -477,6 +489,7 @@ install_oracle_sql() {
           JOIN commit_log co ON co.xid = cl.xid
          WHERE cl.applied = false
            AND (p_since_lsn IS NULL OR co.lsn > p_since_lsn)
+           AND (p_oid_filter IS NULL OR cl.oid = p_oid_filter)
          ORDER BY co.lsn, cl.seq
       LOOP
         SELECT poc_table_map.shadow_regclass, poc_table_map.pk_col INTO shadow, pk
@@ -1178,7 +1191,7 @@ named_txn_verify() {
         || die "$case_name: decoded commit count $commit_delta != expected $expect_commit_delta"
 
     local apply_out ins upd del dup ooo _commits _mark
-    apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$before_lsn'::pg_lsn);")"
+    apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$before_lsn'::pg_lsn, $oid);")"
     IFS='|' read -r _commits ins upd del _mark dup ooo <<<"$apply_out"
     [[ "$dup" == "0" && "$ooo" == "0" ]] || die "$case_name: duplicate_commits=$dup out_of_order=$ooo"
 
@@ -1609,7 +1622,7 @@ SQL
     q "$DB" "INSERT INTO decoded_events(data) SELECT data FROM pg_logical_slot_peek_changes('$slot', NULL, NULL, 'tracked_oids', '$oid', 'metadata_only','false');" >/dev/null
     q "$DB" "INSERT INTO decoded_events(data) SELECT data FROM pg_logical_slot_peek_changes('$slot', NULL, NULL, 'tracked_oids', '$oid', 'metadata_only','false');" >/dev/null
     local retry_out
-    retry_out="$(q "$DB" "SELECT duplicate_commits FROM poc_apply_shadow(NULL);")"
+    retry_out="$(q "$DB" "SELECT duplicate_commits FROM poc_apply_shadow(NULL, $oid);")"
     [[ "$retry_out" -ge 1 ]] || die "17: retry oracle failed to detect the duplicate commit it was fed"
     local retry_rows; retry_rows="$(q "$DB" "SELECT count(*) FROM ${tbl}_shadow_retry WHERE id=1;")"
     [[ "$retry_rows" == "1" ]] \
@@ -1700,7 +1713,7 @@ SQL
     q "$DB" "UPDATE poc_artifact_state SET state='available' WHERE artifact_name='restart-a';" >/dev/null
     consume_slot_to_events "$slot" "$oid"
     local retry_apply retry_dup retry_ooo
-    retry_apply="$(q "$DB" "SELECT duplicate_commits,out_of_order FROM poc_apply_shadow(NULL);")"
+    retry_apply="$(q "$DB" "SELECT duplicate_commits,out_of_order FROM poc_apply_shadow(NULL, $oid);")"
     IFS='|' read -r retry_dup retry_ooo <<<"$retry_apply"
     [[ "$retry_ooo" == "0" ]] || die "restart-a: out-of-order commits after crash retry"
     local fp_live fp_shadow
@@ -1763,7 +1776,7 @@ SQL
              CREATE TABLE ${tbl}_probe_shadow AS SELECT * FROM ${tbl}_probe WHERE false;
              INSERT INTO ${tbl}_probe VALUES (1);" >/dev/null
     consume_slot_to_events "$slot" "$probe_oid"
-    q "$DB" "SELECT poc_apply_shadow(NULL);" >/dev/null
+    q "$DB" "SELECT poc_apply_shadow(NULL, $probe_oid);" >/dev/null
     local probe_rows; probe_rows="$(q "$DB" "SELECT count(*) FROM ${tbl}_probe_shadow;")"
     [[ "$probe_rows" == "1" ]] || die "restart-c: shared slot/stream did not remain healthy after the marker-only failed attempt"
     echo "restart-15c: marker-only commit never produced an active artifact; shared slot remained healthy for a later clean attempt" >&2
