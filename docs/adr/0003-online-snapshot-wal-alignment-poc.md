@@ -535,3 +535,30 @@ binary sha256 (`5657e332...0690c05`) is identical across every rebuild
 across all three rounds, confirming production Rust/SQL never changed.
 Step 8 is where any of this gets wired into production, and that decision
 (which storage/lock seam actually changes) is explicitly out of scope here.
+
+## Addendum — evidence validity note (Faz A correctness closure)
+
+Everything above describes the tree at `source_commit`
+`cfd7eb2f6acca3c77285edf55b6e8fe5b1eb0923` only. After this ADR was written,
+Faz A (A1-A7 correctness closure across Steps 1-7, landing 8 further commits
+ending at `ececde5`) changed production Rust — specifically
+`src/capture/wal_decoder.rs`, the exact file this harness reuses as a
+decoding library (`_PG_output_plugin_init`, `fb_decode_change`) — to detect
+and mark oversized rows instead of silently decoding them (A5), plus
+extensive SQL across state authority, capture staging, restore/verify, and
+the operation journal (A1-A7).
+
+Every "identical across every rebuild," "production Rust/SQL never
+changed," and `extension_binary_sha256` claim in this document is therefore
+**stale** and must not be read as describing current `HEAD`. This does not
+retroactively invalidate the *evidence itself* as a historical record of
+what was proven at `cfd7eb2`, and it does not mean Protocol A/B's measured
+behavior is now wrong — the harness never touched `flashback_track` or
+`SnapshotStore`, and nothing in Faz A changed the decoder's JSON shape for
+an ordinary (non-oversized) row. It does mean: before this ADR's
+conclusions are cited again, or before Step 8 work builds on this evidence,
+the harness must be re-run against current `HEAD` to get a fresh candidate
+identity, hash, and pass/fail record. The harness's own
+`dirty_tree_rejected`/`candidate_mismatch_rejected` selftest gates already
+fail closed on exactly this kind of drift; this note exists so the
+checked-in prose does not silently claim otherwise in the meantime.
