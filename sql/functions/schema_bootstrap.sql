@@ -1469,8 +1469,12 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
                                CHECK (snapshot_schema_fingerprint ~ '^[0-9a-f]{32}$'),
     snapshot_storage_backend  TEXT,
     snapshot_locator          JSONB,
-    expected_delta_rows        BIGINT NOT NULL CHECK (expected_delta_rows >= 0),
-    expected_schema_rows       BIGINT NOT NULL CHECK (expected_schema_rows >= 0),
+    -- Optional forensic observations from older intents.  Retention does not
+    -- scan payload content merely to prove it may delete that content:
+    -- eligibility is identity + continued need, while the actual DELETE row
+    -- counts below remain durable outcome evidence.
+    expected_delta_rows        BIGINT CHECK (expected_delta_rows >= 0),
+    expected_schema_rows       BIGINT CHECK (expected_schema_rows >= 0),
     first_delta_lsn            PG_LSN,
     last_delta_lsn             PG_LSN,
     delta_rows_removed         BIGINT,
@@ -1495,8 +1499,12 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
             AND removed_by IS NULL
         ) OR (
             state = 'removed'
-            AND delta_rows_removed = expected_delta_rows
-            AND schema_rows_removed = expected_schema_rows
+            AND delta_rows_removed IS NOT NULL
+            AND schema_rows_removed IS NOT NULL
+            AND (expected_delta_rows IS NULL
+                 OR delta_rows_removed = expected_delta_rows)
+            AND (expected_schema_rows IS NULL
+                 OR schema_rows_removed = expected_schema_rows)
             AND removed_at IS NOT NULL
             AND removed_by IS NOT NULL
         )
@@ -1522,6 +1530,32 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
 -- intent must resolve to the exact relation it plans to delete.
 DO $$
 BEGIN
+    ALTER TABLE flashback.generation_payload_retirements
+        ALTER COLUMN expected_delta_rows DROP NOT NULL,
+        ALTER COLUMN expected_schema_rows DROP NOT NULL;
+    ALTER TABLE flashback.generation_payload_retirements
+        DROP CONSTRAINT IF EXISTS generation_payload_retirements_removed_shape_check;
+    ALTER TABLE flashback.generation_payload_retirements
+        ADD CONSTRAINT generation_payload_retirements_removed_shape_check CHECK (
+            (
+                state = 'retiring'
+                AND delta_rows_removed IS NULL
+                AND schema_rows_removed IS NULL
+                AND removed_at IS NULL
+                AND removed_by IS NULL
+            ) OR (
+                state = 'removed'
+                AND delta_rows_removed IS NOT NULL
+                AND schema_rows_removed IS NOT NULL
+                AND (expected_delta_rows IS NULL
+                     OR delta_rows_removed = expected_delta_rows)
+                AND (expected_schema_rows IS NULL
+                     OR schema_rows_removed = expected_schema_rows)
+                AND removed_at IS NOT NULL
+                AND removed_by IS NOT NULL
+            )
+        );
+
     ALTER TABLE flashback.generation_payload_retirements
         ADD COLUMN IF NOT EXISTS snapshot_rel_oid OID;
 
@@ -2408,86 +2442,6 @@ BEGIN
     END IF;
 END
 $$;
-
-DO $$
-BEGIN
-    IF to_regclass('flashback.restore_log') IS NULL THEN
-        EXECUTE 'CREATE TABLE flashback.restore_log (
-            restore_id     BIGSERIAL PRIMARY KEY,
-            table_name     TEXT NOT NULL,
-            target_time    TIMESTAMPTZ,
-            target_lsn     PG_LSN,
-            restored_by    TEXT NOT NULL DEFAULT current_user,
-            restored_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-            rows_affected  BIGINT NOT NULL DEFAULT 0,
-            success        BOOLEAN NOT NULL DEFAULT true,
-            error_message  TEXT
-        )';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'flashback' AND table_name = 'restore_log'
-          AND column_name = 'target_lsn'
-    ) THEN
-        ALTER TABLE flashback.restore_log ADD COLUMN target_lsn PG_LSN;
-    END IF;
-    ALTER TABLE flashback.restore_log ALTER COLUMN target_time DROP NOT NULL;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conrelid = 'flashback.restore_log'::regclass
-          AND conname = 'restore_log_target_coordinate_check'
-    ) THEN
-        ALTER TABLE flashback.restore_log
-            ADD CONSTRAINT restore_log_target_coordinate_check
-            CHECK (target_time IS NOT NULL OR target_lsn IS NOT NULL);
-    END IF;
-END
-$$;
-
--- Enhanced monitoring view with per-table storage breakdown
-CREATE OR REPLACE VIEW flashback.pg_stat_flashback AS
-SELECT
-    (SELECT count(*) FROM flashback.tracked_tables WHERE is_active) AS tracked_tables,
-    (SELECT count(*) FROM flashback.tracked_tables WHERE NOT is_active) AS untracked_tables,
-    (SELECT count(*) FROM flashback.pending_wal_events) AS pending_events,
-    (SELECT count(*) FROM flashback.delta_log) AS total_deltas,
-    (SELECT pg_size_pretty(pg_total_relation_size('flashback.delta_log'))) AS delta_storage,
-    (SELECT pg_size_pretty(pg_total_relation_size('flashback.pending_wal_events'))) AS staging_storage,
-    (SELECT count(*) FROM flashback.snapshots) AS total_snapshots,
-    (SELECT count(*) FROM flashback.restore_log) AS total_restores,
-    (SELECT count(*) FROM flashback.restore_log WHERE success) AS successful_restores,
-    (SELECT count(*) FROM flashback.restore_log WHERE NOT success) AS failed_restores,
-    (SELECT max(restored_at) FROM flashback.restore_log) AS last_restore_at,
-    COALESCE(current_setting('pg_flashback.enabled', true), 'on') AS capture_enabled,
-    COALESCE(current_setting('pg_flashback.max_row_size', true), '64kB') AS max_row_size,
-    COALESCE(current_setting('pg_flashback.worker_interval_ms', true), '75') AS worker_interval_ms;
-
--- Per-table storage breakdown for capacity planning
-CREATE OR REPLACE VIEW flashback.pg_stat_flashback_tables AS
-SELECT
-    format('%I.%I', tt.schema_name, tt.table_name) AS table_name,
-    tt.tracked_since,
-    tt.checkpoint_interval,
-    tt.retention_interval,
-    tt.is_active,
-    (SELECT count(*) FROM flashback.delta_log d
-     WHERE d.tracking_id = tt.tracking_id
-        OR (d.tracking_id IS NULL AND d.rel_oid = tt.rel_oid)) AS delta_count,
-    (SELECT pg_size_pretty(
-        COALESCE(sum(pg_column_size(d.old_data) + pg_column_size(d.new_data)), 0)::bigint
-    ) FROM flashback.delta_log d
-      WHERE d.tracking_id = tt.tracking_id
-         OR (d.tracking_id IS NULL AND d.rel_oid = tt.rel_oid)) AS delta_data_size,
-    (SELECT count(*) FROM flashback.snapshots s
-     WHERE s.tracking_id = tt.tracking_id
-        OR (s.tracking_id IS NULL AND s.rel_oid = tt.rel_oid)) AS snapshot_count,
-    (SELECT max(s.captured_at) FROM flashback.snapshots s
-     WHERE s.tracking_id = tt.tracking_id
-        OR (s.tracking_id IS NULL AND s.rel_oid = tt.rel_oid)) AS last_checkpoint_at,
-    (SELECT count(*) FROM flashback.restore_log r
-     WHERE r.table_name = format('%I.%I', tt.schema_name, tt.table_name)) AS restore_count
-FROM flashback.tracked_tables tt;
 
 -- No recovery or tracking state is extension configuration data.  A logical
 -- dump cannot preserve relation OIDs, logical-slot incarnations, partitioned

@@ -1125,29 +1125,6 @@ BEGIN
            is_active = true
      WHERE tracking_id = admission.tracking_id;
 
-    -- A7: restore_log is a compatibility projection, not a second authority.
-    -- For an audited recover, the real outcome is decided later by the
-    -- operation journal (flashback_finalize_recover_operations/
-    -- flashback_recover_mark_failed/flashback_reconcile_recover_operations),
-    -- which alone writes this table's row once that outcome is known --
-    -- writing success=true here unconditionally would let this table claim
-    -- a restore succeeded before its coverage was ever verified healthy, and
-    -- since nothing here ever runs on a verification failure (this whole
-    -- function raises and rolls back instead), success would never be able
-    -- to read false either. The unaudited escape-hatch path has no journal
-    -- entry and no later re-verification at all, so this synchronous,
-    -- already-passed data-verification IS the only and final truth for it.
-    -- Fetched here (not reused from below): this is a pure backend-local
-    -- read with no side effects, and the point of this specific check is
-    -- "is this call audited," decided once, right where it gates the write.
-    IF flashback_internal_get_audited_recover_context() IS NULL THEN
-        INSERT INTO flashback.restore_log(
-            table_name, target_time, target_lsn, rows_affected, success
-        ) VALUES (
-            p_target_table, NULL, p_target_lsn, materialized.events_applied, true
-        );
-    END IF;
-
     -- The restore transaction swaps the user relation while capture is
     -- suppressed, so its post-restore generation also needs an explicit WAL
     -- marker.  The decoder uses this transaction's COMMIT record to seal the
@@ -1175,49 +1152,63 @@ BEGIN
     -- rather than silently attaching this restore's proof to an operation
     -- header that does not actually describe it.
     v_audited_op := flashback_internal_get_audited_recover_context();
-    IF v_audited_op IS NOT NULL THEN
-        SELECT o.command, o.tracking_id, o.target_lsn, o.disaster_event_id, s.state
-          INTO v_audited_command, v_audited_tracking_id, v_audited_target_lsn,
-               v_audited_disaster_event_id, v_audited_state
-        FROM flashback.operations o
-        JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
-        WHERE o.operation_id = v_audited_op;
-
-        IF v_audited_command IS DISTINCT FROM 'recover'
-           OR v_audited_state IS DISTINCT FROM 'started'
-           OR v_audited_tracking_id IS DISTINCT FROM admission.tracking_id
-           OR v_audited_target_lsn IS DISTINCT FROM p_target_lsn
-           OR v_audited_disaster_event_id IS DISTINCT FROM p_disaster_event_id
-        THEN
-            RAISE EXCEPTION 'pg_flashback: audited recover context (operation %) no longer matches this restore at finalize (table %, tracking_id=%, target_lsn=%, disaster_event_id=%)',
-                v_audited_op, p_target_table, admission.tracking_id, p_target_lsn, p_disaster_event_id
-                USING ERRCODE = 'serialization_failure';
-        END IF;
-
-        PERFORM flashback_operation_append_event(
-            v_audited_op,
-            'applied_coverage_pending',
-            NULL, NULL,
-            'restore applied; waiting for exact successor coverage',
-            jsonb_build_object(
-                'rows_affected', materialized.events_applied,
-                'expected_proof', v_expected_proof,
-                'restore_verification', v_restore_verification,
-                'successor', jsonb_build_object(
-                    'tracking_id', admission.tracking_id,
-                    'generation_id', v_new_generation_id,
-                    'stream_id', v_new_stream_id,
-                    'boundary_xid', v_boundary_xid,
-                    'boundary_marker', format(
-                        'post-restore:%s:%s:%s',
-                        admission.tracking_id, v_boundary_xid, v_generation_no
-                    ),
-                    'restored_target_lsn', p_target_lsn,
-                    'rel_oid_at_boundary', v_new_rel_oid
-                )
-            )
+    IF v_audited_op IS NULL THEN
+        -- The privileged raw restore escape hatch still gets an immutable
+        -- journal record.  It skips pre-authorized plan-token admission, not
+        -- post-restore coverage verification or audit.
+        v_audited_op := public.flashback_operation_begin(
+            p_command => 'restore_lsn',
+            p_table => p_target_table,
+            p_tracking_id => admission.tracking_id,
+            p_disaster_event_id => p_disaster_event_id,
+            p_generation_id => admission.generation_id,
+            p_target_lsn => p_target_lsn,
+            p_details => jsonb_build_object('raw_privileged_restore', true)
         );
     END IF;
+
+    SELECT o.command, o.tracking_id, o.target_lsn, o.disaster_event_id, s.state
+      INTO v_audited_command, v_audited_tracking_id, v_audited_target_lsn,
+           v_audited_disaster_event_id, v_audited_state
+    FROM flashback.operations o
+    JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
+    WHERE o.operation_id = v_audited_op;
+
+    IF v_audited_command IS NULL
+       OR v_audited_command NOT IN ('recover', 'restore_lsn')
+       OR v_audited_state IS DISTINCT FROM 'started'
+       OR v_audited_tracking_id IS DISTINCT FROM admission.tracking_id
+       OR v_audited_target_lsn IS DISTINCT FROM p_target_lsn
+       OR v_audited_disaster_event_id IS DISTINCT FROM p_disaster_event_id
+    THEN
+        RAISE EXCEPTION 'pg_flashback: restore journal context (operation %) no longer matches this restore at finalize (table %, tracking_id=%, target_lsn=%, disaster_event_id=%)',
+            v_audited_op, p_target_table, admission.tracking_id, p_target_lsn, p_disaster_event_id
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    PERFORM flashback_operation_append_event(
+        v_audited_op,
+        'applied_coverage_pending',
+        NULL, NULL,
+        'restore applied; waiting for exact successor coverage',
+        jsonb_build_object(
+            'rows_affected', materialized.events_applied,
+            'expected_proof', v_expected_proof,
+            'restore_verification', v_restore_verification,
+            'successor', jsonb_build_object(
+                'tracking_id', admission.tracking_id,
+                'generation_id', v_new_generation_id,
+                'stream_id', v_new_stream_id,
+                'boundary_xid', v_boundary_xid,
+                'boundary_marker', format(
+                    'post-restore:%s:%s:%s',
+                    admission.tracking_id, v_boundary_xid, v_generation_no
+                ),
+                'restored_target_lsn', p_target_lsn,
+                'rel_oid_at_boundary', v_new_rel_oid
+            )
+        )
+    );
 
     PERFORM public.flashback_set_restore_in_progress(false);
     RETURN materialized.events_applied;

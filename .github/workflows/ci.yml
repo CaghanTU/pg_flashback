@@ -153,6 +153,12 @@ jobs:
       - name: Runtime state mutations are centralized
         run: scripts/check_centralized_state_surface.sh
 
+      - name: Retention runtime is generation-only and avoids payload scans
+        run: scripts/check_retention_runtime_surface.sh
+
+      - name: Restore history is projected only from the operation journal
+        run: scripts/check_operation_journal_surface.sh
+
       - name: Restore expected/actual proofs derive from independent sources
         run: scripts/check_restore_proof_independence.sh
 

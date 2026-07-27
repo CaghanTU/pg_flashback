@@ -47,6 +47,75 @@ BEGIN
 END
 $$;
 
+-- Upgrade the former writable restore_log table into the append-only journal
+-- before exposing its compatibility view.  Preserve any historical rows as
+-- terminal journal events, then remove the second mutation authority.
+DO $$
+DECLARE
+    r record;
+    v_operation_id bigint;
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'flashback'
+          AND c.relname = 'restore_log'
+          AND c.relkind IN ('r', 'p')
+    ) THEN
+        DROP VIEW IF EXISTS flashback.pg_stat_flashback_tables;
+        DROP VIEW IF EXISTS flashback.pg_stat_flashback;
+        DROP VIEW IF EXISTS flashback.restore_log_v;
+
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'flashback'
+              AND table_name = 'restore_log'
+              AND column_name = 'target_lsn'
+        ) THEN
+            ALTER TABLE flashback.restore_log ADD COLUMN target_lsn pg_lsn;
+        END IF;
+
+        FOR r IN
+            SELECT table_name, target_time, target_lsn, restored_by,
+                   restored_at, rows_affected, success, error_message
+            FROM flashback.restore_log
+            ORDER BY restore_id
+        LOOP
+            INSERT INTO flashback.operations (
+                command, database_name, session_user_name, table_name,
+                target_lsn, created_at, details
+            ) VALUES (
+                'restore_lsn', current_database(),
+                COALESCE(r.restored_by, current_user::text),
+                r.table_name, r.target_lsn, r.restored_at,
+                jsonb_build_object(
+                    'migrated_from_restore_log', true,
+                    'legacy_target_time', r.target_time
+                )
+            ) RETURNING operation_id INTO v_operation_id;
+
+            INSERT INTO flashback.operation_events (
+                operation_id, event_type, recorded_at, error_code, message, payload
+            ) VALUES (
+                v_operation_id,
+                CASE WHEN r.success THEN 'verified' ELSE 'failed' END,
+                r.restored_at,
+                CASE WHEN r.success THEN NULL ELSE 'legacy_restore_failed' END,
+                r.error_message,
+                jsonb_build_object(
+                    'rows_affected', COALESCE(r.rows_affected, 0),
+                    'legacy_target_time', r.target_time,
+                    'migrated_from_restore_log', true
+                )
+            );
+        END LOOP;
+
+        DROP TABLE flashback.restore_log;
+    END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_operations_guard_trigger()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -113,18 +182,22 @@ FROM flashback.operations o
 JOIN flashback.operation_events e ON e.operation_id = o.operation_id
 ORDER BY o.operation_id, e.event_id DESC;
 
--- Compatibility projection over recover operations (not a second write path).
-CREATE OR REPLACE VIEW flashback.restore_log_v AS
+-- Compatibility projection over terminal recover operations.  In-progress
+-- operations are intentionally absent rather than being misreported as
+-- failures.  This is the only restore_log object; it has no writable table
+-- behind it.
+CREATE OR REPLACE VIEW flashback.restore_log AS
 SELECT
     o.operation_id AS restore_id,
     o.table_name,
-    NULL::timestamptz AS target_time,
+    NULLIF(e.payload->>'legacy_target_time', '')::timestamptz AS target_time,
     o.target_lsn,
     o.session_user_name AS restored_by,
-    o.created_at AS restored_at,
+    e.recorded_at AS restored_at,
     COALESCE((e.payload->>'rows_affected')::bigint, 0) AS rows_affected,
     (e.event_type = 'verified') AS success,
-    CASE WHEN e.event_type = 'failed' THEN e.message ELSE NULL END AS error_message
+    CASE WHEN e.event_type IN ('failed', 'abandoned')
+         THEN e.message ELSE NULL END AS error_message
 FROM flashback.operations o
 JOIN LATERAL (
     SELECT *
@@ -133,7 +206,55 @@ JOIN LATERAL (
     ORDER BY ev.event_id DESC
     LIMIT 1
 ) e ON true
-WHERE o.command IN ('recover', 'restore_lsn');
+WHERE o.command IN ('recover', 'restore_lsn')
+  AND e.event_type IN ('verified', 'failed', 'abandoned');
+
+CREATE OR REPLACE VIEW flashback.restore_log_v AS
+SELECT * FROM flashback.restore_log;
+
+-- Monitoring views are defined after the journal projection so fresh install
+-- and upgrades share the same dependency graph.
+CREATE OR REPLACE VIEW flashback.pg_stat_flashback AS
+SELECT
+    (SELECT count(*) FROM flashback.tracked_tables WHERE is_active) AS tracked_tables,
+    (SELECT count(*) FROM flashback.tracked_tables WHERE NOT is_active) AS untracked_tables,
+    (SELECT count(*) FROM flashback.pending_wal_events) AS pending_events,
+    (SELECT count(*) FROM flashback.delta_log) AS total_deltas,
+    (SELECT pg_size_pretty(pg_total_relation_size('flashback.delta_log'))) AS delta_storage,
+    (SELECT pg_size_pretty(pg_total_relation_size('flashback.pending_wal_events'))) AS staging_storage,
+    (SELECT count(*) FROM flashback.snapshots) AS total_snapshots,
+    (SELECT count(*) FROM flashback.restore_log) AS total_restores,
+    (SELECT count(*) FROM flashback.restore_log WHERE success) AS successful_restores,
+    (SELECT count(*) FROM flashback.restore_log WHERE NOT success) AS failed_restores,
+    (SELECT max(restored_at) FROM flashback.restore_log) AS last_restore_at,
+    COALESCE(current_setting('pg_flashback.enabled', true), 'on') AS capture_enabled,
+    COALESCE(current_setting('pg_flashback.max_row_size', true), '64kB') AS max_row_size,
+    COALESCE(current_setting('pg_flashback.worker_interval_ms', true), '75') AS worker_interval_ms;
+
+CREATE OR REPLACE VIEW flashback.pg_stat_flashback_tables AS
+SELECT
+    format('%I.%I', tt.schema_name, tt.table_name) AS table_name,
+    tt.tracked_since,
+    tt.checkpoint_interval,
+    tt.retention_interval,
+    tt.is_active,
+    (SELECT count(*) FROM flashback.delta_log d
+     WHERE d.tracking_id = tt.tracking_id
+        OR (d.tracking_id IS NULL AND d.rel_oid = tt.rel_oid)) AS delta_count,
+    (SELECT pg_size_pretty(
+        COALESCE(sum(pg_column_size(d.old_data) + pg_column_size(d.new_data)), 0)::bigint
+    ) FROM flashback.delta_log d
+      WHERE d.tracking_id = tt.tracking_id
+         OR (d.tracking_id IS NULL AND d.rel_oid = tt.rel_oid)) AS delta_data_size,
+    (SELECT count(*) FROM flashback.snapshots s
+     WHERE s.tracking_id = tt.tracking_id
+        OR (s.tracking_id IS NULL AND s.rel_oid = tt.rel_oid)) AS snapshot_count,
+    (SELECT max(s.captured_at) FROM flashback.snapshots s
+     WHERE s.tracking_id = tt.tracking_id
+        OR (s.tracking_id IS NULL AND s.rel_oid = tt.rel_oid)) AS last_checkpoint_at,
+    (SELECT count(*) FROM flashback.restore_log r
+     WHERE r.table_name = format('%I.%I', tt.schema_name, tt.table_name)) AS restore_count
+FROM flashback.tracked_tables tt;
 
 CREATE OR REPLACE FUNCTION flashback_operation_begin(
     p_command text,
@@ -331,10 +452,8 @@ SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_state text;
-    v_table_name text;
-    v_target_lsn pg_lsn;
 BEGIN
-    SELECT state, table_name, target_lsn INTO v_state, v_table_name, v_target_lsn
+    SELECT state INTO v_state
     FROM flashback.operation_current_state
     WHERE operation_id = p_operation_id;
 
@@ -360,15 +479,6 @@ BEGIN
         COALESCE(p_payload, '{}'::jsonb) || jsonb_build_object('phase', 'mark_failed')
     );
 
-    -- A7: restore_log is a projection of this single authority, populated
-    -- exactly where the journal decides the terminal outcome -- the only
-    -- way this table can ever honestly record a failed restore.
-    INSERT INTO flashback.restore_log(
-        table_name, target_time, target_lsn, rows_affected, success, error_message
-    ) VALUES (
-        v_table_name, NULL, v_target_lsn, 0, false,
-        COALESCE(p_message, 'recover execute failed')
-    );
 END;
 $$;
 
@@ -400,12 +510,6 @@ BEGIN
                 'finalizer', 'flashback_reconcile_recover_operations',
                 'stale_after', p_stale_after::text
             )
-        );
-        INSERT INTO flashback.restore_log(
-            table_name, target_time, target_lsn, rows_affected, success, error_message
-        ) VALUES (
-            r.table_name, NULL, r.target_lsn, 0, false,
-            'recover begin committed but execute never reached applied_coverage_pending'
         );
         v_n := v_n + 1;
     END LOOP;
@@ -459,14 +563,12 @@ BEGIN
             PERFORM public.flashback_operation_append_event(
                 r.operation_id, 'failed', NULL, 'restore_verification_failed',
                 'restore verification proof marked failed',
-                COALESCE(v_restore_verification, '{}'::jsonb)
-            );
-            INSERT INTO flashback.restore_log(
-                table_name, target_time, target_lsn, rows_affected, success, error_message
-            ) VALUES (
-                r.table_name, NULL, r.target_lsn,
-                COALESCE((v_payload->>'rows_affected')::bigint, 0), false,
-                'restore verification proof marked failed'
+                jsonb_build_object(
+                    'rows_affected',
+                    COALESCE((v_payload->>'rows_affected')::bigint, 0),
+                    'restore_verification',
+                    COALESCE(v_restore_verification, '{}'::jsonb)
+                )
             );
             CONTINUE;
         END IF;
@@ -574,12 +676,6 @@ BEGIN
                 'boundary_lsn', v_cg.boundary_lsn,
                 'stream_id', v_cg.stream_id
             )
-        );
-        INSERT INTO flashback.restore_log(
-            table_name, target_time, target_lsn, rows_affected, success
-        ) VALUES (
-            r.table_name, NULL, r.target_lsn,
-            COALESCE((v_payload->>'rows_affected')::bigint, 0), true
         );
         v_n := v_n + 1;
     END LOOP;

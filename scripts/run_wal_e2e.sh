@@ -716,6 +716,12 @@ assert_eq "post-restore successor aktif" "1" \
     "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='active' AND cg.generation_no=2")"
 assert_eq "post-restore pending generation kalmadı" "0" \
     "$(q "SELECT count(*) FROM flashback.coverage_generations cg JOIN flashback.tracked_tables tt USING (tracking_id) WHERE tt.table_name='orders' AND cg.state='building'")"
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.restore_log WHERE success")" -ge 2 ]] && break
+    sleep 0.1
+done
+assert_eq "restore journal exact successor sonrası terminal success üretti" "2" \
+    "$(q "SELECT count(*) FROM flashback.restore_log WHERE success")"
 assert_eq "restore öncesi buffered eski-OID WAL predecessor generation'a bağlandı" "1" \
     "$(q "SELECT count(*)
            FROM flashback.delta_log d

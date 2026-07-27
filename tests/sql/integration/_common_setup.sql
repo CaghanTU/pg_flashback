@@ -3,6 +3,8 @@
 -- as soon as a schema-contract test inserts a generation.
 TRUNCATE
     flashback.pending_wal_events,
+    flashback.operation_events,
+    flashback.operations,
     flashback.generation_payload_retirements,
     flashback.coverage_gaps,
     flashback.coverage_generations,
@@ -12,6 +14,5 @@ TRUNCATE
     flashback.snapshots,
     flashback.tracked_tables,
     flashback.tracking_lifecycles,
-    flashback.schema_versions,
-    flashback.restore_log
+    flashback.schema_versions
 RESTART IDENTITY;

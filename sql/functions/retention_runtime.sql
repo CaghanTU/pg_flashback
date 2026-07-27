@@ -15,10 +15,6 @@ DECLARE
     gen record;
     v_tracking_id bigint;
     v_retirement_id bigint;
-    v_delta_rows bigint;
-    v_schema_rows bigint;
-    v_first_lsn pg_lsn;
-    v_last_lsn pg_lsn;
     v_snap record;
 BEGIN
     IF p_reason IS NULL OR btrim(p_reason) = '' THEN
@@ -153,14 +149,6 @@ BEGIN
             p_generation_id;
     END IF;
 
-    SELECT count(*), min(commit_lsn), max(commit_lsn)
-      INTO v_delta_rows, v_first_lsn, v_last_lsn
-    FROM flashback.delta_log
-    WHERE generation_id = p_generation_id;
-    SELECT count(*) INTO v_schema_rows
-    FROM flashback.schema_versions
-    WHERE generation_id = p_generation_id;
-
     v_retirement_id := flashback_internal_create_retirement_intent(
         p_generation_id => p_generation_id,
         p_tracking_id => gen.tracking_id,
@@ -174,10 +162,13 @@ BEGIN
         ),
         p_snapshot_storage_backend => v_snap.storage_backend,
         p_snapshot_locator => v_snap.locator,
-        p_expected_delta_rows => v_delta_rows,
-        p_expected_schema_rows => v_schema_rows,
-        p_first_delta_lsn => v_first_lsn,
-        p_last_delta_lsn => v_last_lsn,
+        -- Deliberately no COUNT/MIN/MAX content scan here.  The immutable
+        -- generation/snapshot identity plus a still-required successor decide
+        -- eligibility; actual DELETE row counts are recorded on completion.
+        p_expected_delta_rows => NULL,
+        p_expected_schema_rows => NULL,
+        p_first_delta_lsn => NULL,
+        p_last_delta_lsn => NULL,
         p_details => jsonb_build_object(
             'sealed_at', gen.sealed_at,
             'valid_through_lsn', gen.valid_through_lsn,
@@ -201,8 +192,6 @@ AS $$
 DECLARE
     retirement record;
     v_tracking_id bigint;
-    v_current_delta_rows bigint;
-    v_current_schema_rows bigint;
     v_removed_delta_rows bigint;
     v_removed_schema_rows bigint;
     v_snap record;
@@ -310,24 +299,6 @@ BEGIN
             USING HINT = 'Re-anchor coverage (flashback_reanchor) before retiring the last sealed generation.';
     END IF;
 
-    SELECT count(*) INTO v_current_delta_rows
-    FROM flashback.delta_log
-    WHERE generation_id = p_generation_id;
-    SELECT count(*) INTO v_current_schema_rows
-    FROM flashback.schema_versions
-    WHERE generation_id = p_generation_id;
-    IF v_current_delta_rows <> retirement.expected_delta_rows
-       OR v_current_schema_rows <> retirement.expected_schema_rows
-    THEN
-        RAISE EXCEPTION 'pg_flashback: retirement % payload counts changed after durable intent',
-            retirement.retirement_id
-            USING DETAIL = format(
-                'delta expected/current=%s/%s, schema expected/current=%s/%s',
-                retirement.expected_delta_rows, v_current_delta_rows,
-                retirement.expected_schema_rows, v_current_schema_rows
-            );
-    END IF;
-
     PERFORM flashback_internal_snapshot_retire(
         retirement.snapshot_id, retirement.tracking_id, 'retired'
     );
@@ -351,8 +322,6 @@ BEGIN
            SELECT 1 FROM flashback.schema_versions
            WHERE generation_id = p_generation_id
        )
-       OR v_removed_delta_rows::bigint <> retirement.expected_delta_rows
-       OR v_removed_schema_rows::bigint <> retirement.expected_schema_rows
     THEN
         RAISE EXCEPTION 'pg_flashback: retirement % could not verify complete payload removal',
             retirement.retirement_id;
@@ -466,9 +435,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     rec record;
-    snap_rec record;
     v_actions integer := 0;
-    v_rows bigint := 0;
     v_eligible boolean;
 BEGIN
     -- Retention is a database-wide coordinator.  Acquire the stream key once
@@ -619,48 +586,6 @@ BEGIN
             rec.generation_id, 'retention_window_elapsed'
         );
         v_actions := v_actions + 1;
-    END LOOP;
-
-    -- Legacy trigger lifecycles have no qualified generations. Keep their old
-    -- best-effort age policy isolated from the WAL-local correctness path.
-    FOR rec IN
-        SELECT rel_oid, retention_interval
-        FROM flashback.tracked_tables
-        WHERE is_active
-          AND NOT EXISTS (
-              SELECT 1 FROM flashback.coverage_generations cg
-              WHERE cg.tracking_id = tracked_tables.tracking_id
-          )
-    LOOP
-        DELETE FROM flashback.delta_log d
-        WHERE d.rel_oid = rec.rel_oid
-          AND d.committed_at < clock_timestamp() - rec.retention_interval;
-        GET DIAGNOSTICS v_rows = ROW_COUNT;
-        IF v_rows > 0 THEN
-            v_actions := v_actions + 1;
-        END IF;
-
-        IF v_rows > 0 THEN
-            UPDATE flashback.tracked_tables
-               SET retention_cutoff = GREATEST(
-                   retention_cutoff,
-                   clock_timestamp() - rec.retention_interval
-               )
-             WHERE rel_oid = rec.rel_oid;
-        END IF;
-
-        FOR snap_rec IN
-            SELECT snapshot_id
-            FROM flashback.snapshots s
-            WHERE s.rel_oid = rec.rel_oid
-              AND s.tracking_id IS NULL
-              AND s.captured_at < clock_timestamp() - rec.retention_interval
-              AND s.payload_state = 'available'
-        LOOP
-            IF public.flashback_internal_snapshot_retire_legacy(snap_rec.snapshot_id, 'retired') THEN
-                v_actions := v_actions + 1;
-            END IF;
-        END LOOP;
     END LOOP;
 
     v_actions := v_actions + flashback_drop_empty_delta_partitions();

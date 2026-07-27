@@ -273,7 +273,8 @@ BEGIN
         WHERE retirement_id = v_retirement_id
           AND generation_id = v_generation_1
           AND state = 'retiring'
-          AND expected_delta_rows = 1
+          AND expected_delta_rows IS NULL
+          AND expected_schema_rows IS NULL
           AND snapshot_rel_oid = to_regclass(snapshot_table)::oid
     ) THEN
         RAISE EXCEPTION 'durable retirement intent did not freeze payload evidence';
