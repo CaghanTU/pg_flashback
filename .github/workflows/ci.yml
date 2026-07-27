@@ -107,7 +107,16 @@ jobs:
         run: rm -rf target/test-pgdata
 
       - name: cargo pgrx test
-        run: cargo pgrx test pg${{ matrix.pg }}
+        # All pg_test scenarios share ONE postgres instance, and coverage
+        # generation/capture stream transitions are deliberately serialized
+        # with advisory locks (single-authority state machine, not a race).
+        # Running scenarios concurrently (the default) races unrelated tests'
+        # DDL against each other and against those locks, producing
+        # non-deterministic deadlocks that are a test-harness concurrency
+        # artifact, not a product defect. Every scenario is single-threaded
+        # internally, so serial execution changes nothing about what is
+        # tested.
+        run: RUST_TEST_THREADS=1 cargo pgrx test pg${{ matrix.pg }}
 
       - name: Generated SQL duplicate-definition check
         run: |

@@ -154,6 +154,21 @@ BEGIN
         RAISE EXCEPTION 'internal cores must not be EXECUTE-able by PUBLIC';
     END IF;
 
-    DROP TABLE public.it_failclosed_synth;
+    -- Teardown only: this row's stream/generation is a deliberately
+    -- adversarial fixture (no real physical slot), which is the whole point
+    -- of the test above -- but that also means this DROP would otherwise hit
+    -- the same "no real slot" wall via the now-correctly-firing DDL hook.
+    -- The assertions this test cares about already ran directly against
+    -- flashback_assert_relation_wal_drained/flashback_capture_configuration_guard;
+    -- bypass capture for this cleanup DROP the same way pg_flashback's own
+    -- internal DDL does.
+    PERFORM flashback_set_restore_in_progress(true);
+    BEGIN
+        DROP TABLE public.it_failclosed_synth;
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM flashback_set_restore_in_progress(false);
+        RAISE;
+    END;
+    PERFORM flashback_set_restore_in_progress(false);
 END;
 $tv$;

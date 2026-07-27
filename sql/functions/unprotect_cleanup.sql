@@ -282,12 +282,18 @@ BEGIN
                     END
                 ELSE 'DEFAULT'
             END;
+            -- Runs against a still-actively-tracked row (this loop iteration
+            -- is what seals it inactive), so A2's corrected nested-DDL
+            -- capture would otherwise treat this internal maintenance ALTER
+            -- as user DDL. Bypass via the explicit backend-local flag.
+            PERFORM flashback_set_restore_in_progress(true);
             BEGIN
                 EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
                     r.schema_name, r.table_name, v_ri_clause);
             EXCEPTION WHEN OTHERS THEN
                 NULL; -- seal still proceeds; RI restore is best-effort
             END;
+            PERFORM flashback_set_restore_in_progress(false);
         END IF;
 
         FOR gen_rec IN

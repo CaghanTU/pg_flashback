@@ -226,6 +226,10 @@ mod tests {
         "../tests/sql/integration/audited_recover_context_failclosed.sql"
     );
     sql_test!(
+        it_nested_ddl_capture,
+        "../tests/sql/integration/nested_ddl_capture.sql"
+    );
+    sql_test!(
         it_pitr_time_filtering,
         "../tests/sql/integration/pitr_time_filtering.sql"
     );

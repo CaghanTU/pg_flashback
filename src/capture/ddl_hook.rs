@@ -130,15 +130,27 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         return;
     }
 
-    // DDL executed internally by flashback_restore runs either with the
-    // restore-in-progress flag set (checked above) or in a non-TOPLEVEL
-    // ProcessUtility context (SPI), so no query-string inspection is needed.
+    // DDL executed internally by flashback_restore is bypassed above by the
+    // explicit restore-in-progress flag, not by a context assumption: a
+    // DROP/TRUNCATE/ALTER a user issues from inside a DO block, a PL/pgSQL
+    // function body, or a CALLed procedure reaches ProcessUtility with
+    // context PROCESS_UTILITY_QUERY (or PROCESS_UTILITY_QUERY_NONATOMIC for
+    // a procedure managing its own transactions) rather than TOPLEVEL, and
+    // is exactly as user-originated as a direct top-level statement -- it
+    // must be captured too. PROCESS_UTILITY_SUBCOMMAND is deliberately
+    // excluded: that context marks an internal sub-action PostgreSQL itself
+    // generates while processing a single top-level command (e.g. implicit
+    // index/constraint DDL), not a second user statement, and capturing it
+    // would double-count one user DDL as two events.
     let capture_enabled = is_extension_installed_current_db();
+    let user_originated_context = matches!(
+        context,
+        pg_sys::ProcessUtilityContext::PROCESS_UTILITY_TOPLEVEL
+            | pg_sys::ProcessUtilityContext::PROCESS_UTILITY_QUERY
+            | pg_sys::ProcessUtilityContext::PROCESS_UTILITY_QUERY_NONATOMIC
+    );
 
-    if capture_enabled
-        && context == pg_sys::ProcessUtilityContext::PROCESS_UTILITY_TOPLEVEL
-        && !pstmt.is_null()
-    {
+    if capture_enabled && user_originated_context && !pstmt.is_null() {
         // Do NOT use catch_unwind around SPI calls — it leaks the SPI
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
@@ -204,10 +216,7 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         );
     }
 
-    if capture_enabled
-        && context == pg_sys::ProcessUtilityContext::PROCESS_UTILITY_TOPLEVEL
-        && !pstmt.is_null()
-    {
+    if capture_enabled && user_originated_context && !pstmt.is_null() {
         if let Some((event_type, targets)) = parse_post_utility_targets(pstmt) {
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
                 // The post-utility hook is still part of the same user

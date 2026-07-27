@@ -155,7 +155,21 @@ BEGIN
 
     -- 6. Relation physically absent after DROP: tracked_tables metadata is
     -- authoritative, resolution must not depend on to_regclass() success.
-    DROP TABLE public.it_res_dropped;
+    -- This fixture's tracked_tables row is a bare metadata INSERT above (no
+    -- coverage_generations row), purely to exercise the resolver -- it was
+    -- never meant to exercise real DDL capture, which correctly fails closed
+    -- ("no active WAL generation") for a qualified lifecycle with no
+    -- generation at all. Bypass capture the same way pg_flashback's own
+    -- internal DDL does, since this DROP is test fixture teardown, not the
+    -- user DDL under test here.
+    PERFORM flashback_set_restore_in_progress(true);
+    BEGIN
+        DROP TABLE public.it_res_dropped;
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM flashback_set_restore_in_progress(false);
+        RAISE;
+    END;
+    PERFORM flashback_set_restore_in_progress(false);
     IF to_regclass('public.it_res_dropped') IS NOT NULL THEN
         RAISE EXCEPTION 'fixture relation was not actually dropped';
     END IF;

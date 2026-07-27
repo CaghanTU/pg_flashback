@@ -67,7 +67,18 @@ BEGIN
         p_plugin_name => p_plugin,
         p_confirmed_flush_lsn => p_confirmed_flush_lsn,
         p_restart_lsn => COALESCE(p_restart_lsn, p_confirmed_flush_lsn),
-        p_details => jsonb_build_object('initial_confirmed_flush_lsn', p_confirmed_flush_lsn)
+        -- no_physical_slot marks this stream as backed by no real physical
+        -- slot: flashback_internal_prepare_destructive_ddl checks it to skip
+        -- a real pg_logical_slot_peek_changes call it could never satisfy
+        -- (Postgres refuses to create a logical slot in a transaction that
+        -- has already performed writes, which every pg_test script has by
+        -- the time it reaches this call -- there is no way to give this
+        -- stream a real slot from here). Production streams
+        -- (flashback_track's own admission path) never set this.
+        p_details => jsonb_build_object(
+            'initial_confirmed_flush_lsn', p_confirmed_flush_lsn,
+            'no_physical_slot', true
+        )
     );
 
     RETURN v_stream_id;
@@ -95,7 +106,9 @@ BEGIN
     END IF;
 
     -- Ephemeral metadata stream for pg_test. Not a physical slot and not a
-    -- production bypass: public restore still requires physical admission.
+    -- production bypass: public restore still requires physical admission
+    -- (flashback_ensure_active_wal_stream/flashback_restore_lsn reject this
+    -- synthetic capture_streams row regardless of what follows here).
     v_slot_name := format(
         'pg_flashback_test_%s',
         (SELECT oid FROM pg_database WHERE datname = current_database())::text

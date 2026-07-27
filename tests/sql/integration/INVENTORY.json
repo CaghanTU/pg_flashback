@@ -196,6 +196,10 @@
       "class": "infra",
       "reason": "native partition track rejection"
     },
+    "nested_ddl_capture.sql": {
+      "class": "infra",
+      "reason": "DROP/TRUNCATE/ALTER issued from a DO block, function body, or dynamic EXECUTE must still be captured (non-TOPLEVEL ProcessUtility context)"
+    },
     "non_public_schema_restore.sql": {
       "class": "supported-core",
       "reason": "non-public schema restore via seam"

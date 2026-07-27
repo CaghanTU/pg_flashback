@@ -830,9 +830,20 @@ BEGIN
     END IF;
     PERFORM public.flashback_admit_local_capacity(v_rel_oid, 'reanchor');
 
-    -- Preserve full old-row WAL images for the successor generation.
-    EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',
-                   v_schema_name, v_table_name);
+    -- Preserve full old-row WAL images for the successor generation. Runs
+    -- against an actively-tracked table, so A2's corrected nested-DDL
+    -- capture would otherwise treat this internal maintenance ALTER as user
+    -- DDL; bypass via the explicit backend-local flag, not a context
+    -- assumption.
+    PERFORM flashback_set_restore_in_progress(true);
+    BEGIN
+        EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',
+                       v_schema_name, v_table_name);
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM flashback_set_restore_in_progress(false);
+        RAISE;
+    END;
+    PERFORM flashback_set_restore_in_progress(false);
 
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
     SELECT COALESCE(max(generation_no), 0) + 1

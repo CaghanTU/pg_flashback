@@ -1068,8 +1068,23 @@ BEGIN
                     END
                 ELSE 'DEFAULT'
             END;
-            EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
-                v_schema_name, v_table_name, v_ri_clause);
+            -- This ALTER runs while the row is still actively tracked (the
+            -- DELETE below hasn't happened yet): without the guard, A2's
+            -- corrected nested-DDL capture would treat pg_flashback's own
+            -- untrack cleanup as user DDL and route it through the qualified
+            -- capture pipeline, which can reject it if the generation isn't
+            -- in the exact expected state. Bypass via the same explicit
+            -- backend-local flag flashback_restore_lsn uses, not a context
+            -- assumption.
+            PERFORM flashback_set_restore_in_progress(true);
+            BEGIN
+                EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
+                    v_schema_name, v_table_name, v_ri_clause);
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM flashback_set_restore_in_progress(false);
+                RAISE;
+            END;
+            PERFORM flashback_set_restore_in_progress(false);
         END;
     END IF;
 
@@ -1170,6 +1185,7 @@ SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
     v_rel_oid oid;
+    v_tracking_id bigint;
     v_schema_name text;
     v_table_name text;
     v_slot_name text;
@@ -1179,6 +1195,7 @@ DECLARE
     v_timeout_ms integer;
     v_database_oid oid;
     v_drain_lock_acquired boolean;
+    v_synthetic_stream boolean;
 BEGIN
     IF input_table IS NULL OR input_table = '' THEN
         RETURN;
@@ -1193,8 +1210,8 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT n.nspname, c.relname
-      INTO v_schema_name, v_table_name
+    SELECT tt.tracking_id, n.nspname, c.relname
+      INTO v_tracking_id, v_schema_name, v_table_name
     FROM flashback.tracked_tables tt
     JOIN pg_class c ON c.oid = tt.rel_oid
     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1202,6 +1219,30 @@ BEGIN
       AND tt.recovery_profile = 'local_delta'
       AND tt.rel_oid = v_rel_oid;
     IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    -- A stream established through the normal admission path is always
+    -- backed by a genuine physical replication slot; a stream explicitly
+    -- marked as having no physical slot backing it is not, and there is no
+    -- real WAL to drain in the first place for it -- the pre-drain wait
+    -- below exists to protect a real decoder against a real unlinked TOAST
+    -- pointer, which cannot happen without real WAL. Skip straight to the
+    -- destructive DDL rather than peeking a slot that was never created.
+    --
+    -- No matching active generation at all (NOT FOUND) is treated the same
+    -- way: there is no real backlog to protect either, and this is not a
+    -- silent gap -- flashback_capture_ddl_event's own
+    -- flashback_capture_configuration_guard check, immediately after this
+    -- function returns, independently re-verifies an active generation
+    -- exists and fails closed if a qualified lifecycle genuinely lacks one.
+    SELECT COALESCE((cs.details->>'no_physical_slot')::boolean, false)
+      INTO v_synthetic_stream
+    FROM flashback.coverage_generations cg
+    JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
+    WHERE cg.tracking_id = v_tracking_id
+      AND cg.state = 'active';
+    IF NOT FOUND OR COALESCE(v_synthetic_stream, false) THEN
         RETURN;
     END IF;
 

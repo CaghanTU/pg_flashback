@@ -64,10 +64,16 @@ DECLARE
 BEGIN
     SELECT tracking_id INTO v_tid FROM it_audit_boot WHERE label = 'happy';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_audit_happy', false);
+    -- A2 fixed the DDL hook to capture this literal DROP for real (it runs
+    -- via SPI/QUERY context, same as every pg_test statement): the hook's own
+    -- capture_drop_dependency_manifests + flashback_stage_local_delta_ddl_event
+    -- already stage the exact manifest and a pending DROP event under the
+    -- current transaction's real xid. Only finalize that pending event here
+    -- (flashback_test_inject_commit, not the "_ddl_" variant that would stage
+    -- a second, competing DROP event for the same DROP statement).
     v_xid := (txid_current() % 4294967296)::bigint;
     DROP TABLE public.it_audit_happy;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, '0/9000'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, '0/9000'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     v_plan := flashback_recover_plan('public.it_audit_happy');
@@ -196,7 +202,6 @@ BEGIN
     SELECT tracking_id INTO v_tid_a FROM it_audit_boot WHERE label = 'a';
     SELECT tracking_id, boundary_lsn INTO v_tid_b, v_boundary_b FROM it_audit_boot WHERE label = 'b';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_audit_a', false);
     v_xid := (txid_current() % 4294967296)::bigint;
     DROP TABLE public.it_audit_a;
     PERFORM flashback_test_inject_ddl_commit(v_tid_a, '0/9100'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
@@ -329,10 +334,11 @@ DECLARE
 BEGIN
     SELECT tracking_id, boundary_lsn INTO v_tid, v_boundary FROM it_audit_boot WHERE label = 'failpoint';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_audit_failpoint', false);
+    -- See the "happy" scenario above: finalize the hook's own pending DROP
+    -- capture rather than staging a second, competing one.
     v_xid := (txid_current() % 4294967296)::bigint;
     DROP TABLE public.it_audit_failpoint;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, '0/9200'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, '0/9200'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     v_plan := flashback_recover_plan('public.it_audit_failpoint');

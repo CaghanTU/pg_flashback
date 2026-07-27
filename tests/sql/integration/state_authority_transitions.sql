@@ -313,6 +313,19 @@ BEGIN
         RAISE EXCEPTION 'RBAC Check 4 Failed: flashback_admin must not EXECUTE internal locks';
     END IF;
 
-    DROP TABLE IF EXISTS public.it_state_auth CASCADE;
+    -- Teardown only: this fixture's generation/stream may be left in a
+    -- non-active authority state by the transition tests above, which is the
+    -- point of this file -- but that also means this DROP can hit the
+    -- now-correctly-firing DDL hook's real capture requirements. Bypass
+    -- capture for this cleanup DROP the same way pg_flashback's own internal
+    -- DDL does.
+    PERFORM flashback_set_restore_in_progress(true);
+    BEGIN
+        DROP TABLE IF EXISTS public.it_state_auth CASCADE;
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM flashback_set_restore_in_progress(false);
+        RAISE;
+    END;
+    PERFORM flashback_set_restore_in_progress(false);
 END;
 $tv$;
