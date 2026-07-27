@@ -424,7 +424,7 @@ install_oracle_sql() {
     -- a concurrent writer run. VOLATILE prevents the planner from constant-
     -- folding or hoisting it out of the per-row evaluation; referencing the
     -- row's own id keeps it correlated. Two separate statements, not
-    -- 'pg_sleep($2) IS NULL OR $1 IS NOT NULL': the planner reorders OR
+    -- 'pg_sleep(\$2) IS NULL OR \$1 IS NOT NULL': the planner reorders OR
     -- disjuncts by estimated cost and short-circuits once one is true, so a
     -- single-expression version with a cheap escape hatch let pg_sleep
     -- never actually run (verified empirically -- a 5-row CTAS with a
