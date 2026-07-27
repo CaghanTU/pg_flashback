@@ -994,6 +994,66 @@ BEGIN
             'REVOKE ALL ON %I.%I FROM PUBLIC',
             materialized.source_schema_name, materialized.source_table_name
         );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_change_owner' THEN
+        EXECUTE format(
+            'ALTER TABLE %I.%I OWNER TO %I',
+            materialized.source_schema_name, materialized.source_table_name,
+            (SELECT r.rolname FROM pg_roles r
+              WHERE r.rolname <> (SELECT pg_get_userbyid(c.relowner)
+                                    FROM pg_class c WHERE c.oid = v_restored_rel)
+              ORDER BY r.rolname LIMIT 1)
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_drop_pk' THEN
+        -- Primary key is verified via the inventory's separate 'primary_key'
+        -- column-name array, not the general 'constraints' array (which
+        -- deliberately excludes contype='p' to match schema_def's own
+        -- collection) -- a distinct code path from the unique/check case
+        -- below, so it needs its own adversarial proof.
+        EXECUTE format(
+            'ALTER TABLE %I.%I DROP CONSTRAINT %I',
+            materialized.source_schema_name, materialized.source_table_name,
+            (SELECT con.conname FROM pg_constraint con
+              WHERE con.conrelid = v_restored_rel AND con.contype = 'p'
+              LIMIT 1)
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_drop_constraint' THEN
+        EXECUTE format(
+            'ALTER TABLE %I.%I DROP CONSTRAINT %I',
+            materialized.source_schema_name, materialized.source_table_name,
+            (SELECT con.conname FROM pg_constraint con
+              WHERE con.conrelid = v_restored_rel AND con.contype IN ('u', 'c')
+              LIMIT 1)
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_disable_rls' THEN
+        EXECUTE format(
+            'ALTER TABLE %I.%I DISABLE ROW LEVEL SECURITY',
+            materialized.source_schema_name, materialized.source_table_name
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_disable_force_rls' THEN
+        EXECUTE format(
+            'ALTER TABLE %I.%I NO FORCE ROW LEVEL SECURITY',
+            materialized.source_schema_name, materialized.source_table_name
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_drop_comment' THEN
+        EXECUTE format(
+            'COMMENT ON TABLE %I.%I IS NULL',
+            materialized.source_schema_name, materialized.source_table_name
+        );
+    ELSIF NULLIF(current_setting('pg_flashback.test_restore_failpoint', true), '')
+         = 'after_swap_change_replica_identity' THEN
+        -- Restore always forces FULL; DEFAULT is a genuine, detectable drift
+        -- from what flashback_build_expected_restore_proof hardcodes as the
+        -- only correct post-restore value while a table is actively tracked.
+        EXECUTE format(
+            'ALTER TABLE %I.%I REPLICA IDENTITY DEFAULT',
+            materialized.source_schema_name, materialized.source_table_name
+        );
     END IF;
 
     v_restore_verification := flashback_verify_restored_relation(

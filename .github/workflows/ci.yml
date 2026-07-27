@@ -153,6 +153,9 @@ jobs:
       - name: Runtime state mutations are centralized
         run: scripts/check_centralized_state_surface.sh
 
+      - name: Restore expected/actual proofs derive from independent sources
+        run: scripts/check_restore_proof_independence.sh
+
       - name: Integration SQL inventory classification
         run: python3 scripts/check_integration_inventory.py
 
