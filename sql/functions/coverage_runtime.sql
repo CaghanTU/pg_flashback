@@ -371,7 +371,7 @@ BEGIN
     );
     v_timeline := public.flashback_current_timeline_id();
 
-    SELECT slot_name, plugin, database, restart_lsn, confirmed_flush_lsn
+    SELECT slot_name, plugin, database, restart_lsn, confirmed_flush_lsn, wal_status
       INTO v_slot
     FROM pg_replication_slots
     WHERE slot_name = public.flashback_effective_slot_name();
@@ -398,6 +398,33 @@ BEGIN
     THEN
         RAISE EXCEPTION 'pg_flashback: slot % has database/plugin %/%, expected %/pg_flashback',
             v_slot.slot_name, v_slot.database, v_slot.plugin, current_database();
+    END IF;
+
+    IF v_slot.wal_status = 'lost' THEN
+        -- The physical slot object still exists under this name but PostgreSQL
+        -- has invalidated it (WAL required to resume decoding was removed).
+        -- Consuming from it raises SQLSTATE 55000 on every attempt forever, so
+        -- this must fail closed here rather than let the caller hit that error:
+        -- falling through to the same-slot re-epoch path below would silently
+        -- rebind a fresh epoch to a slot that can never produce changes again,
+        -- masking the gap as continuous coverage. No new stream is created;
+        -- recovery requires an explicit re-anchor onto a freshly created slot.
+        SELECT * INTO v_stream
+        FROM flashback.capture_streams
+        WHERE database_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND state = 'active'
+        FOR UPDATE;
+        IF FOUND THEN
+            PERFORM public.flashback_mark_capture_stream_broken(
+                v_stream.stream_id,
+                'replication_slot_lost',
+                jsonb_build_object(
+                    'slot_name', v_slot.slot_name,
+                    'wal_status', v_slot.wal_status
+                )
+            );
+        END IF;
+        RETURN NULL;
     END IF;
 
     SELECT * INTO v_stream

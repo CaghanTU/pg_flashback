@@ -58,12 +58,12 @@ case "$MODE" in
             metadata_failpoint_matrix local_compatibility_matrix maintain_lifecycle_e2e local_capacity_e2e
         ;;
     bench)
-        qst_init cluster_bootstrap byte_support_envelope_bench
+        qst_init cluster_bootstrap byte_table_size_bench byte_churn_bench
         ;;
     all)
         qst_init cluster_bootstrap exact_manifest_matrix independent_restore_proof_matrix \
             metadata_failpoint_matrix local_compatibility_matrix maintain_lifecycle_e2e local_capacity_e2e \
-            byte_support_envelope_bench
+            byte_table_size_bench byte_churn_bench
         ;;
     *)
         die "unknown PGFB_QUAL_MODE=$MODE (use bench|matrices|all)"
@@ -277,18 +277,18 @@ qst_mark_step "cluster_bootstrap" "pass" "port=$PORT socket=$SOCKET"
 # Reads BENCH_SIZES/BENCH_SHAPES/BENCH_EXPECTED_JSON globals (set just before
 # the qst_run_verified_child call below); qst_run_verified_child invokes
 # verifiers with no arguments, so this can't take the path as a parameter.
-verify_bench_result() {
+verify_table_size_bench_result() {
     local expected_json="$BENCH_EXPECTED_JSON"
     if [[ ! -f "$expected_json" ]]; then
-        echo "bench result JSON missing: $expected_json" >&2
+        echo "table-size bench result JSON missing: $expected_json" >&2
         return 1
     fi
     if [[ ! -s "$expected_json" ]]; then
-        echo "bench result JSON is empty: $expected_json" >&2
+        echo "table-size bench result JSON is empty: $expected_json" >&2
         return 1
     fi
     if ! jq -e . "$expected_json" >/dev/null 2>&1; then
-        echo "bench result JSON does not parse: $expected_json" >&2
+        echo "table-size bench result JSON does not parse: $expected_json" >&2
         return 1
     fi
 
@@ -297,7 +297,7 @@ verify_bench_result() {
     actual_cases="$(jq -r '.results[]? | "\(.size_label)|\(.shape)"' "$expected_json" | sort -u)"
     missing_cases="$(comm -23 <(printf '%s\n' "$expected_cases") <(printf '%s\n' "$actual_cases") || true)"
     if [[ -n "$missing_cases" ]]; then
-        echo "bench result missing requested size/shape case(s):" >&2
+        echo "table-size bench result missing requested size/shape case(s):" >&2
         echo "$missing_cases" >&2
         return 1
     fi
@@ -308,7 +308,7 @@ verify_bench_result() {
         | "\(.size_label)/\(.shape)"
     ' "$expected_json")"
     if [[ -n "$unverdicted" ]]; then
-        echo "bench result case(s) ran without a fingerprint_ok verdict: $unverdicted" >&2
+        echo "table-size bench result case(s) ran without a fingerprint_ok verdict: $unverdicted" >&2
         return 1
     fi
 
@@ -318,7 +318,45 @@ verify_bench_result() {
         or (.status == "error") or (.status == "timeout")
     )] | length' "$expected_json")"
     if [[ "$bad_n" -gt 0 ]]; then
-        echo "bench result has $bad_n failing/errored/timed-out case(s)" >&2
+        echo "table-size bench result has $bad_n failing/errored/timed-out case(s)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Reads CHURN_TIERS/CHURN_EXPECTED_JSON globals (set just before the
+# qst_run_verified_child call below).
+verify_churn_bench_result() {
+    local expected_json="$CHURN_EXPECTED_JSON"
+    if [[ ! -f "$expected_json" ]]; then
+        echo "churn bench result JSON missing: $expected_json" >&2
+        return 1
+    fi
+    if [[ ! -s "$expected_json" ]]; then
+        echo "churn bench result JSON is empty: $expected_json" >&2
+        return 1
+    fi
+    if ! jq -e . "$expected_json" >/dev/null 2>&1; then
+        echo "churn bench result JSON does not parse: $expected_json" >&2
+        return 1
+    fi
+
+    local expected_tiers actual_tiers missing_tiers
+    expected_tiers="$(printf '%s\n' $CHURN_TIERS | sort -u)"
+    actual_tiers="$(jq -r '.results[]? | .tier' "$expected_json" | sort -u)"
+    missing_tiers="$(comm -23 <(printf '%s\n' "$expected_tiers") <(printf '%s\n' "$actual_tiers") || true)"
+    if [[ -n "$missing_tiers" ]]; then
+        echo "churn bench result missing requested tier(s):" >&2
+        echo "$missing_tiers" >&2
+        return 1
+    fi
+
+    local bad_n
+    bad_n="$(jq '[.results[]? | select(
+        .fingerprint_ok == false or .status == "error" or .status == "timeout"
+    )] | length' "$expected_json")"
+    if [[ "$bad_n" -gt 0 ]]; then
+        echo "churn bench result has $bad_n failing/errored/timed-out tier(s)" >&2
         return 1
     fi
     return 0
@@ -344,16 +382,27 @@ fi
 
 if [[ "$MODE" == "bench" || "$MODE" == "all" ]]; then
     BENCH_SIZES="${PG_FLASHBACK_BENCH_SIZES:-10MiB 100MiB 500MiB 1GiB}"
-    BENCH_SHAPES="${PG_FLASHBACK_BENCH_SHAPES:-narrow indexed toast churn}"
+    BENCH_SHAPES="${PG_FLASHBACK_TABLESIZE_SHAPES:-narrow indexed toast}"
     BENCH_RESULT_DIR="$WORK_ROOT/bench"
-    BENCH_EXPECTED_JSON="$BENCH_RESULT_DIR/byte-support-envelope-$RUN_ID.json"
-    qst_run_verified_child "byte_support_envelope_bench" verify_bench_result \
+    BENCH_EXPECTED_JSON="$BENCH_RESULT_DIR/byte-table-size-$RUN_ID.json"
+    qst_run_verified_child "byte_table_size_bench" verify_table_size_bench_result \
         env PG_FLASHBACK_BENCH_RUN_ID="$RUN_ID" \
             PG_FLASHBACK_BENCH_SIZES="$BENCH_SIZES" \
-            PG_FLASHBACK_BENCH_SHAPES="$BENCH_SHAPES" \
+            PG_FLASHBACK_TABLESIZE_SHAPES="$BENCH_SHAPES" \
             PG_FLASHBACK_BENCH_RESULT_DIR="$BENCH_RESULT_DIR" \
             PG_CONFIG="$PG_CONFIG" \
-            "$ROOT/scripts/run_byte_support_envelope_bench.sh"
+            "$ROOT/scripts/run_byte_table_size_bench.sh"
+
+    CHURN_TIERS="${PG_FLASHBACK_CHURN_TIERS:-pct1 pct10 pct100 small_batches single_large_tx}"
+    CHURN_BASE_SIZE="${PG_FLASHBACK_CHURN_BASE_SIZE:-10MiB}"
+    CHURN_EXPECTED_JSON="$BENCH_RESULT_DIR/byte-churn-$RUN_ID.json"
+    qst_run_verified_child "byte_churn_bench" verify_churn_bench_result \
+        env PG_FLASHBACK_BENCH_RUN_ID="$RUN_ID" \
+            PG_FLASHBACK_CHURN_TIERS="$CHURN_TIERS" \
+            PG_FLASHBACK_CHURN_BASE_SIZE="$CHURN_BASE_SIZE" \
+            PG_FLASHBACK_BENCH_RESULT_DIR="$BENCH_RESULT_DIR" \
+            PG_CONFIG="$PG_CONFIG" \
+            "$ROOT/scripts/run_byte_churn_bench.sh"
 fi
 
 if (( QST_FAILED > 0 )); then

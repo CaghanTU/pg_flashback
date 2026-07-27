@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# TABLE-SIZE MODE: measures protect/DROP/recover cost against a table that is
+# already at its target byte size *before* protection starts. This is the
+# honest counterpart to run_byte_churn_bench.sh's post-protect WAL/DML stress
+# — a table-size result here reflects the cost of protecting and recovering
+# an existing large table, not the cost of writing a large table's worth of
+# new WAL after tracking begins.
+#
+# Per table: create -> load target bytes (untracked) -> record physical size
+# -> stabilize slot baseline -> protect -> wait healthy -> apply a small
+# post-protect churn (default 1%, PG_FLASHBACK_TABLESIZE_CHURN_PCT=5 for the
+# 5% option) -> verify WAL catch-up -> DROP -> automatic discovery+plan+recover
+# -> verify exact row fingerprint AND schema/owner/ACL/index/constraint ->
+# record disk peak, snapshot/delta bytes, WAL bytes, protect/recover durations.
+#
+# Requires a live cluster with pg_flashback installed (PG* / libpq).
+# Results go under target/ (never commit). Trap cleans only this run's tables.
+#
+# Staged tiers: sizes run smallest-first as a gate. All shapes in a tier must
+# pass before the next larger tier runs; a failing tier blocks larger tiers as
+# BLOCKED (not run).
+#
+# Usage:
+#   PGHOST=... PGDATABASE=... ./scripts/run_byte_table_size_bench.sh
+#   PG_FLASHBACK_BENCH_SIZES="10MiB 100MiB" ./scripts/run_byte_table_size_bench.sh
+#   PG_FLASHBACK_TABLESIZE_CHURN_PCT=5 ./scripts/run_byte_table_size_bench.sh
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RESULT_DIR="${PG_FLASHBACK_BENCH_RESULT_DIR:-$ROOT/target/bench}"
+RUN_ID="${PG_FLASHBACK_BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+RUN_ID_SAFE="$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_' | cut -c1-24)"
+OUT_JSON="$RESULT_DIR/byte-table-size-$RUN_ID.json"
+SIZES="${PG_FLASHBACK_BENCH_SIZES:-10MiB 100MiB 500MiB 1GiB}"
+SHAPES="${PG_FLASHBACK_TABLESIZE_SHAPES:-narrow indexed toast}"
+CHURN_PCT="${PG_FLASHBACK_TABLESIZE_CHURN_PCT:-1}"
+MAX_TEMP_BYTES="${PG_FLASHBACK_BENCH_MAX_TEMP_BYTES:-$((8 * 1024 * 1024 * 1024))}"
+TABLE_TIMEOUT_SECS="${PG_FLASHBACK_BENCH_TABLE_TIMEOUT_SECS:-600}"
+FS_RESERVE_BYTES="${PG_FLASHBACK_BENCH_FS_RESERVE_BYTES:-$((1024 * 1024 * 1024))}"
+mkdir -p "$RESULT_DIR"
+export ROOT RUN_ID RUN_ID_SAFE
+
+# shellcheck source=scripts/lib/byte_bench_common.sh
+source "$ROOT/scripts/lib/byte_bench_common.sh"
+
+TIMEOUT_BIN="$(command -v timeout || true)"
+export TIMEOUT_BIN TABLE_TIMEOUT_SECS
+
+case "$CHURN_PCT" in
+    1|5) ;;
+    *) die "PG_FLASHBACK_TABLESIZE_CHURN_PCT must be 1 or 5, got $CHURN_PCT" ;;
+esac
+export CHURN_PCT
+
+trap cleanup_all_created EXIT
+
+bench_preflight || die "preflight failed"
+host_meta="$(host_meta_json)"
+printf '%s' "$host_meta" | jq -e . >/dev/null 2>&1 || die "host metadata is not valid JSON"
+
+SOURCE_HEAD="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+EXT_SHA256="$(extension_sha256)"
+
+# Canonical schema fingerprint: owner, ACL, index defs, constraint defs. Must
+# be stable across DROP+recover for "exact" to mean anything beyond row data.
+schema_fingerprint() {
+    local rel=$1
+    psqlq -c "SELECT md5(jsonb_build_object(
+        'owner', (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='$rel'::regclass),
+        'acl', COALESCE((SELECT relacl::text FROM pg_class WHERE oid='$rel'::regclass), ''),
+        'indexes', COALESCE((SELECT jsonb_agg(pg_get_indexdef(indexrelid) ORDER BY pg_get_indexdef(indexrelid))
+                    FROM pg_index WHERE indrelid='$rel'::regclass), '[]'::jsonb),
+        'constraints', COALESCE((SELECT jsonb_agg(pg_get_constraintdef(oid) ORDER BY pg_get_constraintdef(oid))
+                    FROM pg_constraint WHERE conrelid='$rel'::regclass), '[]'::jsonb)
+    )::text);"
+}
+export -f schema_fingerprint
+
+# Records rough progress into $PHASE_FILE (if set) so a killed/timed-out or
+# unexpectedly-exited attempt still leaves evidence of where it got to,
+# instead of a bare status:"error" with nothing to investigate.
+set_phase() {
+    [[ -n "${PHASE_FILE:-}" ]] && printf '%s' "$1" > "$PHASE_FILE" 2>/dev/null
+    return 0
+}
+export -f set_phase
+
+run_one_table() {
+    local size_label=$1 bytes=$2 shape=$3 rel=$4 outfile=$5
+    local ddl insert_fn tid=""
+
+    # Scales every bounded wait in this function (protect healthy, DROP
+    # discovery, plan, recover, verify) with target size, not just the
+    # DROP-recovery phase: a 100MiB table's row count (and so its base-snapshot
+    # copy time) varies a lot by shape, and a fixed short poll window silently
+    # mistook "still copying" for "stuck" on the narrowest/highest-row-count shape.
+    local catchup_timeout_secs size_based_secs
+    catchup_timeout_secs="${PG_FLASHBACK_BENCH_CATCHUP_TIMEOUT_SECS:-1800}"
+    if (( catchup_timeout_secs < 300 )); then catchup_timeout_secs=300; fi
+    size_based_secs=$(( 300 + (bytes / (1024 * 1024)) * 2 ))
+    if (( size_based_secs > catchup_timeout_secs )); then size_based_secs=$catchup_timeout_secs; fi
+
+    case "$shape" in
+      narrow)
+        ddl="CREATE TABLE $rel (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, v int NOT NULL);"
+        insert_fn="insert_batch_narrow"
+        ;;
+      indexed)
+        ddl="CREATE TABLE $rel (
+              id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+              a int NOT NULL, b int NOT NULL, c text NOT NULL,
+              UNIQUE (a), CHECK (b >= 0));
+             CREATE INDEX ON $rel (b); CREATE INDEX ON $rel (c);"
+        insert_fn="insert_batch_indexed"
+        ;;
+      toast)
+        ddl="CREATE TABLE $rel (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, blob text NOT NULL);"
+        insert_fn="insert_batch_toast"
+        ;;
+      *) echo "unknown shape $shape" >&2; exit 2 ;;
+    esac
+
+    psqlq -c "DROP TABLE IF EXISTS $rel CASCADE;" >/dev/null 2>&1 || true
+
+    # ---- 1-2. create + load to target pg_table_size BEFORE protect
+    # (untracked), measuring real on-disk bytes as we go rather than assuming
+    # a fixed row width -- a one-shot INSERT sized off an estimated row width
+    # missed target by ~3x (narrow, tuple/page overhead) to ~0.04x (toast,
+    # compressible filler collapsed under TOAST compression). ----
+    set_phase "create_and_load"
+    psqlq -c "$ddl"
+    load_to_target_table_size "$rel" "$bytes" "$insert_fn"
+    local rows=$LOAD_TOTAL_ROWS
+    local load_final_bytes=$LOAD_FINAL_BYTES load_iterations=$LOAD_ITERATIONS
+    psqlq -c "VACUUM ANALYZE $rel;"
+
+    # ---- 3. physical size breakdown of the pre-existing table ----
+    local size_json
+    size_json=$(relation_size_json "$rel")
+    local pre_protect_table_size
+    pre_protect_table_size=$(printf '%s' "$size_json" | jq -r '.pg_table_size')
+    local size_tol_low=$(( bytes * 90 / 100 )) size_tol_high=$(( bytes * 110 / 100 ))
+    local size_calibration_ok=false
+    if (( pre_protect_table_size >= size_tol_low && pre_protect_table_size <= size_tol_high )); then
+        size_calibration_ok=true
+    fi
+    if [[ "$size_calibration_ok" != "true" ]]; then
+        echo "FAIL $rel: pg_table_size=$pre_protect_table_size outside +/-10% of target=$bytes (tol=[$size_tol_low,$size_tol_high], iterations=$load_iterations, load_loop_measured=$load_final_bytes)" >&2
+        exit 1
+    fi
+    echo "  ok: pg_table_size=$pre_protect_table_size within +/-10% of target=$bytes ($load_iterations load iterations)" >&2
+
+    # ---- 4. stabilize slot baseline so the untracked load's own WAL noise
+    # doesn't pollute the protect-time lag measurement ----
+    set_phase "stabilize_slot_baseline"
+    wait_slot_lag_near_start "before-protect-${rel}"
+
+    # ---- 5-6. protect + wait healthy boundary ----
+    set_phase "protect"
+    local t0 t_protect h protect_deadline
+    t0=$(date +%s%N)
+    psqlq -c "SELECT flashback_track('$rel');"
+    tid="$(psqlq -c "SELECT tracking_id FROM flashback.tracked_tables
+                    WHERE is_active AND format('%I.%I', schema_name, table_name) = '$rel'
+                    ORDER BY tracking_id DESC LIMIT 1;")"
+    protect_deadline=$(( $(date +%s) + size_based_secs ))
+    h=""
+    while (( $(date +%s) <= protect_deadline )); do
+      h=$(psqlq -c "SELECT flashback_lifecycle_health('$rel');")
+      [[ "$h" == "healthy" ]] && break
+      sleep 0.25
+    done
+    [[ "$h" == "healthy" ]] || { echo "FAIL $rel: never reached healthy boundary after protect within ${size_based_secs}s (last=$h)" >&2; exit 1; }
+    t_protect=$(( ($(date +%s%N) - t0) / 1000000 ))
+
+    local snapshot_bytes_baseline delta_bytes_baseline
+    snapshot_bytes_baseline=$(psqlq -c "SELECT COALESCE(local_snapshot_bytes,0) FROM flashback_health() WHERE table_name='$rel';")
+    delta_bytes_baseline=$(psqlq -c "SELECT COALESCE(retained_delta_bytes,0) FROM flashback_health() WHERE table_name='$rel';")
+
+    local schema_fp_before fp_before rows_before
+    schema_fp_before=$(schema_fingerprint "$rel")
+
+    # ---- 7. apply the small post-protect churn (default 1%, or 5%) ----
+    set_phase "churn"
+    local churn_rows lsn_before_churn lsn_after_churn wal_churn_bytes t_churn0
+    churn_rows=$(( rows * CHURN_PCT / 100 ))
+    (( churn_rows > 0 )) || churn_rows=1
+    lsn_before_churn=$(psqlq -c "SELECT pg_current_wal_lsn();")
+    t_churn0=$(date +%s%N)
+    psqlq -c "UPDATE $rel SET id = id WHERE id IN (
+                SELECT id FROM $rel ORDER BY id LIMIT $churn_rows);" >/dev/null
+    lsn_after_churn=$(psqlq -c "SELECT pg_current_wal_lsn();")
+    wal_churn_bytes=$(psqlq -c "SELECT pg_wal_lsn_diff('$lsn_after_churn','$lsn_before_churn')::bigint;")
+
+    fp_before=$(psqlq -c "SELECT md5(count(*)::text || ':' || coalesce(sum(hashtext(t::text)),0)::text) FROM $rel t;")
+    rows_before=$(psqlq -c "SELECT count(*) FROM $rel;")
+
+    # ---- 8. verify WAL catch-up after churn ----
+    set_phase "churn_catchup"
+    wait_slot_lag_near_start "after-churn-${rel}"
+    local t_churn_catchup_ms
+    t_churn_catchup_ms=$(( ($(date +%s%N) - t_churn0) / 1000000 ))
+
+    # ---- 9-10. DROP, then automatic discovery + plan + recover ----
+    # (size_based_secs computed once at the top of this function)
+
+    set_phase "drop_discovery"
+    local t1 t_discover st
+    t1=$(date +%s%N)
+    psqlq -c "DROP TABLE $rel;"
+    local catchup_deadline catchup_i
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    st=""
+    catchup_i=0
+    while (( $(date +%s) <= catchup_deadline )); do
+      st=$(psqlq -c "SELECT status FROM flashback_disaster_points('$rel', interval '1 day') WHERE event_type='DROP' ORDER BY disaster_commit_lsn DESC LIMIT 1;")
+      [[ "$st" == "restorable" ]] && break
+      if (( catchup_i % 8 == 0 )); then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+      fi
+      catchup_i=$((catchup_i + 1))
+      sleep 0.5
+    done
+    t_discover=$(( ($(date +%s%N) - t1) / 1000000 ))
+    [[ "$st" == "restorable" ]] || { echo "FAIL $rel: DROP not restorable after ${size_based_secs}s" >&2; exit 1; }
+
+    set_phase "plan"
+    local t2 t_dry plan plan_status token plan_code
+    t2=$(date +%s%N)
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    plan=""
+    plan_status=""
+    catchup_i=0
+    while (( $(date +%s) <= catchup_deadline )); do
+      plan=$(psqlq -c "SELECT flashback_recover_plan('$rel', interval '1 day');")
+      plan_status=$(printf '%s' "$plan" | jq -r '.status // empty')
+      [[ "$plan_status" == "restorable" ]] && break
+      plan_code=$(printf '%s' "$plan" | jq -r '.code // empty')
+      if [[ "$plan_status" == "error" && "$plan_code" != "capture_catchup_pending" && "$plan_code" != "manifest_pending" ]]; then
+        echo "FAIL plan $rel: $plan" >&2
+        exit 1
+      fi
+      if (( catchup_i % 8 == 0 )); then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+      fi
+      catchup_i=$((catchup_i + 1))
+      sleep 0.5
+    done
+    t_dry=$(( ($(date +%s%N) - t2) / 1000000 ))
+    token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')
+    [[ "$plan_status" == "restorable" && -n "$token" && "$token" != "null" ]] \
+      || { echo "FAIL plan $rel after ${size_based_secs}s catch-up: $plan" >&2; exit 1; }
+
+    set_phase "recover"
+    local t3 op exec_err exec_rc t_recover fp_after schema_fp_after ok disk_peak
+    t3=$(date +%s%N)
+    catchup_deadline=$(( $(date +%s) + size_based_secs ))
+    exec_rc=1
+    while (( $(date +%s) <= catchup_deadline )); do
+      op=$(psqlq -c "SELECT flashback_recover_begin('$rel', '$token', interval '1 day')->>'operation_id';")
+      set +e
+      exec_err=$(psqlq -c "SELECT flashback_recover_execute('$rel', '$token', interval '1 day', NULL, NULL, NULL, $op);" 2>&1)
+      exec_rc=$?
+      set -e
+      [[ $exec_rc -eq 0 ]] && break
+      if printf '%s' "$exec_err" | grep -qi 'logical slot is .* bytes behind'; then
+        psqlq -c "SELECT flashback_consume_wal(65536);" >/dev/null 2>&1 || true
+        sleep 0.5
+        plan=$(psqlq -c "SELECT flashback_recover_plan('$rel', interval '1 day');")
+        token=$(printf '%s' "$plan" | jq -r '.plan_token // empty')
+        [[ -n "$token" && "$token" != "null" ]] || { echo "FAIL replan $rel: $plan" >&2; exit 1; }
+        continue
+      fi
+      echo "FAIL recover_execute $rel: $exec_err" >&2
+      exit 1
+    done
+    [[ $exec_rc -eq 0 ]] || { echo "FAIL recover_execute $rel: WAL never drained in ${size_based_secs}s (last: $exec_err)" >&2; exit 1; }
+    local verify_deadline
+    verify_deadline=$(( $(date +%s) + size_based_secs ))
+    while (( $(date +%s) <= verify_deadline )); do
+      st=$(psqlq -c "SELECT COALESCE(flashback_operation_state($op),'missing');")
+      [[ "$st" == "verified" || "$st" == "failed" ]] && break
+      sleep 0.5
+    done
+    t_recover=$(( ($(date +%s%N) - t3) / 1000000 ))
+
+    # ---- 11. verify exact row fingerprint AND schema/owner/ACL/index/constraint ----
+    set_phase "verify_fingerprint"
+    fp_after=$(psqlq -c "SELECT md5(count(*)::text || ':' || coalesce(sum(hashtext(t::text)),0)::text) FROM $rel t;")
+    schema_fp_after=$(schema_fingerprint "$rel")
+    ok=$([[ "$fp_before" == "$fp_after" && "$schema_fp_before" == "$schema_fp_after" \
+            && "$st" == "verified" && "$size_calibration_ok" == "true" ]] && echo true || echo false)
+
+    # ---- 12. disk peak / snapshot / delta / WAL bytes / durations ----
+    disk_peak=$(psqlq -c "SELECT COALESCE((flashback_disk_retention_status())->>'used_bytes','0')::bigint;")
+
+    set_phase "cleanup"
+    local t5 t_cleanup
+    t5=$(date +%s%N)
+    cleanup_table_lifecycle "$rel" "$tid"
+    t_cleanup=$(( ($(date +%s%N) - t5) / 1000000 ))
+
+    set_phase "done"
+    jq -n \
+      --arg size "$size_label" --argjson bytes "$bytes" --arg shape "$shape" \
+      --arg rel "$rel" --argjson protect_ms "$t_protect" --argjson discover_ms "$t_discover" \
+      --argjson dry_run_ms "$t_dry" --argjson recover_ms "$t_recover" \
+      --argjson churn_catchup_ms "$t_churn_catchup_ms" --argjson cleanup_ms "$t_cleanup" \
+      --argjson rows "$rows_before" --argjson churn_pct "$CHURN_PCT" --argjson churn_rows "$churn_rows" \
+      --argjson wal_churn_bytes "$wal_churn_bytes" \
+      --argjson pre_protect_size "$size_json" \
+      --argjson snapshot_bytes "$snapshot_bytes_baseline" --argjson delta_bytes "$delta_bytes_baseline" \
+      --argjson disk_peak "$disk_peak" \
+      --argjson ok "$ok" --arg op_state "$st" --arg status "ran" \
+      --argjson row_fingerprint_ok "$([[ "$fp_before" == "$fp_after" ]] && echo true || echo false)" \
+      --argjson schema_fingerprint_ok "$([[ "$schema_fp_before" == "$schema_fp_after" ]] && echo true || echo false)" \
+      --argjson pre_protect_table_size "$pre_protect_table_size" \
+      --argjson size_calibration_ok "$size_calibration_ok" \
+      --argjson size_calibration_load_iterations "$load_iterations" \
+      '{
+        size_label:$size, target_bytes:$bytes, shape:$shape, table:$rel,
+        pre_protect_size:$pre_protect_size,
+        pre_protect_table_size:$pre_protect_table_size, size_calibration_ok:$size_calibration_ok,
+        size_calibration_load_iterations:$size_calibration_load_iterations,
+        protect_ms:$protect_ms, churn_pct:$churn_pct, churn_rows:$churn_rows,
+        wal_churn_bytes:$wal_churn_bytes, churn_catchup_ms:$churn_catchup_ms,
+        drop_discovery_ms:$discover_ms, dry_run_ms:$dry_run_ms, recover_ms:$recover_ms,
+        cleanup_ms:$cleanup_ms, rows:$rows,
+        snapshot_bytes:$snapshot_bytes, delta_bytes:$delta_bytes, disk_peak_bytes:$disk_peak,
+        row_fingerprint_ok:$row_fingerprint_ok, schema_fingerprint_ok:$schema_fingerprint_ok,
+        fingerprint_ok:$ok, operation_state:$op_state, status:$status
+      }' > "$outfile"
+}
+export -f run_one_table schema_fingerprint
+
+RESULTS='[]'
+tier_blocked=0
+tier_block_reason=""
+
+for size_label in $SIZES; do
+  bytes="$(size_to_bytes "$size_label")"
+
+  if (( tier_blocked )); then
+    for shape in $SHAPES; do
+      echo "BLOCKED $size_label/$shape: earlier smaller tier did not pass ($tier_block_reason)" >&2
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --arg size "$size_label" --argjson bytes "$bytes" \
+        --arg shape "$shape" --arg reason "$tier_block_reason" \
+        '$acc + [{size_label:$size, target_bytes:$bytes, shape:$shape, status:"blocked", reason:$reason}]')
+    done
+    continue
+  fi
+
+  need=$((bytes * 4))
+  avail="$(printf '%s' "$host_meta" | jq -r '.filesystem_available_bytes // 0')"
+  if (( need > MAX_TEMP_BYTES )); then
+    echo "SKIP $size_label: projected temp $need exceeds MAX_TEMP_BYTES=$MAX_TEMP_BYTES" >&2
+    for shape in $SHAPES; do
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --arg size "$size_label" --argjson bytes "$bytes" --arg shape "$shape" \
+        '$acc + [{size_label:$size, target_bytes:$bytes, shape:$shape, status:"skipped", reason:"exceeds_max_temp_bytes"}]')
+    done
+    continue
+  fi
+  if (( avail > 0 && (need + FS_RESERVE_BYTES) > avail )); then
+    echo "SKIP $size_label: need~$need + reserve=$FS_RESERVE_BYTES but filesystem_available=$avail" >&2
+    for shape in $SHAPES; do
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --arg size "$size_label" --argjson bytes "$bytes" --arg shape "$shape" \
+        '$acc + [{size_label:$size, target_bytes:$bytes, shape:$shape, status:"skipped", reason:"insufficient_filesystem_reserve"}]')
+    done
+    continue
+  fi
+
+  tier_had_failure=0
+  for shape in $SHAPES; do
+    size_slug=$(printf '%s' "$size_label" | tr '[:upper:]' '[:lower:]')
+    rel="public.bts_${RUN_ID_SAFE}_${shape}_${size_slug}"
+    CREATED_TABLES+=("$rel")
+    echo "== $rel (table-size mode) =="
+
+    resfile="$(mktemp "${RESULT_DIR}/one-tablesize-result.XXXXXX.json")"
+    PHASE_FILE="$(mktemp "${RESULT_DIR}/one-tablesize-phase.XXXXXX.txt")"
+    export PHASE_FILE
+    stderr_file="$(mktemp "${RESULT_DIR}/one-tablesize-stderr.XXXXXX.log")"
+    : > "$PHASE_FILE"
+    timed_out=0
+    rc=0
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+      if ! "$TIMEOUT_BIN" "${TABLE_TIMEOUT_SECS}s" bash -c \
+          'set -Eeuo pipefail; run_one_table "$1" "$2" "$3" "$4" "$5"' \
+          _ "$size_label" "$bytes" "$shape" "$rel" "$resfile" \
+          2>"$stderr_file"; then
+        rc=$?
+        [[ $rc -eq 124 ]] && timed_out=1
+      fi
+    else
+      run_one_table "$size_label" "$bytes" "$shape" "$rel" "$resfile" \
+        2>"$stderr_file" || rc=$?
+    fi
+    cat "$stderr_file" >&2
+    last_phase="$(cat "$PHASE_FILE" 2>/dev/null || echo unknown)"
+    [[ -n "$last_phase" ]] || last_phase="unknown"
+    stderr_tail="$(tail -c 4000 "$stderr_file" 2>/dev/null || echo "")"
+
+    if [[ $timed_out -eq 1 ]]; then
+      echo "TIMEOUT $rel after ${TABLE_TIMEOUT_SECS}s (phase=$last_phase)" >&2
+      tid="$(psqlq -c "SELECT tracking_id FROM flashback.tracked_tables
+                       WHERE format('%I.%I', schema_name, table_name) = '$rel'
+                       ORDER BY tracking_id DESC LIMIT 1;" 2>/dev/null || true)"
+      cleanup_table_lifecycle "$rel" "$tid"
+      remove_from_created "$rel"
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --arg size "$size_label" --argjson bytes "$bytes" \
+        --arg shape "$shape" --arg rel "$rel" --argjson timeout "$TABLE_TIMEOUT_SECS" \
+        --arg phase "$last_phase" --arg reason "timed out after ${TABLE_TIMEOUT_SECS}s in phase $last_phase" \
+        --arg stderr_tail "$stderr_tail" \
+        '$acc + [{size_label:$size, target_bytes:$bytes, shape:$shape, table:$rel, status:"timeout",
+                   timeout_secs:$timeout, phase:$phase, reason:$reason, stderr_tail:$stderr_tail,
+                   fingerprint_ok:false}]')
+      tier_had_failure=1
+    elif [[ -s "$resfile" ]] && jq -e . >/dev/null 2>&1 < "$resfile"; then
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --argjson one "$(cat "$resfile")" '$acc + [$one]')
+      remove_from_created "$rel"
+      [[ "$(jq -r '.fingerprint_ok' "$resfile")" == "true" ]] || tier_had_failure=1
+    else
+      echo "FAIL $rel: no result produced (rc=$rc, phase=$last_phase)" >&2
+      tid="$(psqlq -c "SELECT tracking_id FROM flashback.tracked_tables
+                       WHERE format('%I.%I', schema_name, table_name) = '$rel'
+                       ORDER BY tracking_id DESC LIMIT 1;" 2>/dev/null || true)"
+      cleanup_table_lifecycle "$rel" "$tid"
+      remove_from_created "$rel"
+      RESULTS=$(jq -n --argjson acc "$RESULTS" --arg size "$size_label" --argjson bytes "$bytes" \
+        --arg shape "$shape" --arg rel "$rel" --argjson exit_code "$rc" \
+        --arg phase "$last_phase" --arg reason "no result produced (exit_code=$rc) in phase $last_phase" \
+        --arg stderr_tail "$stderr_tail" \
+        '$acc + [{size_label:$size, target_bytes:$bytes, shape:$shape, table:$rel, status:"error",
+                   exit_code:$exit_code, phase:$phase, reason:$reason, stderr_tail:$stderr_tail,
+                   fingerprint_ok:false}]')
+      tier_had_failure=1
+    fi
+    rm -f "$resfile" "$PHASE_FILE" "$stderr_file"
+    unset PHASE_FILE
+  done
+
+  if (( tier_had_failure )); then
+    tier_blocked=1
+    tier_block_reason="tier $size_label had a failing/timed-out shape"
+  fi
+done
+
+trap - EXIT
+cleanup_all_created
+
+[[ -n "$START_SLOT_LAG" && "$START_SLOT_LAG" =~ ^[0-9]+$ ]] || START_SLOT_LAG=0
+[[ -n "$PREFLIGHT_JSON" ]] || PREFLIGHT_JSON='{}'
+printf '%s' "$PREFLIGHT_JSON" | jq -e . >/dev/null 2>&1 || PREFLIGHT_JSON='{}'
+printf '%s' "$RESULTS" | jq -e . >/dev/null 2>&1 || die "results accumulator is not valid JSON"
+
+jq -n \
+  --argjson host "$host_meta" \
+  --argjson results "$RESULTS" \
+  --arg run "$RUN_ID" \
+  --arg run_id_safe "$RUN_ID_SAFE" \
+  --arg source_head "$SOURCE_HEAD" \
+  --arg ext_sha256 "$EXT_SHA256" \
+  --argjson preflight "$PREFLIGHT_JSON" \
+  --argjson start_slot_lag "$START_SLOT_LAG" \
+  --argjson max_start_lag_bytes "$MAX_START_LAG_BYTES" \
+  --arg slot_name "$SLOT_NAME" \
+  '{
+    schema_version: 1,
+    mode: "table_size",
+    run_id: $run,
+    run_id_safe: $run_id_safe,
+    source_head: $source_head,
+    extension_binary_sha256: $ext_sha256,
+    worker_preflight: $preflight,
+    start_slot_lag_bytes: $start_slot_lag,
+    max_start_lag_bytes: $max_start_lag_bytes,
+    slot_name: $slot_name,
+    host: $host,
+    results: $results,
+    note: "Data is loaded to target byte size BEFORE protect; measures protect/DROP/recover cost against a pre-existing large table, not post-protect WAL/DML stress (see run_byte_churn_bench.sh for that)."
+  }' > "$OUT_JSON"
+echo "Wrote $OUT_JSON"
+jq -r '.results[] | "\(.size_label)\t\(.shape)\t\(.status // "ran")\tprotect=\(.protect_ms // "-")ms recover=\(.recover_ms // "-")ms row_fp=\(.row_fingerprint_ok // false) schema_fp=\(.schema_fingerprint_ok // false)"' "$OUT_JSON"
+
+failed_n="$(jq '[.results[] | select(
+    (.fingerprint_ok == false and (.status // "") != "blocked" and (.status // "") != "skipped")
+    or (.status == "error") or (.status == "timeout")
+  )] | length' "$OUT_JSON")"
+blocked_after_fail_n="$(jq '[.results[] | select(.status == "blocked")] | length' "$OUT_JSON")"
+if (( failed_n > 0 )); then
+  echo "FAIL: $failed_n table-size shape(s) failed (plus $blocked_after_fail_n blocked)" >&2
+  exit 1
+fi
+echo "byte_table_size_bench PASS"

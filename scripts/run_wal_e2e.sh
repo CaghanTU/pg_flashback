@@ -177,6 +177,9 @@ cleanup() {
     echo "━━━ Temizlik: GUC'ları geri al, restart, test DB/slot'larını düşür ━━━"
     if [[ "$GUCS_MODIFIED" == "1" ]]; then
         restore_gucs
+        # max_slot_wal_keep_size is a core GUC, not pg_flashback.*, so
+        # restore_gucs() above never touches it; reset it explicitly here.
+        qp "ALTER SYSTEM RESET max_slot_wal_keep_size" > /dev/null 2>&1
         restart_pg || echo "  uyarı: instance yeniden başlatılamadı — elle kontrol edin"
     fi
     qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
@@ -189,6 +192,7 @@ cleanup() {
         /tmp/pg_flashback_boundary_writer.out \
         /tmp/pg_flashback_consume_lock.out \
         /tmp/pg_flashback_slot_loss_lock.out \
+        /tmp/pg_flashback_slot_lost_gap_reject.out \
         /tmp/pg_flashback_retention_pause.out \
         /tmp/pg_flashback_retention_pin.out \
         /tmp/pg_flashback_retention_begin.out \
@@ -1086,6 +1090,153 @@ assert_eq "re-anchor sonrası DML yeni generation'a bağlandı" "1" \
     "$(q "SELECT count(*) FROM flashback.delta_log d
            WHERE d.generation_id=$REANCHOR_GENERATION
              AND d.event_type='UPDATE'")"
+
+echo "━━━ 4d2. wal_status=lost (max_slot_wal_keep_size aşımı) fail-closed, restart-storm yok ━━━"
+q "CREATE TABLE slot_loss_bulk (id int, payload text)" > /dev/null
+
+LOST_OLD_STREAM_ID=$(q "SELECT stream_id FROM flashback.capture_streams WHERE state='active'")
+qp "ALTER SYSTEM SET max_slot_wal_keep_size = '256kB'" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+
+STOPPED_WORKER_PID=$(stop_idle_worker)
+[[ -n "$STOPPED_WORKER_PID" ]] || { echo "FAIL: wal_status=lost testi worker PID bulamadı"; exit 1; }
+
+q "INSERT INTO slot_loss_bulk SELECT g, repeat('z', 800) FROM generate_series(1, 300000) g" > /dev/null
+q "CHECKPOINT" > /dev/null
+
+WAL_STATUS=""
+for _ in $(seq 1 100); do
+    WAL_STATUS=$(q "SELECT wal_status FROM pg_replication_slots WHERE slot_name='pg_flashback_${DB}'")
+    [[ "$WAL_STATUS" == "lost" ]] && break
+    sleep 0.1
+done
+assert_eq "slot gerçekten wal_status=lost oldu" "lost" "$WAL_STATUS"
+
+kill -CONT "$STOPPED_WORKER_PID"
+STOPPED_WORKER_PID=""
+
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.capture_streams
+               WHERE stream_id=$LOST_OLD_STREAM_ID AND state='broken'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "eski stream wal_status=lost ile kırıldı" "replication_slot_lost" \
+    "$(q "SELECT invalidation_reason FROM flashback.capture_streams
+           WHERE stream_id=$LOST_OLD_STREAM_ID")"
+assert_eq "health slot kaybını slot_lost gösteriyor (wal_status=lost yolu)" "slot_lost" \
+    "$(q "SELECT health FROM flashback_health() WHERE table_name='public.orders'")"
+
+# No restart storm: the delta worker process must stay the SAME PID across a
+# sustained observation window. Before the fix, an uncaught SQLSTATE 55000
+# from flashback_consume_wal killed the whole bgworker every cycle and the
+# postmaster's bgw_restart_time relaunched it roughly once a second.
+NEW_WORKER_PID=$(q "SELECT pid FROM pg_stat_activity
+                     WHERE backend_type='pg_flashback delta worker'
+                       AND datname=current_database()")
+[[ -n "$NEW_WORKER_PID" ]] || { echo "FAIL: wal_status=lost sonrası delta worker yok"; exit 1; }
+RESTART_STORM=0
+for _ in $(seq 1 40); do
+    sleep 0.1
+    SAMPLED_PID=$(q "SELECT pid FROM pg_stat_activity
+                      WHERE backend_type='pg_flashback delta worker'
+                        AND datname=current_database()")
+    if [[ "$SAMPLED_PID" != "$NEW_WORKER_PID" ]]; then
+        RESTART_STORM=1
+        break
+    fi
+done
+assert_eq "delta worker PID sabit kaldı (restart-storm yok)" "0" "$RESTART_STORM"
+
+# No wrongful auto-recreation: the same invalidated slot must not silently
+# gain a fresh active stream while it remains unusable.
+assert_eq "kırık slot üzerinde sahte yeni aktif stream oluşmadı" "0" \
+    "$(q "SELECT count(*) FROM flashback.capture_streams
+           WHERE slot_name='pg_flashback_${DB}' AND state='active'")"
+
+LOST_OLD_GENERATION_ID=$(q "SELECT generation_id FROM flashback.coverage_generations
+                             WHERE stream_id=$LOST_OLD_STREAM_ID
+                             ORDER BY generation_id DESC LIMIT 1")
+LOST_FRONTIER=$(q "SELECT valid_through_lsn FROM flashback.coverage_generations
+                    WHERE generation_id=$LOST_OLD_GENERATION_ID")
+
+q "UPDATE orders SET amount=amount+11 WHERE id=1001" > /dev/null
+LOST_MISSING_INTERVAL_LSN=$(q "SELECT pg_current_wal_insert_lsn()")
+
+# Durability across a full PostgreSQL restart: the broken/gap state must
+# survive, and the worker must NOT crash-loop again on restart either — this
+# is the exact original-incident shape (slot already lost at process start).
+restart_pg || { echo "FAIL: wal_status=lost testi için restart başarısız"; exit 1; }
+assert_eq "restart sonrası kırık stream durumu kalıcı" "broken" \
+    "$(q "SELECT state FROM flashback.capture_streams WHERE stream_id=$LOST_OLD_STREAM_ID")"
+assert_eq "restart sonrası health hâlâ slot_lost" "slot_lost" \
+    "$(q "SELECT health FROM flashback_health() WHERE table_name='public.orders'")"
+
+RESTART_PID_1=$(q "SELECT pid FROM pg_stat_activity
+                    WHERE backend_type='pg_flashback delta worker'
+                      AND datname=current_database()")
+[[ -n "$RESTART_PID_1" ]] || { echo "FAIL: restart sonrası delta worker yok"; exit 1; }
+POST_RESTART_STORM=0
+for _ in $(seq 1 40); do
+    sleep 0.1
+    RESTART_PID_N=$(q "SELECT pid FROM pg_stat_activity
+                        WHERE backend_type='pg_flashback delta worker'
+                          AND datname=current_database()")
+    if [[ "$RESTART_PID_N" != "$RESTART_PID_1" ]]; then
+        POST_RESTART_STORM=1
+        break
+    fi
+done
+assert_eq "restart sonrası da delta worker PID sabit (restart-storm yok)" "0" "$POST_RESTART_STORM"
+
+GAP_RC=0
+$PSQL -d "$DB" -qc "SELECT * FROM flashback_admit_lsn_target('orders', '$LOST_MISSING_INTERVAL_LSN')" \
+    > /tmp/pg_flashback_slot_lost_gap_reject.out 2>&1 || GAP_RC=$?
+[[ "$GAP_RC" != "0" ]] || { echo "FAIL: wal_status=lost aralığındaki LSN kabul edildi"; exit 1; }
+grep -q "owned by 0 eligible generations" /tmp/pg_flashback_slot_lost_gap_reject.out
+echo "  ok: wal_status=lost ile re-anchor arasındaki kalıcı boşluk reddedildi"
+
+q "SELECT pg_drop_replication_slot('pg_flashback_${DB}')" > /dev/null 2>&1 || true
+q "SELECT pg_create_logical_replication_slot('pg_flashback_${DB}', 'pg_flashback')" > /dev/null
+LOST_REANCHOR_GENERATION=$(q "SELECT flashback_reanchor('orders')")
+[[ -n "$LOST_REANCHOR_GENERATION" ]] || { echo "FAIL: wal_status=lost sonrası flashback_reanchor generation döndürmedi"; exit 1; }
+for _ in $(seq 1 100); do
+    [[ "$(q "SELECT count(*) FROM flashback.coverage_generations
+               WHERE generation_id=$LOST_REANCHOR_GENERATION AND state='active'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "wal_status=lost sonrası re-anchor aktif" "1" \
+    "$(q "SELECT count(*) FROM flashback.coverage_generations
+           WHERE generation_id=$LOST_REANCHOR_GENERATION AND state='active'")"
+assert_eq "wal_status=lost eski generation watermark'ı gap üzerinden ileri uydurulmadı" "$LOST_FRONTIER" \
+    "$(q "SELECT valid_through_lsn FROM flashback.coverage_generations
+           WHERE generation_id=$LOST_OLD_GENERATION_ID")"
+
+qp "ALTER SYSTEM RESET max_slot_wal_keep_size" > /dev/null
+qp "SELECT pg_reload_conf()" > /dev/null
+
+echo "━━━ 4d3. SQLSTATE 55000 slot-loss'a özgü değil; gerçekten lost değilse re-raise ━━━"
+FAILPOINT_STREAM_ID=$(q "SELECT stream_id FROM flashback.capture_streams WHERE state='active'")
+FAILPOINT_WAL_STATUS=$(q "SELECT wal_status FROM pg_replication_slots WHERE slot_name='pg_flashback_${DB}'")
+assert_eq "failpoint testi öncesi slot sağlıklı (lost değil)" "t" \
+    "$(q "SELECT '$FAILPOINT_WAL_STATUS' IS DISTINCT FROM 'lost'")"
+
+q "ALTER SYSTEM SET pg_flashback.test_consume_wal_failpoint = 'fake_non_lost_55000';" > /dev/null
+q "SELECT pg_reload_conf();" > /dev/null
+FAILPOINT_RC=0
+FAILPOINT_ERR=$($PSQL -d "$DB" -qAtc "SELECT flashback_consume_wal();" 2>&1) || FAILPOINT_RC=$?
+[[ "$FAILPOINT_RC" != "0" ]] || { echo "FAIL: fake_non_lost_55000 failpoint SQLSTATE 55000'i yuttu (return 0 ile)"; exit 1; }
+printf '%s' "$FAILPOINT_ERR" | grep -q "fake_non_lost_55000" \
+    || { echo "FAIL: consume_wal orijinal hatayı re-raise etmedi: $FAILPOINT_ERR"; exit 1; }
+echo "  ok: SQLSTATE 55000 (lost değilken) yutulmadı, orijinal hata re-raise edildi"
+
+assert_eq "failpoint sonrası stream hâlâ active (yanlış slot_lost kırılmadı)" "active" \
+    "$(q "SELECT state FROM flashback.capture_streams WHERE stream_id=$FAILPOINT_STREAM_ID")"
+assert_eq "failpoint sonrası invalidation_reason replication_slot_lost DEĞİL" "1" \
+    "$(q "SELECT (invalidation_reason IS DISTINCT FROM 'replication_slot_lost')::int
+           FROM flashback.capture_streams WHERE stream_id=$FAILPOINT_STREAM_ID")"
+
+q "ALTER SYSTEM RESET pg_flashback.test_consume_wal_failpoint;" > /dev/null
+q "SELECT pg_reload_conf();" > /dev/null
 
 echo "━━━ 4e. Harici slot ilerletme sessiz devam etmiyor ━━━"
 q "CREATE TABLE external_advance_probe (id int PRIMARY KEY)" > /dev/null

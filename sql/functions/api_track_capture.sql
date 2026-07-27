@@ -510,6 +510,7 @@ DECLARE
     pending record;
     v_gap_inserted integer;
     lock_rec record;
+    v_recheck_wal_status text;
 BEGIN
     IF to_regclass('flashback.delta_log') IS NULL THEN
         RETURN 0;
@@ -568,15 +569,55 @@ BEGIN
     -- limit, so never aggregate the peek into one JSONB value. This lightweight
     -- pass exists only to identify lifecycle locks before get_changes: logical
     -- slot advancement is not safely undone by a later PL/pgSQL exception.
-    SELECT EXISTS (
-        SELECT 1
-        FROM pg_logical_slot_peek_changes(
-                 v_slot_name, v_upto_lsn, batch_size,
-                 'tracked_oids', v_tracked_oids,
-                 'metadata_only', 'true'
-             ) AS ch(lsn, xid, data)
-        WHERE ch.data LIKE '{%'
-    ) INTO v_has_output;
+    BEGIN
+        IF NULLIF(current_setting('pg_flashback.test_consume_wal_failpoint', true), '')
+             = 'fake_non_lost_55000'
+        THEN
+            -- TEST ONLY: proves the exception handler below distinguishes a
+            -- genuine slot-loss SQLSTATE 55000 from an unrelated one instead
+            -- of always treating this SQLSTATE as slot loss.
+            RAISE EXCEPTION 'pg_flashback: test_consume_wal_failpoint=fake_non_lost_55000'
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_logical_slot_peek_changes(
+                     v_slot_name, v_upto_lsn, batch_size,
+                     'tracked_oids', v_tracked_oids,
+                     'metadata_only', 'true'
+                 ) AS ch(lsn, xid, data)
+            WHERE ch.data LIKE '{%'
+        ) INTO v_has_output;
+    EXCEPTION WHEN OBJECT_NOT_IN_PREREQUISITE_STATE THEN
+        -- SQLSTATE 55000 is not unique to slot invalidation: e.g. pointing
+        -- pg_logical_slot_peek_changes at a physical replication slot raises
+        -- the identical SQLSTATE with an unrelated message ("cannot use
+        -- physical replication slot for logical decoding"). Catching the
+        -- SQLSTATE alone and unconditionally declaring the slot lost would
+        -- misclassify any such unrelated failure as slot loss and silently
+        -- swallow it (RETURN 0) instead of surfacing it. Re-verify against
+        -- the authoritative wal_status column before treating this as the
+        -- TOCTOU race against a concurrent checkpoint/WAL-removal cycle that
+        -- flashback_ensure_active_wal_stream's own wal_status check can miss;
+        -- anything else re-raises the original error unchanged.
+        SELECT wal_status INTO v_recheck_wal_status
+        FROM pg_replication_slots
+        WHERE slot_name = v_slot_name;
+        IF FOUND AND v_recheck_wal_status = 'lost' THEN
+            -- Fail closed the same way the upstream check does rather than
+            -- let the raw error propagate: an uncaught ERROR here kills the
+            -- whole background worker process, and the postmaster's
+            -- bgw_restart_time relaunch hits the identical error immediately,
+            -- producing an unbounded once-a-second restart loop.
+            PERFORM public.flashback_mark_capture_stream_broken(
+                v_stream_id,
+                'replication_slot_lost',
+                jsonb_build_object('slot_name', v_slot_name, 'detected_in', 'flashback_consume_wal')
+            );
+            RETURN 0;
+        END IF;
+        RAISE;
+    END;
 
     IF NOT v_has_output THEN
         -- Avoid a self-sustaining metadata-WAL loop for tiny internal tails.
@@ -1116,6 +1157,138 @@ BEGIN
     RETURN true;
 END;
 $$;
+
+-- Destructive DDL removes heap/TOAST files that logical decoding can still
+-- need for an older UPDATE whose unchanged varlena values remain represented
+-- by on-disk TOAST pointers. Lock the relation first, then let the independent
+-- capture worker drain a fixed committed prefix while those files still exist.
+--
+-- Do not call flashback_consume_wal() here: slot advancement would belong to
+-- the caller's open DDL transaction. The background worker owns the separate
+-- transaction required to advance durably while this transaction waits.
+CREATE OR REPLACE FUNCTION flashback_internal_prepare_destructive_ddl(
+    input_schema text,
+    input_table text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel_oid oid;
+    v_schema_name text;
+    v_table_name text;
+    v_slot_name text;
+    v_barrier_lsn pg_lsn;
+    v_has_pending boolean;
+    v_deadline timestamptz;
+    v_timeout_ms integer;
+    v_database_oid oid;
+    v_drain_lock_acquired boolean;
+BEGIN
+    IF input_table IS NULL OR input_table = '' THEN
+        RETURN;
+    END IF;
+
+    IF input_schema IS NULL OR input_schema = '' THEN
+        v_rel_oid := to_regclass(quote_ident(input_table));
+    ELSE
+        v_rel_oid := to_regclass(format('%I.%I', input_schema, input_table));
+    END IF;
+    IF v_rel_oid IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT n.nspname, c.relname
+      INTO v_schema_name, v_table_name
+    FROM flashback.tracked_tables tt
+    JOIN pg_class c ON c.oid = tt.rel_oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE tt.is_active
+      AND tt.recovery_profile = 'local_delta'
+      AND tt.rel_oid = v_rel_oid;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    -- SHARE blocks INSERT/UPDATE/DELETE and competing destructive DDL, while
+    -- still allowing logical decoding to open the relation under ACCESS SHARE.
+    -- Once granted, the fixed barrier is stable because no new writer can
+    -- commit against this relation. The real DROP/TRUNCATE upgrades this to
+    -- ACCESS EXCLUSIVE only after the decoder has drained.
+    v_timeout_ms := public.flashback_apply_local_boundary_lock_timeout();
+    EXECUTE format(
+        'LOCK TABLE %I.%I IN SHARE MODE',
+        v_schema_name,
+        v_table_name
+    );
+
+    v_slot_name := public.flashback_effective_slot_name();
+    SELECT oid INTO v_database_oid
+    FROM pg_database
+    WHERE datname = current_database();
+    v_barrier_lsn := pg_current_wal_insert_lsn();
+    v_timeout_ms := GREATEST(v_timeout_ms, 1);
+    v_deadline := clock_timestamp() + make_interval(secs => v_timeout_ms / 1000.0);
+
+    LOOP
+        -- Coordinate with the worker's session-scoped stream lock. Hold it
+        -- only for the metadata peek; release it whenever work remains so the
+        -- independent worker can consume and commit that prefix.
+        v_drain_lock_acquired := pg_try_advisory_lock(
+            public.flashback_internal_lock_ns_stream(),
+            v_database_oid::integer
+        );
+        IF v_drain_lock_acquired THEN
+            BEGIN
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_logical_slot_peek_changes(
+                        v_slot_name,
+                        v_barrier_lsn,
+                        1,
+                        'tracked_oids',
+                        v_rel_oid::text,
+                        'metadata_only',
+                        'true'
+                    ) AS ch(lsn, xid, data)
+                    WHERE ch.data LIKE '{%'
+                )
+                  INTO v_has_pending;
+                PERFORM pg_advisory_unlock(
+                    public.flashback_internal_lock_ns_stream(),
+                    v_database_oid::integer
+                );
+                v_drain_lock_acquired := false;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    PERFORM pg_advisory_unlock(
+                        public.flashback_internal_lock_ns_stream(),
+                        v_database_oid::integer
+                    );
+                    v_drain_lock_acquired := false;
+                    RAISE;
+            END;
+        ELSE
+            v_has_pending := true;
+        END IF;
+
+        EXIT WHEN NOT v_has_pending;
+
+        IF clock_timestamp() >= v_deadline THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL refused because committed WAL for % did not drain before the % ms write-stall limit',
+                format('%I.%I', v_schema_name, v_table_name), v_timeout_ms
+                USING ERRCODE = 'lock_not_available',
+                      HINT = 'Let the capture worker catch up, inspect flashback_health(), then retry. The table was not changed.';
+        END IF;
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION flashback_internal_prepare_destructive_ddl(text, text) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION flashback_capture_ddl_event(
     event_type text,

@@ -31,10 +31,21 @@ experimental recovery helper. Helper packaging remains separate.
 
 ## Byte support envelope
 
+Two honest, separately-scored modes: table-size mode loads data to the
+target byte size *before* protecting the table (measures protect/DROP/recover
+cost against a pre-existing large table); churn mode measures post-protect
+WAL/DML stress in isolation, against a small fixed base table. A failure in
+one mode does not imply anything about the other.
+
 ```bash
-# Against a live installed cluster with capacity GUCs set:
+# Table-size mode: physical size at target bytes before protect.
 PG_FLASHBACK_BENCH_SIZES="10MiB 100MiB" \
-  ./scripts/run_byte_support_envelope_bench.sh
+  ./scripts/run_byte_table_size_bench.sh
+
+# Churn mode: 1%/10%/100% single-transaction churn, small-batch commits,
+# and one large mixed transaction, all against a 10MiB base table.
+PG_FLASHBACK_CHURN_TIERS="pct1 pct10 pct100" \
+  ./scripts/run_byte_churn_bench.sh
 ```
 
 Results are written under `target/bench/` and are host/config specific.

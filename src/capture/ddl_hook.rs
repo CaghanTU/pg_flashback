@@ -142,6 +142,18 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
         // Do NOT use catch_unwind around SPI calls — it leaks the SPI
         // connection and corrupts the portal snapshot state (PG17 assertion).
         if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
+            // Unchanged varlena values may remain external TOAST pointers in
+            // logical WAL. Before destructive DDL unlinks the source files,
+            // lock each protected relation and let the independent worker
+            // drain its fixed committed prefix.
+            if event_type == "DROP" || event_type == "TRUNCATE" {
+                if let Err(err) = prepare_destructive_ddl(&targets) {
+                    error!(
+                        "pg_flashback: {} pre-drain failed before destructive DDL: {}",
+                        event_type, err
+                    );
+                }
+            }
             // Pre-DROP dependency manifests must be written while target OIDs
             // still exist, before standard_ProcessUtility, in this same TX.
             if event_type == "DROP" {
@@ -449,6 +461,23 @@ fn capture_ddl_for_targets(event_type: &str, targets: &[UtilityTarget]) -> Resul
         )?;
     }
 
+    Ok(())
+}
+
+fn prepare_destructive_ddl(targets: &[UtilityTarget]) -> Result<(), SpiError> {
+    let extension_owner = Spi::get_one::<pg_sys::Oid>(
+        "SELECT extowner FROM pg_extension WHERE extname = 'pg_flashback'",
+    )?
+    .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
+    let _security_context = SecurityContextGuard::switch_to(extension_owner);
+
+    for target in targets {
+        let schema = target.schema.as_deref().unwrap_or("");
+        Spi::run_with_args(
+            "SELECT public.flashback_internal_prepare_destructive_ddl(NULLIF($1, ''), $2)",
+            &[schema.into(), target.table.as_str().into()],
+        )?;
+    }
     Ok(())
 }
 

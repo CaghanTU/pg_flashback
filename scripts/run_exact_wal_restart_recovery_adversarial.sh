@@ -16,16 +16,27 @@
 #           after a hard restart instead of leaving a half-applied or
 #           permanently stuck operation.
 #
-# Usage: ./scripts/run_exact_wal_restart_recovery_adversarial.sh
-# Env:   PG_CONFIG, PGFB_RESTART_ADV_PORT, PGFB_RESTART_ADV_KEEP=1
+# Installs ONLY from CANDIDATE_DIR (scripts/build_candidate_archive.sh
+# output). Never cargo-builds. Bind failure (missing/tampered manifest,
+# archive digest mismatch, dirty/mismatched source tree, wrong arch/PG major,
+# or an installed .so whose hash disagrees with the manifest) is fail-closed:
+# the run aborts before any cluster is started. Result JSON carries the full
+# candidate identity (source_commit, source_tree, package_sha256,
+# extension_binary_sha256, installed_extension_sha256, candidate_dir,
+# pg_major, arch) alongside per-case results.
+#
+# Usage: CANDIDATE_DIR=/path/to/candidate ./scripts/run_exact_wal_restart_recovery_adversarial.sh
+# Env:   CANDIDATE_DIR (required), PGFB_RESTART_ADV_PORT, PGFB_RESTART_ADV_KEEP=1
 
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PG_CONFIG="${PG_CONFIG:-/usr/local/pgsql-17/bin/pg_config}"
-PG_BIN="$("$PG_CONFIG" --bindir)"
-SHARE_DIR="$("$PG_CONFIG" --sharedir)"
-PSQL="$PG_BIN/psql"
+REPO_ROOT="$ROOT"
+export REPO_ROOT
+# shellcheck source=scripts/lib/exact_candidate_identity.sh
+source "$ROOT/scripts/lib/exact_candidate_identity.sh"
+
+CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required: bind this run to a built candidate archive (scripts/build_candidate_archive.sh)}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 PORT="${PGFB_RESTART_ADV_PORT:-28967}"
 WORK_ROOT="${PGFB_RESTART_ADV_WORK_ROOT:-$ROOT/target/exact-wal-restart-adversarial/$RUN_ID}"
@@ -36,6 +47,9 @@ LOG="$WORK_ROOT/postgresql.log"
 DB=postgres
 PASSED=0
 FAILED=0
+EC_BOUND=0
+PREFIX_INSTALLED=0
+PRIMARY_STARTED=0
 declare -a CASE_RESULTS=()
 
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -44,11 +58,16 @@ pass() { echo "  PASS: $*"; PASSED=$((PASSED + 1)); CASE_RESULTS+=("{\"name\":$(
 cleanup() {
     local rc=$?
     set +e
-    if [[ "${PGFB_RESTART_ADV_KEEP:-0}" != "1" ]]; then
+    if [[ "$PRIMARY_STARTED" == 1 ]]; then
         "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1
+    fi
+    if [[ "${PGFB_RESTART_ADV_KEEP:-0}" != "1" ]]; then
         rm -rf "$DATA" "$SOCKET"
     else
         echo "PGFB_RESTART_ADV_KEEP=1: leaving $WORK_ROOT" >&2
+    fi
+    if [[ "$PREFIX_INSTALLED" == 1 ]]; then
+        exact_candidate_restore_prefix || true
     fi
     mkdir -p "$(dirname "$RESULT_JSON")"
     local arr
@@ -56,7 +75,9 @@ cleanup() {
     jq -n \
         --arg run_id "$RUN_ID" --argjson passed "$PASSED" --argjson failed "$FAILED" \
         --argjson cases "$arr" --argjson exit_code "$rc" \
+        --argjson identity "$([[ "$EC_BOUND" == 1 ]] && exact_candidate_identity_json || echo '{}')" \
         '{run_id:$run_id,passed:$passed,failed:$failed,cases:$cases,exit_code:$exit_code,
+          identity:$identity,
           status:(if $failed==0 and $exit_code==0 then "PASS" else "FAIL" end)}' \
         >"$RESULT_JSON"
     echo "exact-WAL restart adversarial: $([[ $FAILED -eq 0 && $rc -eq 0 ]] && echo PASS || echo FAIL) ($RESULT_JSON)"
@@ -65,7 +86,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -x "$PSQL" ]] || die "psql not found via $PG_CONFIG"
+exact_candidate_bind_dir "$CANDIDATE_DIR" || die "candidate bind failed"
+EC_BOUND=1
+exact_candidate_install_into_prefix || die "candidate install failed"
+PREFIX_INSTALLED=1
+exact_candidate_verify_installed || die "installed identity mismatch"
+SHARE_DIR="$("$PG_BIN/pg_config" --sharedir)"
+PSQL="$PG_BIN/psql"
+
+[[ -x "$PSQL" ]] || die "psql not found under candidate-bound $PG_BIN"
 [[ -f "$SHARE_DIR/extension/pg_flashback.control" ]] || die "extension not installed in $SHARE_DIR"
 
 mkdir -p "$WORK_ROOT" "$SOCKET"
@@ -87,6 +116,7 @@ pg_flashback.local_safety_reserve_bytes = 16MB
 pg_flashback.allow_unaudited_restore = on
 EOF
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w >/dev/null
+PRIMARY_STARTED=1
 
 q() { "$PSQL" -X -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAtc "$1"; }
 qe() { "$PSQL" -X -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAtc "$1" 2>&1; }
@@ -188,33 +218,43 @@ q "ALTER SYSTEM SET pg_flashback.target_databases = 'postgres';" >/dev/null
 restart_pg || die "initial restart after target_databases"
 wait_worker || die "worker did not attach"
 
-# ── Case A: DROP under severe idled-worker lag, then a full restart ────────
+# ── Case A: idled-worker lag refuses DROP; retry survives full restart ─────
 q "CREATE TABLE public.radv_lagdrop(id int PRIMARY KEY, payload text);"
 q "SELECT flashback_track('public.radv_lagdrop');" >/dev/null
 wait_health public.radv_lagdrop healthy || die "A: initial health"
 q "INSERT INTO public.radv_lagdrop SELECT g, repeat('x', 200) FROM generate_series(1,500) g;"
 wait_health public.radv_lagdrop healthy || die "A: health after seed dml"
 
-# Freeze the delta worker (not pg_flashback.enabled=off, which also refuses
-# new DDL capture -- see stop_idle_worker's comment): DDL/DML capture stays
-# fully live and WAL genuinely piles up unconsumed in the slot while the
-# worker is stopped, the actual "severe lag" condition.
+# Freeze the delta worker (not pg_flashback.enabled=off): DML still commits and
+# WAL genuinely piles up. Destructive DDL must now refuse this state because an
+# unchanged external TOAST value cannot be reconstructed after DROP unlinks
+# the relation files. This fail-closed refusal is the product contract.
 WORKER_PID=$(stop_idle_worker) || die "A: could not freeze delta worker"
 q "UPDATE public.radv_lagdrop SET payload = 'late-' || id WHERE id <= 50;"
 # Fingerprint reflects the state immediately before DROP (i.e. including the
 # late UPDATE), since exact recovery must reconstruct the table as of the
 # DROP, not as of the earlier seed insert.
 FP_BEFORE=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.radv_lagdrop;")
-q "DROP TABLE public.radv_lagdrop;"
-LAG_BYTES=$(q "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint
-    FROM pg_replication_slots WHERE database = current_database();")
-[[ -n "$LAG_BYTES" && "$LAG_BYTES" -gt 0 ]] || die "A: expected nonzero unconsumed WAL lag before restart, got ${LAG_BYTES:-<none>}"
+set +e
+DROP_REFUSAL=$(qe "DROP TABLE public.radv_lagdrop;")
+DROP_REFUSAL_RC=$?
+set -e
+[[ "$DROP_REFUSAL_RC" -ne 0 ]] || die "A: DROP unexpectedly succeeded while capture worker was frozen"
+[[ "$DROP_REFUSAL" == *"destructive DDL refused"* ]] \
+    || die "A: DROP refusal did not report the fail-closed pre-drain contract: $DROP_REFUSAL"
+[[ "$(q "SELECT to_regclass('public.radv_lagdrop') IS NOT NULL;")" == "t" ]] \
+    || die "A: refused DROP changed the live table"
+pass "A1: DROP is fail-closed while committed relation WAL cannot drain"
 
-# The full stop/start (not just a worker kill) is the actual gap: prove the
-# durable slot + delta_log state survives a real postmaster restart with the
-# DROP's WAL still sitting unconsumed. A STOPped process cannot be woken by
-# a normal shutdown signal, so resume it first.
+# Resume the worker and retry the exact same DROP. The pre-DROP SHARE fence
+# lets the independent worker consume the committed UPDATE while preventing
+# new writers, then the real DROP upgrades to ACCESS EXCLUSIVE.
 kill -CONT "$WORKER_PID" >/dev/null 2>&1 || true
+q "DROP TABLE public.radv_lagdrop;"
+
+# The full stop/start proves the admitted pre-DROP history and the DROP marker
+# survive a real postmaster restart regardless of whether the fast worker
+# consumed the marker just before shutdown.
 "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w -t 60 >/dev/null
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w >/dev/null
 for _ in $(seq 1 60); do q "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
@@ -227,7 +267,7 @@ recover_begin_execute public.radv_lagdrop >/dev/null
 wait_health public.radv_lagdrop healthy || die "A: post-recover health"
 FP_AFTER=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.radv_lagdrop;")
 [[ "$FP_AFTER" == "$FP_BEFORE" ]] || die "A: fingerprint mismatch after restart-survived DROP recovery ($FP_AFTER vs $FP_BEFORE)"
-pass "A: DROP under idled-worker lag recovers exactly across a full PostgreSQL restart"
+pass "A2: retried DROP recovers exactly across a full PostgreSQL restart"
 
 # ── Case B: restore failpoint crash, then a full restart, then reconcile+retry ──
 q "CREATE TABLE public.radv_failcrash(id int PRIMARY KEY, v text);"

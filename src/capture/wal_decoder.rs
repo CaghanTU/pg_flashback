@@ -131,6 +131,7 @@ pub unsafe extern "C-unwind" fn _PG_output_plugin_init(cb: *mut OutputPluginCall
 
 // ─── Startup ────────────────────────────────────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_startup(
     ctx: *mut LogicalDecodingContext,
     options: *mut OutputPluginOptions,
@@ -150,6 +151,7 @@ unsafe extern "C-unwind" fn fb_decode_startup(
 
 // ─── Begin Transaction ──────────────────────────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_begin(
     _ctx: *mut LogicalDecodingContext,
     _txn: *mut ReorderBufferTXN,
@@ -162,6 +164,7 @@ unsafe extern "C-unwind" fn fb_decode_begin(
 
 // ─── DML Change (INSERT / UPDATE / DELETE) ──────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_change(
     ctx: *mut LogicalDecodingContext,
     txn: *mut ReorderBufferTXN,
@@ -271,6 +274,7 @@ unsafe extern "C-unwind" fn fb_decode_change(
 
 // ─── Commit ─────────────────────────────────────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_commit(
     ctx: *mut LogicalDecodingContext,
     txn: *mut ReorderBufferTXN,
@@ -296,6 +300,7 @@ unsafe extern "C-unwind" fn fb_decode_commit(
 
 // ─── Transactional Commit Marker ──────────────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_message(
     ctx: *mut LogicalDecodingContext,
     txn: *mut ReorderBufferTXN,
@@ -333,6 +338,7 @@ unsafe extern "C-unwind" fn fb_decode_message(
 
 // ─── Shutdown ───────────────────────────────────────────────────────
 
+#[pg_guard]
 unsafe extern "C-unwind" fn fb_decode_shutdown(ctx: *mut LogicalDecodingContext) {
     emitted_transactions()
         .lock()

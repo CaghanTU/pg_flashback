@@ -56,6 +56,10 @@ static AUDITED_RECOVER_OPERATION_ID_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 static TEST_RESTORE_FAILPOINT_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
+/// Test-only consume_wal failpoint name. Empty = disabled (release default).
+/// Superuser-only (SUSET). Not a production control plane.
+static TEST_CONSUME_WAL_FAILPOINT_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
 /// Slot retained-WAL warning threshold for health projection.
 static SLOT_LAG_WARNING_BYTES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
@@ -314,6 +318,15 @@ pub fn register_worker_and_guc() {
         c"TEST ONLY: named restore failpoint/barrier (empty disables)",
         c"Superuser-only. Release default is empty/off. Valid names are checked inside flashback_restore_lsn for deterministic cancel/retry tests. Never enable in production.",
         &TEST_RESTORE_FAILPOINT_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.test_consume_wal_failpoint",
+        c"TEST ONLY: named consume_wal failpoint/barrier (empty disables)",
+        c"Superuser-only. Release default is empty/off. Valid names are checked inside flashback_consume_wal for deterministic slot-loss-misclassification regression tests. Never enable in production.",
+        &TEST_CONSUME_WAL_FAILPOINT_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );

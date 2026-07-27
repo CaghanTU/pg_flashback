@@ -215,7 +215,7 @@ COMMENT ON FUNCTION flashback_health()
 COMMENT ON FUNCTION flashback_query(text, timestamptz, text)
     IS 'Reconstruct table state at a past timestamp in a temp table and return rows matching an optional WHERE predicate (SELECT AS OF). Runs as SECURITY INVOKER — filter_clause executes with the caller''s privileges, not the extension owner''s.';
 COMMENT ON FUNCTION flashback_checkpoint(text)
-    IS 'Create an on-demand point-in-time snapshot (checkpoint) of a tracked table. Returns snapshot_id.';
+    IS '[Disabled] Legacy on-demand checkpoint API. Permanently disabled (always raises) for correctness-qualified WAL coverage; retained only as a compatibility stub.';
 COMMENT ON FUNCTION flashback_reanchor(text)
     IS 'Create an explicit exact local base and pending successor generation; activation waits for the boundary transaction COMMIT LSN.';
 COMMENT ON FUNCTION flashback_apply_retention()
@@ -231,7 +231,7 @@ COMMENT ON FUNCTION flashback_set_restore_in_progress(bool)
 COMMENT ON FUNCTION flashback_is_restore_in_progress(oid)
     IS 'Return whether the current backend has a restore in progress. Safe to call from triggers or monitoring.';
 COMMENT ON FUNCTION flashback_take_due_checkpoints()
-    IS 'Auto-checkpoint all tracked tables whose checkpoint_interval has elapsed. Called by the background worker.';
+    IS '[Disabled] Legacy periodic full-table checkpoint API. Permanently disabled (always raises) for correctness-qualified WAL coverage; not called by any background worker; retained only as a compatibility stub. tracked_tables.checkpoint_interval is inert.';
 COMMENT ON FUNCTION flashback_consume_wal(integer)
     IS 'Consume decoded changes from this database''s logical replication slot into delta_log, stamped with real commit time and LSN. Normally called by the background worker. Returns number of events inserted.';
 COMMENT ON FUNCTION flashback_capture_ddl_event(text, text, text)

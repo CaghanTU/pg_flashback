@@ -14,6 +14,7 @@
 #   PGFB_MATRIX_SKIP_ADVERSARIAL=1
 #   PGFB_MATRIX_SKIP_DROP=1
 #   PGFB_MATRIX_SKIP_FUNCTIONAL=1
+#   PGFB_MATRIX_SKIP_RESTART_ADVERSARIAL=1
 #
 # This is NOT a 24h soak.
 
@@ -99,6 +100,14 @@ else
     record drop_adversarial skipped
 fi
 
+if [[ "${PGFB_MATRIX_SKIP_RESTART_ADVERSARIAL:-0}" != 1 ]]; then
+    run_child restart_recovery_adversarial \
+        env CANDIDATE_DIR="$CANDIDATE_DIR" \
+        "$REPO_ROOT/scripts/run_exact_wal_restart_recovery_adversarial.sh" || OVERALL=1
+else
+    record restart_recovery_adversarial skipped
+fi
+
 # Classification ledger (product contract). Values reflect code+suite coverage.
 CLASSIFICATION_JSON='{
   "latest_drop_commit_lsn": "supported-preserved",
@@ -124,10 +133,12 @@ CASES_JSON="$(
     --arg functional "${CASE_STATUS[functional_suite]:-missing}" \
     --arg dropq "${CASE_STATUS[drop_qualification]:-missing}" \
     --arg adv "${CASE_STATUS[drop_adversarial]:-missing}" \
+    --arg restartadv "${CASE_STATUS[restart_recovery_adversarial]:-missing}" \
     '{
       functional_suite:$functional,
       drop_qualification:$dropq,
-      drop_adversarial:$adv
+      drop_adversarial:$adv,
+      restart_recovery_adversarial:$restartadv
     }'
 )"
 
