@@ -51,7 +51,7 @@ epoch being recovered to is outside it.
 | Outgoing foreign keys | Preserved |
 | Plain btree indexes | Preserved |
 | Owner and table-level ACL | Preserved |
-| TOAST / large values | Preserved |
+| TOAST / large values | Preserved up to `pg_flashback.max_row_size` (default 65536 bytes / 64 KiB, configurable 512 bytes-100 MiB), measured as one row's combined old+new captured JSON size. A row whose captured size exceeds the configured limit is never silently applied: capture freezes the affected stream and opens a durable gap instead (see Incidents below). 64 KiB comfortably covers ordinary large-value usage (PostgreSQL's own TOAST threshold is ~2 KiB, so this default already covers moderate documents/blobs well past the point of being TOASTed) without being large enough that a single pathological row risks meaningful decoder memory/CPU pressure; raise the GUC explicitly for workloads with routinely larger values. |
 | Replica identity | Preserved; forced to `FULL` while actively tracked, restored to the original setting on untrack |
 | Basic row-level security policies | Preserved |
 | `FORCE ROW LEVEL SECURITY` | Preserved |
@@ -92,6 +92,7 @@ epoch being recovered to is outside it.
 | `DROP ... CASCADE` | Planned from the pre-DROP manifest; rejected if any dependency is unsupported |
 | `TRUNCATE` or destructive DML | Captured by the engine; advanced LSN recovery remains available |
 | DDL across an unproven schema epoch | Rejected |
+| A changed row exceeding `pg_flashback.max_row_size` | Never silently applied; capture freezes the affected stream and opens a durable gap |
 | Maintenance / reanchor | Opt-in via `pg_flashback maintain`; never silent auto-maintain |
 | Uninstall | `pg_flashback prepare-uninstall` refuses active lifecycles/pending restores |
 

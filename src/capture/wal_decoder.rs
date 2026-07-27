@@ -218,29 +218,67 @@ unsafe extern "C-unwind" fn fb_decode_change(
     let tupdesc = rel.rd_att;
     let reloid: pg_sys::Oid = rd_rel.oid;
     let tp = unsafe { change_ref.data.tp };
+    let max_row_size = crate::storage::worker::max_row_size_bytes().max(0) as usize;
 
     // PG15/PG16: oldtuple/newtuple are *mut ReorderBufferTupleBuf; extract inner HeapTupleData.
     // PG17+: they are already HeapTuple (*mut HeapTupleData).
-    let old_json = if !metadata_only && (op == "UPDATE" || op == "DELETE") && !tp.oldtuple.is_null()
-    {
-        #[cfg(any(feature = "pg15", feature = "pg16"))]
-        let ht: HeapTuple = unsafe { &raw mut (*tp.oldtuple).tuple };
-        #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-        let ht: HeapTuple = tp.oldtuple;
-        Some(unsafe { heap_tuple_to_json(ht, tupdesc, reloid) })
-    } else {
-        None
-    };
+    let old_tuple: Option<HeapTuple> =
+        if !metadata_only && (op == "UPDATE" || op == "DELETE") && !tp.oldtuple.is_null() {
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            let ht: HeapTuple = unsafe { &raw mut (*tp.oldtuple).tuple };
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            let ht: HeapTuple = tp.oldtuple;
+            Some(ht)
+        } else {
+            None
+        };
+    let new_tuple: Option<HeapTuple> =
+        if !metadata_only && (op == "INSERT" || op == "UPDATE") && !tp.newtuple.is_null() {
+            #[cfg(any(feature = "pg15", feature = "pg16"))]
+            let ht: HeapTuple = unsafe { &raw mut (*tp.newtuple).tuple };
+            #[cfg(not(any(feature = "pg15", feature = "pg16")))]
+            let ht: HeapTuple = tp.newtuple;
+            Some(ht)
+        } else {
+            None
+        };
 
-    let new_json = if !metadata_only && (op == "INSERT" || op == "UPDATE") && !tp.newtuple.is_null()
-    {
-        #[cfg(any(feature = "pg15", feature = "pg16"))]
-        let ht: HeapTuple = unsafe { &raw mut (*tp.newtuple).tuple };
-        #[cfg(not(any(feature = "pg15", feature = "pg16")))]
-        let ht: HeapTuple = tp.newtuple;
-        Some(unsafe { heap_tuple_to_json(ht, tupdesc, reloid) })
+    // Deform (cheap: no detoast, just pointer/offset arithmetic over the
+    // tuple's null bitmap) before deciding whether the expensive per-attribute
+    // output-function conversion (which DOES detoast) is worth paying for.
+    let old_deformed = old_tuple.map(|ht| unsafe { deform_tuple(ht, tupdesc) });
+    let new_deformed = new_tuple.map(|ht| unsafe { deform_tuple(ht, tupdesc) });
+
+    // Preflight: a cheap, no-detoast raw-size estimate (see estimate_raw_row_size)
+    // used only to decide whether to SKIP the expensive conversion below for a
+    // row that is unambiguously, hugely oversized -- a generous multiple of the
+    // configured limit, since this estimate is not a precise prediction of the
+    // final JSON byte count (bytea's hex encoding alone roughly doubles a
+    // value's raw byte count). Anything not caught by this margin still goes
+    // through full conversion, where the exact post-conversion byte-length
+    // check below remains the sole authority.
+    const PREFLIGHT_SAFETY_MULTIPLE: usize = 3;
+    let preflight_estimate = old_deformed.as_ref().map_or(0, |(values, nulls)| unsafe {
+        estimate_raw_row_size(values, nulls, tupdesc)
+    }) + new_deformed.as_ref().map_or(0, |(values, nulls)| unsafe {
+        estimate_raw_row_size(values, nulls, tupdesc)
+    });
+    let preflight_oversized = !metadata_only
+        && (op == "INSERT" || op == "UPDATE" || op == "DELETE")
+        && max_row_size > 0
+        && preflight_estimate > max_row_size.saturating_mul(PREFLIGHT_SAFETY_MULTIPLE);
+
+    let (old_json, new_json, captured_len) = if preflight_oversized {
+        (None, None, preflight_estimate)
     } else {
-        None
+        let old_json = old_deformed
+            .as_ref()
+            .map(|(values, nulls)| unsafe { values_to_json(values, nulls, tupdesc, reloid) });
+        let new_json = new_deformed
+            .as_ref()
+            .map(|(values, nulls)| unsafe { values_to_json(values, nulls, tupdesc, reloid) });
+        let len = old_json.as_deref().map_or(0, str::len) + new_json.as_deref().map_or(0, str::len);
+        (old_json, new_json, len)
     };
 
     let xid = unsafe { (*txn).xid };
@@ -255,11 +293,13 @@ unsafe extern "C-unwind" fn fb_decode_change(
     // (flashback_apply_decoded_wal_batch) detects it and freezes the stream
     // the same way it already does for a missing COMMIT record, so recovery
     // never silently continues past a row it could not honestly capture.
-    let captured_len =
-        old_json.as_deref().map_or(0, str::len) + new_json.as_deref().map_or(0, str::len);
-    let oversized = !metadata_only
-        && (op == "INSERT" || op == "UPDATE" || op == "DELETE")
-        && captured_len > crate::storage::worker::max_row_size_bytes().max(0) as usize;
+    // This exact check (comparing the real, final encoded byte length) is
+    // the authority; preflight_oversized above is only an optimization that
+    // skips paying for a conversion we already know we'd discard.
+    let oversized = preflight_oversized
+        || (!metadata_only
+            && (op == "INSERT" || op == "UPDATE" || op == "DELETE")
+            && captured_len > max_row_size);
 
     let mut json = std::string::String::with_capacity(256);
     json.push_str("{\"op\":\"");
@@ -374,13 +414,9 @@ unsafe extern "C-unwind" fn fb_decode_shutdown(ctx: *mut LogicalDecodingContext)
     }
 }
 
-// ─── Utility: HeapTuple → JSON string ───────────────────────────────
+// ─── Utility: HeapTuple → (Datum, is_null) arrays, cheap, no detoast ────
 
-unsafe fn heap_tuple_to_json(
-    tuple: HeapTuple,
-    tupdesc: TupleDesc,
-    #[cfg_attr(not(feature = "pg18"), allow(unused_variables))] reloid: pg_sys::Oid,
-) -> std::string::String {
+unsafe fn deform_tuple(tuple: HeapTuple, tupdesc: TupleDesc) -> (Vec<Datum>, Vec<bool>) {
     let td = unsafe { &*tupdesc };
     let natts = td.natts as usize;
 
@@ -390,6 +426,74 @@ unsafe fn heap_tuple_to_json(
     unsafe {
         heap_deform_tuple(tuple, tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
     }
+
+    (values, nulls)
+}
+
+/// (attlen, attbyval) for one attribute, cheap (no detoast) on either
+/// pre-PG18 FormData_pg_attribute or PG18's CompactAttribute.
+unsafe fn attr_len_byval(tupdesc: TupleDesc, i: usize) -> (i16, bool) {
+    let td = unsafe { &*tupdesc };
+    #[cfg(feature = "pg18")]
+    {
+        let attr = unsafe { &td.compact_attrs.as_slice(td.natts as usize)[i] };
+        (attr.attlen, attr.attbyval)
+    }
+    #[cfg(not(feature = "pg18"))]
+    {
+        let attr = unsafe { &*td.attrs.as_ptr().add(i) };
+        (attr.attlen, attr.attbyval)
+    }
+}
+
+/// Cheap, no-detoast estimate of one row's total encoded size. Used only to
+/// decide whether to SKIP the expensive per-attribute output-function
+/// conversion (values_to_json) for a row already known to be hugely
+/// oversized -- see PREFLIGHT_SAFETY_MULTIPLE at the call site.
+///
+/// toast_raw_datum_size() is PostgreSQL's own primitive for exactly this: for
+/// an external TOAST pointer it reads only the small fixed-size on-disk
+/// pointer struct (va_rawsize), never fetching the actual toasted value from
+/// the TOAST table; for an inline (possibly PGLZ-compressed) datum it reads
+/// the varlena header. Neither path ever detoasts, unlike the output-function
+/// conversion this is trying to let a huge row skip.
+///
+/// cstring attributes (attlen == -2) have no such cheap primitive -- their
+/// length is unknown without dereferencing and scanning the string, which
+/// defeats the purpose of a preflight check. Rather than guess, they are
+/// explicitly excluded from this estimate (contributing 0): this is a
+/// deliberate, fail-closed-by-omission classification, not an oversight --
+/// a cstring-containing row always falls through to full conversion, where
+/// the exact post-conversion byte-length check is what actually protects it.
+unsafe fn estimate_raw_row_size(values: &[Datum], nulls: &[bool], tupdesc: TupleDesc) -> usize {
+    let mut total = 0usize;
+    for (i, (value, is_null)) in values.iter().zip(nulls.iter()).enumerate() {
+        if *is_null {
+            continue;
+        }
+        let (attlen, attbyval) = unsafe { attr_len_byval(tupdesc, i) };
+        if attbyval {
+            total += attlen.max(0) as usize;
+        } else if attlen == -1 {
+            total += unsafe { pg_sys::toast_raw_datum_size(*value) } as usize;
+        } else if attlen >= 0 {
+            total += attlen as usize;
+        }
+        // attlen == -2 (cstring): excluded, see doc comment above.
+    }
+    total
+}
+
+// ─── Utility: (Datum, is_null) arrays → JSON string ─────────────────
+
+unsafe fn values_to_json(
+    values: &[Datum],
+    nulls: &[bool],
+    tupdesc: TupleDesc,
+    #[cfg_attr(not(feature = "pg18"), allow(unused_variables))] reloid: pg_sys::Oid,
+) -> std::string::String {
+    let td = unsafe { &*tupdesc };
+    let natts = td.natts as usize;
 
     let mut json = std::string::String::with_capacity(128);
     json.push('{');
