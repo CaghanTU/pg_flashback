@@ -389,6 +389,10 @@ SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_row flashback.coverage_generations%ROWTYPE;
+    v_prefetched_stream_id bigint;
+    v_stream flashback.capture_streams%ROWTYPE;
+    v_effective_boundary_lsn pg_lsn;
+    v_effective_valid_lsn pg_lsn;
     v_n integer;
     v_legal boolean;
 BEGIN
@@ -399,6 +403,46 @@ BEGIN
     IF p_expected_state IS NULL OR p_new_state IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: generation transition requires expected and new state'
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Activation is the eligibility boundary.  Pin the owning stream before
+    -- the generation row so a concurrent stream break cannot slip between a
+    -- pre-check and the state transition.
+    IF p_new_state = 'active' THEN
+        SELECT stream_id INTO v_prefetched_stream_id
+        FROM flashback.coverage_generations
+        WHERE generation_id = p_generation_id
+          AND tracking_id = p_tracking_id;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'pg_flashback: unknown coverage generation % (tracking %)',
+                p_generation_id, p_tracking_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        SELECT * INTO v_stream
+        FROM flashback.capture_streams
+        WHERE stream_id = v_prefetched_stream_id
+        FOR SHARE;
+
+        IF NOT FOUND OR v_stream.state IS DISTINCT FROM 'active' THEN
+            RAISE EXCEPTION
+                'pg_flashback: generation % cannot activate because stream % is not active',
+                p_generation_id, v_prefetched_stream_id
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        IF v_stream.database_oid IS DISTINCT FROM (
+            SELECT oid FROM pg_database WHERE datname = current_database()
+        ) OR v_stream.database_name IS DISTINCT FROM current_database()::name THEN
+            RAISE EXCEPTION
+                'pg_flashback: generation % stream % belongs to a different database',
+                p_generation_id, v_prefetched_stream_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        PERFORM public.flashback_internal_lock_database_stream(v_stream.database_oid);
+        PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
     END IF;
 
     SELECT * INTO v_row
@@ -412,6 +456,13 @@ BEGIN
             'pg_flashback: unknown coverage generation % (tracking %)',
             p_generation_id, p_tracking_id
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_new_state = 'active'
+       AND v_row.stream_id IS DISTINCT FROM v_prefetched_stream_id
+    THEN
+        RAISE EXCEPTION 'pg_flashback: generation % stream identity changed during activation',
+            p_generation_id
+            USING ERRCODE = 'serialization_failure';
     END IF;
 
     IF v_row.state = p_new_state THEN
@@ -455,6 +506,45 @@ BEGIN
             p_expected_state, p_new_state, p_generation_id
             USING ERRCODE = 'invalid_parameter_value',
                   HINT = 'Use active → sealed → retired; direct active → retired is forbidden.';
+    END IF;
+
+    IF p_new_state = 'active' THEN
+        v_effective_boundary_lsn := COALESCE(p_boundary_lsn, v_row.boundary_lsn);
+        v_effective_valid_lsn := COALESCE(p_valid_through_lsn, v_row.valid_through_lsn);
+
+        IF v_effective_boundary_lsn IS NULL OR v_effective_valid_lsn IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: activating generation % requires boundary and valid-through LSNs',
+                p_generation_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF v_effective_valid_lsn < v_effective_boundary_lsn THEN
+            RAISE EXCEPTION 'pg_flashback: generation % valid-through LSN precedes its boundary',
+                p_generation_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        -- An open historical gap may only be closed by a successor explicitly
+        -- linked to that gap's source generation, at a strictly newer proven
+        -- boundary.  Any unrelated activation would fabricate continuous
+        -- coverage across a permanent rejection interval.
+        IF EXISTS (
+            SELECT 1
+            FROM flashback.coverage_gaps g
+            WHERE g.tracking_id = p_tracking_id
+              AND g.reanchored_by_generation_id IS NULL
+        ) AND NOT EXISTS (
+            SELECT 1
+            FROM flashback.coverage_gaps g
+            WHERE g.tracking_id = p_tracking_id
+              AND g.source_generation_id = v_row.parent_generation_id
+              AND g.reanchored_by_generation_id IS NULL
+              AND g.gap_start_lsn IS NOT NULL
+              AND v_effective_boundary_lsn > g.gap_start_lsn
+        ) THEN
+            RAISE EXCEPTION 'pg_flashback: generation % does not validly re-anchor the open coverage gap',
+                p_generation_id
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
     END IF;
 
     UPDATE flashback.coverage_generations
@@ -730,13 +820,26 @@ SECURITY DEFINER
 SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
-    v_db_oid oid := COALESCE(p_database_oid, (SELECT oid FROM pg_database WHERE datname = current_database()));
+    v_real_db_oid oid := (SELECT oid FROM pg_database WHERE datname = current_database());
+    v_db_oid oid := COALESCE(p_database_oid, v_real_db_oid);
     v_db_name text := current_database();
     v_epoch bigint;
     v_stream_id bigint;
 BEGIN
     IF v_db_oid IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: create stream requires database_oid'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- A capture stream's database_oid/database_name pair must always describe
+    -- THIS session's actual connected database -- a caller-supplied
+    -- p_database_oid that names a different database would create a stream
+    -- row whose database_name (always current_database()) disagrees with its
+    -- own database_oid, and every downstream lookup keyed on either column
+    -- (flashback_internal_lock_database_stream, flashback_ensure_active_wal_stream)
+    -- would silently operate on the wrong bookkeeping for that stream.
+    IF v_db_oid IS DISTINCT FROM v_real_db_oid THEN
+        RAISE EXCEPTION 'pg_flashback: create stream database_oid % does not match the current database % (real oid %)',
+            v_db_oid, current_database(), v_real_db_oid
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
     IF p_initial_state NOT IN ('initializing', 'active') THEN
@@ -793,7 +896,10 @@ SET search_path = pg_catalog, flashback, pg_temp
 AS $$
 DECLARE
     v_gen_id bigint;
-    v_stream_state text;
+    v_stream flashback.capture_streams%ROWTYPE;
+    v_lifecycle_retired_at timestamptz;
+    v_snapshot flashback.snapshots%ROWTYPE;
+    v_parent_tracking_id bigint;
 BEGIN
     IF p_tracking_id IS NULL OR p_generation_no IS NULL OR p_stream_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: create generation requires tracking_id, generation_no, stream_id'
@@ -804,15 +910,72 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
-
-    SELECT state INTO v_stream_state
+    -- Lock order is stream -> lifecycle.  Holding the stream row prevents a
+    -- concurrent break/retire from racing the generation constructor.
+    SELECT * INTO v_stream
     FROM flashback.capture_streams
-    WHERE stream_id = p_stream_id;
+    WHERE stream_id = p_stream_id
+    FOR SHARE;
 
-    IF v_stream_state IS NULL THEN
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'pg_flashback: stream % does not exist', p_stream_id
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_stream.database_oid IS DISTINCT FROM (
+        SELECT oid FROM pg_database WHERE datname = current_database()
+    ) OR v_stream.database_name IS DISTINCT FROM current_database()::name THEN
+        RAISE EXCEPTION 'pg_flashback: stream % belongs to database % (oid %), not current database %',
+            p_stream_id, v_stream.database_name, v_stream.database_oid, current_database()
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_stream.state IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'pg_flashback: cannot create generation on stream % in state %',
+            p_stream_id, v_stream.state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    PERFORM public.flashback_internal_lock_database_stream(v_stream.database_oid);
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+
+    SELECT retired_at INTO v_lifecycle_retired_at
+    FROM flashback.tracking_lifecycles
+    WHERE tracking_id = p_tracking_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % does not exist', p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_lifecycle_retired_at IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % is retired', p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT * INTO v_snapshot
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_boundary_snapshot_id
+    FOR SHARE;
+    IF NOT FOUND
+       OR v_snapshot.tracking_id IS DISTINCT FROM p_tracking_id
+       OR v_snapshot.rel_oid IS DISTINCT FROM p_rel_oid_at_boundary
+    THEN
+        RAISE EXCEPTION 'pg_flashback: boundary snapshot % does not belong to tracking % / relation %',
+            p_boundary_snapshot_id, p_tracking_id, p_rel_oid_at_boundary
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_snapshot.payload_state IS DISTINCT FROM 'available' THEN
+        RAISE EXCEPTION 'pg_flashback: boundary snapshot % is not available',
+            p_boundary_snapshot_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF p_parent_generation_id IS NOT NULL THEN
+        SELECT tracking_id INTO v_parent_tracking_id
+        FROM flashback.coverage_generations
+        WHERE generation_id = p_parent_generation_id;
+        IF NOT FOUND OR v_parent_tracking_id IS DISTINCT FROM p_tracking_id THEN
+            RAISE EXCEPTION 'pg_flashback: parent generation % does not belong to tracking %',
+                p_parent_generation_id, p_tracking_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
     END IF;
 
     INSERT INTO flashback.coverage_generations (

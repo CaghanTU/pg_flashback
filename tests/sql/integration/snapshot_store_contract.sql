@@ -16,6 +16,18 @@ INSERT INTO public.snst_src1 VALUES (1, 'a'), (2, 'b');
 CREATE TABLE public.snst_src2 (id int PRIMARY KEY, v text);
 INSERT INTO public.snst_src2 VALUES (10, 'x');
 
+-- Scenarios 12-15 and 20 cross the SnapshotStore/generation boundary.  Use
+-- real lifecycle identities so the centralized generation constructor can
+-- enforce ownership instead of relying on pg_test's outer rollback to avoid
+-- checking a deferred FK.
+INSERT INTO flashback.tracking_lifecycles (
+    tracking_id, recovery_profile, initial_rel_oid,
+    initial_schema_name, initial_table_name
+)
+SELECT tid, 'local_delta', 'public.snst_src1'::regclass,
+       'public', 'snst_src1'
+FROM unnest(ARRAY[820014, 820015, 820016, 820017, 820030]::bigint[]) AS tid;
+
 -- 1. Fresh create -> available.
 DO $s1$
 DECLARE

@@ -4,9 +4,15 @@ DECLARE
     v_db oid := (SELECT oid FROM pg_database WHERE datname = current_database());
     v_stream bigint;
     v_stream2 bigint;
+    v_stream3 bigint;
+    v_stream4 bigint;
     v_tracking bigint;
     v_rel oid;
     v_snap bigint;
+    v_snap2 bigint;
+    v_snapshot_table text;
+    v_snapshot_locator jsonb;
+    v_snapshot_rows bigint;
     v_gen bigint;
     v_gen2 bigint;
     v_ret bigint;
@@ -17,6 +23,7 @@ DECLARE
     v_ok boolean;
     v_lsn pg_lsn := '0/ABCDEF'::pg_lsn;
     v_epoch bigint;
+    v_other_db oid;
 BEGIN
     CREATE TABLE IF NOT EXISTS public.it_state_auth (id int PRIMARY KEY);
     v_rel := 'public.it_state_auth'::regclass;
@@ -133,13 +140,15 @@ BEGIN
         v_rel, 'public', 'it_state_auth', NULL, 'local_delta'
     ) RETURNING tracking_id INTO v_tracking;
 
-    INSERT INTO flashback.snapshots (
-        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
-        schema_def, row_count, captured_at
-    ) VALUES (
-        v_rel, v_tracking, 'flashback.it_state_auth_snap', v_lsn,
-        '{}'::jsonb, 0, clock_timestamp()
-    ) RETURNING snapshot_id INTO v_snap;
+    v_snap := public.flashback_internal_snapshot_create(
+        v_tracking, v_rel, 'public', 'it_state_auth',
+        v_lsn, 'generation'
+    );
+    SELECT snapshot_table, locator, row_count
+      INTO v_snapshot_table, v_snapshot_locator, v_snapshot_rows
+    FROM flashback.snapshots
+    WHERE snapshot_id = v_snap
+      AND tracking_id = v_tracking;
 
     -- Use Authority Constructor for Generation
     v_gen := public.flashback_internal_create_coverage_generation(
@@ -207,6 +216,101 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'sealed->retired should mutate';
     END IF;
+    PERFORM public.flashback_internal_transition_capture_stream(
+        v_stream2, ARRAY['active'], 'retired', 'generation_retired', '{}'::jsonb
+    );
+
+    -- Constructor identity: a caller cannot pair current_database() with a
+    -- different catalog OID.
+    SELECT oid INTO v_other_db
+    FROM pg_database
+    WHERE oid <> v_db
+    ORDER BY oid
+    LIMIT 1;
+    IF v_other_db IS NOT NULL THEN
+        v_raised := false;
+        BEGIN
+            PERFORM public.flashback_internal_create_capture_stream(
+                p_database_oid => v_other_db,
+                p_initial_state => 'active',
+                p_slot_name => 'it_auth_wrong_db',
+                p_plugin_name => 'pg_flashback_decoder'
+            );
+        EXCEPTION WHEN invalid_parameter_value THEN
+            v_raised := true;
+        END;
+        IF NOT v_raised THEN
+            RAISE EXCEPTION 'capture stream accepted a database_oid from another database';
+        END IF;
+    END IF;
+
+    -- A broken stream cannot own a newly-created generation.
+    v_stream3 := public.flashback_internal_create_capture_stream(
+        p_database_oid => v_db,
+        p_initial_state => 'active',
+        p_slot_name => 'it_auth_slot_3',
+        p_plugin_name => 'pg_flashback_decoder'
+    );
+    PERFORM public.flashback_internal_transition_capture_stream(
+        v_stream3, ARRAY['active'], 'broken', 'break_before_generation', '{}'::jsonb
+    );
+    v_raised := false;
+    BEGIN
+        PERFORM public.flashback_internal_create_coverage_generation(
+            p_tracking_id => v_tracking,
+            p_generation_no => 2,
+            p_stream_id => v_stream3,
+            p_boundary_kind => 'maintenance_reanchor',
+            p_rel_oid_at_boundary => v_rel,
+            p_boundary_snapshot_id => v_snap,
+            p_boundary_xid => txid_current(),
+            p_boundary_marker => 'state-auth-broken-stream'
+        );
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        v_raised := true;
+    END;
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 'generation constructor accepted a broken stream';
+    END IF;
+
+    -- The stream is checked again while locked at building -> active.  A
+    -- stream break after construction therefore cannot qualify the draft.
+    v_stream4 := public.flashback_internal_create_capture_stream(
+        p_database_oid => v_db,
+        p_initial_state => 'active',
+        p_slot_name => 'it_auth_slot_4',
+        p_plugin_name => 'pg_flashback_decoder'
+    );
+    v_snap2 := public.flashback_internal_snapshot_create(
+        v_tracking, v_rel, 'public', 'it_state_auth',
+        v_lsn, 'generation'
+    );
+    v_gen2 := public.flashback_internal_create_coverage_generation(
+        p_tracking_id => v_tracking,
+        p_generation_no => 2,
+        p_stream_id => v_stream4,
+        p_boundary_kind => 'maintenance_reanchor',
+        p_rel_oid_at_boundary => v_rel,
+        p_boundary_snapshot_id => v_snap2,
+        p_boundary_xid => txid_current(),
+        p_boundary_marker => 'state-auth-break-before-activate'
+    );
+    PERFORM public.flashback_internal_transition_capture_stream(
+        v_stream4, ARRAY['active'], 'broken', 'break_before_activation', '{}'::jsonb
+    );
+    v_raised := false;
+    BEGIN
+        PERFORM public.flashback_internal_transition_coverage_generation(
+            v_gen2, v_tracking, 'building', 'active', 'must_fail',
+            v_lsn, clock_timestamp(), v_lsn, clock_timestamp(),
+            NULL, NULL, '{}'::jsonb
+        );
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        v_raised := true;
+    END;
+    IF NOT v_raised THEN
+        RAISE EXCEPTION 'generation activated after its capture stream broke';
+    END IF;
 
     -- 3. Generation Payload Retirement Intent Constructor & Transitions
     v_ret := public.flashback_internal_create_retirement_intent(
@@ -214,12 +318,12 @@ BEGIN
         p_tracking_id => v_tracking,
         p_reason => 'retention_policy',
         p_snapshot_id => v_snap,
-        p_snapshot_table => 'flashback.it_state_auth_snap',
+        p_snapshot_table => v_snapshot_table,
         p_snapshot_rel_oid => v_rel,
-        p_snapshot_row_count => 0,
+        p_snapshot_row_count => v_snapshot_rows,
         p_snapshot_schema_fingerprint => md5('dummy_schema'),
         p_snapshot_storage_backend => 'heap_v1',
-        p_snapshot_locator => jsonb_build_object('schema', 'flashback', 'relation', 'it_state_auth_snap'),
+        p_snapshot_locator => v_snapshot_locator,
         p_expected_delta_rows => 0,
         p_expected_schema_rows => 0,
         p_first_delta_lsn => v_lsn,
