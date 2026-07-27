@@ -1093,15 +1093,15 @@ BEGIN
             -- in the exact expected state. Bypass via the same explicit
             -- backend-local flag flashback_restore_lsn uses, not a context
             -- assumption.
-            PERFORM flashback_set_restore_in_progress(true);
+            PERFORM public.flashback_set_restore_in_progress(true);
             BEGIN
                 EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY %s',
                     v_schema_name, v_table_name, v_ri_clause);
             EXCEPTION WHEN OTHERS THEN
-                PERFORM flashback_set_restore_in_progress(false);
+                PERFORM public.flashback_set_restore_in_progress(false);
                 RAISE;
             END;
-            PERFORM flashback_set_restore_in_progress(false);
+            PERFORM public.flashback_set_restore_in_progress(false);
         END;
     END IF;
 

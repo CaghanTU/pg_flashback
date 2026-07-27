@@ -226,7 +226,7 @@ COMMENT ON FUNCTION flashback_adopt_existing_payload_tables()
     IS 'Upgrade helper: idempotently adopt legacy runtime payload tables as pg_flashback extension members so logical dumps cannot export orphan recovery data.';
 COMMENT ON FUNCTION flashback_history(text, interval)
     IS 'Return change history (INSERT/UPDATE/DELETE events) for a table within a lookback window, with PK-based row identity.';
-COMMENT ON FUNCTION flashback_set_restore_in_progress(bool)
+COMMENT ON FUNCTION public.flashback_set_restore_in_progress(bool)
     IS '[Internal] Set the process-local restore-in-progress flag. Extension-owner execution chain only.';
 COMMENT ON FUNCTION flashback_is_restore_in_progress(oid)
     IS 'Return whether the current backend has a restore in progress. Safe to call from triggers or monitoring.';

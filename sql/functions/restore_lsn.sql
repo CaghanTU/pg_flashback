@@ -713,7 +713,7 @@ DECLARE
     v_audited_disaster_event_id bigint;
     v_audited_state text;
 BEGIN
-    PERFORM flashback_set_restore_in_progress(true);
+    PERFORM public.flashback_set_restore_in_progress(true);
 
     IF p_stream_id IS NULL THEN
         RAISE EXCEPTION 'flashback_internal_restore_lsn_core: stream_id is required';
@@ -1219,13 +1219,13 @@ BEGIN
         );
     END IF;
 
-    PERFORM flashback_set_restore_in_progress(false);
+    PERFORM public.flashback_set_restore_in_progress(false);
     RETURN materialized.events_applied;
 EXCEPTION WHEN OTHERS THEN
     IF v_shadow_name IS NOT NULL THEN
         EXECUTE format('DROP TABLE IF EXISTS flashback.%I CASCADE', v_shadow_name);
     END IF;
-    PERFORM flashback_set_restore_in_progress(false);
+    PERFORM public.flashback_set_restore_in_progress(false);
     RAISE;
 END;
 $$;
@@ -1283,7 +1283,7 @@ BEGIN
         v_locked.out_disaster_event_id
     );
 EXCEPTION WHEN OTHERS THEN
-    PERFORM flashback_set_restore_in_progress(false);
+    PERFORM public.flashback_set_restore_in_progress(false);
     RAISE;
 END;
 $$;

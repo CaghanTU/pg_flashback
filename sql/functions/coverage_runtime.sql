@@ -836,15 +836,15 @@ BEGIN
     -- capture would otherwise treat this internal maintenance ALTER as user
     -- DDL; bypass via the explicit backend-local flag, not a context
     -- assumption.
-    PERFORM flashback_set_restore_in_progress(true);
+    PERFORM public.flashback_set_restore_in_progress(true);
     BEGIN
         EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',
                        v_schema_name, v_table_name);
     EXCEPTION WHEN OTHERS THEN
-        PERFORM flashback_set_restore_in_progress(false);
+        PERFORM public.flashback_set_restore_in_progress(false);
         RAISE;
     END;
-    PERFORM flashback_set_restore_in_progress(false);
+    PERFORM public.flashback_set_restore_in_progress(false);
 
     v_boundary_xid := (txid_current() % 4294967296)::bigint;
     SELECT COALESCE(max(generation_no), 0) + 1
@@ -1235,4 +1235,3 @@ END;
 $$;
 
 -- public.flashback_health() is defined in health_runtime.sql (actionable projection).
-
