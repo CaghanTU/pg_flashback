@@ -591,9 +591,20 @@ BEGIN
     v_tracking_id := (v_plan->>'tracking_id')::bigint;
     v_table := v_plan->>'table_name';
 
-    PERFORM set_config('pg_flashback.audited_recover_operation_id', v_op::text, true);
-
-    v_rows := flashback_restore_lsn(v_table, v_lsn);
+    -- Backend-local Rust execution context, not a user-settable GUC: see
+    -- flashback_internal_set_audited_recover_context. Cleared on both the
+    -- success and exception paths here; a permanent transaction-end callback
+    -- also force-clears it on commit/abort as a backstop against a bug in
+    -- this exception handling ever leaking the context into a later,
+    -- unrelated restore in the same backend/connection.
+    PERFORM flashback_internal_set_audited_recover_context(v_op);
+    BEGIN
+        v_rows := flashback_restore_lsn(v_table, v_lsn);
+    EXCEPTION WHEN OTHERS THEN
+        PERFORM flashback_internal_clear_audited_recover_context();
+        RAISE;
+    END;
+    PERFORM flashback_internal_clear_audited_recover_context();
 
     SELECT COALESCE(e.payload->'successor', '{}'::jsonb), e.payload
       INTO v_binding, v_proof_payload

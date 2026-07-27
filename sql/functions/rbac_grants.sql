@@ -230,6 +230,12 @@ COMMENT ON FUNCTION flashback_set_restore_in_progress(bool)
     IS '[Internal] Set the process-local restore-in-progress flag. Extension-owner execution chain only.';
 COMMENT ON FUNCTION flashback_is_restore_in_progress(oid)
     IS 'Return whether the current backend has a restore in progress. Safe to call from triggers or monitoring.';
+COMMENT ON FUNCTION flashback_internal_set_audited_recover_context(bigint)
+    IS '[Internal] Set the backend-local (not GUC, not user-settable) audited-recover operation_id. Extension-owner execution chain only (flashback_recover_execute).';
+COMMENT ON FUNCTION flashback_internal_clear_audited_recover_context()
+    IS '[Internal] Clear the backend-local audited-recover context. Extension-owner execution chain only. Also unconditionally cleared on every transaction commit/abort by a permanent xact callback.';
+COMMENT ON FUNCTION flashback_internal_get_audited_recover_context()
+    IS '[Internal] Return this backend''s audited-recover operation_id, or NULL if unset. Read-only.';
 COMMENT ON FUNCTION flashback_take_due_checkpoints()
     IS '[Disabled] Legacy periodic full-table checkpoint API. Permanently disabled (always raises) for correctness-qualified WAL coverage; not called by any background worker; retained only as a compatibility stub. tracked_tables.checkpoint_interval is inert.';
 COMMENT ON FUNCTION flashback_consume_wal(integer)

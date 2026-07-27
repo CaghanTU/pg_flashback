@@ -8,6 +8,10 @@
       "class": "supported-core",
       "reason": "ACL restore via seam"
     },
+    "audited_recover_context_failclosed.sql": {
+      "class": "infra",
+      "reason": "audited-recover backend-local execution context is unforgeable and fails closed on mismatched/terminal/unknown operations"
+    },
     "batch_replay_mixed_ops.sql": {
       "class": "supported-core",
       "reason": "batch replay mixed ops via seam"

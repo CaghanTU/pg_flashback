@@ -144,11 +144,7 @@ BEGIN
         v_boundary,
         jsonb_build_object('test', 'exact_drop_identity_propagation')
     );
-    PERFORM set_config(
-        'pg_flashback.audited_recover_operation_id',
-        v_audit_op::text,
-        true
-    );
+    PERFORM public.flashback_internal_set_audited_recover_context(v_audit_op);
 
     SELECT * INTO v_locked
     FROM public.flashback_restore_lsn_lock_phase('public.it_exact_drop_id', v_boundary);
@@ -232,11 +228,7 @@ BEGIN
         '0/5000'::pg_lsn,
         jsonb_build_object('test', 'exact_drop_identity_dml')
     );
-    PERFORM set_config(
-        'pg_flashback.audited_recover_operation_id',
-        v_dml_op::text,
-        true
-    );
+    PERFORM public.flashback_internal_set_audited_recover_context(v_dml_op);
     PERFORM public.flashback_test_restore_lsn('public.it_exact_drop_id', '0/5000'::pg_lsn);
 
     SELECT payload->'expected_proof' INTO v_dml_proof

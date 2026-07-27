@@ -464,6 +464,27 @@ BEGIN
             CONTINUE;
         END IF;
 
+        -- A4: 'verified' is the durable, externally-trusted outcome of an
+        -- audited recover operation. Re-check the restore's own independent
+        -- proof (expected_proof.binding, built from the pre-swap shadow and
+        -- lock-phase disaster identity) against the operation HEADER
+        -- (flashback.operations, set at flashback_recover_begin time) one
+        -- more time here -- never write 'verified' on a payload whose target
+        -- LSN or disaster identity has drifted from what this operation was
+        -- actually authorized to restore.
+        IF r.target_lsn IS NOT NULL
+           AND NULLIF(v_payload->'expected_proof'->'binding'->>'target_lsn', '')::pg_lsn
+               IS DISTINCT FROM r.target_lsn
+        THEN
+            CONTINUE;
+        END IF;
+        IF r.disaster_event_id IS NOT NULL
+           AND NULLIF(v_payload->'expected_proof'->'binding'->>'disaster_event_id', '')::bigint
+               IS DISTINCT FROM r.disaster_event_id
+        THEN
+            CONTINUE;
+        END IF;
+
         SELECT cg.* INTO v_cg
         FROM flashback.coverage_generations cg
         WHERE cg.generation_id = v_generation_id

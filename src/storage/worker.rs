@@ -52,8 +52,6 @@ static LOCAL_CAPACITY_OVERRIDE_GUC: GucSetting<bool> = GucSetting::<bool>::new(f
 /// Test-only restore failpoint name. Empty = disabled (release default).
 /// Superuser-only (SUSET). Not a production control plane.
 static ALLOW_UNAUDITED_RESTORE_GUC: GucSetting<bool> = GucSetting::<bool>::new(false);
-static AUDITED_RECOVER_OPERATION_ID_GUC: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
 static TEST_RESTORE_FAILPOINT_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 /// Test-only consume_wal failpoint name. Empty = disabled (release default).
@@ -301,15 +299,6 @@ pub fn register_worker_and_guc() {
         c"Default off. The supported operator path is flashback_recover_begin then flashback_recover_execute. Enable only for emergency/lab use; failed unaudited restores leave no durable operation audit.",
         &ALLOW_UNAUDITED_RESTORE_GUC,
         GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_flashback.audited_recover_operation_id",
-        c"Session-local recover operation_id set by flashback_recover_execute",
-        c"Operators must not set this manually. flashback_recover_execute sets it for the destructive restore transaction so flashback_restore_lsn can attach successor binding to the durable operation header.",
-        &AUDITED_RECOVER_OPERATION_ID_GUC,
-        GucContext::Userset,
         GucFlags::default(),
     );
 

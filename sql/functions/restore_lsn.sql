@@ -487,7 +487,11 @@ DECLARE
     v_disaster_commit_lsn pg_lsn := NULL;
     v_source_xid bigint := NULL;
     v_disaster_event_type text := NULL;
-    v_audited text;
+    v_audited_op bigint;
+    v_audited_command text;
+    v_audited_tracking_id bigint;
+    v_audited_target_lsn pg_lsn;
+    v_audited_state text;
 BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
@@ -506,15 +510,38 @@ BEGIN
     -- reconstruction (live relation gone) and for audited recover selections
     -- whose disaster is a DROP. Pure DML/schema point-in-time restore against
     -- a still-live relation must not invent or require a DROP identity.
-    v_audited := NULLIF(
-        btrim(COALESCE(current_setting('pg_flashback.audited_recover_operation_id', true), '')),
-        ''
-    );
-    IF v_audited IS NOT NULL AND v_audited ~ '^[0-9]+$' THEN
-        SELECT o.disaster_event_id
-          INTO v_disaster_event_id
+    --
+    -- The audited operation_id comes from a backend-local Rust execution
+    -- context (flashback_internal_get_audited_recover_context), never from a
+    -- user-settable GUC: only flashback_recover_execute's owner-run body may
+    -- set it. Even so, an operation_id that does not actually describe THIS
+    -- restore (wrong command/state/tracking_id/target_lsn) must never be
+    -- trusted for disaster_event_id binding -- fail closed rather than
+    -- silently falling back to "unaudited" or borrowing an unrelated
+    -- operation's disaster identity.
+    v_audited_op := flashback_internal_get_audited_recover_context();
+    IF v_audited_op IS NOT NULL THEN
+        SELECT o.disaster_event_id, o.command, o.tracking_id, o.target_lsn, s.state
+          INTO v_disaster_event_id, v_audited_command, v_audited_tracking_id,
+               v_audited_target_lsn, v_audited_state
         FROM flashback.operations o
-        WHERE o.operation_id = v_audited::bigint;
+        JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
+        WHERE o.operation_id = v_audited_op;
+
+        IF v_audited_command IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: audited recover context refers to unknown operation %', v_audited_op
+                USING ERRCODE = 'serialization_failure';
+        END IF;
+        IF v_audited_command IS DISTINCT FROM 'recover'
+           OR v_audited_state IS DISTINCT FROM 'started'
+           OR v_audited_tracking_id IS DISTINCT FROM admission.tracking_id
+           OR v_audited_target_lsn IS DISTINCT FROM p_target_lsn
+        THEN
+            RAISE EXCEPTION 'pg_flashback: audited recover context (operation %, command=%, state=%, tracking_id=%, target_lsn=%) does not match this restore (table %, tracking_id=%, target_lsn=%)',
+                v_audited_op, v_audited_command, v_audited_state, v_audited_tracking_id, v_audited_target_lsn,
+                p_target_table, admission.tracking_id, p_target_lsn
+                USING ERRCODE = 'serialization_failure';
+        END IF;
     END IF;
 
     IF v_live_oid IS NULL THEN
@@ -529,11 +556,23 @@ BEGIN
             ORDER BY dl.commit_lsn ASC, dl.event_id ASC
             LIMIT 1;
         ELSE
+            -- Audited disaster_event_id: still an untrusted foreign key into
+            -- delta_log until its own tracking_id and event_type are checked
+            -- here -- an operation row can never borrow another lifecycle's
+            -- DROP identity just because tracking_id/target_lsn happened to
+            -- match above.
             SELECT dl.commit_lsn, dl.source_xid
               INTO v_disaster_commit_lsn, v_source_xid
             FROM flashback.delta_log dl
             WHERE dl.event_id = v_disaster_event_id
+              AND dl.tracking_id = admission.tracking_id
+              AND dl.event_type = 'DROP'
             LIMIT 1;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'pg_flashback: audited disaster_event_id % is not a DROP event for tracking_id %',
+                    v_disaster_event_id, admission.tracking_id
+                    USING ERRCODE = 'serialization_failure';
+            END IF;
         END IF;
 
         IF v_disaster_event_id IS NULL THEN
@@ -550,11 +589,20 @@ BEGIN
             v_disaster_event_id
         );
     ELSIF v_disaster_event_id IS NOT NULL THEN
+        -- Same untrusted-foreign-key concern as the DROP-reconstruct branch
+        -- above: an audited disaster_event_id must belong to this admitted
+        -- tracking_id, never a different lifecycle's event.
         SELECT dl.commit_lsn, dl.source_xid, dl.event_type
           INTO v_disaster_commit_lsn, v_source_xid, v_disaster_event_type
         FROM flashback.delta_log dl
         WHERE dl.event_id = v_disaster_event_id
+          AND dl.tracking_id = admission.tracking_id
         LIMIT 1;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'pg_flashback: audited disaster_event_id % does not belong to tracking_id %',
+                v_disaster_event_id, admission.tracking_id
+                USING ERRCODE = 'serialization_failure';
+        END IF;
 
         IF v_disaster_event_type = 'DROP' THEN
             PERFORM flashback_bind_drop_dependency_manifests();
@@ -654,6 +702,12 @@ DECLARE
     v_restored_rel regclass;
     v_expected_proof jsonb;
     v_restore_verification jsonb;
+    v_audited_op bigint;
+    v_audited_command text;
+    v_audited_tracking_id bigint;
+    v_audited_target_lsn pg_lsn;
+    v_audited_disaster_event_id bigint;
+    v_audited_state text;
 BEGIN
     PERFORM flashback_set_restore_in_progress(true);
 
@@ -1004,10 +1058,36 @@ BEGIN
     RAISE NOTICE 'pg_flashback: restore applied at target LSN %; successor coverage is pending until this transaction COMMIT is consumed. Check flashback_health() before another historical operation.',
         p_target_lsn;
 
-    -- Attach exact successor binding and proof to the durable recover operation.
-    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NOT NULL THEN
+    -- Attach exact successor binding and proof to the durable recover
+    -- operation. The audited operation_id comes from the backend-local Rust
+    -- execution context, never a user-settable GUC. Re-verify the binding
+    -- against the operation header one more time here (command/state/
+    -- tracking_id/target_lsn/disaster_event_id) rather than trusting that the
+    -- lock-phase check earlier in the same restore still holds -- fail closed
+    -- rather than silently attaching this restore's proof to an operation
+    -- header that does not actually describe it.
+    v_audited_op := flashback_internal_get_audited_recover_context();
+    IF v_audited_op IS NOT NULL THEN
+        SELECT o.command, o.tracking_id, o.target_lsn, o.disaster_event_id, s.state
+          INTO v_audited_command, v_audited_tracking_id, v_audited_target_lsn,
+               v_audited_disaster_event_id, v_audited_state
+        FROM flashback.operations o
+        JOIN flashback.operation_current_state s ON s.operation_id = o.operation_id
+        WHERE o.operation_id = v_audited_op;
+
+        IF v_audited_command IS DISTINCT FROM 'recover'
+           OR v_audited_state IS DISTINCT FROM 'started'
+           OR v_audited_tracking_id IS DISTINCT FROM admission.tracking_id
+           OR v_audited_target_lsn IS DISTINCT FROM p_target_lsn
+           OR v_audited_disaster_event_id IS DISTINCT FROM p_disaster_event_id
+        THEN
+            RAISE EXCEPTION 'pg_flashback: audited recover context (operation %) no longer matches this restore at finalize (table %, tracking_id=%, target_lsn=%, disaster_event_id=%)',
+                v_audited_op, p_target_table, admission.tracking_id, p_target_lsn, p_disaster_event_id
+                USING ERRCODE = 'serialization_failure';
+        END IF;
+
         PERFORM flashback_operation_append_event(
-            current_setting('pg_flashback.audited_recover_operation_id')::bigint,
+            v_audited_op,
             'applied_coverage_pending',
             NULL, NULL,
             'restore applied; waiting for exact successor coverage',
@@ -1062,7 +1142,7 @@ DECLARE
 BEGIN
     PERFORM flashback_require_primary('flashback_restore_lsn');
 
-    IF NULLIF(current_setting('pg_flashback.audited_recover_operation_id', true), '') IS NULL
+    IF flashback_internal_get_audited_recover_context() IS NULL
        AND NOT COALESCE(
             NULLIF(current_setting('pg_flashback.allow_unaudited_restore', true), '')::boolean,
             false

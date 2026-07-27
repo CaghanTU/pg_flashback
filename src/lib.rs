@@ -22,6 +22,7 @@ pub use capture::wal_decoder::_PG_output_plugin_init;
 pub extern "C-unwind" fn _PG_init() {
     capture::ddl_hook::install_process_utility_hook();
     storage::worker::register_worker_and_guc();
+    runtime_guard::install_audited_recover_context_xact_callback();
 }
 
 #[pg_guard]
@@ -219,6 +220,10 @@ mod tests {
     sql_test!(
         it_lifecycle_resolver_ambiguity_failclosed,
         "../tests/sql/integration/lifecycle_resolver_ambiguity_failclosed.sql"
+    );
+    sql_test!(
+        it_audited_recover_context_failclosed,
+        "../tests/sql/integration/audited_recover_context_failclosed.sql"
     );
     sql_test!(
         it_pitr_time_filtering,

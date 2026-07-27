@@ -135,6 +135,12 @@ jobs:
             OUT_DIR=target/generated-sql-wal-only-surface \
             scripts/check_core_wal_only_surface.sh
 
+      - name: No user-settable audited-recover GUC surface
+        run: |
+          PG_MAJOR=${{ matrix.pg }} \
+            OUT_DIR=target/generated-sql-no-audited-recover-guc-surface \
+            scripts/check_no_audited_recover_guc_surface.sh
+
       - name: Runtime state mutations are centralized
         run: scripts/check_centralized_state_surface.sh
 

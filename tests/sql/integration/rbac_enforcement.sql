@@ -288,6 +288,42 @@ BEGIN
             'flashback_admin can execute capture-bypass internals';
     END IF;
 
+    -- A4: the audited-recover execution context setter/clearer must remain
+    -- owner-only. A role that could call these directly could forge an
+    -- audited flashback_restore_lsn call against an arbitrary operation_id.
+    IF has_function_privilege(
+        'flashback_admin',
+        'public.flashback_internal_set_audited_recover_context(bigint)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'flashback_admin can forge the audited-recover execution context (set)';
+    END IF;
+    IF has_function_privilege(
+        'flashback_admin',
+        'public.flashback_internal_clear_audited_recover_context()',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'flashback_admin can forge the audited-recover execution context (clear)';
+    END IF;
+    IF has_function_privilege(
+        'public',
+        'public.flashback_internal_set_audited_recover_context(bigint)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'PUBLIC can forge the audited-recover execution context (set)';
+    END IF;
+    IF has_function_privilege(
+        'flashback_admin',
+        'public.flashback_internal_get_audited_recover_context()',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION
+            'flashback_admin can probe the audited-recover execution context (get)';
+    END IF;
+
     -- Legacy trigger-capture admin APIs must not exist at all.
     IF to_regprocedure('flashback_flush_staging(integer)') IS NOT NULL
        OR to_regprocedure('flashback_attach_capture_trigger(text,text)') IS NOT NULL
