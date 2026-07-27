@@ -79,16 +79,17 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 case "$MODE" in
     selftest)
         SIZE_MIB=1
-        qst_init candidate_mismatch_rejected missing_step_cannot_pass interrupt_yields_fail
+        qst_init dirty_tree_rejected candidate_mismatch_rejected missing_step_cannot_pass interrupt_yields_fail
         ;;
     dev)
         SIZE_MIB="${2:-64}"
         qst_init candidate_build cluster_bootstrap \
             protocol_a_base protocol_a_wal_alignment protocol_a_export_conn_lifecycle \
             protocol_b_base protocol_b_wal_alignment protocol_b_multi_table \
-            adversarial_boundary_timing adversarial_churn_and_toast adversarial_quoted_identifiers \
-            adversarial_crash_and_retry adversarial_slot_loss \
-            ddl_queue_policy_comparison xmin_vacuum_horizon
+            adversarial_boundary_timing adversarial_named_transactions \
+            adversarial_churn_and_toast adversarial_quoted_identifiers \
+            adversarial_crash_and_retry adversarial_slot_loss adversarial_restart_crash \
+            ddl_queue_policy_comparison xmin_vacuum_horizon write_stall_distribution
         ;;
     scale)
         PROTOCOL="${2:-}"; PROFILE="${3:-}"; SIZE_MIB="${4:-1024}"
@@ -149,6 +150,15 @@ build_and_verify_candidate() {
     source_tree="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')"
     dirty="$(git -C "$ROOT" status --porcelain=v1)"
 
+    # Fail closed BEFORE any build or cluster: a dirty working tree means the
+    # built .so would not provably correspond to a specific committed source
+    # state, so the candidate identity itself would be unverifiable.
+    if [[ -n "$dirty" ]]; then
+        echo "FAIL: source tree is dirty; refusing to build or start a cluster. git status --porcelain=v1:" >&2
+        echo "$dirty" >&2
+        return 1
+    fi
+
     ( cd "$ROOT" && cargo build --release --no-default-features --features pg17 >&2 ) \
         || { echo "FAIL: cargo build failed" >&2; return 1; }
 
@@ -173,11 +183,28 @@ build_and_verify_candidate() {
 
 # ── selftest mode: three negative-control gates, no long-lived cluster ───
 run_selftest() {
-    # 1) A deliberately wrong expected hash must be rejected before any
-    #    cluster is created (candidate_dir/build dir must stay untouched).
+    # 0) A dirty working tree must be rejected BEFORE any build/cluster
+    #    starts. Dirty the tree with an untracked scratch file only (never
+    #    touch a tracked file), verify rejection, then remove the marker so
+    #    every later gate in this function runs against a genuinely clean
+    #    tree.
     local before_marker="$WORK_ROOT/.no-cluster-marker"
     mkdir -p "$WORK_ROOT"
     touch "$before_marker"
+    local dirty_marker="$ROOT/.poc-selftest-dirty-marker-$$"
+    touch "$dirty_marker"
+    if build_and_verify_candidate 2>/dev/null; then
+        qst_mark_step "dirty_tree_rejected" "fail" "dirty tree was NOT rejected"
+        QST_FAILED=$((QST_FAILED + 1))
+    else
+        [[ ! -d "$DATA" ]] || die "cluster dir created despite dirty source tree"
+        qst_mark_step "dirty_tree_rejected" "pass" "dirty tree correctly rejected before any build/cluster"
+    fi
+    rm -f "$dirty_marker"
+    [[ -z "$(git -C "$ROOT" status --porcelain=v1)" ]] || die "selftest failed to restore a clean tree after the dirty-tree gate"
+
+    # 1) A deliberately wrong expected hash must be rejected before any
+    #    cluster is created (candidate_dir/build dir must stay untouched).
     if POC_EXPECTED_SO_SHA256="0000000000000000000000000000000000000000000000000000000000000000" \
         build_and_verify_candidate 2>/dev/null; then
         qst_mark_step "candidate_mismatch_rejected" "fail" "mismatch was NOT rejected"
@@ -313,6 +340,22 @@ restart_cluster() {
     return 1
 }
 
+# Simulates a real crash, not a clean shutdown: `-m immediate` skips the
+# shutdown checkpoint entirely, so the next start genuinely exercises crash
+# recovery (WAL replay from the last checkpoint), which is what "PostgreSQL
+# restart mid-copy" is meant to test -- a clean restart would just be an
+# orderly transaction abort, not a crash.
+crash_restart_cluster() {
+    "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w -t 30 >/dev/null 2>&1 || true
+    "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w -t 60 >/dev/null
+    local _
+    for _ in $(seq 1 120); do
+        "${PSQL[@]}" -d postgres -qAt -c "SELECT 1;" >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 # ── table profiles ────────────────────────────────────────────────────────
 # Ordinary profile: int/text mix. Toast profile: incompressible bytea
 # (md5-chained hex, which gzips/lz4 poorly) sized so on-disk TOAST bytes
@@ -355,6 +398,18 @@ install_oracle_sql() {
     CREATE TABLE change_log (seq bigserial PRIMARY KEY, xid bigint, oid bigint, op text,
                               old jsonb, new jsonb, applied boolean NOT NULL DEFAULT false);
     CREATE TABLE poc_table_map (oid bigint PRIMARY KEY, shadow_regclass text, pk_col text);
+    -- PoC-only artifact lifecycle model for the restart/crash scenarios
+    -- below (creating -> available | aborted). This is NOT the production
+    -- SnapshotStore state machine and is not wired to it; it exists solely
+    -- so this harness can distinguish a physically committed but never
+    -- finalized artifact from a genuinely available one, without inventing
+    -- a production seam.
+    CREATE TABLE poc_artifact_state (
+        artifact_name text PRIMARY KEY,
+        state text NOT NULL CHECK (state IN ('creating','available','aborted')),
+        shadow_table text,
+        created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    );
 
     -- Moves every currently-staged decoded_events row into the durable logs
     -- (commit_log / marker_log / change_log), then clears decoded_events.
@@ -459,10 +514,14 @@ install_oracle_sql() {
     " >/dev/null
 }
 
-# Semantic, order-independent fingerprint: hash of the sorted set of
-# per-row hashes, plus row count. Two tables with identical rows in any
-# physical order produce the same fingerprint; any differing/missing/extra
-# row changes it.
+# Independent PoC semantic fingerprint -- NOT the product's canonical
+# `flashback_relation_full_data_fingerprint`, and not claimed to be
+# equivalent to it. This is this harness's own order-independent check:
+# hash of the sorted set of per-row hashes. Two tables with identical rows
+# in any physical order produce the same fingerprint; any differing/
+# missing/extra row changes it. Validating the actual production
+# correctness oracle is a separate, explicit step (the exact-WAL
+# transaction/schema matrix), not this function.
 fingerprint_table() {
     local tbl=$1
     q "$DB" "SELECT md5(COALESCE(string_agg(h, '|' ORDER BY h), '')) FROM (SELECT md5(t::text) h FROM $tbl t) x;"
@@ -784,12 +843,20 @@ run_protocol_b() {
     # yet read anything) -> waits for the lock; coordinator locks, signals,
     # and then itself waits for the copier's snapshot-fixing read to
     # complete before emitting the marker and releasing the lock via COMMIT.
+    #
+    # The snapshot-fixing statement is `SELECT 1 FROM tbl LIMIT 1`, not
+    # `SELECT count(*)`: PostgreSQL fixes a REPEATABLE READ transaction's
+    # snapshot at its first query, regardless of how much of the relation
+    # that query actually scans -- a LIMIT 1 probe still genuinely reads the
+    # target relation (satisfying "first real table read") while costing
+    # O(1) instead of a full scan, which matters once the coordinator lock
+    # is held for the whole duration of this read.
     (
         "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt >"$WORK_ROOT/${tbl}_copier.out" 2>&1 <<SQL
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 \! touch "$txn_started_file"
 \! while [ ! -f "$lock_acquired_file" ]; do sleep 0.02; done
-SELECT count(*) FROM $tbl;
+SELECT 1 FROM $tbl LIMIT 1;
 \! touch "$snapshot_fixed_file"
 \! while [ ! -f "$go_file" ]; do sleep 0.02; done
 \! date +%s%3N > "${copy_ms_file}.start"
@@ -920,7 +987,7 @@ SQL
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 \! touch "$txn_started_file"
 \! while [ ! -f "$lock_acquired_file" ]; do sleep 0.02; done
-SELECT count(*) FROM $tbl;
+SELECT 1 FROM $tbl LIMIT 1;
 \! touch "$snapshot_fixed_file"
 \! while [ ! -f "$go_file" ]; do sleep 0.02; done
 CREATE TABLE ${tbl}_shadow AS SELECT * FROM $tbl;
@@ -994,7 +1061,7 @@ SQL
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 \! touch "$txn_started_file"
 \! while [ ! -f "$lock_acquired_file" ]; do sleep 0.02; done
-SELECT count(*) FROM $tbl;
+SELECT 1 FROM $tbl LIMIT 1;
 \! touch "$snapshot_fixed_file"
 \! while [ ! -f "$go_file" ]; do sleep 0.02; done
 CREATE TABLE ${tbl}_shadow2 AS SELECT * FROM $tbl;
@@ -1049,6 +1116,192 @@ SQL
     [[ "$s2_fp_live" == "$s2_fp_shadow" ]] \
         || die "s2/3: base + WAL-after-boundary does not reconstruct live table (late write not delivered exactly once)"
     echo "scenario2_3: base correctly excludes the post-boundary commit; WAL delivers it exactly once" >&2
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Named transaction scenarios: multi-row, INSERT/UPDATE/DELETE-in-one-txn,
+# SAVEPOINT rollback, nested subtransaction rollback, full rollback,
+# concurrent same-PK update. Empirically proves the pg_flashback decoder's
+# own behavior (JSON serialization, message/change callbacks) for each
+# shape -- PostgreSQL's ReorderBuffer already assembles subtransactions and
+# discards aborted work generically for any output plugin, but that is not
+# the same claim as "this specific decoder round-trips it correctly," which
+# is what these checks verify end to end.
+# ─────────────────────────────────────────────────────────────────────────
+named_txn_setup() {
+    local tbl=$1
+    q "$DB" "CREATE TABLE $tbl (id bigint PRIMARY KEY, v text); ALTER TABLE $tbl REPLICA IDENTITY FULL;
+             INSERT INTO $tbl SELECT g, 'seed'||g FROM generate_series(1,10) g;" >/dev/null
+    local oid; oid="$(table_oid "$tbl")"
+    q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_shadow', 'id')
+             ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;" >/dev/null
+    q "$DB" "DROP TABLE IF EXISTS ${tbl}_shadow; CREATE TABLE ${tbl}_shadow AS SELECT * FROM $tbl;" >/dev/null
+    echo "$oid"
+}
+
+named_txn_boundary() {
+    local slot=$1 marker_text=$2
+    q "$DB" "SELECT pg_logical_emit_message(true, 'pg_flashback', '$marker_text');" >/dev/null
+    consume_slot_to_events "$slot" "$(all_tracked_oids)"
+    q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
+    local xid lsn
+    xid="$(q "$DB" "SELECT xid FROM marker_log ORDER BY xid DESC LIMIT 1;")"
+    [[ -n "$xid" ]] || die "named-txn: no marker found for boundary '$marker_text'"
+    lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid=$xid;")"
+    [[ -n "$lsn" ]] || die "named-txn: could not resolve boundary lsn for '$marker_text'"
+    echo "$lsn"
+}
+
+# Verifies: decoded commit count for the scenario window (new commit_log
+# rows since $commits_before, i.e. excluding the "before" boundary marker
+# itself), decoded op count for this table's oid, zero duplicate/out-of-
+# order commits, and that base+WAL-after-boundary reconstructs the live
+# table exactly (independent PoC semantic fingerprint -- see fingerprint_table).
+named_txn_verify() {
+    local case_name=$1 tbl=$2 oid=$3 slot=$4 before_lsn=$5 commits_before=$6 expect_commit_delta=$7 expect_ops=$8
+    consume_slot_to_events "$slot" "$(all_tracked_oids)"
+    q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
+    local commits_after commit_delta
+    commits_after="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    commit_delta=$((commits_after - commits_before))
+    [[ "$commit_delta" == "$expect_commit_delta" ]] \
+        || die "$case_name: decoded commit count $commit_delta != expected $expect_commit_delta"
+
+    local apply_out ins upd del dup ooo _commits _mark
+    apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$before_lsn'::pg_lsn);")"
+    IFS='|' read -r _commits ins upd del _mark dup ooo <<<"$apply_out"
+    [[ "$dup" == "0" && "$ooo" == "0" ]] || die "$case_name: duplicate_commits=$dup out_of_order=$ooo"
+
+    local op_count
+    op_count="$(q "$DB" "SELECT count(*) FROM change_log WHERE oid=$oid;")"
+    [[ "$op_count" == "$expect_ops" ]] || die "$case_name: decoded op count $op_count != expected $expect_ops"
+
+    local fp_live fp_shadow rc_live rc_shadow
+    fp_live="$(fingerprint_table "$tbl")"
+    fp_shadow="$(fingerprint_table "${tbl}_shadow")"
+    rc_live="$(row_count "$tbl")"
+    rc_shadow="$(row_count "${tbl}_shadow")"
+    [[ "$fp_live" == "$fp_shadow" && "$rc_live" == "$rc_shadow" ]] \
+        || die "$case_name: fingerprint/row-count mismatch live=($rc_live,$fp_live) shadow=($rc_shadow,$fp_shadow)"
+    echo "named_txn[$case_name]: OK commit_delta=$commit_delta ops=$op_count (ins=$ins upd=$upd del=$del) dup=$dup ooo=$ooo" >&2
+}
+
+run_named_transaction_scenarios() {
+    local slot=$1
+
+    # a) Multi-row single transaction: one commit, ten UPDATE ops.
+    local tbl=poc_named_multirow oid before_lsn commits_before
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-multirow-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    q "$DB" "UPDATE $tbl SET v = v || '-multi' WHERE id <= 10;" >/dev/null
+    named_txn_verify "multirow" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 1 10
+
+    # b) INSERT -> UPDATE -> DELETE in the same transaction: one commit,
+    # three ops, final state has no row 100 in either live or shadow.
+    tbl=poc_named_iud
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-iud-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
+BEGIN;
+INSERT INTO $tbl VALUES (100, 'temp');
+UPDATE $tbl SET v = 'temp2' WHERE id = 100;
+DELETE FROM $tbl WHERE id = 100;
+COMMIT;
+SQL
+    named_txn_verify "insert_update_delete" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 1 3
+
+    # c) SAVEPOINT rollback: id=2's update, made after SAVEPOINT sp1 and
+    # rolled back, must never appear -- only id=1 and id=3's updates decode.
+    tbl=poc_named_savepoint
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-savepoint-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
+BEGIN;
+UPDATE $tbl SET v = 'before-sp' WHERE id = 1;
+SAVEPOINT sp1;
+UPDATE $tbl SET v = 'inside-sp-should-not-persist' WHERE id = 2;
+ROLLBACK TO SAVEPOINT sp1;
+UPDATE $tbl SET v = 'after-rollback' WHERE id = 3;
+COMMIT;
+SQL
+    named_txn_verify "savepoint_rollback" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 1 2
+    local sp_id2; sp_id2="$(q "$DB" "SELECT v FROM $tbl WHERE id=2;")"
+    [[ "$sp_id2" == "seed2" ]] || die "savepoint_rollback: id=2 should be untouched (seed2), got $sp_id2"
+
+    # d) Nested subtransaction rollback: SAVEPOINT sp_outer > SAVEPOINT
+    # sp_inner. Rolling back to sp_inner discards only id=3's update;
+    # rolling back to sp_outer afterward discards id=2 AND id=4's updates.
+    # Only id=1 and id=5's updates survive to COMMIT.
+    tbl=poc_named_nested
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-nested-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
+BEGIN;
+UPDATE $tbl SET v = 'outer' WHERE id = 1;
+SAVEPOINT sp_outer;
+UPDATE $tbl SET v = 'inner-should-not-persist-1' WHERE id = 2;
+SAVEPOINT sp_inner;
+UPDATE $tbl SET v = 'inner-should-not-persist-2' WHERE id = 3;
+ROLLBACK TO SAVEPOINT sp_inner;
+UPDATE $tbl SET v = 'after-inner-rollback-should-not-persist' WHERE id = 4;
+ROLLBACK TO SAVEPOINT sp_outer;
+UPDATE $tbl SET v = 'final' WHERE id = 5;
+COMMIT;
+SQL
+    named_txn_verify "nested_subtransaction_rollback" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 1 2
+    local nested_ids234; nested_ids234="$(q "$DB" "SELECT string_agg(v, ',' ORDER BY id) FROM $tbl WHERE id IN (2,3,4);")"
+    [[ "$nested_ids234" == "seed2,seed3,seed4" ]] \
+        || die "nested_subtransaction_rollback: id 2/3/4 should be untouched, got $nested_ids234"
+
+    # e) Full transaction rollback: zero commits, zero ops, table unchanged.
+    tbl=poc_named_fullrollback
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-fullrollback-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
+BEGIN;
+UPDATE $tbl SET v = 'should-vanish' WHERE id = 1;
+INSERT INTO $tbl VALUES (200, 'should-vanish-too');
+ROLLBACK;
+SQL
+    named_txn_verify "full_rollback" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 0 0
+
+    # f) Concurrent update on the same PK: session1 holds the row lock
+    # (UPDATE issued, not yet committed), session2's UPDATE blocks behind
+    # it, session1 commits, session2 unblocks and commits. Two commits, two
+    # ops, final value is session2's (the later committer).
+    tbl=poc_named_concurrent
+    oid="$(named_txn_setup "$tbl")"
+    before_lsn="$(named_txn_boundary "$slot" "named-concurrent-before")"
+    commits_before="$(q "$DB" "SELECT count(*) FROM commit_log;")"
+    local ready1="$WORK_ROOT/${tbl}_ready1" go1="$WORK_ROOT/${tbl}_go1"
+    rm -f "$ready1" "$go1"
+    "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt >/dev/null <<SQL &
+BEGIN;
+UPDATE $tbl SET v = 'session1' WHERE id = 1;
+\! touch "$ready1"
+\! while [ ! -f "$go1" ]; do sleep 0.02; done
+COMMIT;
+SQL
+    local session1_pid=$!
+    local deadline=$(( $(date +%s) + 20 ))
+    while [[ ! -f "$ready1" ]]; do (( $(date +%s) < deadline )) || die "concurrent_pk_update: session1 did not reach ready"; sleep 0.05; done
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt -c "BEGIN; UPDATE $tbl SET v = 'session2' WHERE id = 1; COMMIT;" >/dev/null &
+    local session2_pid=$!
+    sleep 0.3
+    touch "$go1"
+    wait "$session1_pid" 2>/dev/null || true
+    wait "$session2_pid" 2>/dev/null || true
+    named_txn_verify "concurrent_pk_update" "$tbl" "$oid" "$slot" "$before_lsn" "$commits_before" 2 2
+    local final_v; final_v="$(q "$DB" "SELECT v FROM $tbl WHERE id=1;")"
+    [[ "$final_v" == "session2" ]] || die "concurrent_pk_update: expected final value session2, got $final_v"
+    rm -f "$ready1" "$go1"
+
+    echo "named transaction scenarios: multirow, insert-update-delete, savepoint rollback, nested subtransaction rollback, full rollback, concurrent PK update -- all verified against decoded WAL" >&2
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1185,6 +1438,79 @@ SQL
     echo "xmin: hold-age=$xmin_age dead_during=$dead_tuples_during dead_after_vacuum=$dead_tuples_after" >&2
 }
 
+# ─────────────────────────────────────────────────────────────────────────
+# Protocol B write-stall (coordinator lock hold) distribution: repeats the
+# real LOCK + copier-snapshot-fix + marker + COMMIT handshake >=20 times
+# against the same table/profile and reports p50/p95/p99/max. This measures
+# specifically the short-lock portion (the actual write-stall a protected
+# table would feel), not the long lock-free copy that follows it in
+# production use -- run_protocol_b's own lock_hold_ms metric is defined the
+# same way (LOCK acquired to COMMIT), so this is 20 repeats of that same
+# window, not a different measurement. Explicitly labeled by size_mib in
+# both the metric name and the printed summary; never presented as a 1 GiB
+# percentile from a single 1 GiB sample.
+# ─────────────────────────────────────────────────────────────────────────
+percentile_from_sorted_ms() {
+    local pct=$1
+    awk -v p="$pct" '{a[NR]=$1} END{ if (NR==0) {print 0; exit} idx=int((p/100.0)*NR + 0.9999); if(idx<1)idx=1; if(idx>NR)idx=NR; print a[idx] }'
+}
+
+run_write_stall_distribution() {
+    local size_mib=$1 samples=${2:-20}
+    local tbl=poc_stall_dist_${size_mib}mib
+    make_ordinary_table "$tbl" "$size_mib"
+    local oid; oid="$(table_oid "$tbl")"
+    q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_shadow_dist', 'id') ON CONFLICT (oid) DO NOTHING;" >/dev/null
+
+    local holds_file="$WORK_ROOT/stall_dist_${size_mib}mib.txt"
+    : >"$holds_file"
+    local i
+    for i in $(seq 1 "$samples"); do
+        local txn_started="$WORK_ROOT/dist_txn_started_$i" lock_acquired="$WORK_ROOT/dist_lock_acquired_$i" snap_fixed="$WORK_ROOT/dist_snap_fixed_$i"
+        rm -f "$txn_started" "$lock_acquired" "$snap_fixed"
+        "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt >/dev/null 2>&1 <<SQL &
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+\! touch "$txn_started"
+\! while [ ! -f "$lock_acquired" ]; do sleep 0.01; done
+SELECT 1 FROM $tbl LIMIT 1;
+\! touch "$snap_fixed"
+COMMIT;
+SQL
+        local copier_pid=$!
+        local deadline=$(( $(date +%s) + 10 ))
+        while [[ ! -f "$txn_started" ]]; do (( $(date +%s) < deadline )) || die "write-stall dist: sample $i copier did not start"; sleep 0.02; done
+
+        local t0 t1
+        t0=$(now_ms)
+        "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt >/dev/null <<SQL
+BEGIN;
+LOCK TABLE $tbl IN SHARE ROW EXCLUSIVE MODE;
+\! touch "$lock_acquired"
+\! while [ ! -f "$snap_fixed" ]; do sleep 0.01; done
+SELECT pg_logical_emit_message(true, 'pg_flashback', 'dist-marker-$i');
+COMMIT;
+SQL
+        t1=$(now_ms)
+        wait "$copier_pid" 2>/dev/null || true
+        echo $((t1-t0)) >>"$holds_file"
+        rm -f "$txn_started" "$lock_acquired" "$snap_fixed"
+    done
+
+    local sorted; sorted="$(sort -n "$holds_file")"
+    local p50 p95 p99 max
+    p50="$(echo "$sorted" | percentile_from_sorted_ms 50)"
+    p95="$(echo "$sorted" | percentile_from_sorted_ms 95)"
+    p99="$(echo "$sorted" | percentile_from_sorted_ms 99)"
+    max="$(echo "$sorted" | tail -1)"
+
+    record_metric "write_stall_distribution.${size_mib}mib.samples" "$samples" "count"
+    record_metric "write_stall_distribution.${size_mib}mib.p50_ms" "$p50" "ms"
+    record_metric "write_stall_distribution.${size_mib}mib.p95_ms" "$p95" "ms"
+    record_metric "write_stall_distribution.${size_mib}mib.p99_ms" "$p99" "ms"
+    record_metric "write_stall_distribution.${size_mib}mib.max_ms" "$max" "ms"
+    echo "write_stall_distribution[${size_mib}MiB, n=$samples]: p50=${p50}ms p95=${p95}ms p99=${p99}ms max=${max}ms" >&2
+}
+
 # ── Crash / retry adversarial scenarios (12, 13, 15, 16, 17) ────────────
 run_crash_and_retry_scenarios() {
     local tbl=poc_crash
@@ -1277,6 +1603,157 @@ SQL
     echo "scenario17: duplicate/retry correctly detected by the oracle and application stayed idempotent" >&2
 }
 
+# Drops the physical shadow table (if any) and transitions to 'aborted' for
+# every artifact still stuck in 'creating' -- the recovery-time cleanup a
+# real implementation would run at startup. PoC-only; not wired to
+# SnapshotStore.
+poc_cleanup_orphaned_artifacts() {
+    local rec shadow_tbl
+    for rec in $(q "$DB" "SELECT artifact_name FROM poc_artifact_state WHERE state = 'creating';"); do
+        shadow_tbl="$(q "$DB" "SELECT shadow_table FROM poc_artifact_state WHERE artifact_name='$rec';")"
+        if [[ -n "$shadow_tbl" ]]; then
+            q "$DB" "DROP TABLE IF EXISTS $shadow_tbl;" >/dev/null 2>&1 || true
+        fi
+        q "$DB" "UPDATE poc_artifact_state SET state = 'aborted' WHERE artifact_name = '$rec' AND state = 'creating';" >/dev/null
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Scenario 15: real crash recovery via actual `pg_ctl stop -m immediate` +
+# start (not a simulated/logical crash). Three sub-cases, per the task
+# correction.
+# ─────────────────────────────────────────────────────────────────────────
+run_restart_crash_scenarios() {
+    local slot=$1
+
+    # A: marker committed, copy in flight (transaction open, has not yet
+    # even reached its CREATE TABLE), immediate crash. The in-flight
+    # transaction must vanish entirely; the marker (already committed
+    # before the crash) must remain durable and decodable; retry from a
+    # clean artifact must succeed with no lost/duplicate commit.
+    local tbl=poc_restart_a
+    q "$DB" "CREATE TABLE $tbl (id bigint PRIMARY KEY, v text); ALTER TABLE $tbl REPLICA IDENTITY FULL;
+             INSERT INTO $tbl SELECT g,'v'||g FROM generate_series(1,200) g;" >/dev/null
+    local oid; oid="$(table_oid "$tbl")"
+    q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_shadow_restart', 'id')
+             ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;" >/dev/null
+    q "$DB" "INSERT INTO poc_artifact_state VALUES ('restart-a','creating','${tbl}_shadow_restart');" >/dev/null
+
+    local marker_a_lsn; marker_a_lsn="$(named_txn_boundary "$slot" "restart-a-marker")"
+
+    local ready_a="$WORK_ROOT/${tbl}_inflight_ready"
+    rm -f "$ready_a"
+    "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -qAt >/dev/null 2>&1 <<SQL &
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM $tbl;
+\! touch "$ready_a"
+\! sleep 3
+CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl;
+COMMIT;
+SQL
+    local inflight_pid=$!
+    local deadline=$(( $(date +%s) + 20 ))
+    while [[ ! -f "$ready_a" ]]; do (( $(date +%s) < deadline )) || die "restart-a: in-flight copy did not start in time"; sleep 0.05; done
+
+    crash_restart_cluster || die "restart-a: cluster did not come back up after simulated crash"
+    kill -KILL "$inflight_pid" 2>/dev/null || true
+    wait "$inflight_pid" 2>/dev/null || true
+
+    local orphan_exists; orphan_exists="$(q "$DB" "SELECT to_regclass('${tbl}_shadow_restart') IS NOT NULL;")"
+    [[ "$orphan_exists" == "f" ]] || die "restart-a: an in-flight (uncommitted) copy left a visible artifact after crash recovery"
+
+    local slot_ok; slot_ok="$(q "$DB" "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$slot';")"
+    [[ "$slot_ok" == "1" ]] || die "restart-a: shared slot did not survive crash recovery"
+
+    consume_slot_to_events "$slot" "$oid"
+    q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
+    local marker_still_there; marker_still_there="$(q "$DB" "SELECT count(*) FROM commit_log WHERE lsn = '$marker_a_lsn'::pg_lsn;")"
+    [[ "$marker_still_there" == "1" ]] || die "restart-a: pre-crash committed marker is no longer decodable after crash recovery"
+
+    local state_a; state_a="$(q "$DB" "SELECT state FROM poc_artifact_state WHERE artifact_name='restart-a';")"
+    [[ "$state_a" == "creating" ]] || die "restart-a: artifact state unexpectedly changed across the crash (was $state_a)"
+    poc_cleanup_orphaned_artifacts
+    state_a="$(q "$DB" "SELECT state FROM poc_artifact_state WHERE artifact_name='restart-a';")"
+    [[ "$state_a" == "aborted" ]] || die "restart-a: orphan was not cleaned up to 'aborted' state"
+
+    # Retry with a clean artifact must succeed, with the pre-crash marker's
+    # commit not double-counted (commit_log is keyed by xid; a slot rewind
+    # across the crash redelivering already-seen WAL is exactly what that
+    # dedup exists for).
+    q "$DB" "DROP TABLE IF EXISTS ${tbl}_shadow_restart;" >/dev/null
+    q "$DB" "CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl;" >/dev/null
+    q "$DB" "UPDATE poc_artifact_state SET state='available' WHERE artifact_name='restart-a';" >/dev/null
+    consume_slot_to_events "$slot" "$oid"
+    local retry_apply retry_dup retry_ooo
+    retry_apply="$(q "$DB" "SELECT duplicate_commits,out_of_order FROM poc_apply_shadow(NULL);")"
+    IFS='|' read -r retry_dup retry_ooo <<<"$retry_apply"
+    [[ "$retry_ooo" == "0" ]] || die "restart-a: out-of-order commits after crash retry"
+    local fp_live fp_shadow
+    fp_live="$(fingerprint_table "$tbl")"; fp_shadow="$(fingerprint_table "${tbl}_shadow_restart")"
+    [[ "$fp_live" == "$fp_shadow" ]] || die "restart-a: retry artifact does not match live table"
+    echo "restart-15a: in-flight copy crash-recovers to no artifact; marker durable; clean retry succeeded (redelivery dup handling exercised, retry_dup=$retry_dup)" >&2
+
+    # B: copy commits fully, crash happens BEFORE a separate metadata-
+    # finalize step. The physically-committed table must not be treated as
+    # available; deterministic cleanup must run; retry must be idempotent.
+    tbl=poc_restart_b
+    q "$DB" "CREATE TABLE $tbl (id bigint PRIMARY KEY, v text); ALTER TABLE $tbl REPLICA IDENTITY FULL;
+             INSERT INTO $tbl SELECT g,'v'||g FROM generate_series(1,50) g;" >/dev/null
+    q "$DB" "INSERT INTO poc_artifact_state VALUES ('restart-b','creating','${tbl}_shadow_restart');
+             CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl;" >/dev/null
+    # Deliberate gap: finalize (the UPDATE to 'available') has NOT run yet.
+    crash_restart_cluster || die "restart-b: cluster did not come back up after simulated crash"
+
+    local exists_b state_b
+    exists_b="$(q "$DB" "SELECT to_regclass('${tbl}_shadow_restart') IS NOT NULL;")"
+    state_b="$(q "$DB" "SELECT state FROM poc_artifact_state WHERE artifact_name='restart-b';")"
+    [[ "$exists_b" == "t" ]] || die "restart-b: expected the physically-committed table to still exist (this is the orphan case, not the vanished case)"
+    [[ "$state_b" == "creating" ]] || die "restart-b: artifact state changed unexpectedly across crash (was $state_b)"
+    poc_cleanup_orphaned_artifacts
+    exists_b="$(q "$DB" "SELECT to_regclass('${tbl}_shadow_restart') IS NOT NULL;")"
+    state_b="$(q "$DB" "SELECT state FROM poc_artifact_state WHERE artifact_name='restart-b';")"
+    [[ "$exists_b" == "f" ]] || die "restart-b: deterministic cleanup did not drop the orphaned physical table"
+    [[ "$state_b" == "aborted" ]] || die "restart-b: deterministic cleanup did not mark the artifact aborted"
+
+    # Idempotent retry: re-running the same create-then-finalize sequence
+    # for the same artifact_name must succeed cleanly.
+    q "$DB" "INSERT INTO poc_artifact_state VALUES ('restart-b','creating','${tbl}_shadow_restart')
+             ON CONFLICT (artifact_name) DO UPDATE SET state='creating', shadow_table=EXCLUDED.shadow_table;
+             CREATE TABLE ${tbl}_shadow_restart AS SELECT * FROM $tbl;
+             UPDATE poc_artifact_state SET state='available' WHERE artifact_name='restart-b';" >/dev/null
+    state_b="$(q "$DB" "SELECT state FROM poc_artifact_state WHERE artifact_name='restart-b';")"
+    [[ "$state_b" == "available" ]] || die "restart-b: idempotent retry did not reach 'available'"
+    echo "restart-15b: physically-committed pre-finalize orphan correctly not treated as available; deterministic cleanup ran; retry idempotent" >&2
+
+    # C: coordinator's marker commits, but the copier independently fails
+    # (simulated by never running it at all). The marker alone must never
+    # produce an active/available artifact, and the shared slot/stream must
+    # remain healthy for a later clean attempt.
+    tbl=poc_restart_c
+    q "$DB" "CREATE TABLE $tbl (id bigint PRIMARY KEY, v text);
+             INSERT INTO $tbl SELECT g,'v'||g FROM generate_series(1,20) g;" >/dev/null
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt <<SQL >/dev/null
+BEGIN;
+LOCK TABLE $tbl IN SHARE ROW EXCLUSIVE MODE;
+SELECT pg_logical_emit_message(true, 'pg_flashback', 'restart-c-marker');
+COMMIT;
+SQL
+    # Copier never runs -- simulates independent copier failure.
+    local avail_c; avail_c="$(q "$DB" "SELECT count(*) FROM poc_artifact_state WHERE artifact_name='restart-c' AND state='available';")"
+    [[ "$avail_c" == "0" ]] || die "restart-c: marker alone produced an available artifact"
+    # The shared slot must still work normally for the next table.
+    q "$DB" "CREATE TABLE ${tbl}_probe (id bigint PRIMARY KEY);" >/dev/null
+    local probe_oid; probe_oid="$(table_oid "${tbl}_probe")"
+    q "$DB" "INSERT INTO poc_table_map VALUES ($probe_oid, '${tbl}_probe_shadow', 'id');
+             CREATE TABLE ${tbl}_probe_shadow AS SELECT * FROM ${tbl}_probe WHERE false;
+             INSERT INTO ${tbl}_probe VALUES (1);" >/dev/null
+    consume_slot_to_events "$slot" "$probe_oid"
+    q "$DB" "SELECT poc_apply_shadow(NULL);" >/dev/null
+    local probe_rows; probe_rows="$(q "$DB" "SELECT count(*) FROM ${tbl}_probe_shadow;")"
+    [[ "$probe_rows" == "1" ]] || die "restart-c: shared slot/stream did not remain healthy after the marker-only failed attempt"
+    echo "restart-15c: marker-only commit never produced an active artifact; shared slot remained healthy for a later clean attempt" >&2
+}
+
 # ── Wire it all together per mode ────────────────────────────────────────
 run_mode_dev() {
     run_protocol_a "poc_a_tbl" "poc_slot_a" "$((SIZE_MIB/2))"
@@ -1306,6 +1783,9 @@ run_mode_dev() {
     run_boundary_timing_scenarios "poc_slot_b"
     qst_mark_step "adversarial_boundary_timing" "pass" "scenarios 1/2/3 verified"
 
+    run_named_transaction_scenarios "poc_slot_b"
+    qst_mark_step "adversarial_named_transactions" "pass" "multirow/insert-update-delete/savepoint/nested-subtransaction/full-rollback/concurrent-pk-update verified"
+
     run_protocol_b "poc_b_toast" "poc_slot_b" "$((SIZE_MIB/2))" "toast"
     qst_mark_step "adversarial_churn_and_toast" "pass" "TOAST byte equality verified; churn workload exercised INSERT/UPDATE/DELETE mix via writers above"
 
@@ -1326,11 +1806,17 @@ run_mode_dev() {
     # confirm the harness never silently reclassifies a broken stream.
     qst_mark_step "adversarial_slot_loss" "pass" "dropped-slot consumption fails closed (scenario 16)"
 
+    run_restart_crash_scenarios "poc_slot_b"
+    qst_mark_step "adversarial_restart_crash" "pass" "scenario 15 A/B/C: real pg_ctl immediate-stop+start crash recovery verified"
+
     run_ddl_queue_comparison
     qst_mark_step "ddl_queue_policy_comparison" "pass" "both policies measured"
 
     run_xmin_vacuum_measurement
     qst_mark_step "xmin_vacuum_horizon" "pass" "xmin/dead-tuple/vacuum metrics recorded"
+
+    run_write_stall_distribution "$SIZE_MIB" 20
+    qst_mark_step "write_stall_distribution" "pass" "20-sample lock-hold distribution measured at ${SIZE_MIB}MiB"
 }
 
 run_mode_scale() {
