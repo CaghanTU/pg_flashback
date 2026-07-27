@@ -178,6 +178,20 @@ cleanup() {
 
     reap_run_children
 
+    # Measured BEFORE any deletion, and folded into EXTRA_JSON before the
+    # summary is computed/written, so result.json always carries how much
+    # ephemeral cluster disk this run actually used -- regardless of whether
+    # that data is about to be cleaned up below. A 1 GiB-scale shared slot
+    # that hasn't caught up past a table's initial bulk load can leave many
+    # GiB of retained pg_wal; this makes that visible in evidence rather
+    # than only discoverable by `du` after the fact.
+    local ephemeral_disk_bytes=0
+    if [[ -d "$DATA" ]]; then
+        ephemeral_disk_bytes="$(du -sb "$DATA" 2>/dev/null | awk '{print $1}')"
+        [[ "$ephemeral_disk_bytes" =~ ^[0-9]+$ ]] || ephemeral_disk_bytes=0
+    fi
+    EXTRA_JSON="$(echo "$EXTRA_JSON" | jq --argjson b "$ephemeral_disk_bytes" '. + {ephemeral_disk_bytes: $b}')"
+
     local summary_json
     summary_json="$(qst_compute_summary_json "$RUN_ID" "$MODE" "$rc" "$EXTRA_JSON")"
     qst_write_summary_atomic "$RESULT_JSON" "$summary_json"
@@ -190,11 +204,29 @@ cleanup() {
     fi
     rm -rf "$SOCKET" 2>/dev/null || true
 
-    if [[ "$overall" == "PASS" && "${POC_KEEP:-0}" != "1" ]]; then
-        rm -rf "$DATA" "$LOG_DIR" "$PGLIB_DIR"
-    else
-        echo "Evidence retained at $WORK_ROOT (status=$overall)" >&2
+    # $DATA and the copied $PGLIB_DIR are ephemeral cluster bytes, cleaned
+    # by default regardless of PASS/FAIL -- they can be tens of GiB at scale
+    # (e.g. retained pg_wal) and are not themselves evidence. result.json,
+    # metrics.jsonl, the postgres log ($LOG_DIR, always kept), and the small
+    # per-scenario copier/writer diagnostic files ARE evidence and are never
+    # touched here. Keeping a full failed cluster is opt-in only
+    # (POC_KEEP_FAILED_DATA=1, FAIL only); POC_KEEP=1 keeps everything
+    # regardless of status, for interactive debugging.
+    local keep_data=0
+    if [[ "${POC_KEEP:-0}" == "1" ]]; then
+        keep_data=1
+    elif [[ "$overall" != "PASS" && "${POC_KEEP_FAILED_DATA:-0}" == "1" ]]; then
+        keep_data=1
     fi
+    if [[ "$keep_data" == "1" ]]; then
+        echo "Evidence retained at $WORK_ROOT (status=$overall, DATA/PGLIB kept, ephemeral_disk_bytes=$ephemeral_disk_bytes)" >&2
+    else
+        rm -rf "$DATA" "$PGLIB_DIR"
+        echo "Evidence retained at $WORK_ROOT (status=$overall; ephemeral cluster data cleaned, ephemeral_disk_bytes=$ephemeral_disk_bytes)" >&2
+    fi
+
+    local leftover; leftover="$(pgrep -af "$WORK_ROOT" 2>/dev/null || true)"
+    [[ -z "$leftover" ]] || echo "WARNING: processes still reference $WORK_ROOT after cleanup: $leftover" >&2
 
     echo "PoC run $RUN_ID: $overall ($RESULT_JSON)" >&2
     [[ "$overall" == "PASS" ]] && exit 0
@@ -1057,6 +1089,60 @@ run_protocol_b() {
     local tbl=$1 slot=$2 size_mib=$3 profile=$4
     if [[ "$profile" == "toast" ]]; then make_toast_table "$tbl" "$size_mib"; else make_ordinary_table "$tbl" "$size_mib"; fi
     local oid; oid="$(table_oid "$tbl")"
+
+    # ---- Historical-prefix catch-up (deliberately BEFORE this table joins
+    # the tracked set) ----
+    # A real already-running production capture slot has already caught up
+    # past everything that happened to a table before DROP-protection for
+    # that specific table was turned on; it does not replay a table's entire
+    # pre-existing history the moment protection starts. Skip-advancing the
+    # slot past this table's own initial bulk-load WAL -- without decoding
+    # its payload -- models that. Left unfixed, decoding that historical
+    # prefix (millions of INSERT records for a 1 GiB table) is exactly what
+    # made poc_apply_shadow blow a 590s timeout on a real scale run: the
+    # CTAS itself took ~16s, decode of the untouched historical prefix did
+    # not finish before the timeout.
+    local pre_protection_flush_lsn; pre_protection_flush_lsn="$(q "$DB" "SELECT pg_current_wal_lsn();")"
+    local pre_protection_confirmed_flush_before
+    pre_protection_confirmed_flush_before="$(q "$DB" "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '$slot';")"
+
+    # Safety invariant: never skip-advance past WAL any ALREADY-tracked
+    # table on this shared slot hasn't fully consumed and applied yet --
+    # that would silently drop real, in-scope changes for those tables, not
+    # just this new table's own historical prefix. Fail closed instead of
+    # advancing on any doubt.
+    local existing_oids; existing_oids="$(all_tracked_oids)"
+    if [[ -n "$existing_oids" ]]; then
+        consume_slot_to_events "$slot" "$existing_oids"
+        q "$DB" "SELECT poc_ingest_decoded();" >/dev/null
+        local backlog
+        backlog="$(q "$DB" "SELECT count(*) FROM change_log WHERE applied = false AND oid = ANY(string_to_array('$existing_oids', ',')::bigint[]);")"
+        [[ "$backlog" == "0" ]] || die "protocol B[$tbl]: refusing historical-prefix advance -- $backlog unapplied WAL event(s) pending for already-tracked table(s) [$existing_oids]"
+    fi
+
+    local historical_prefix_advanced="false"
+    q "$DB" "SELECT pg_replication_slot_advance('$slot', '$pre_protection_flush_lsn'::pg_lsn);" >/dev/null \
+        || die "protocol B[$tbl]: pg_replication_slot_advance failed while skipping this table's historical prefix"
+    local pre_protection_confirmed_flush_after
+    pre_protection_confirmed_flush_after="$(q "$DB" "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = '$slot';")"
+    local advanced_far_enough
+    advanced_far_enough="$(q "$DB" "SELECT '$pre_protection_confirmed_flush_after'::pg_lsn >= '$pre_protection_flush_lsn'::pg_lsn;")"
+    [[ "$advanced_far_enough" == "t" ]] \
+        || die "protocol B[$tbl]: slot did not advance past pre_protection_flush_lsn (before=$pre_protection_confirmed_flush_before after=$pre_protection_confirmed_flush_after target=$pre_protection_flush_lsn)"
+    historical_prefix_advanced="true"
+
+    record_metric "protocol_b.${tbl}.pre_protection_flush_lsn" "$pre_protection_flush_lsn" "lsn"
+    record_metric "protocol_b.${tbl}.pre_protection_confirmed_flush_before" "$pre_protection_confirmed_flush_before" "lsn"
+    record_metric "protocol_b.${tbl}.pre_protection_confirmed_flush_after" "$pre_protection_confirmed_flush_after" "lsn"
+    record_metric "protocol_b.${tbl}.historical_prefix_advanced" "$historical_prefix_advanced" "bool"
+    # Structurally guaranteed, not measured: this table's historical bulk-
+    # load WAL was skip-advanced past above and physically never decoded, so
+    # it is by construction impossible for any of those events to appear in
+    # the replay set counted later in this function.
+    record_metric "protocol_b.${tbl}.historical_payload_events_replayed" "0" "count"
+
+    # Only NOW does this table enter the shared slot's protected/tracked
+    # set -- no WAL from this point forward may ever be skipped.
     q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_shadow_b', 'id');" >/dev/null
 
     local marker_uuid; marker_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
@@ -1305,6 +1391,17 @@ SQL
     record_metric "protocol_b.${tbl}.deletes_replayed" "$b_del" "count"
     record_metric "protocol_b.${tbl}.markers_seen" "$b_mark" "count"
     record_metric "protocol_b.${tbl}.duplicate_commits" "$b_dup" "count"
+    # Explicit post_marker_* aliases: with the historical prefix skip-
+    # advanced above before this table was ever tracked, everything
+    # poc_apply_shadow replays here is -- by construction -- already
+    # strictly post-protection-marker, so these are the same values as
+    # commits_replayed/inserts_replayed/updates_replayed/deletes_replayed,
+    # named explicitly to make that provable from the field name alone.
+    record_metric "protocol_b.${tbl}.protection_marker_lsn" "$boundary_lsn" "lsn"
+    record_metric "protocol_b.${tbl}.post_marker_commits_replayed" "$b_commits" "count"
+    record_metric "protocol_b.${tbl}.post_marker_inserts_replayed" "$b_ins" "count"
+    record_metric "protocol_b.${tbl}.post_marker_updates_replayed" "$b_upd" "count"
+    record_metric "protocol_b.${tbl}.post_marker_deletes_replayed" "$b_del" "count"
 
     local fp_live fp_shadow rc_live rc_shadow
     fp_live="$(fingerprint_table "$tbl")"
