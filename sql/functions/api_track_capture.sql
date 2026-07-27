@@ -918,18 +918,11 @@ DECLARE
     v_pk_cols text[];
     rec record;
 BEGIN
-    SELECT tt.rel_oid, tt.tracking_id INTO v_rel_oid, v_tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND (
-          tt.rel_oid = to_regclass(target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
-          OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
-      )
-    ORDER BY
-        (tt.rel_oid = to_regclass(target_table)::oid) DESC,
-        tt.tracked_since DESC
-    LIMIT 1;
+    -- Single canonical, ambiguity-safe resolver; an ambiguous unqualified
+    -- name must fail closed rather than silently returning one schema's
+    -- history and hiding the other's.
+    SELECT r.rel_oid, r.tracking_id INTO v_rel_oid, v_tracking_id
+    FROM public.flashback_internal_resolve_tracked_table(target_table) r;
 
     IF v_rel_oid IS NULL THEN
         SELECT d.rel_oid INTO v_rel_oid
@@ -995,22 +988,22 @@ DECLARE
     snap_rec record;
 BEGIN
     PERFORM flashback_require_primary('flashback_untrack');
-    SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.base_snapshot_table, tt.recovery_profile
-      INTO v_rel_oid, v_tracking_id, v_schema_name, v_table_name, v_base_snapshot, v_recovery_profile
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND (
-          tt.rel_oid = to_regclass(target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
-          OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
-      )
-    ORDER BY
-        (tt.rel_oid = to_regclass(target_table)::oid) DESC,
-        (format('%I.%I', tt.schema_name, tt.table_name) = target_table) DESC,
-        tt.tracked_since DESC
-    LIMIT 1;
+
+    -- Single canonical, ambiguity-safe resolver; an ambiguous unqualified
+    -- name must fail closed rather than silently untracking one of several
+    -- same-named lifecycles across schemas.
+    SELECT r.rel_oid, r.tracking_id, r.schema_name, r.table_name
+      INTO v_rel_oid, v_tracking_id, v_schema_name, v_table_name
+    FROM public.flashback_internal_resolve_tracked_table(target_table) r;
 
     IF v_rel_oid IS NULL THEN RETURN false; END IF;
+
+    -- Not part of the name-resolution algorithm: a plain lookup by the
+    -- already-resolved tracking_id, not a second name search.
+    SELECT tt.base_snapshot_table, tt.recovery_profile
+      INTO v_base_snapshot, v_recovery_profile
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id;
 
     SELECT EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg

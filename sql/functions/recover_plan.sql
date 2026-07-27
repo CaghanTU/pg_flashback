@@ -38,18 +38,27 @@ DECLARE
     v_epoch_schema_def jsonb;
     v_epoch_compat jsonb;
 BEGIN
-    -- Resolve tracking identity
-    SELECT tt.tracking_id, tt.rel_oid, format('%I.%I', tt.schema_name, tt.table_name)
-      INTO v_tracking_id, v_tracked_oid, v_canonical
-    FROM flashback.tracked_tables tt
-    WHERE tt.recovery_profile = 'local_delta'
-      AND (
-          (to_regclass(p_table) IS NOT NULL AND tt.rel_oid = to_regclass(p_table))
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_table
-          OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
-      )
-    ORDER BY tt.is_active DESC, tt.tracked_since DESC
-    LIMIT 1;
+    -- Resolve tracking identity through the single canonical, ambiguity-safe
+    -- resolver (flashback_internal_resolve_tracked_table). No other query in
+    -- this function, or in flashback_recover_begin/flashback_recover_execute
+    -- below, re-implements the name-matching algorithm. flashback_recover_plan
+    -- keeps its "always returns JSON, never raises for a bad table argument"
+    -- contract, so an ambiguous unqualified name is translated into a
+    -- structured error response here instead of propagating the exception.
+    BEGIN
+        SELECT r.tracking_id, r.rel_oid, format('%I.%I', r.schema_name, r.table_name)
+          INTO v_tracking_id, v_tracked_oid, v_canonical
+        FROM public.flashback_internal_resolve_tracked_table(p_table) r;
+    EXCEPTION WHEN too_many_rows THEN
+        RETURN jsonb_build_object(
+            'schema_version', v_plan_version,
+            'status', 'error',
+            'code', 'ambiguous_table',
+            'table', p_table,
+            'blockers', jsonb_build_array(SQLERRM),
+            'action', 'use a schema-qualified name (schema.table)'
+        );
+    END;
 
     IF v_tracking_id IS NULL THEN
         RETURN jsonb_build_object(
@@ -409,22 +418,20 @@ DECLARE
 BEGIN
     PERFORM flashback_require_primary('flashback_recover_begin');
 
-    SELECT tt.tracking_id INTO v_tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.recovery_profile = 'local_delta'
-      AND (
-          (to_regclass(p_table) IS NOT NULL AND tt.rel_oid = to_regclass(p_table))
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_table
-          OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
-      )
-    ORDER BY tt.is_active DESC, tt.tracked_since DESC
-    LIMIT 1
-    FOR UPDATE OF tt;
+    -- Resolve once via the canonical resolver (no name-parsing algorithm of
+    -- our own), then lock the row by tracking_id -- never by re-searching on
+    -- the caller's name string a second time.
+    SELECT r.tracking_id INTO v_tracking_id
+    FROM public.flashback_internal_resolve_tracked_table(p_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: no local_delta lifecycle for %', p_table
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
+
+    PERFORM 1 FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id
+    FOR UPDATE OF tt;
 
     v_plan := flashback_recover_plan(p_table, p_lookback, p_disaster_event_id, p_at, p_lsn);
     v_token := v_plan->>'plan_token';
@@ -437,6 +444,16 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: recover plan is not restorable (%)',
             COALESCE(v_plan->>'code', 'unknown')
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- The lock above pins a specific tracking_id; if the freshly recomputed
+    -- plan (under lock) resolved a different lifecycle, the picture changed
+    -- between the two resolves (e.g. a concurrent unprotect+reprotect
+    -- committed in between) -- fail closed rather than begin against a
+    -- lifecycle that was never actually locked.
+    IF (v_plan->>'tracking_id')::bigint IS DISTINCT FROM v_tracking_id THEN
+        RAISE EXCEPTION 'pg_flashback: concurrent lifecycle change detected for %; replan required', p_table
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'Call flashback_recover_plan again and retry begin with the new plan_token.';
     END IF;
 
     v_tracking_id := (v_plan->>'tracking_id')::bigint;
@@ -534,21 +551,23 @@ BEGIN
             USING ERRCODE = 'serialization_failure';
     END IF;
 
-    SELECT tt.tracking_id INTO v_tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.recovery_profile = 'local_delta'
-      AND (
-          (to_regclass(p_table) IS NOT NULL AND tt.rel_oid = to_regclass(p_table))
-          OR format('%I.%I', tt.schema_name, tt.table_name) = p_table
-          OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
-      )
-    ORDER BY tt.is_active DESC, tt.tracked_since DESC
-    LIMIT 1
-    FOR UPDATE OF tt;
+    -- Resolve once via the canonical resolver, then lock by tracking_id --
+    -- never by re-searching on the caller's name string a second time.
+    SELECT r.tracking_id INTO v_tracking_id
+    FROM public.flashback_internal_resolve_tracked_table(p_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: no local_delta lifecycle for %', p_table
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM 1 FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id
+    FOR UPDATE OF tt;
+
+    IF v_tracking_id IS DISTINCT FROM v_header_tracking THEN
+        RAISE EXCEPTION 'pg_flashback: operation tracking_id drift versus locked lifecycle for %', p_table
+            USING ERRCODE = 'serialization_failure';
     END IF;
 
     v_plan := flashback_recover_plan(p_table, p_lookback, p_disaster_event_id, p_at, p_lsn);

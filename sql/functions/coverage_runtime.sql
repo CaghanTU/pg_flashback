@@ -571,8 +571,13 @@ BEGIN
         -- silently -- fail closed exactly like the unqualified branch below
         -- if it is ever violated.
         IF v_count > 1 THEN
+            -- Distinct SQLSTATE from the malformed-identifier branches below:
+            -- callers that must keep returning a structured JSON response
+            -- (flashback_recover_plan) catch this specific condition and
+            -- translate it, rather than treating every resolver failure the
+            -- same way.
             RAISE EXCEPTION 'pg_flashback: ambiguous table; use schema-qualified name (%)', p_target_table
-                USING ERRCODE = 'invalid_parameter_value';
+                USING ERRCODE = 'too_many_rows';
         END IF;
 
         RETURN QUERY
@@ -600,7 +605,7 @@ BEGIN
         END IF;
         IF v_count > 1 THEN
             RAISE EXCEPTION 'pg_flashback: ambiguous table; use schema-qualified name (%)', p_target_table
-                USING ERRCODE = 'invalid_parameter_value';
+                USING ERRCODE = 'too_many_rows';
         END IF;
 
         RETURN QUERY

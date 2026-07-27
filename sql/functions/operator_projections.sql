@@ -25,16 +25,13 @@ BEGIN
         END IF;
     END IF;
 
-    SELECT format('%I.%I', tt.schema_name, tt.table_name)
+    -- Single canonical, ambiguity-safe resolver: an ambiguous unqualified
+    -- name must be rejected here too, not silently resolved to one of
+    -- several same-named lifecycles across schemas. A not-found name is not
+    -- an error for this display helper -- it falls back to the raw input.
+    SELECT format('%I.%I', r.schema_name, r.table_name)
       INTO v_name
-    FROM flashback.tracked_tables tt
-    WHERE tt.recovery_profile = 'local_delta'
-      AND (
-          format('%I.%I', tt.schema_name, tt.table_name) = p_table
-          OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
-      )
-    ORDER BY tt.is_active DESC, tt.tracked_since DESC
-    LIMIT 1;
+    FROM public.flashback_internal_resolve_tracked_table(p_table) r;
 
     RETURN COALESCE(v_name, p_table);
 END;
@@ -66,17 +63,9 @@ STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-    SELECT EXISTS (
-        SELECT 1
-        FROM flashback.tracked_tables tt
-        WHERE tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-          AND (
-              (to_regclass(p_table) IS NOT NULL AND tt.rel_oid = to_regclass(p_table))
-              OR format('%I.%I', tt.schema_name, tt.table_name) = p_table
-              OR (position('.' IN p_table) = 0 AND tt.table_name = p_table)
-          )
-    );
+    -- Single canonical, ambiguity-safe resolver. An ambiguous unqualified
+    -- name raises rather than returning a possibly-wrong true/false.
+    SELECT EXISTS (SELECT 1 FROM public.flashback_internal_resolve_tracked_table(p_table));
 $$;
 
 CREATE OR REPLACE FUNCTION flashback_lifecycle_health(p_table text)

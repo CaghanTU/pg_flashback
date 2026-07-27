@@ -120,25 +120,22 @@ DECLARE
 BEGIN
     PERFORM flashback_require_primary('flashback_unprotect');
 
-    SELECT tt.tracking_id, tt.schema_name, tt.table_name, tt.rel_oid,
-           COALESCE(tt.protection_state, 'active')
-      INTO v_tracking_id, v_schema, v_table, v_rel_oid, v_state
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND (
-          tt.rel_oid = to_regclass(target_table)::oid
-          OR format('%I.%I', tt.schema_name, tt.table_name) = target_table
-          OR (position('.' IN target_table) = 0 AND tt.table_name = target_table)
-      )
-    ORDER BY tt.tracked_since DESC
-    LIMIT 1
-    FOR UPDATE OF tt;
+    -- Resolve once via the canonical resolver, then lock by tracking_id and
+    -- re-read the row under lock -- never re-search by name a second time.
+    SELECT r.tracking_id INTO v_tracking_id
+    FROM public.flashback_internal_resolve_tracked_table(target_table) r;
 
     IF v_tracking_id IS NULL THEN
         RAISE EXCEPTION 'flashback_unprotect: no active local_delta lifecycle for %', target_table
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
+
+    SELECT tt.schema_name, tt.table_name, tt.rel_oid,
+           COALESCE(tt.protection_state, 'active')
+      INTO v_schema, v_table, v_rel_oid, v_state
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id
+    FOR UPDATE OF tt;
 
     IF v_state = 'stopping' THEN
         RETURN jsonb_build_object(

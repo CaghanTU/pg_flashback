@@ -217,6 +217,10 @@ mod tests {
         "../tests/sql/integration/tracked_table_resolver_search_path.sql"
     );
     sql_test!(
+        it_lifecycle_resolver_ambiguity_failclosed,
+        "../tests/sql/integration/lifecycle_resolver_ambiguity_failclosed.sql"
+    );
+    sql_test!(
         it_pitr_time_filtering,
         "../tests/sql/integration/pitr_time_filtering.sql"
     );

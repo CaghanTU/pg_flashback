@@ -155,6 +155,10 @@
       "class": "infra",
       "reason": "proves pre-generation legacy snapshot APIs fail closed under WAL coverage"
     },
+    "lifecycle_resolver_ambiguity_failclosed.sql": {
+      "class": "infra",
+      "reason": "ambiguous unqualified table name must fail closed across every public/operator resolver call site"
+    },
     "local_capacity_admission.sql": {
       "class": "infra",
       "reason": "capacity admission under wal; illegal mode rejected"
