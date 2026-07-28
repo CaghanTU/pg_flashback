@@ -906,9 +906,17 @@ persist_in_db_logged_zstd() {
     ARTIFACT_BYTES="$(q "$DB" "SELECT COALESCE(sum(octet_length(chunk_bytes)),0) FROM poc_bench_chunks WHERE artifact_id='$artifact_id';")"
 
     crash_checkpoint "metadata_commit_before" "$crash_point" || return 0
+    # row_count/logical_bytes must reflect the actual snapshot content
+    # (what's really in rawfile/the chunks), not the LIVE $tbl -- which by
+    # this point has kept mutating under the concurrent writer since the
+    # snapshot was fixed. $GT_TBL is loaded from the same rawfile this
+    # persist call chunked, so it is the correct snapshot-consistent
+    # reference. Using $tbl here was a real bug: it recorded a row count
+    # that included post-boundary writer churn, caught by
+    # validate_manifest_binding comparing against $GT_TBL at restore time.
     q "$DB" "UPDATE poc_bench_manifest SET state='available', chunk_count=$CHUNK_COUNT,
              manifest_root_digest='$MANIFEST_ROOT_DIGEST', raw_stream_sha256='$RAW_STREAM_SHA256',
-             row_count=(SELECT count(*) FROM $tbl), logical_bytes=(SELECT sum(pg_column_size(t.*)) FROM $tbl t)
+             row_count=(SELECT count(*) FROM $GT_TBL), logical_bytes=(SELECT sum(pg_column_size(t.*)) FROM $GT_TBL t)
              WHERE artifact_id='$artifact_id';" >/dev/null
     crash_checkpoint "metadata_commit_after" "$crash_point" || return 0
     return 0
@@ -1063,9 +1071,14 @@ persist_external_zstd() {
     MANIFEST_ROOT_DIGEST="$(printf '%s' "$chunk_hashes" | sha256sum | awk '{print $1}')"
     ARTIFACT_BYTES="$(du -sb "$art_dir" 2>/dev/null | awk '{print $1}')"
 
+    # $GT_TBL, not the live $tbl -- same bug/reasoning as
+    # persist_in_db_logged_zstd's identical fix: $tbl keeps mutating under
+    # the concurrent writer after the snapshot was fixed, so counting it
+    # here recorded a manifest row_count that did not match what was
+    # actually captured into rawfile/the chunks.
     local row_count logical_bytes
-    row_count="$(q "$DB" "SELECT count(*) FROM $tbl;")"
-    logical_bytes="$(q "$DB" "SELECT sum(pg_column_size(t.*)) FROM $tbl t;")"
+    row_count="$(q "$DB" "SELECT count(*) FROM $GT_TBL;")"
+    logical_bytes="$(q "$DB" "SELECT sum(pg_column_size(t.*)) FROM $GT_TBL t;")"
     local manifest_tmp="$tmp_dir/manifest.json.tmp"
     jq -n --arg artifact_id "$artifact_id" --arg backend external_zstd --argjson format_version 1 \
         --arg boundary_lsn "$BOUNDARY_LSN" --argjson boundary_xid "$MARKER_XID" \
