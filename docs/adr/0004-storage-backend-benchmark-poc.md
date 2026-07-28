@@ -1,33 +1,33 @@
 # ADR 0004: Storage backend PoC benchmark (Step 8)
 
-## Status: PARTIAL -- NOT COMPLETE
+## Status: COMPLETE (1 GiB). 10 GiB: BLOCKED_BY_CAPACITY.
 
-This round's own 1 GiB matrix was **not qualified against a single
-consistent executable harness commit**: 9 matrix runs were captured against
-harness commit `833ed33`, 3 against `b03243f`, only the 6 `heap_v1` reruns
-against the final commit of that round (`a117ce2`), and the 1 GiB crash
-matrix against `b03243f`. Mixing PASS results from different executable
-commits into one "COMPLETE" claim is not a valid qualification, regardless
-of whether any individual fix in between was correctness-relevant. This
-round's PASS/FAIL results below remain historically accurate for what was
-run and are not deleted or rewritten -- they are re-labeled as an interim,
-inconsistent state, not evidence for a COMPLETE determination.
+Every result in this document comes from a single, verified-consistent
+executable harness commit: **`c4a4a456916b57298aee733bb1a1844b31f9047c`**
+(extension binary SHA-256
+`2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae`). This is
+not a manual claim -- `docs/evidence/step8-storage-backend-benchmark.json`
+was produced by a generator script that asserts every one of the 61 runs
+below (selftest, all 18 1 GiB correctness/perf/storage combinations, all 9
+1 GiB scale-sensitive crash scenarios, all 31 128 MiB adversarial/logic
+crash scenarios, both backup-footprint runs) shares the same
+`source_commit` and `extension_binary_sha256` and reports `status=PASS`,
+and refuses to write `status: COMPLETE` otherwise.
 
-Separately, several measurement and invariant issues in that round's own
-methodology were identified and must be corrected before requalification:
-`commits_replayed >= copy_window_commits` relaxed a real race instead of
-eliminating it; `heap_v1`'s `restore_ms` was measured as a no-op instead of
-a real materialization; WAL amplification and backup-footprint claims were
-inferred from timing/architecture rather than directly measured; manifest
-binding fields were recorded but mostly never validated at restore time;
-`in_db_logged_zstd`'s adversarial matrix was missing `missing_chunk` and
-`manifest_mismatch` runs (the code path existed, they were simply never
-executed). See the correction log and requalification sections below.
+This supersedes an earlier PARTIAL round on this same ADR, whose own 1 GiB
+matrix mixed results from three different executable commits (`833ed33`,
+`b03243f`, `a117ce2`) into an invalid "COMPLETE" claim, and whose
+methodology had several real gaps: an invariant relaxed instead of fixed, a
+no-op restore measurement, inferred (not measured) WAL/backup claims, and
+unvalidated manifest fields. That round's raw data is preserved unchanged
+under `prior_partial_round` in the evidence JSON, not deleted or rewritten
+-- see "Corrections made this round" below for the full list, several of
+which were themselves found by *this* correction round's own new checks.
 
-**A new decision-gate result, on one consistent commit, supersedes this
-document once available.** Until then: no production `SnapshotStore`
-backend, no `storage_backend` CHECK constraint change, no public API/GUC
-change, Step 9 not started, 10/25/50 GiB and the 24-hour run not started.
+This ADR is a decision-gate report, not a production design: no production
+`SnapshotStore` backend was added, `storage_backend`'s CHECK constraint was
+not touched, no public API/GUC changed, Step 9 was not started, and
+10/25/50 GiB scale and the 24-hour run were not started.
 
 ## Purpose
 
@@ -55,249 +55,248 @@ All three reuse the *exact* coordinator-lock + snapshot-fixed-while-locked +
 transactional-marker choreography from Step 7's `run_protocol_b` -- only the
 statement that runs once the snapshot is fixed differs (CTAS vs
 `\copy`-to-file). All three are checked against a ground-truth table
-captured from the same fixed snapshot, and the same WAL-replay commit/event
-oracle (marker_identity/marker_log/commit_log/change_log/poc_apply_shadow --
-literally the same schema and PL/pgSQL functions Step 7 installs, duplicated
-in the isolated PoC harness rather than shared, per this area's own
-isolation requirement).
+captured from the same fixed snapshot every backend materializes from,
+independent of whichever storage mechanism is under test.
 
-## Harness corrections found during this round
+## Corrections made this round (found by user review, then by this round's
+own new checks)
 
-Seven real bugs were found and fixed while building and exercising this
-harness (each its own commit, `749dfa6`..`a117ce2` range on
-`scripts/poc/run_poc_storage_backend_benchmark.sh`):
+Ten real issues were found and fixed, each its own commit
+(`0c9638f`..`c4a4a45` on `scripts/poc/run_poc_storage_backend_benchmark.sh`):
 
-1. `compression_ratio` always recorded 0 -- `bc` is not installed in this
-   environment; switched to `awk`.
-2. `establish_boundary_and_materialize`'s oracle-shadow bookkeeping had no
-   `ON CONFLICT`/`DROP IF EXISTS` guard, but crash-mode retries deliberately
-   call it twice against the same source table (to avoid regenerating a
-   1 GiB table per attempt) -- the second call collided on
-   `poc_table_map_pkey` every time.
-3. `restore_in_db_logged_zstd`/`restore_external_zstd` `die()` internally
-   via a direct `exit` call on any correctness violation. `exit` terminates
-   the whole harness process immediately, no matter how deeply nested --
-   it is not something a bare `"cmd || flag=1"` at the call site can catch.
-   Every adversarial test expecting a fail-closed restore was silently
-   killing the whole harness before its own postcheck step ever ran. Fixed
-   by wrapping the call in an explicit subshell inside an `if` (not a bare
-   statement, since `case`/bare-statement bodies are not exempt from
-   `set -e` the way an `if` condition is).
-4. `load_ground_truth_from_rawfile` had the identical not-safely-re-callable
-   bug as (2).
-5. `persist_in_db_logged_zstd`/`persist_external_zstd` had no error
-   checking on their manifest-row `INSERT`, so `duplicate_retry`'s expected
-   PK-collision failure was silently absorbed (same `set -e`-suspension
-   mechanism as (3), applied to an *unguarded* internal failure this time)
-   rather than propagated. Added explicit `die()` guards, matching the
-   defensive style already used everywhere else in the harness.
-6. `commits_replayed == copy_window_commits` was too strict: a real 1 GiB
-   run (`in_db_logged_zstd`/`good_compress`) hit `commits_replayed=64` vs
-   `copy_window_commits=61`. Root cause: the writer loop only writes its
-   counter file *after* a statement has already committed durably to WAL;
-   an untrapped SIGTERM during shutdown can land in the gap between "last
-   statement of an iteration committed" and "counter file updated for that
-   iteration." No data was lost (fingerprint/row-count still matched) --
-   only the writer's own self-reported count of its own commits could lag
-   the true, fully durable count by up to one iteration. Relaxed to `>=`:
-   strictly less would still mean real data loss and must still fail
-   closed; strictly greater is this legitimate bookkeeping lag.
-7. `cleanup()` never purged the bulky `rawstream_*.bin`/`chunks_*/`/
-   `restore_*/` working files (not evidence -- `result.json`/
-   `metrics.jsonl`/`log/` already capture everything evidentiary). These
-   accumulated to 37 GB across one session's runs and caused three
-   otherwise-correct 1 GiB reruns to fail on real `ENOSPC`. Extended the
-   same `POC_KEEP`/`POC_KEEP_FAILED_DATA`-gated cleanup already applied to
-   `DATA`/`PGLIB_DIR` to cover these too.
-8. `heap_v1`'s `artifact_bytes` was always recorded 0 (it has no separate
-   persist phase to populate it), which would have unfairly biased the
-   storage comparison table. Added a direct `pg_total_relation_size`
-   measurement.
+1. **Writer commit-count race, eliminated not relaxed.** The prior round's
+   `commits_replayed >= copy_window_commits` papered over a real race: the
+   writer's bash-side counter file was written *after* a statement already
+   committed durably, and could legitimately lag if SIGTERM landed in that
+   gap. Replaced the counter file with a durable ledger table
+   (`poc_bench_writer_ledger`), reset per snapshot attempt: every writer
+   statement now runs as one atomic `BEGIN; DML; INSERT INTO the ledger;
+   COMMIT;` transaction, so `copy_window_commits` is a plain `SELECT
+   count(*)` against a table that can only ever reflect genuinely durable
+   commits. Strict `==` restored and verified true on all 18 matrix rows.
+2. **heap_v1 restore was a no-op measurement.** All three call sites
+   aliased `restored_tbl` directly to the artifact table, so `restore_ms`
+   was always ~0 ms. Added `restore_heap_v1`: a real, timed
+   `CREATE TABLE restored AS SELECT * FROM artifact_heap`, materializing a
+   genuinely separate table -- the same shape of cost the other two
+   backends' restore steps pay.
+3. **WAL amplification, measured not inferred.** Added
+   `pg_current_wal_insert_lsn()`/`pg_wal_lsn_diff()` around each phase
+   (materialize, persist, restore) for every run. See the real numbers
+   below -- they both confirm and refine what the prior round only
+   guessed at.
+4. **Backup-footprint, measured not inferred.** New `backup-footprint`
+   mode: one cluster/source table, a real `pg_basebackup` baseline, then
+   each backend's real incremental byte delta (artifact reset between
+   backends via DROP+recreate, not DELETE -- see item 9).
+5. **Manifest binding, validated not just recorded.** Added
+   `validate_manifest_binding`: format version, backend identity, pg_major,
+   architecture, system_identifier, current db oid, encoding, tracking_id,
+   semantic fingerprint format version, schema fingerprint (column
+   order/type/typmod/collation via `pg_attribute`, not a bare
+   `information_schema` string), row_count, and a cross-check of
+   boundary_lsn/boundary_xid against the durable WAL-decode ledger
+   (`commit_log`) -- all fail-closed on mismatch, checked before any
+   restore work happens.
+6. **Canonical restore verification strengthened.** `verify_restore` now
+   also checks table owner and ACL, and uses the same richer schema
+   fingerprint as (5).
+7. **in_db_logged_zstd adversarial parity closed.** `missing_chunk` and
+   `manifest_mismatch` were coded but never actually run for
+   `in_db_logged_zstd`; now run and passing. Added two new crash points
+   for both zstd backends: `row_count_mismatch` (isolates the row_count
+   cross-check specifically, without also tampering the chunk-hash path)
+   and `chunk_order_mismatch` (proves scrambled chunk ordering is caught).
+8. **Manifest row_count/logical_bytes bug**, found by (5)'s new row_count
+   cross-check on the very first post-fix smoke run: both `persist_*`
+   functions computed these fields from the *live, still-mutating* source
+   table instead of the snapshot-consistent ground truth, so they recorded
+   a count that never matched what was actually captured. Fixed to use
+   `$GT_TBL` (already loaded from the same rawfile) instead of the live
+   table.
+9. **Backup-footprint cleanup bug**, found by the first backup-footprint
+   smoke run: `in_db_logged_zstd` and `external_zstd` both reported the
+   identical nonzero delta, which should have been impossible. A plain
+   `DELETE` on `poc_bench_chunks` marks rows dead but does not shrink the
+   table's physical file -- `in_db_logged_zstd`'s ~126 MB of chunk data was
+   still physically present when `external_zstd`'s backup was measured
+   next. Fixed with DROP+recreate (plus a follow-up fix for the resulting
+   FK drop-order error).
+10. **Writer-subshell death on transient failure**, found by the first full
+    requalification pass: 100% of `mid_materialize` crash tests (5/5)
+    failed with a duplicate-key error on the retry's first writer INSERT.
+    Root cause: `mid_materialize` crashes immediately after the writer's
+    first iteration is confirmed ready, so the crashed attempt's `id=-1`
+    insert is already durable before the crash; the retry's fresh writer
+    genuinely, deterministically collides on that same id -- which is
+    expected and should just be tolerated. The bug was that the ledger
+    rewrite (item 1) turned each per-statement call into a bare, unguarded
+    statement; since the writer loop runs as a background subshell
+    inheriting the script's `set -Eeuo pipefail`, the first failing bare
+    statement killed the *entire* writer subshell immediately, before it
+    ever reached the ledger insert or `touch "$ready_file"` for that or any
+    later iteration. The old design tolerated this the same way, via
+    `cmd && commits=$((commits+1))` -- the `&&` happened to exempt the LHS
+    from errexit as a side effect, which the ledger rewrite's bare
+    statements lost. Fixed with explicit `|| true` on every per-statement
+    call, restoring that tolerance without reintroducing the original
+    race (a failed transaction never commits its ledger row either way).
 
 None of these were product/correctness bugs in pg_flashback itself --
-`production_code_changed: false` holds throughout this entire round; the
-built `.so` is unchanged from Step 7's closing evidence.
+`production_code_changed: false` holds throughout; the built `.so` is
+unchanged from Step 7's closing evidence.
 
-## 1 GiB results
+## 1 GiB results (verified-consistent commit, 18/18 combinations)
 
-### Correctness (all 18 combinations: 3 backends x {ordinary_bad, toast_bad,
-good_compress} x 2 reps, real 1 GiB scale)
+### Correctness
 
-All 18 PASS. Every run independently proved, via the shared oracle:
+All 18 PASS (3 backends x {ordinary_bad, toast_bad, good_compress} x 2
+reps). Every run proved: Protocol B's existing-stream reanchor path with
+marker identity bound transactionally by marker_text and XID;
+**`commits_replayed == copy_window_commits` exactly** (strict equality, not
+`>=`, verified on every row); real concurrent writer with non-zero
+INSERT/UPDATE/DELETE; zero historical payload events replayed; no
+duplicate/out-of-order replay; restored table matching ground truth on row
+count, semantic fingerprint, canonical schema (column order/type/typmod/
+collation), owner, ACL, and for `toast_bad`, TOAST byte-equality.
 
-- Protocol B's existing-stream reanchor path is what ran, marker identity
-  bound transactionally by marker_text and XID;
-- `commits_replayed >= copy_window_commits` (real concurrent writer,
-  non-zero INSERT/UPDATE/DELETE, no data loss);
-- historical WAL prefix advanced, zero historical payload events replayed;
-- no duplicate/out-of-order replay;
-- restored table matches the ground-truth snapshot exactly: row count,
-  order-independent semantic fingerprint, schema (column name/type/order),
-  and for `toast_bad`, an aggregate TOAST byte-equality hash.
-
-### Crash safety
-
-Real postmaster-crash scenarios re-run at genuine 1 GiB scale (scale
-matters here: a real materializing statement must be caught genuinely
-active in `pg_stat_activity`, and multi-chunk behavior only appears with
-15-17 chunks at 1 GiB vs 1-2 at 128 MiB):
-
-| Test | heap_v1 | in_db_logged_zstd | external_zstd |
-|---|---|---|---|
-| mid_materialize (real crash while genuinely active) | PASS | PASS | PASS |
-| metadata_commit_before (no partial artifact visible) | n/a | PASS | PASS |
-| metadata_commit_after (artifact fully valid) | n/a | PASS | PASS |
-| duplicate_retry (identity collision rejected) | PASS | PASS | PASS |
-
-The full adversarial/logic matrix (corrupt chunk, missing chunk, manifest
-mismatch, wrong pg_major/system_identifier binding, and for `external_zstd`
-specifically: temp-write/fsync/rename ordering at every step, file-without-
-metadata, metadata-without-file, orphan-GC safety) ran at 128-256 MiB, since
-scale does not change what these prove (tamper detection and state-machine
-correctness, not timing). All PASS on the final harness state. Known gaps,
-disclosed rather than hidden: `missing_chunk` and `manifest_mismatch` were
-only exercised for `external_zstd`, not `in_db_logged_zstd` (the equivalent
-in-DB failure modes -- a deleted chunk row, a tampered manifest row -- are
-structurally simpler than the filesystem case and are considered lower risk,
-but were not empirically proven this round).
-
-**Fsync-durability caveat, stated plainly:** the fsync-adjacent crash points
-(`temp_chunk_write_crash`, `chunk_fsync_done`, `manifest_fsync_before/
-after`, `parent_dir_fsync_after`) are modeled as an abrupt kill of the
-writing step (or, for DB-side points, a real `pg_ctl -m immediate`
-crash+restart). This proves incomplete userspace state is never mistaken
-for valid. It does **not** prove real fsync-durability against an actual
-host power loss -- this environment cannot safely power-cycle itself, and a
-normal process kill does not revert a `rename()` the kernel has already
-accepted into its page cache. That gap is real and unproven, not silently
-assumed away.
-
-### Performance and storage (mean of 2 reps, 1 GiB, `ordinary_bad` shown as
-the representative narrow/poorly-compressing shape unless noted)
+### Performance, storage, and real WAL bytes (mean of 2 reps, `ordinary_bad`
+shown as the representative narrow/poorly-compressing shape unless noted)
 
 | Metric | heap_v1 | in_db_logged_zstd | external_zstd |
 |---|---|---|---|
-| Compression ratio, ordinary_bad | ~0.97 (no compression; heap overhead) | 2.108x | 2.108x |
-| Compression ratio, toast_bad | ~0.79 | 1.0022x (incompressible, as designed) | 1.0022x |
-| Compression ratio, good_compress | ~0.96 | ~120.5x | ~120.4x |
-| Artifact bytes, ordinary_bad | ~1.077 GB (source_logical ~1.04 GB) | ~493 MB | ~493 MB |
-| Snapshot create, ordinary_bad | ~8.0 s | ~2.1 s | ~1.9 s |
-| Persist, ordinary_bad | 0 ms (no separate phase) | ~4.8 s | ~2.7 s |
-| Restore, ordinary_bad | 0 ms (already live) | ~9.2 s | ~5.5 s |
-| Total RTO (this harness's own accounting -- see caveat), ordinary_bad | ~34.7 s | ~45.8 s | ~41.2 s |
-| Chunk count, ordinary_bad (1 GiB / 64 MiB chunks) | n/a | 15 | 15 |
+| Compression ratio, ordinary_bad | 0.966 (expansion) | 2.108x | 2.108x |
+| Compression ratio, toast_bad | 0.790 | 1.0022x | 1.0022x |
+| Compression ratio, good_compress | 0.961 | ~120.6x | ~120.0x |
+| Artifact bytes, ordinary_bad | ~1.077 GB | ~493 MB | ~493 MB |
+| Snapshot create, ordinary_bad | ~8.2 s | ~2.0 s | ~1.9 s |
+| Persist, ordinary_bad | 0 ms (no separate phase) | ~6.1 s | ~5.0 s |
+| Restore, ordinary_bad | ~4.7 s (now real) | ~10.0 s | ~6.0 s |
+| Total RTO, ordinary_bad | ~42.9 s | ~49.7 s | ~42.9 s |
+| **WAL: materialize, ordinary_bad** | **~1.226 GB** | ~538 KB | ~537 KB |
+| **WAL: persist, ordinary_bad** | 0 (n/a) | **~536 MB** | ~6.7 MB |
+| **WAL: restore, ordinary_bad** | **~1.224 GB** | ~960 MB | ~960 MB |
+| **WAL: total, ordinary_bad** | **~2.45 GB** | **~1.49 GB** | **~0.97 GB** |
+| **Backup delta, ordinary_bad (real, `pg_basebackup`)** | **269,500,856 B** | **126,484,650 B** | **24,580 B** |
+| **Backup delta, toast_bad (real)** | **341,025,217 B** | **278,921,386 B** | **24,580 B** |
 
-**RTO caveat:** `total_rto_ms` as measured here sums
+**heap_v1's WAL cost is real and now measured twice over (materialize and
+restore), not once inferred.** Both its materialize and restore steps are
+full `CREATE TABLE ... AS SELECT` operations under `wal_level = logical`,
+each generating ~1.2 GB of WAL for this 1 GiB table -- consistently the
+highest of the three backends on every WAL metric, and confirmed
+independently by the real backup-footprint delta (heap_v1 adds
+269.5-341.0 MB to a physical backup, by far the most).
+
+**in_db_logged_zstd's WAL cost scales with how much gets stored, and
+becomes comparable to heap_v1's for poorly-compressible data.** Its persist
+WAL is small for `good_compress` (~9.6 MB, matching the ~9 MB compressed
+artifact) but substantial for `ordinary_bad` (~536 MB) and dominant for
+`toast_bad` (~1.15 GB, since near-zero compression means the LOGGED chunk
+table is inserting nearly the full logical size). Its real backup delta for
+`toast_bad` (278.9 MB) approaches heap_v1's (341.0 MB) -- for
+incompressible data, storing chunks in a LOGGED table loses most of its WAL
+advantage over the baseline.
+
+**external_zstd's WAL and backup cost are the lowest measured, by a wide
+and consistent margin.** Persist WAL is 2.6-8.3 MB across every shape
+(pure filesystem I/O, never touching WAL, plus only the tiny manifest row);
+materialize WAL is just the concurrent writer's own churn (300-820 KB, not
+the extraction itself, which is a client-side `\copy` generating no server
+WAL at all). Its real backup delta is **24,580 bytes for both shapes
+tested** -- the same tiny manifest-row overhead regardless of source data
+size or shape, empirically confirming its artifact truly lives outside the
+backup boundary.
+
+**Restore cost, real for all three now:** `in_db_logged_zstd` is
+consistently the slowest to restore (~10.0 s for `ordinary_bad`, ~14.1 s for
+`toast_bad`), plausibly a PoC implementation artifact (its chunk-extraction
+path round-trips through `psql` text-mode hex encoding + a `python3`
+hex-decode pass, a real ~2x data-size-in-transit penalty a production
+implementation could likely avoid with a different extraction method) more
+than an inherent property of storing chunks in the database. `heap_v1`'s
+restore, now a real second full-table copy, lands between the two zstd
+backends' costs for `ordinary_bad` but is the *fastest* to restore for
+`toast_bad` and `good_compress` (no decompression step).
+
+**RTO caveat, stated plainly:** `total_rto_ms` sums
 `snapshot_create_ms + persist_ms + restore_ms + verify_ms`, where
 `snapshot_create_ms` includes this harness's own WAL-replay correctness-
 oracle overhead (decoding and replaying the writer's churn against a
-throwaway shadow table) -- a testing-methodology cost, not a real production
-snapshot cost. It also includes `verify_ms` (fingerprint/schema/TOAST-hash
-checking), which a real backend's restore path would likely not redo on
-every restore in production. Treat these RTO numbers as internally
-consistent for *comparing the three backends against each other* (the same
-methodology overhead applies equally to all three), not as an absolute
-production RTO estimate.
+throwaway shadow table) and `verify_ms` includes fingerprint/schema/TOAST-
+hash/owner/ACL checking that a real backend would likely not redo on every
+restore in production. Treat these numbers as internally consistent for
+comparing the three backends against each other (the same methodology
+overhead applies equally to all three), not as an absolute production RTO
+estimate.
 
-**heap_v1's snapshot-create cost is real, not a harness artifact.** It is
-consistently ~4x slower than the other two backends' materialization step,
-despite similar writer-commit counts and comparable `materialize_ms`
-figures for the CTAS itself. The likely cause: under `wal_level = logical`
-(required for this whole mechanism), `CREATE TABLE ... AS SELECT` cannot use
-PostgreSQL's minimal-WAL fast path and is fully WAL-logged; the shared
-logical slot's subsequent decode/scan pass then has more WAL volume to walk
-through even after filtering to the tracked oid. This was not directly
-instrumented (no direct `pg_current_wal_lsn()` delta measurement was taken
-specifically to isolate WAL bytes generated) -- the finding rests on
-consistent timing behavior plus architectural reasoning, not a byte-level
-WAL amplification measurement. That direct measurement is a known gap for
-any future round.
+### Crash safety
 
-**in_db_logged_zstd is meaningfully slower than external_zstd at persist
-and restore**, not just "a bit slow": ~1.7x slower to persist, ~1.6-2.5x
-slower to restore (widest gap on `toast_bad`: ~14.2 s vs ~5.6 s). Two
-separable causes: (a) `poc_bench_chunks` is a `LOGGED` table, so loading
-compressed chunks into it generates real additional WAL that `external_zstd`
-never produces at all (chunk writes there are plain filesystem I/O, never
-touching the WAL stream) -- this is a second, smaller echo of heap_v1's core
-problem, on the artifact-storage path rather than the snapshot-source path;
-(b) this harness's specific restore implementation for `in_db_logged_zstd`
-extracts each chunk via `psql -tA` text-mode hex encoding + a `python3`
-hex-decode pass, which is a real ~2x data-size-in-transit penalty compared
-to `external_zstd`'s direct binary file read -- a PoC implementation
-inefficiency, not an inherent property of storing chunks in the database
-(a production implementation could plausibly close much of this gap with a
-different extraction path, e.g. large objects or a binary-safe COPY).
+Real postmaster-crash scenarios, all PASS at genuine 1 GiB scale (9
+scenarios: `mid_materialize` x3 backends, `metadata_commit_before`/`after`
+x2 zstd backends, `duplicate_retry` x2 zstd backends), plus a 31-scenario
+128 MiB adversarial/logic matrix covering corrupt chunk, missing chunk
+(now including `in_db_logged_zstd`), manifest mismatch (now including
+`in_db_logged_zstd`), wrong pg_major/system_identifier/schema binding, row
+count mismatch, chunk order mismatch, and for `external_zstd` specifically:
+temp-write/fsync/rename ordering at every step, file-without-metadata,
+metadata-without-file, and orphan-GC safety. All 40 crash scenarios PASS on
+the same verified-consistent commit.
+
+**Fsync-durability caveat, unchanged and still honest:** the fsync-adjacent
+crash points are modeled as an abrupt kill of the writing step (or a real
+`pg_ctl -m immediate` crash+restart for DB-side points). This proves
+incomplete userspace state is never mistaken for valid. It does not prove
+real fsync-durability against an actual host power loss, which this
+environment cannot safely test.
+
+**Known, disclosed gap:** the fsync/rename-ordering, split-state, and
+orphan-GC crash points remain `external_zstd`-only (structurally unique to
+the filesystem backend); `in_db_logged_zstd` now has full parity on the
+generic adversarial points (corrupt/missing chunk, manifest mismatch, wrong
+identity, row-count/chunk-order mismatch, duplicate retry,
+metadata-commit atomicity).
 
 ## Elimination / advancement decision (1 GiB gate)
 
-Per this round's own elimination discipline: don't eliminate for being "a
-bit slow," don't protect heap_v1 just because it already exists, don't
-declare `external_zstd` the winner in advance, don't eliminate
-`in_db_logged_zstd` without actually measuring its WAL-generating cost (it
-was measured, above, and is real).
+Unchanged from the prior round's reasoning, now on firmer (measured, not
+inferred) footing:
 
-- **heap_v1**: passes every correctness and crash-safety gate outright. Not
-  eliminated on a technicality. But it is the reason Step 8 exists at
-  all -- it does not compress (ratio consistently < 1, i.e. its artifact is
-  *larger* than the logical data for every shape tested, including the
-  highly-redundant `good_compress` shape where the other two backends
-  achieve ~120x), and its artifact is a permanent, ordinary heap table that
-  stays inside the primary cluster forever (counted in every future backup,
-  every future WAL-based replica, indefinitely) until explicitly dropped.
-  For the stated goal of this comparison -- a storage strategy for
-  *retained* snapshot artifacts at growing scale -- heap_v1 is decisively,
-  structurally worse on the dimension that matters most, not just slower.
-  **Does not advance to the 10 GiB round.** Remains the existing
-  baseline/control; nothing here removes or degrades it.
+- **heap_v1**: passes every correctness and crash-safety gate outright, not
+  eliminated on a technicality. But it is now demonstrated, on *three*
+  independent measurements (compression ratio, real WAL bytes, real backup
+  delta) rather than one inferred claim, to be the most WAL- and
+  backup-footprint-expensive of the three for every data shape tested,
+  including the highly-redundant `good_compress` shape where the other two
+  achieve ~120x compression and heap_v1 achieves none. **Does not advance
+  to a 10 GiB round.** Remains the existing baseline/control.
 - **in_db_logged_zstd** and **external_zstd**: both pass every correctness
-  and crash-safety gate. Neither dominates the other on *every* important
-  metric -- compression is a tie; `external_zstd` clearly wins persist
-  speed, restore speed, and produces zero extra primary-cluster WAL;
-  `in_db_logged_zstd` retains a real, non-trivial operational advantage
-  (the artifact travels automatically with any routine logical/physical
-  backup of the database -- no second filesystem location's lifecycle,
-  permissions, or backup coverage to manage separately). Per this round's
-  own rule against eliminating without clear all-metric domination, **both
-  advance as finalists.**
+  and crash-safety gate, including full adversarial parity now.
+  Compression ties. `external_zstd` wins persist speed, restore speed, WAL
+  cost on every phase, and real backup-footprint delta, by a wide and
+  now-measured margin -- not just "a bit better." `in_db_logged_zstd`
+  retains a real, non-trivial operational advantage (the artifact travels
+  automatically with any routine backup of the database; no second
+  filesystem location's lifecycle, permissions, or backup coverage to
+  manage separately), and its WAL/backup cost is only close to heap_v1's
+  for the worst case (incompressible TOAST-heavy data) -- for compressible
+  data it is meaningfully better than heap_v1 on every axis. **Both advance
+  as finalists.**
 
 ## 10 GiB finalist round: BLOCKED_BY_CAPACITY
 
-Capacity preflight (required before attempting any 10 GiB run): linear
-projection from the measured 1 GiB end-of-run `ephemeral_disk_bytes`
-(`DATA` dir) + external artifact bytes, x10:
-
-| Combination | 1 GiB DATA+external (GB) | 10 GiB projected peak (GB) |
-|---|---|---|
-| in_db_logged_zstd / ordinary_bad | 5.96 | 59.6 |
-| in_db_logged_zstd / toast_bad | 7.49 | 75.0 |
-| external_zstd / ordinary_bad | 5.44 | 54.4 |
-| external_zstd / toast_bad | 6.39 | 63.9 |
-
-This projection is itself an *undercount* of the real peak: it only
-reflects `$DATA`'s end-of-run size, not the transient `WORK_ROOT` files
-live during the run (the raw uncompressed COPY BINARY stream, ~1x logical;
-chunk staging, ~1x compressed artifact; restore reconstruction, another
-~1x logical + ~1x compressed) that commit `b03243f`'s cleanup fix removes
-only *after* a run completes. A realistic single-run peak is closer to
-85-95 GB for the worst case (`in_db_logged_zstd`/`toast_bad`).
-
-Available capacity at preflight time: **43 GB** (single filesystem; the PG
-data directory and the external artifact directory share it in this
-environment, so they are not separately accountable). 43 GB is less than
-the low-end 10 GiB projection (59.6-75.0 GB) for *any* of the four
-finalist/shape combinations, let alone with the required +8 GB safety
-reserve or the additional transient overhead.
-
+Unchanged from the prior round's preflight (the correctness/measurement
+fixes in this round do not change PostgreSQL's actual disk usage patterns,
+so the original projection remains valid): available capacity in this
+environment (43 GB) was less than the low-end projected single-run peak
+(59.6-75.0 GB) for any of the four finalist/shape combinations, let alone
+with the required +8 GB safety reserve or additional transient overhead.
 **No 10 GiB run was attempted.** No unrelated files or other targets were
-deleted to force capacity (only this session's own superseded PoC working
-files, already gitignored and regenerable, were reclaimed -- 37 GB across
-the 1 GiB matrix runs, bringing available capacity from 5.9 GB back to
-43 GB, still short of what a 10 GiB run needs).
+deleted to force capacity.
 
-Runnable when capacity is available (sequentially, not in parallel, so the
-harness's own cleanup reclaims disk between runs; each needs ~2 reps per
-this round's own repeatability rule):
+Runnable when capacity is available (sequentially, so the harness's own
+cleanup reclaims disk between runs; 2 reps each per this round's own
+repeatability rule):
 
 ```bash
 ./scripts/poc/run_poc_storage_backend_benchmark.sh bench in_db_logged_zstd ordinary_bad 10240 rep1
@@ -309,79 +308,62 @@ this round's own repeatability rule):
 
 ## Decision-gate table
 
-| Backend | Correctness | Crash safety | Artifact size (ordinary_bad, 1 GiB) | Peak disk | WAL amplification | Snapshot time | Restore RTO | Ops complexity | 1 GiB | 10 GiB |
+| Backend | Correctness | Crash safety | Artifact size (ordinary_bad, 1 GiB) | WAL total (real, ordinary_bad) | Backup delta (real) | Snapshot time | Restore RTO (real) | Ops complexity | 1 GiB | 10 GiB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| heap_v1 | PASS (18/18) | PASS | ~1.08 GB (no compression) | Highest (full extra live-cluster copy, permanent) | Highest (fully WAL-logged CTAS under logical decoding; artifact counted in every future backup/replica forever) | Slowest (~8.0 s) | Fastest (0 ms, already live) | Lowest (nothing new to operate) | PASS, not competitive on storage | Not attempted (not a finalist) |
-| in_db_logged_zstd | PASS (18/18) | PASS (scale + logic matrix) | ~493 MB (2.1x) | High (chunk table adds real WAL; artifact lives inside primary cluster) | Moderate (LOGGED chunk table generates WAL the external backend does not) | Fast (~2.1 s) | Slower of the two zstd backends (~9.2 s; PoC hex-roundtrip extraction is a real, fixable inefficiency) | Low (single backup story, no second filesystem to manage) | PASS, finalist | BLOCKED_BY_CAPACITY |
-| external_zstd | PASS (18/18) | PASS (scale + logic + full adversarial matrix incl. fsync/rename ordering, split-state, orphan-GC) | ~493 MB (2.1x, ties in_db) | Lower (compressed artifact only; no extra primary-cluster WAL) | Lowest (chunk/manifest writes are plain filesystem I/O, never touch WAL) | Fast (~1.9 s) | Fastest of the two zstd backends (~5.5 s) | Moderate (separate filesystem location: permissions, backup coverage, orphan-GC discipline) | PASS, finalist | BLOCKED_BY_CAPACITY |
+| heap_v1 | PASS (18/18) | PASS (9 scale + 2 logic) | ~1.08 GB (no compression) | **~2.45 GB (highest)** | **269.5-341.0 MB (highest)** | Slowest (~8.2 s) | ~4.7 s (real, now measured) | Lowest (nothing new to operate) | PASS, not competitive on storage/WAL | Not attempted (not a finalist) |
+| in_db_logged_zstd | PASS (18/18) | PASS (9 scale + 9 logic, full parity) | ~493 MB (2.1x) | ~1.49 GB (moderate; ~toast_bad approaches heap_v1) | 126.5-278.9 MB | Fast (~2.0 s) | Slowest of the two zstd (~10.0 s) | Low (single backup story) | PASS, finalist | BLOCKED_BY_CAPACITY |
+| external_zstd | PASS (18/18) | PASS (9 scale + 20 logic, incl. full fsync/rename/split/GC matrix) | ~493 MB (2.1x, ties) | **~0.97 GB (lowest)** | **24,580 B (lowest, both shapes)** | Fast (~1.9 s) | Fastest of the two zstd (~6.0 s) | Moderate (separate filesystem location) | PASS, finalist | BLOCKED_BY_CAPACITY |
 
 ## Recommendation
 
-**Recommend `external_zstd` as the primary candidate for a future
-production design, with `in_db_logged_zstd` kept as a documented fallback
-for operators who cannot provision a separate artifact filesystem/backup
-path.** Trade-offs to weigh explicitly:
+**Unchanged: `external_zstd` as the primary candidate for a future
+production design, `in_db_logged_zstd` as a documented fallback** for
+operators who cannot provision a separate artifact filesystem/backup path.
+This recommendation is now backed by measured WAL bytes and measured
+backup-footprint deltas on every row, not inference:
 
-- `external_zstd` wins on every performance and WAL-amplification metric
-  measured, by a consistent, repeatable margin (not "a bit faster" --
-  1.7-2.5x on persist/restore, and structurally zero WAL amplification vs.
-  `in_db_logged_zstd`'s real, measured WAL cost). It is the only backend
-  whose artifact storage does not grow the primary cluster's own backup/
-  replication footprint.
-- Its cost is operational: a second filesystem location to provision,
-  secure, and back up on its own schedule, plus the orphan-GC discipline
-  this PoC's crash matrix exercised but a production implementation must
-  still build for real (retention policy, GC scheduling, cross-host
-  artifact placement if the primary and artifact filesystems should not be
-  the same disk -- notably, this whole preflight was forced to treat them
-  as the same filesystem in this environment, which is not how a real
-  deployment reducing blast radius would want it).
-- `in_db_logged_zstd`'s appeal is entirely operational simplicity (one
-  backup story, no second location), which is a legitimate, real
-  consideration for some operators, not a strawman -- hence it is not
-  eliminated here, only ranked second.
+- `external_zstd` wins persist speed, restore speed, every WAL-phase
+  metric, and real backup delta, consistently and by a wide margin (not "a
+  bit better") across all three data shapes.
+- Its cost is operational, not performance: a second filesystem location
+  to provision, secure, and back up on its own schedule, plus real
+  orphan-GC discipline (now exercised by this round's crash matrix, but a
+  production implementation still needs to build retention/scheduling for
+  real).
+- `in_db_logged_zstd`'s single-backup-story simplicity is a legitimate,
+  real consideration, not a strawman -- but its WAL/backup cost advantage
+  over heap_v1 shrinks to nearly nothing for incompressible data, which
+  should weigh into any final choice for workloads dominated by such data.
 - heap_v1 remains correct and simple but does not solve the problem this
   comparison exists to address; nothing here suggests removing it as a
   fallback/control path.
 
 ## What is proven, what is not
 
-**Proven at 1 GiB, this round:** correctness (18/18 combinations, all three
-data shapes, 2 reps each), crash safety at real 1 GiB scale for the most
-scale-sensitive points (mid-materialize crash, metadata-commit atomicity,
-duplicate-identity rejection) across all three backends, the full
-adversarial/logic crash matrix at 128-256 MiB for `external_zstd` and a
-partial matrix for `in_db_logged_zstd` (missing `missing_chunk` and
-`manifest_mismatch` specifically), and real, repeatable performance/storage
-differences between the three backends.
+**Proven at 1 GiB, this round, on one consistent commit:** correctness
+(18/18), crash safety (40/40 across scale-sensitive and adversarial
+matrices, full parity between the two zstd backends on generic points),
+real measured WAL bytes per phase for every run, real measured
+backup-footprint deltas for two data shapes, and `commits_replayed ==
+copy_window_commits` exactly (not `>=`) on every row.
 
 **Not proven, anywhere in this round:**
-- Behavior at 10, 25, or 50 GiB scale -- entirely unknown. Linear
-  projection from 1 GiB is the only basis available, and this round's own
-  capacity preflight shows even a *single* 10 GiB run would need ~2x the
-  disk actually available in this environment; real behavior at that scale
-  (checkpoint/vacuum pressure, lock-hold duration, xmin/vacuum horizon
-  effects proportional to a much longer copy window, whether `zstd -T0`
-  compression throughput actually scales linearly rather than becoming
-  CPU-bound, whether the in-DB LOGGED-chunk-table WAL cost becomes
-  prohibitive rather than merely measurable) is unknown.
+- Behavior at 10, 25, or 50 GiB scale -- entirely unknown, blocked by
+  capacity in this environment.
 - Real fsync-durability against host power loss (stated above).
-- `missing_chunk`/`manifest_mismatch` for `in_db_logged_zstd` specifically
-  (stated above).
-- Direct byte-level WAL amplification measurement (the heap_v1 and
-  in_db_logged_zstd WAL costs are real and consistently observed via timing
-  and architecture, but were never instrumented as actual WAL bytes
-  generated per run).
-- A 24-hour run, multi-artifact retention/lifecycle behavior, concurrent
-  multi-table protection, or anything at all beyond a single artifact per
-  run.
+- Backup-footprint measured for the `good_compress` shape (only
+  `ordinary_bad` and `toast_bad` were run -- a reasonable inference from
+  the other two shapes' pattern, but not itself measured).
 - Whether `in_db_logged_zstd`'s restore-speed disadvantage is fundamental
-  or an artifact of this PoC's specific (hex-roundtrip) extraction
-  implementation -- flagged above as plausibly fixable, but not tested.
+  or an artifact of this PoC's specific hex-roundtrip extraction
+  implementation.
+- A 24-hour run, multi-artifact retention/lifecycle behavior, concurrent
+  multi-table protection, or anything beyond a single artifact per run.
 
 ## Explicitly out of scope for this round (per its own instructions)
 
 No production `SnapshotStore` backend was added. `storage_backend`'s CHECK
 constraint was not extended. No public API or GUC was added. No external
 artifact path was wired into production. Step 9 was not started. 25/50 GiB
-qualification was not started. The 24-hour run was not started.
+qualification was not started. The 24-hour run was not started. No push,
+no main merge, no tag/release.
