@@ -345,6 +345,16 @@ sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 # dir-fsync protocol below.
 fsync_path() { sync "$1" 2>/dev/null || true; }
 
+# Real WAL-byte accounting, not an inference from timing/architecture.
+# pg_current_wal_insert_lsn() advances monotonically with every WAL record
+# this backend's own session causes to be inserted; pg_wal_lsn_diff gives
+# the exact byte delta between two LSNs. Wrapping a phase's start/end LSN
+# this way measures precisely how much WAL that phase generated, whatever
+# the cause (a WAL-logged CTAS under wal_level=logical, a LOGGED chunk
+# table's INSERTs, a COPY-driven table load during restore, ...).
+wal_insert_lsn() { q "$DB" "SELECT pg_current_wal_insert_lsn();"; }
+wal_bytes_between() { local before=$1 after=$2; q "$DB" "SELECT pg_wal_lsn_diff('$after'::pg_lsn, '$before'::pg_lsn)::bigint;"; }
+
 # ── oracle SQL, installed once per DB -- IDENTICAL schema/functions to
 # Step 7's install_oracle_sql (scripts/run_poc_online_snapshot_wal_alignment.sh),
 # duplicated here (not sourced) because Step 8 is a deliberately isolated
@@ -1115,9 +1125,12 @@ run_bench() {
     local artifact_id="bench-${BACKEND}-${SHAPE}-${SIZE_MIB}-${REP_LABEL}-$$"
     local rawfile="$WORK_ROOT/rawstream_${artifact_id}.bin"
 
-    local t_snap0 t_snap1
+    local t_snap0 t_snap1 wal0 wal1 wal_bytes_materialize
     t_snap0=$(now_ms)
+    wal0="$(wal_insert_lsn)"
     establish_boundary_and_materialize "$tbl" "poc_bench_slot" "$BACKEND" "$rawfile" ""
+    wal1="$(wal_insert_lsn)"
+    wal_bytes_materialize="$(wal_bytes_between "$wal0" "$wal1")"
     t_snap1=$(now_ms)
     qst_mark_step "bench_base" "pass" "rows=$(row_count "$tbl") shape=$SHAPE boundary_lsn=$BOUNDARY_LSN"
 
@@ -1126,24 +1139,30 @@ run_bench() {
         load_ground_truth_from_rawfile "$tbl" "$rawfile"
     fi
 
-    local t_persist0 t_persist1
+    local t_persist0 t_persist1 wal_bytes_persist
     t_persist0=$(now_ms)
+    wal0="$(wal_insert_lsn)"
     case "$BACKEND" in
         heap_v1) : ;; # artifact already materialized as GT_TBL; nothing further to persist
         in_db_logged_zstd) persist_in_db_logged_zstd "$rawfile" "$artifact_id" "$tbl" "" ;;
         external_zstd) persist_external_zstd "$rawfile" "$artifact_id" "$tbl" "" ;;
     esac
+    wal1="$(wal_insert_lsn)"
+    wal_bytes_persist="$(wal_bytes_between "$wal0" "$wal1")"
     t_persist1=$(now_ms)
     qst_mark_step "bench_persist" "pass" "artifact_id=$artifact_id persist_ms=$((t_persist1-t_persist0))"
 
     local restored_tbl="poc_bench_restored"
-    local t_restore0 t_restore1
+    local t_restore0 t_restore1 wal_bytes_restore
     t_restore0=$(now_ms)
+    wal0="$(wal_insert_lsn)"
     case "$BACKEND" in
         heap_v1) restore_heap_v1 "$tbl" "$restored_tbl" ;;
         in_db_logged_zstd) restore_in_db_logged_zstd "$artifact_id" "$restored_tbl" ;;
         external_zstd) restore_external_zstd "$artifact_id" "$restored_tbl" ;;
     esac
+    wal1="$(wal_insert_lsn)"
+    wal_bytes_restore="$(wal_bytes_between "$wal0" "$wal1")"
     t_restore1=$(now_ms)
     local restore_ms=$((t_restore1-t_restore0))
     qst_mark_step "bench_restore" "pass" "restore_ms=$restore_ms"
@@ -1163,6 +1182,17 @@ run_bench() {
     record_metric "bench.${BACKEND}.${SHAPE}.restore_ms" "$restore_ms" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.verify_ms" "$verify_ms" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.total_rto_ms" "$total_rto_ms" "ms"
+    # Real measured WAL bytes (pg_current_wal_insert_lsn + pg_wal_lsn_diff),
+    # not inferred from timing/architecture. wal_bytes_materialize spans
+    # the whole boundary+materialize window and therefore includes
+    # whatever WAL the concurrent writer itself generated during that
+    # window too (by design: a real production copy does not pause
+    # concurrent writers, so this reflects the real total WAL cost of that
+    # wall-clock window, not an isolated single-statement cost).
+    record_metric "bench.${BACKEND}.${SHAPE}.wal_bytes_materialize" "$wal_bytes_materialize" "bytes"
+    record_metric "bench.${BACKEND}.${SHAPE}.wal_bytes_persist" "$wal_bytes_persist" "bytes"
+    record_metric "bench.${BACKEND}.${SHAPE}.wal_bytes_restore" "$wal_bytes_restore" "bytes"
+    record_metric "bench.${BACKEND}.${SHAPE}.wal_bytes_total" "$((wal_bytes_materialize + wal_bytes_persist + wal_bytes_restore))" "bytes"
     record_metric "bench.${BACKEND}.${SHAPE}.gt_load_ms_excluded_from_rto" "$GT_LOAD_MS" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.copy_window_commits" "$COPY_WINDOW_COMMITS" "count"
     record_metric "bench.${BACKEND}.${SHAPE}.commits_replayed" "$COMMITS_REPLAYED" "count"
