@@ -111,7 +111,7 @@ case "$MODE" in
             # closes out only requires it proven for the existing-stream
             # reanchor path); Protocol A's greenfield export-snapshot path
             # keeps its original three-step scale contract unchanged.
-            qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint scale_crash_and_retry
+            qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint scale_crash_and_retry scale_operational_characteristics
         else
             qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint
         fi
@@ -2475,6 +2475,81 @@ SQL
     record_metric "scale.crash.retry_idempotent" "true" "bool"
 }
 
+# DDL-queue-policy and xmin/vacuum-horizon measurement, tied to a REAL
+# size_mib CTAS hold rather than run_ddl_queue_comparison/
+# run_xmin_vacuum_measurement's synthetic pg_sleep(2)/pg_sleep(4) stand-ins.
+# The ADR's own "Open risks for Step 8" note is explicit that the dev-mode
+# versions of these measurements (64 MiB, sleep-simulated hold) do not
+# extrapolate to what a real 1 GiB+ copy's actual hold duration produces;
+# this reuses the same measurement idioms (policy-1 DDL-wait, churn-table
+# dead-tuple accumulation) but against a real full-size CTAS on $tbl, whose
+# AccessShareLock genuinely queues a concurrent ALTER TABLE behind it for
+# the CTAS's real (not simulated) duration.
+run_scale_operational_characteristics() {
+    local tbl=$1 size_mib=$2
+    local shadow3="${tbl}_shadow_scaleopchar"
+    local churn=poc_scaleopchar_churn
+    q "$DB" "DROP TABLE IF EXISTS $shadow3, $churn;" >/dev/null
+    q "$DB" "CREATE TABLE $churn (id bigint PRIMARY KEY, v text);
+             INSERT INTO $churn SELECT g,'v'||g FROM generate_series(1,10000) g;" >/dev/null
+
+    local churn_run="$WORK_ROOT/${tbl}_opchar_churn_run"
+    touch "$churn_run"
+    ( while [[ -f "$churn_run" ]]; do
+        q "$DB" "UPDATE $churn SET v = v || 'x' WHERE id = (random()*9999+1)::int;" >/dev/null 2>&1 || true
+      done ) &
+    local churn_pid=$!
+    register_child_pid "$churn_pid"
+
+    local copy_done="$WORK_ROOT/${tbl}_opchar_copy_done"
+    rm -f "$copy_done"
+    "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -v ON_ERROR_STOP=1 -qAt >/dev/null 2>&1 <<SQL &
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM $tbl;
+CREATE TABLE $shadow3 AS SELECT * FROM $tbl;
+\! touch "$copy_done"
+COMMIT;
+SQL
+    local copier_pid=$!
+    register_child_pid "$copier_pid"
+
+    sleep 0.3
+    local xmin_age dead_tuples_during
+    xmin_age="$(q "$DB" "SELECT max(age(backend_xmin)) FROM pg_stat_activity WHERE state != 'idle' AND backend_xmin IS NOT NULL;")"
+    dead_tuples_during="$(q "$DB" "SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname='$churn';")"
+
+    # Real DDL-queue-policy-1 measurement: this ALTER TABLE needs an
+    # AccessExclusiveLock on $tbl, which genuinely conflicts with the
+    # AccessShareLock the real CTAS above holds for its entire (real, not
+    # simulated) scan duration.
+    local ddl_wait_start ddl_wait_end
+    ddl_wait_start=$(now_ms)
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -qAt -c "ALTER TABLE $tbl ADD COLUMN opchar_probe int;" >/dev/null
+    ddl_wait_end=$(now_ms)
+    q "$DB" "ALTER TABLE $tbl DROP COLUMN opchar_probe;" >/dev/null
+
+    local deadline=$(( $(date +%s) + 60 ))
+    while [[ ! -f "$copy_done" ]]; do
+        (( $(date +%s) < deadline )) || die "scale-opchar: real ${size_mib}MiB copy did not finish in time"
+        sleep 0.05
+    done
+    wait "$copier_pid" 2>/dev/null || true
+    rm -f "$churn_run"
+    wait "$churn_pid" 2>/dev/null || true
+
+    q "$DB" "VACUUM $churn;" >/dev/null
+    local dead_tuples_after
+    dead_tuples_after="$(q "$DB" "SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname='$churn';")"
+
+    record_metric "scale.ddl_queue.policy1_ddl_wait_ms" "$((ddl_wait_end-ddl_wait_start))" "ms"
+    record_metric "scale.xmin.snapshot_hold_xmin_age" "$xmin_age" "xids"
+    record_metric "scale.xmin.churn_dead_tuples_during_hold" "$dead_tuples_during" "tuples"
+    record_metric "scale.xmin.churn_dead_tuples_after_vacuum" "$dead_tuples_after" "tuples"
+
+    q "$DB" "DROP TABLE IF EXISTS $shadow3, $churn;" >/dev/null
+    echo "scale-opchar: DDL wait=${ddl_wait_end}-${ddl_wait_start}ms xmin_hold_age=$xmin_age dead_during=$dead_tuples_during dead_after_vacuum=$dead_tuples_after (real ${size_mib}MiB hold, not simulated)" >&2
+}
+
 # ── Wire it all together per mode ────────────────────────────────────────
 run_mode_dev() {
     run_protocol_a "poc_a_tbl" "poc_slot_a" "$((SIZE_MIB/2))"
@@ -2562,6 +2637,9 @@ run_mode_scale() {
     if [[ "$PROTOCOL" == "b" ]]; then
         run_scale_crash_and_retry "$tbl" "poc_scale_slot_b" "$SIZE_MIB"
         qst_mark_step "scale_crash_and_retry" "pass" "real ${SIZE_MIB}MiB mid-CTAS crash: no partial artifact after restart; retry succeeded, row-count/fingerprint matched, shared slot stayed healthy"
+
+        run_scale_operational_characteristics "$tbl" "$SIZE_MIB"
+        qst_mark_step "scale_operational_characteristics" "pass" "DDL-queue-policy1 wait and xmin/dead-tuple hold effect measured against a real ${SIZE_MIB}MiB CTAS"
     fi
 }
 
