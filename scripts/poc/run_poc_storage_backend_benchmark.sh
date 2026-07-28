@@ -1077,7 +1077,7 @@ run_bench() {
     record_metric "bench.${BACKEND}.${SHAPE}.artifact_bytes" "$ARTIFACT_BYTES" "bytes"
     record_metric "bench.${BACKEND}.${SHAPE}.chunk_count" "$CHUNK_COUNT" "count"
     if [[ -n "$source_logical_bytes" && "$source_logical_bytes" -gt 0 && -n "$ARTIFACT_BYTES" && "$ARTIFACT_BYTES" -gt 0 ]]; then
-        record_metric "bench.${BACKEND}.${SHAPE}.compression_ratio" "$(echo "scale=4; $source_logical_bytes / $ARTIFACT_BYTES" | bc 2>/dev/null || echo 0)" "ratio"
+        record_metric "bench.${BACKEND}.${SHAPE}.compression_ratio" "$(awk -v a="$source_logical_bytes" -v b="$ARTIFACT_BYTES" 'BEGIN{printf "%.4f", a/b}')" "ratio"
     fi
     if [[ "$BACKEND" != "heap_v1" ]]; then
         record_metric "bench.${BACKEND}.${SHAPE}.raw_stream_bytes" "$(stat -c%s "$rawfile" 2>/dev/null || echo 0)" "bytes"
