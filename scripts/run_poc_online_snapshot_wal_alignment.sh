@@ -106,7 +106,15 @@ case "$MODE" in
         PROTOCOL="${2:-}"; PROFILE="${3:-}"; SIZE_MIB="${4:-1024}"
         [[ "$PROTOCOL" == "a" || "$PROTOCOL" == "b" ]] || die "scale mode needs protocol a|b"
         [[ "$PROFILE" == "ordinary" || "$PROFILE" == "toast" ]] || die "scale mode needs profile ordinary|toast"
-        qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint
+        if [[ "$PROTOCOL" == "b" ]]; then
+            # Crash/restart/retry is Protocol-B-specific (the task this PoC
+            # closes out only requires it proven for the existing-stream
+            # reanchor path); Protocol A's greenfield export-snapshot path
+            # keeps its original three-step scale contract unchanged.
+            qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint scale_crash_and_retry
+        else
+            qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint
+        fi
         ;;
     __selftest_child_missing_named_step|__selftest_child_interrupt_target)
         # Handled entirely by the dedicated blocks below, which qst_init
@@ -2378,6 +2386,95 @@ SQL
     echo "restart-15c: marker-only commit never produced an active artifact; shared slot remained healthy for a later clean attempt" >&2
 }
 
+# Crash-during-CTAS/restart/retry, proven at the REAL scale under test --
+# not the tiny synthetic tables run_restart_crash_scenarios uses at dev
+# scale. Reuses the already-loaded, already-verified $tbl from this scale
+# run's own baseline copy as the crash attempt's source (no new bulk load,
+# and this crash-test shadow is deliberately never registered in
+# poc_table_map, since it needs no WAL-replay verification -- only that no
+# partial artifact survives the crash). At size_mib=1024 a real CTAS is
+# already measured at several seconds (see run_protocol_b's own comment),
+# so poll_ctas_active reliably catches it active with no artificial
+# slowdown needed.
+run_scale_crash_and_retry() {
+    local tbl=$1 slot=$2 size_mib=$3
+    local shadow1="${tbl}_shadow_scalecrash"
+    local app_name="poc_scalecrash_$$"
+    local ready="$WORK_ROOT/${tbl}_scalecrash_ready"
+    rm -f "$ready"
+    q "$DB" "DROP TABLE IF EXISTS $shadow1;" >/dev/null
+    PGAPPNAME="$app_name" "${PG_BIN}/psql" -h "$SOCKET" -p "$PORT" -d "$DB" -qAt >/dev/null 2>&1 <<SQL &
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM $tbl;
+\! touch "$ready"
+CREATE TABLE $shadow1 AS SELECT * FROM $tbl;
+COMMIT;
+SQL
+    local inflight_pid=$!
+    register_child_pid "$inflight_pid"
+    local deadline=$(( $(date +%s) + 30 ))
+    while [[ ! -f "$ready" ]]; do
+        (( $(date +%s) < deadline )) || die "scale-crash: in-flight ${size_mib}MiB copy did not start in time"
+        sleep 0.05
+    done
+
+    poll_ctas_active "$app_name" 30 \
+        || die "scale-crash: never observed the real ${size_mib}MiB CTAS active in pg_stat_activity before crash -- refusing to claim a mid-copy crash"
+
+    crash_restart_cluster || die "scale-crash: cluster did not come back up after simulated crash"
+    wait "$inflight_pid" 2>/dev/null || true
+
+    local shadow1_regclass
+    shadow1_regclass="$(q "$DB" "SELECT to_regclass('$shadow1');")"
+    [[ -z "$shadow1_regclass" ]] \
+        || die "scale-crash: partial artifact $shadow1 appears recoverable after restart (to_regclass=$shadow1_regclass)"
+    record_metric "scale.crash.partial_artifact_absent" "true" "bool"
+
+    # Idempotent clean retry, still against the SAME real-scale source table.
+    local shadow2="${tbl}_shadow_scaleretry"
+    q "$DB" "DROP TABLE IF EXISTS $shadow2;" >/dev/null
+    local t0 t1
+    t0=$(now_ms)
+    q "$DB" "CREATE TABLE $shadow2 AS SELECT * FROM $tbl;" >/dev/null \
+        || die "scale-crash: retry CTAS failed after crash+restart"
+    t1=$(now_ms)
+    record_metric "scale.crash.retry_copy_ms" "$((t1-t0))" "ms"
+
+    local src_rows shadow_rows
+    src_rows="$(row_count "$tbl")"
+    shadow_rows="$(row_count "$shadow2")"
+    [[ "$src_rows" == "$shadow_rows" ]] \
+        || die "scale-crash: retry row count mismatch src=$src_rows shadow=$shadow_rows"
+
+    local fp_src fp_shadow
+    fp_src="$(q "$DB" "SELECT md5(string_agg(md5(t::text), '|' ORDER BY md5(t::text))) FROM $tbl t;")"
+    fp_shadow="$(q "$DB" "SELECT md5(string_agg(md5(t::text), '|' ORDER BY md5(t::text))) FROM $shadow2 t;")"
+    [[ "$fp_src" == "$fp_shadow" ]] \
+        || die "scale-crash: retry fingerprint mismatch after crash+restart"
+
+    q "$DB" "DROP TABLE IF EXISTS $shadow1, $shadow2;" >/dev/null
+
+    # Shared slot/stream must remain healthy for a genuinely NEW tracked
+    # table after the crash -- same probe idiom as run_restart_crash_scenarios
+    # (15C), proving the crash did not poison $slot for later use.
+    local probe="poc_scalecrash_probe"
+    q "$DB" "DROP TABLE IF EXISTS $probe, ${probe}_shadow;" >/dev/null
+    q "$DB" "CREATE TABLE $probe (id bigint PRIMARY KEY);" >/dev/null
+    local probe_oid; probe_oid="$(table_oid "$probe")"
+    q "$DB" "INSERT INTO poc_table_map VALUES ($probe_oid, '${probe}_shadow', 'id')
+             ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;
+             CREATE TABLE ${probe}_shadow AS SELECT * FROM $probe WHERE false;
+             INSERT INTO $probe VALUES (1);" >/dev/null
+    consume_slot_to_events "$slot" "$probe_oid"
+    q "$DB" "SELECT poc_apply_shadow(NULL, $probe_oid);" >/dev/null
+    local probe_rows; probe_rows="$(q "$DB" "SELECT count(*) FROM ${probe}_shadow;")"
+    [[ "$probe_rows" == "1" ]] \
+        || die "scale-crash: shared slot/stream did not remain healthy for a fresh table after the crash"
+    q "$DB" "DROP TABLE IF EXISTS $probe, ${probe}_shadow;" >/dev/null
+
+    record_metric "scale.crash.retry_idempotent" "true" "bool"
+}
+
 # ── Wire it all together per mode ────────────────────────────────────────
 run_mode_dev() {
     run_protocol_a "poc_a_tbl" "poc_slot_a" "$((SIZE_MIB/2))"
@@ -2462,6 +2559,10 @@ run_mode_scale() {
     logical_bytes="$(q "$DB" "SELECT sum(pg_column_size(t.*))::bigint FROM $tbl t;")"
     record_metric "scale.${PROTOCOL}.${PROFILE}.table_total_bytes" "$table_bytes" "bytes"
     record_metric "scale.${PROTOCOL}.${PROFILE}.logical_payload_bytes" "$logical_bytes" "bytes"
+    if [[ "$PROTOCOL" == "b" ]]; then
+        run_scale_crash_and_retry "$tbl" "poc_scale_slot_b" "$SIZE_MIB"
+        qst_mark_step "scale_crash_and_retry" "pass" "real ${SIZE_MIB}MiB mid-CTAS crash: no partial artifact after restart; retry succeeded, row-count/fingerprint matched, shared slot stayed healthy"
+    fi
 }
 
 if [[ "$MODE" == "dev" ]]; then
