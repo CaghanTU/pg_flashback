@@ -564,7 +564,13 @@ establish_boundary_and_materialize() {
     caught_up="$(q "$DB" "SELECT '$after_flush'::pg_lsn >= '$pre_flush'::pg_lsn;")"
     [[ "$caught_up" == "t" ]] || die "bench[$tbl]: slot did not advance past historical prefix"
 
-    q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_oracle_shadow', 'id');
+    # ON CONFLICT + DROP-IF-EXISTS: crash-mode retries and duplicate_retry
+    # deliberately call this function more than once against the SAME
+    # source table (to avoid regenerating a 1 GiB table per attempt), so
+    # this must be safely re-callable, not a one-shot setup.
+    q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_oracle_shadow', 'id')
+             ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;
+             DROP TABLE IF EXISTS ${tbl}_oracle_shadow;
              CREATE TABLE ${tbl}_oracle_shadow AS SELECT * FROM $tbl WHERE false;" >/dev/null
 
     local marker_uuid; marker_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
@@ -1267,12 +1273,26 @@ run_crash_tamper() {
     esac
     qst_mark_step "crash_postcheck" "pass" "tampered artifact prepared ($point)"
 
+    # restore_* die() internally on any correctness violation, and die()
+    # calls bash's exit builtin directly -- that terminates this whole
+    # process immediately no matter how deeply nested the call, completely
+    # bypassing a plain "|| restore_failed=1" at the call site (confirmed
+    # empirically: an earlier version of this exact line let a die()
+    # inside restore_external_zstd kill the harness process before
+    # crash_retry was ever marked). Running the call in an explicit
+    # subshell makes its exit terminate only that subshell; wrapping the
+    # whole thing in `if` (not a bare statement) is required too, since
+    # `case` branch bodies are NOT exempt from set -e the way an `if`
+    # condition is -- a bare nonzero exit here would still abort the
+    # script before restore_failed=$? ever ran.
     local restored_tbl=poc_bench_restored_tamper restore_failed=0
     case "$BACKEND" in
-        in_db_logged_zstd) restore_in_db_logged_zstd "$artifact_id" "$restored_tbl" >/dev/null 2>&1 || restore_failed=1 ;;
-        external_zstd) restore_external_zstd "$artifact_id" "$restored_tbl" >/dev/null 2>&1 || restore_failed=1 ;;
+        in_db_logged_zstd)
+            if ( restore_in_db_logged_zstd "$artifact_id" "$restored_tbl" ) >/dev/null 2>&1; then restore_failed=0; else restore_failed=$?; fi ;;
+        external_zstd)
+            if ( restore_external_zstd "$artifact_id" "$restored_tbl" ) >/dev/null 2>&1; then restore_failed=0; else restore_failed=$?; fi ;;
     esac
-    [[ "$restore_failed" == "1" ]] || die "crash[$point]: restore did NOT fail closed on a tampered/corrupt artifact -- real correctness gap"
+    [[ "$restore_failed" != "0" ]] || die "crash[$point]: restore did NOT fail closed on a tampered/corrupt artifact -- real correctness gap"
     qst_mark_step "crash_retry" "pass" "restore correctly refused the tampered artifact ($point); fail-closed confirmed"
 }
 
@@ -1291,9 +1311,12 @@ run_crash_split_state() {
     fi
     qst_mark_step "crash_postcheck" "pass" "split state prepared ($point)"
 
+    # Subshell + if, not a bare "|| restore_failed=1": restore_external_zstd
+    # die()s internally via a direct exit call, which a plain || cannot
+    # catch (see the identical note in run_crash_tamper above).
     local restored_tbl=poc_bench_restored_split restore_failed=0
-    restore_external_zstd "$artifact_id" "$restored_tbl" >/dev/null 2>&1 || restore_failed=1
-    [[ "$restore_failed" == "1" ]] || die "crash[$point]: restore did NOT fail closed on a file/DB-metadata split -- real correctness gap"
+    if ( restore_external_zstd "$artifact_id" "$restored_tbl" ) >/dev/null 2>&1; then restore_failed=0; else restore_failed=$?; fi
+    [[ "$restore_failed" != "0" ]] || die "crash[$point]: restore did NOT fail closed on a file/DB-metadata split -- real correctness gap"
     qst_mark_step "crash_retry" "pass" "restore correctly refused a split file/DB-metadata state ($point); fail-closed confirmed"
 }
 
