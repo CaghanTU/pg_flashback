@@ -108,7 +108,7 @@ case "$MODE" in
         [[ "$PROFILE" == "ordinary" || "$PROFILE" == "toast" ]] || die "scale mode needs profile ordinary|toast"
         qst_init candidate_build cluster_bootstrap scale_base scale_wal_alignment scale_fingerprint
         ;;
-    __selftest_child_missing_step|__selftest_child_interrupt_target)
+    __selftest_child_missing_named_step|__selftest_child_interrupt_target)
         # Handled entirely by the dedicated blocks below, which qst_init
         # their own step lists and exit before the shared cluster machinery.
         ;;
@@ -328,17 +328,28 @@ run_selftest() {
         qst_mark_step "candidate_mismatch_rejected" "pass" "mismatched hash correctly rejected pre-cluster"
     fi
 
-    # 2) A child harness invocation that deliberately skips a required step
-    #    must never write status=PASS.
-    local child_out
-    child_out="$(env POC_SELFTEST_FORCE_SKIP=cluster_bootstrap \
-        "$ROOT/scripts/run_poc_online_snapshot_wal_alignment.sh" __selftest_child_missing_step 2>/dev/null || true)"
-    local child_status
-    child_status="$(echo "$child_out" | tail -1)"
-    if [[ "$child_status" == "FAIL_AS_EXPECTED" ]]; then
-        qst_mark_step "missing_step_cannot_pass" "pass" "child with skipped step correctly could not PASS"
+    # 2) A required step whose real work genuinely runs -- a real candidate
+    #    build and a real cluster bootstrap/teardown, not a synthetic step
+    #    name -- but is deliberately never marked complete, must never let
+    #    the run report PASS. A fake step_one/step_two pair would only
+    #    prove the tracker's generic contract in isolation; this proves a
+    #    real named step (cluster_bootstrap) is fail-closed in practice.
+    "$ROOT/scripts/run_poc_online_snapshot_wal_alignment.sh" __selftest_child_missing_named_step \
+        > "$WORK_ROOT/missing_step_child.out" 2>&1 || true
+    local missing_step_result_dir missing_step_status missing_step_list
+    missing_step_result_dir="$(find "$ROOT/target/poc/online-snapshot-wal-alignment" -maxdepth 1 -newer "$before_marker" -name 'missing-step-child-*' -type d 2>/dev/null | sort | tail -1 || true)"
+    if [[ -n "$missing_step_result_dir" && -f "$missing_step_result_dir/result.json" ]]; then
+        missing_step_status="$(jq -r '.status' "$missing_step_result_dir/result.json" 2>/dev/null || echo "")"
+        missing_step_list="$(jq -r '.missing_steps | join(",")' "$missing_step_result_dir/result.json" 2>/dev/null || echo "")"
+        if [[ "$missing_step_status" != "PASS" && "$missing_step_list" == *"cluster_bootstrap"* ]]; then
+            qst_mark_step "missing_step_cannot_pass" "pass" "real cluster_bootstrap work ran but was never marked; status=$missing_step_status missing_steps=$missing_step_list"
+        else
+            qst_mark_step "missing_step_cannot_pass" "fail" "status=$missing_step_status missing_steps=$missing_step_list"
+            QST_FAILED=$((QST_FAILED + 1))
+        fi
+        rm -rf "$missing_step_result_dir" 2>/dev/null || true
     else
-        qst_mark_step "missing_step_cannot_pass" "fail" "child output: $child_out"
+        qst_mark_step "missing_step_cannot_pass" "fail" "no result.json found for missing-step child"
         QST_FAILED=$((QST_FAILED + 1))
     fi
 
@@ -388,16 +399,27 @@ run_selftest() {
     fi
 }
 
-# A tiny internal mode used only by run_selftest's children above: proves the
-# tracker itself (not a real cluster) refuses to report PASS when a required
-# step never ran, and correctly marks an interrupted run.
-if [[ "$MODE" == "__selftest_child_missing_step" ]]; then
-    qst_init step_one step_two
-    qst_mark_step "step_one" "pass" "ok"
-    # step_two deliberately never marked -> must not be able to PASS.
-    summary="$(qst_compute_summary_json "child-$$" "child" 0 '{}')"
-    status="$(echo "$summary" | jq -r .status)"
-    [[ "$status" != "PASS" ]] && echo "FAIL_AS_EXPECTED" || echo "UNEXPECTED_PASS"
+# A tiny internal mode used only by run_selftest above: proves that a real
+# named step (cluster_bootstrap) whose work genuinely runs -- a real
+# candidate build, a real initdb/pg_ctl start, a real database -- but is
+# deliberately never marked complete, cannot yield status=PASS. cleanup()
+# (registered via the EXIT trap below) tears the real cluster back down and
+# writes the actual result.json that run_selftest inspects.
+if [[ "$MODE" == "__selftest_child_missing_named_step" ]]; then
+    MODE=dev
+    SIZE_MIB=1
+    RUN_ID="missing-step-child-$$"
+    WORK_ROOT="$ROOT/target/poc/online-snapshot-wal-alignment/$RUN_ID"
+    DATA="$WORK_ROOT/data"; LOG_DIR="$WORK_ROOT/log"; LOG="$LOG_DIR/postgresql.log"
+    PGLIB_DIR="$WORK_ROOT/pglib"; SOCKET="/tmp/pgfb-poc-$RUN_ID"; RESULT_JSON="$WORK_ROOT/result.json"
+    qst_init candidate_build cluster_bootstrap
+    trap 'qst_on_signal HUP' HUP; trap 'qst_on_signal INT' INT; trap 'qst_on_signal TERM' TERM
+    trap cleanup EXIT
+    build_and_verify_candidate || die "candidate build failed"
+    qst_mark_step "candidate_build" "pass" "sha256=$CANDIDATE_SO_SHA256"
+    bootstrap_cluster
+    install_oracle_sql
+    # cluster_bootstrap deliberately never marked -> must not be able to PASS.
     exit 0
 fi
 if [[ "$MODE" == "__selftest_child_interrupt_target" ]]; then
@@ -1432,6 +1454,13 @@ SQL
     apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,markers,duplicate_commits,out_of_order FROM poc_apply_shadow('$boundary_lsn'::pg_lsn, $oid);")"
     IFS='|' read -r b_commits b_ins b_upd b_del b_mark b_dup b_ooo <<<"$apply_out"
     [[ "$b_dup" == "0" && "$b_ooo" == "0" ]] || die "protocol B[$tbl]: duplicate_commits=$b_dup out_of_order=$b_ooo"
+    # The writer loop's own commit counter and the WAL-decoded replay count
+    # observe the exact same window (writer starts strictly after the
+    # marker's boundary_lsn, per poll_ctas_active above) and the exact same
+    # table (no other session writes $tbl during the copy), so they must be
+    # numerically equal. A silent under/over-count that still stayed
+    # nonzero would otherwise pass every other check here undetected.
+    [[ "$b_commits" == "$copy_window_commits" ]] || die "protocol B[$tbl]: commits_replayed=$b_commits != copy_window_commits=$copy_window_commits"
     [[ "$b_ins" -gt 0 ]] || die "protocol B[$tbl]: inserts_replayed is 0, expected concurrent-writer inserts to replay"
     [[ "$b_upd" -gt 0 ]] || die "protocol B[$tbl]: updates_replayed is 0, expected concurrent-writer updates to replay"
     [[ "$b_del" -gt 0 ]] || die "protocol B[$tbl]: deletes_replayed is 0, expected concurrent-writer deletes to replay"
