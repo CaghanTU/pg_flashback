@@ -1256,8 +1256,25 @@ run_backup_footprint() {
     take_physical_backup "$indb_dir"
     local indb_bytes; indb_bytes="$(du -sb "$indb_dir" | awk '{print $1}')"
     rm -rf "$indb_dir"
-    q "$DB" "DELETE FROM poc_bench_chunks WHERE artifact_id='$indb_artifact_id';
-             DELETE FROM poc_bench_manifest WHERE artifact_id='$indb_artifact_id';" >/dev/null
+    # DROP + recreate, not DELETE: a plain DELETE marks rows dead but does
+    # not shrink poc_bench_chunks' physical file (that needs VACUUM FULL or
+    # an equivalent full rewrite) -- confirmed empirically: without this,
+    # the next backend's ("external_zstd") backup measurement included
+    # in_db_logged_zstd's still-physically-present ~126 MB of deleted
+    # chunk bytea, making both backends report the identical, wrong,
+    # nonzero delta. DROP TABLE fully releases the underlying relation
+    # file, same discipline heap_v1's DROP TABLE artifact table above
+    # already gets right.
+    q "$DB" "DELETE FROM poc_bench_manifest WHERE artifact_id='$indb_artifact_id';
+             DROP TABLE poc_bench_chunks;
+             CREATE TABLE poc_bench_chunks (
+                 artifact_id text NOT NULL REFERENCES poc_bench_manifest(artifact_id),
+                 chunk_seq int NOT NULL,
+                 chunk_sha256 text NOT NULL,
+                 chunk_bytes bytea NOT NULL,
+                 PRIMARY KEY (artifact_id, chunk_seq)
+             );
+             ALTER TABLE poc_bench_chunks ALTER COLUMN chunk_bytes SET STORAGE EXTERNAL;" >/dev/null
     record_metric "backup_footprint.${SHAPE}.in_db_logged_zstd_backup_bytes" "$indb_bytes" "bytes"
     record_metric "backup_footprint.${SHAPE}.in_db_logged_zstd_backup_delta_bytes" "$((indb_bytes - baseline_bytes))" "bytes"
     qst_mark_step "backup_in_db_logged_zstd" "pass" "delta_bytes=$((indb_bytes - baseline_bytes))"
