@@ -582,31 +582,49 @@ run_bench_writer_loop() {
     local i=0
     while [[ ! -f "$stop_file" ]]; do
         i=$((i+1))
+        # "|| true" on every statement: this whole function runs as a
+        # background subshell that inherits the script's global
+        # set -Eeuo pipefail, so a bare (unguarded) failing statement would
+        # kill the ENTIRE writer subshell right there -- never reaching the
+        # remaining statements, the ledger insert, or touch "$ready_file"
+        # for this or any later iteration. That is not hypothetical: a
+        # mid_materialize crash's retry starts a FRESH writer loop with i
+        # reset to 1, but the crashed first attempt's own i=1 INSERT (id=-1)
+        # already committed durably before the crash -- so the retry's
+        # first INSERT genuinely, deterministically collides on that same
+        # id, and every mid_materialize test failed with "duplicate key
+        # value violates unique constraint" until this was added. The old
+        # (pre-ledger) design tolerated this the same way, via
+        # "cmd && commits=$((commits+1))" -- the && exempted the LHS from
+        # errexit as a side effect, which the ledger rewrite lost. The
+        # ledger itself is unaffected: a transaction that fails never
+        # commits its ledger row either way, so copy_window_commits still
+        # only ever counts genuinely durable commits.
         if [[ "$schema_kind" == "toast" ]]; then
             q "$DB" "BEGIN;
                      INSERT INTO $tbl VALUES (-$i, decode(repeat('00',200),'hex'));
                      INSERT INTO poc_bench_writer_ledger(op) VALUES ('ins');
-                     COMMIT;" >/dev/null 2>&1
+                     COMMIT;" >/dev/null 2>&1 || true
             q "$DB" "BEGIN;
                      UPDATE $tbl SET blob = (SELECT decode(string_agg(md5((g||'-$i')::text), ''), 'hex')
                        FROM generate_series(1,64) g) WHERE id = 1;
                      INSERT INTO poc_bench_writer_ledger(op) VALUES ('upd');
-                     COMMIT;" >/dev/null 2>&1
+                     COMMIT;" >/dev/null 2>&1 || true
         else
             q "$DB" "BEGIN;
                      INSERT INTO $tbl VALUES (-$i, 'writer-'||$i, $i, clock_timestamp());
                      INSERT INTO poc_bench_writer_ledger(op) VALUES ('ins');
-                     COMMIT;" >/dev/null 2>&1
+                     COMMIT;" >/dev/null 2>&1 || true
             q "$DB" "BEGIN;
                      UPDATE $tbl SET payload = 'updated-'||$i WHERE id = 1;
                      INSERT INTO poc_bench_writer_ledger(op) VALUES ('upd');
-                     COMMIT;" >/dev/null 2>&1
+                     COMMIT;" >/dev/null 2>&1 || true
         fi
         if (( i > 2 )); then
             q "$DB" "BEGIN;
                      DELETE FROM $tbl WHERE id = $(( -(i-2) ));
                      INSERT INTO poc_bench_writer_ledger(op) VALUES ('del');
-                     COMMIT;" >/dev/null 2>&1
+                     COMMIT;" >/dev/null 2>&1 || true
         fi
         touch "$ready_file"
         [[ -f "$stop_file" ]] && break
