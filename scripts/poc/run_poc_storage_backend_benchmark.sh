@@ -37,6 +37,7 @@
 #   ./scripts/poc/run_poc_storage_backend_benchmark.sh selftest
 #   ./scripts/poc/run_poc_storage_backend_benchmark.sh bench  <backend> <shape> <size_mib> [rep_label]
 #   ./scripts/poc/run_poc_storage_backend_benchmark.sh crash  <backend> <shape> <size_mib> <crash_point>
+#   ./scripts/poc/run_poc_storage_backend_benchmark.sh backup-footprint <shape> [size_mib]
 #
 #   backend: heap_v1 | in_db_logged_zstd | external_zstd
 #   shape:   ordinary_bad | toast_bad | good_compress
@@ -70,11 +71,16 @@ case "$MODE" in
         BACKEND="${2:-}"; SHAPE="${3:-}"; SIZE_MIB="${4:-1024}"; CRASH_POINT="${5:-}"
         [[ -n "$CRASH_POINT" ]] || { echo "FAIL: crash mode needs a crash_point" >&2; exit 2; }
         ;;
+    backup-footprint)
+        SHAPE="${2:-ordinary_bad}"; SIZE_MIB="${3:-512}"
+        ;;
     __selftest_child_missing_named_step|__selftest_child_interrupt_target) ;;
-    *) { echo "FAIL: unknown mode $MODE (use selftest|bench|crash)" >&2; exit 2; } ;;
+    *) { echo "FAIL: unknown mode $MODE (use selftest|bench|crash|backup-footprint)" >&2; exit 2; } ;;
 esac
 if [[ "$MODE" == "bench" || "$MODE" == "crash" ]]; then
     case "$BACKEND" in heap_v1|in_db_logged_zstd|external_zstd) ;; *) { echo "FAIL: unknown backend $BACKEND" >&2; exit 2; } ;; esac
+fi
+if [[ "$MODE" == "bench" || "$MODE" == "crash" || "$MODE" == "backup-footprint" ]]; then
     case "$SHAPE" in ordinary_bad|toast_bad|good_compress) ;; *) { echo "FAIL: unknown shape $SHAPE" >&2; exit 2; } ;; esac
 fi
 
@@ -113,6 +119,9 @@ case "$MODE" in
         ;;
     crash)
         qst_init candidate_build cluster_bootstrap crash_setup crash_injected crash_postcheck crash_retry
+        ;;
+    backup-footprint)
+        qst_init candidate_build cluster_bootstrap backup_baseline backup_heap_v1 backup_in_db_logged_zstd backup_external_zstd
         ;;
     __selftest_child_missing_named_step|__selftest_child_interrupt_target)
         ;;
@@ -1187,6 +1196,93 @@ verify_restore() {
     return 0
 }
 
+# Real physical-backup byte measurement, not an inference from timing or
+# architecture. pg_basebackup against the SAME cluster/source table,
+# before and after each backend's artifact exists (one backend at a time,
+# artifact removed between measurements so deltas are independent, not
+# cumulative) -- -X none since this measures data-directory contents
+# specifically, not a WAL archive. -A trust at initdb already covers the
+# generated replication pg_hba.conf entries, so no separate auth setup is
+# needed here.
+take_physical_backup() {
+    local dest=$1
+    "$PG_BIN/pg_basebackup" -h "$SOCKET" -p "$PORT" -D "$dest" -Fp -X none --checkpoint=fast >/dev/null 2>&1 \
+        || die "backup-footprint: pg_basebackup failed (dest=$dest)"
+}
+
+# ── backup-footprint mode: measure each backend's real incremental
+# contribution to a physical backup of the SAME cluster/source table ────
+run_backup_footprint() {
+    local tbl=poc_bench_src
+    make_shape "$SHAPE" "$tbl" "$SIZE_MIB"
+    capture_runtime_identity
+    local source_table_bytes source_logical_bytes
+    source_table_bytes="$(q "$DB" "SELECT pg_total_relation_size('$tbl');")"
+    source_logical_bytes="$(q "$DB" "SELECT sum(pg_column_size(t.*))::bigint FROM $tbl t;")"
+    record_metric "backup_footprint.${SHAPE}.source_table_bytes" "$source_table_bytes" "bytes"
+    record_metric "backup_footprint.${SHAPE}.source_logical_bytes" "$source_logical_bytes" "bytes"
+
+    local baseline_dir="$WORK_ROOT/backup_baseline"
+    take_physical_backup "$baseline_dir"
+    local baseline_bytes; baseline_bytes="$(du -sb "$baseline_dir" | awk '{print $1}')"
+    rm -rf "$baseline_dir"
+    record_metric "backup_footprint.${SHAPE}.baseline_backup_bytes" "$baseline_bytes" "bytes"
+    qst_mark_step "backup_baseline" "pass" "baseline_backup_bytes=$baseline_bytes"
+
+    # heap_v1: artifact is just another heap table in the same cluster.
+    q "$DB" "DROP TABLE IF EXISTS ${tbl}_artifact_heap; CREATE TABLE ${tbl}_artifact_heap AS SELECT * FROM $tbl;" >/dev/null
+    local heap_dir="$WORK_ROOT/backup_heap"
+    take_physical_backup "$heap_dir"
+    local heap_bytes; heap_bytes="$(du -sb "$heap_dir" | awk '{print $1}')"
+    rm -rf "$heap_dir"
+    q "$DB" "DROP TABLE ${tbl}_artifact_heap;" >/dev/null
+    record_metric "backup_footprint.${SHAPE}.heap_v1_backup_bytes" "$heap_bytes" "bytes"
+    record_metric "backup_footprint.${SHAPE}.heap_v1_backup_delta_bytes" "$((heap_bytes - baseline_bytes))" "bytes"
+    qst_mark_step "backup_heap_v1" "pass" "delta_bytes=$((heap_bytes - baseline_bytes))"
+
+    # No concurrent writer in this mode (this measures storage footprint,
+    # not WAL-replay correctness, which the bench/crash modes already
+    # cover) -- the static source table itself is the correct reference,
+    # so GT_TBL=$tbl directly rather than a separate loaded copy.
+    local rawfile="$WORK_ROOT/rawstream_footprint.bin"
+    "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -c "\\copy (SELECT * FROM $tbl) TO '$rawfile' (FORMAT binary)" >/dev/null
+    GT_TBL="$tbl"
+    RAW_STREAM_SHA256="$(sha256_file "$rawfile")"
+    BOUNDARY_LSN="0/0"; MARKER_XID=0
+
+    local indb_artifact_id="footprint-indb-${SHAPE}-$$"
+    persist_in_db_logged_zstd "$rawfile" "$indb_artifact_id" "$tbl" ""
+    local indb_dir="$WORK_ROOT/backup_indb"
+    take_physical_backup "$indb_dir"
+    local indb_bytes; indb_bytes="$(du -sb "$indb_dir" | awk '{print $1}')"
+    rm -rf "$indb_dir"
+    q "$DB" "DELETE FROM poc_bench_chunks WHERE artifact_id='$indb_artifact_id';
+             DELETE FROM poc_bench_manifest WHERE artifact_id='$indb_artifact_id';" >/dev/null
+    record_metric "backup_footprint.${SHAPE}.in_db_logged_zstd_backup_bytes" "$indb_bytes" "bytes"
+    record_metric "backup_footprint.${SHAPE}.in_db_logged_zstd_backup_delta_bytes" "$((indb_bytes - baseline_bytes))" "bytes"
+    qst_mark_step "backup_in_db_logged_zstd" "pass" "delta_bytes=$((indb_bytes - baseline_bytes))"
+
+    local ext_artifact_id="footprint-ext-${SHAPE}-$$"
+    persist_external_zstd "$rawfile" "$ext_artifact_id" "$tbl" ""
+    local ext_dir="$WORK_ROOT/backup_ext"
+    take_physical_backup "$ext_dir"
+    local ext_bytes; ext_bytes="$(du -sb "$ext_dir" | awk '{print $1}')"
+    rm -rf "$ext_dir"
+    q "$DB" "DELETE FROM poc_bench_manifest WHERE artifact_id='$ext_artifact_id';" >/dev/null
+    rm -rf "${EXTERNAL_ARTIFACT_ROOT:?}/${ext_artifact_id:?}"
+    record_metric "backup_footprint.${SHAPE}.external_zstd_backup_bytes" "$ext_bytes" "bytes"
+    record_metric "backup_footprint.${SHAPE}.external_zstd_backup_delta_bytes" "$((ext_bytes - baseline_bytes))" "bytes"
+    qst_mark_step "backup_external_zstd" "pass" "delta_bytes=$((ext_bytes - baseline_bytes))"
+
+    EXTRA_JSON="$(echo "$EXTRA_JSON" | jq \
+        --arg shape "$SHAPE" --argjson size_mib "$SIZE_MIB" \
+        --arg source_commit "$CANDIDATE_SOURCE_COMMIT" --arg source_tree "$CANDIDATE_SOURCE_TREE" \
+        --arg so_sha256 "$CANDIDATE_SO_SHA256" \
+        --argjson metrics "$(jq -s '.' "$METRICS_JSON" 2>/dev/null || echo '[]')" \
+        '. + {shape:$shape, size_mib:$size_mib, source_commit:$source_commit, source_tree:$source_tree,
+              extension_binary_sha256:$so_sha256, metrics:$metrics}')"
+}
+
 # ── bench mode: one full backend x shape x size_mib trial ────────────────
 run_bench() {
     local tbl=poc_bench_src
@@ -1665,4 +1761,7 @@ case "$MODE" in
     crash) build_and_verify_candidate || die "candidate build/verify failed"; qst_mark_step "candidate_build" "pass" "commit=$CANDIDATE_SOURCE_COMMIT so_sha256=$CANDIDATE_SO_SHA256"
            bootstrap_cluster; install_oracle_sql; qst_mark_step "cluster_bootstrap" "pass" "port=$PORT socket=$SOCKET"
            run_crash ;;
+    backup-footprint) build_and_verify_candidate || die "candidate build/verify failed"; qst_mark_step "candidate_build" "pass" "commit=$CANDIDATE_SOURCE_COMMIT so_sha256=$CANDIDATE_SO_SHA256"
+           bootstrap_cluster; install_oracle_sql; qst_mark_step "cluster_bootstrap" "pass" "port=$PORT socket=$SOCKET"
+           run_backup_footprint ;;
 esac
