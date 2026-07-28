@@ -786,10 +786,22 @@ persist_in_db_logged_zstd() {
     local db_oid schema_fp
     db_oid="$(q "$DB" "SELECT oid FROM pg_database WHERE datname='$DB';")"
     schema_fp="$(q "$DB" "SELECT md5(string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position)) FROM information_schema.columns WHERE table_name='$tbl';")"
+    # This INSERT is the collision point duplicate_retry depends on
+    # (artifact_id PRIMARY KEY): it MUST hard-fail via die() on error, not
+    # silently continue. Without an explicit guard here, a caller wrapping
+    # this whole function in "|| flag=1" to test for exactly this failure
+    # suspends errexit for the entire call (that is how `cmd || fallback`
+    # works), so an unguarded failing statement deep inside would be
+    # silently absorbed and the function would still return 0 from its
+    # last (unrelated) statement -- confirmed empirically: duplicate_retry
+    # reported "did NOT fail closed" even though the second INSERT really
+    # did violate the PK, because nothing inside this function ever turned
+    # that into the function's own failure.
     q "$DB" "INSERT INTO poc_bench_manifest(artifact_id, backend, format_version, state, tracking_id, boundary_lsn, boundary_xid,
              pg_major, arch, system_identifier, db_oid, schema_fingerprint, semantic_fingerprint_format_version, encoding)
              VALUES ('$artifact_id','in_db_logged_zstd',1,'creating','$artifact_id','$BOUNDARY_LSN',$MARKER_XID,
-             '$PG_MAJOR_RUNTIME','$(uname -m)','$SYSTEM_IDENTIFIER_RUNTIME',$db_oid,'$schema_fp',1,'binary');" >/dev/null
+             '$PG_MAJOR_RUNTIME','$(uname -m)','$SYSTEM_IDENTIFIER_RUNTIME',$db_oid,'$schema_fp',1,'binary');" >/dev/null \
+        || die "persist-in_db[$artifact_id]: manifest row insert failed (duplicate artifact_id?)"
     crash_checkpoint "metadata_creating_row_committed" "$crash_point" || return 0
 
     ( cd "$chunk_dir" && split -b 67108864 -d -a4 "$rawfile" raw_ )
@@ -872,10 +884,14 @@ persist_external_zstd() {
     local db_oid schema_fp
     db_oid="$(q "$DB" "SELECT oid FROM pg_database WHERE datname='$DB';")"
     schema_fp="$(q "$DB" "SELECT md5(string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position)) FROM information_schema.columns WHERE table_name='$tbl';")"
+    # See the matching comment in persist_in_db_logged_zstd: this must
+    # hard-fail via die() (not silently continue) for duplicate_retry's
+    # collision detection to actually work.
     q "$DB" "INSERT INTO poc_bench_manifest(artifact_id, backend, format_version, state, tracking_id, boundary_lsn, boundary_xid,
              pg_major, arch, system_identifier, db_oid, schema_fingerprint, semantic_fingerprint_format_version, encoding)
              VALUES ('$artifact_id','external_zstd',1,'creating','$artifact_id','$BOUNDARY_LSN',$MARKER_XID,
-             '$PG_MAJOR_RUNTIME','$(uname -m)','$SYSTEM_IDENTIFIER_RUNTIME',$db_oid,'$schema_fp',1,'binary');" >/dev/null
+             '$PG_MAJOR_RUNTIME','$(uname -m)','$SYSTEM_IDENTIFIER_RUNTIME',$db_oid,'$schema_fp',1,'binary');" >/dev/null \
+        || die "persist-external[$artifact_id]: manifest row insert failed (duplicate artifact_id?)"
 
     local chunk_dir="$WORK_ROOT/chunks_${artifact_id}"
     mkdir -p "$chunk_dir"
@@ -1213,16 +1229,20 @@ run_crash_duplicate_retry() {
     esac
     qst_mark_step "crash_injected" "pass" "no crash for duplicate_retry -- tests idempotent double-persist under the SAME artifact identity"
 
+    # persist_in_db_logged_zstd/persist_external_zstd now die() internally
+    # on a manifest-row collision -- same subshell+if requirement as the
+    # restore_* calls above, since a bare "|| dup_failed=1" cannot catch an
+    # internal exit call.
     local dup_failed=0
     case "$BACKEND" in
         heap_v1)
             q "$DB" "CREATE TABLE ${tbl}_artifact_heap AS SELECT * FROM $tbl;" >/dev/null 2>&1 || dup_failed=1
             ;;
         in_db_logged_zstd)
-            persist_in_db_logged_zstd "$rawfile" "$artifact_id" "$tbl" "" >/dev/null 2>&1 || dup_failed=1
+            if ( persist_in_db_logged_zstd "$rawfile" "$artifact_id" "$tbl" "" ) >/dev/null 2>&1; then dup_failed=0; else dup_failed=1; fi
             ;;
         external_zstd)
-            persist_external_zstd "$rawfile" "$artifact_id" "$tbl" "" >/dev/null 2>&1 || dup_failed=1
+            if ( persist_external_zstd "$rawfile" "$artifact_id" "$tbl" "" ) >/dev/null 2>&1; then dup_failed=0; else dup_failed=1; fi
             ;;
     esac
     [[ "$dup_failed" == "1" ]] || die "crash[duplicate_retry]: persisting the same identity twice did NOT fail closed -- expected a collision rejection"
