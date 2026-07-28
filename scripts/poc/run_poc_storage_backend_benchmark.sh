@@ -190,7 +190,20 @@ cleanup() {
         echo "Evidence retained at $WORK_ROOT (status=$overall, DATA/PGLIB/artifacts kept, ephemeral_disk_bytes=$ephemeral_disk_bytes external_artifact_bytes=$external_artifact_bytes)" >&2
     else
         rm -rf "$DATA" "$PGLIB_DIR" "$EXTERNAL_ARTIFACT_ROOT" || cleanup_failed=1
-        echo "Evidence retained at $WORK_ROOT (status=$overall; ephemeral cluster/artifact data cleaned, ephemeral_disk_bytes=$ephemeral_disk_bytes external_artifact_bytes=$external_artifact_bytes)" >&2
+        # rawstream_*.bin (the uncompressed COPY BINARY snapshot, up to the
+        # full logical size of whatever was under test), chunks_*/ (staged
+        # compressed chunks before they're loaded into the DB or renamed
+        # into the external artifact dir), and restore_*/ (reconstructed
+        # streams used only to verify a restore) are working files, not
+        # evidence -- result.json/metrics.jsonl/log/ already capture
+        # everything evidentiary. At 1 GiB+ scale across many runs these
+        # accumulate fast enough to exhaust disk on their own (observed:
+        # 37G across one session's runs, three later runs FAILed on ENOSPC
+        # as a direct result). Removed under the same POC_KEEP/
+        # POC_KEEP_FAILED_DATA gate as DATA/PGLIB above.
+        rm -f "$WORK_ROOT"/rawstream_*.bin 2>/dev/null
+        find "$WORK_ROOT" -maxdepth 1 -type d \( -name 'chunks_*' -o -name 'restore_*' \) -exec rm -rf {} + 2>/dev/null
+        echo "Evidence retained at $WORK_ROOT (status=$overall; ephemeral cluster/artifact/working data cleaned, ephemeral_disk_bytes=$ephemeral_disk_bytes external_artifact_bytes=$external_artifact_bytes)" >&2
     fi
 
     local leftover; leftover="$(pgrep -af "$WORK_ROOT" 2>/dev/null || true)"
