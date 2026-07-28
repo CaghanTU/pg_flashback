@@ -355,6 +355,24 @@ fsync_path() { sync "$1" 2>/dev/null || true; }
 wal_insert_lsn() { q "$DB" "SELECT pg_current_wal_insert_lsn();"; }
 wal_bytes_between() { local before=$1 after=$2; q "$DB" "SELECT pg_wal_lsn_diff('$after'::pg_lsn, '$before'::pg_lsn)::bigint;"; }
 
+# Column order (via ORDER BY attnum), type+typmod (via format_type, which
+# renders e.g. numeric(10,2) or varchar(50), not just the bare type name),
+# and collation -- a bare "column_name:data_type" string_agg (the previous
+# version of this fingerprint) cannot distinguish text COLLATE "C" from
+# text COLLATE "en_US", or numeric from numeric(10,2). Shared by persist
+# (recorded into the manifest) and restore (recomputed and compared).
+compute_schema_fingerprint() {
+    local tbl=$1
+    q "$DB" "SELECT md5(string_agg(
+        a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' || COALESCE(c.collname, 'default'),
+        ',' ORDER BY a.attnum))
+      FROM pg_attribute a
+      LEFT JOIN pg_collation c ON c.oid = a.attcollation
+      WHERE a.attrelid = '$tbl'::regclass AND a.attnum > 0 AND NOT a.attisdropped;"
+}
+table_owner() { local tbl=$1; q "$DB" "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '$tbl'::regclass;"; }
+table_acl() { local tbl=$1; q "$DB" "SELECT COALESCE(relacl::text, '(none)') FROM pg_class WHERE oid = '$tbl'::regclass;"; }
+
 # ── oracle SQL, installed once per DB -- IDENTICAL schema/functions to
 # Step 7's install_oracle_sql (scripts/run_poc_online_snapshot_wal_alignment.sh),
 # duplicated here (not sourced) because Step 8 is a deliberately isolated
@@ -850,7 +868,7 @@ persist_in_db_logged_zstd() {
 
     local db_oid schema_fp
     db_oid="$(q "$DB" "SELECT oid FROM pg_database WHERE datname='$DB';")"
-    schema_fp="$(q "$DB" "SELECT md5(string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position)) FROM information_schema.columns WHERE table_name='$tbl';")"
+    schema_fp="$(compute_schema_fingerprint "$tbl")"
     # This INSERT is the collision point duplicate_retry depends on
     # (artifact_id PRIMARY KEY): it MUST hard-fail via die() on error, not
     # silently continue. Without an explicit guard here, a caller wrapping
@@ -896,6 +914,55 @@ persist_in_db_logged_zstd() {
     return 0
 }
 
+# Validates every field actually recorded in the manifest, not just the two
+# (pg_major, system_identifier) checked before: format version, backend
+# identity, architecture, current db oid, encoding, tracking id, semantic
+# fingerprint format version, row count, and schema fingerprint (column
+# order/type/typmod/collation, via compute_schema_fingerprint) against
+# $GT_TBL -- available and already correct at this point, so this check
+# runs genuinely BEFORE any restore work happens, not after. Also cross-
+# checks boundary_lsn/boundary_xid against the durable WAL-decode ledger
+# (commit_log) from the SAME snapshot run: independent corroboration that
+# the manifest's own provenance claim agrees with what was actually
+# decoded, not merely "the same bash variable used twice." Any mismatch
+# is fail-closed.
+validate_manifest_binding() {
+    local artifact_id=$1 expected_backend=$2
+    local m_format_version m_backend m_pg_major m_arch m_sysid m_db_oid m_encoding
+    local m_tracking_id m_semantic_fp_version m_schema_fp m_row_count m_boundary_lsn m_boundary_xid
+    read -r m_format_version m_backend m_pg_major m_arch m_sysid m_db_oid m_encoding \
+        m_tracking_id m_semantic_fp_version m_schema_fp m_row_count m_boundary_lsn m_boundary_xid \
+        <<<"$(q "$DB" "SELECT format_version||' '||backend||' '||pg_major||' '||arch||' '||system_identifier||' '||
+                  db_oid||' '||encoding||' '||tracking_id||' '||semantic_fingerprint_format_version||' '||
+                  schema_fingerprint||' '||row_count||' '||boundary_lsn||' '||boundary_xid
+                  FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
+
+    [[ "$m_format_version" == "1" ]] || die "manifest-binding[$artifact_id]: unexpected format_version=$m_format_version (expected 1) -- refusing to restore"
+    [[ "$m_backend" == "$expected_backend" ]] || die "manifest-binding[$artifact_id]: backend=$m_backend != expected $expected_backend -- refusing to restore"
+    [[ "$m_pg_major" == "$PG_MAJOR_RUNTIME" ]] || die "manifest-binding[$artifact_id]: pg_major=$m_pg_major != runtime $PG_MAJOR_RUNTIME -- refusing to restore"
+    [[ "$m_arch" == "$(uname -m)" ]] || die "manifest-binding[$artifact_id]: arch=$m_arch != runtime $(uname -m) -- refusing to restore"
+    [[ "$m_sysid" == "$SYSTEM_IDENTIFIER_RUNTIME" ]] || die "manifest-binding[$artifact_id]: system_identifier=$m_sysid != runtime $SYSTEM_IDENTIFIER_RUNTIME -- refusing to restore"
+    local current_db_oid; current_db_oid="$(q "$DB" "SELECT oid FROM pg_database WHERE datname='$DB';")"
+    [[ "$m_db_oid" == "$current_db_oid" ]] || die "manifest-binding[$artifact_id]: db_oid=$m_db_oid != current db oid $current_db_oid -- refusing to restore"
+    [[ "$m_encoding" == "binary" ]] || die "manifest-binding[$artifact_id]: encoding=$m_encoding != expected binary -- refusing to restore"
+    [[ "$m_tracking_id" == "$artifact_id" ]] || die "manifest-binding[$artifact_id]: tracking_id=$m_tracking_id != artifact_id -- refusing to restore"
+    [[ "$m_semantic_fp_version" == "1" ]] || die "manifest-binding[$artifact_id]: semantic_fingerprint_format_version=$m_semantic_fp_version != expected 1 -- refusing to restore"
+
+    [[ -n "$GT_TBL" ]] || die "manifest-binding[$artifact_id]: no ground-truth table in scope to validate against"
+    local current_schema_fp; current_schema_fp="$(compute_schema_fingerprint "$GT_TBL")"
+    [[ "$m_schema_fp" == "$current_schema_fp" ]] \
+        || die "manifest-binding[$artifact_id]: schema_fingerprint mismatch (manifest=$m_schema_fp current=$current_schema_fp) -- refusing to restore"
+    local current_row_count; current_row_count="$(row_count "$GT_TBL")"
+    [[ "$m_row_count" == "$current_row_count" ]] \
+        || die "manifest-binding[$artifact_id]: row_count mismatch (manifest=$m_row_count ground_truth=$current_row_count) -- refusing to restore"
+
+    local ledger_lsn; ledger_lsn="$(q "$DB" "SELECT lsn::text FROM commit_log WHERE xid = $m_boundary_xid;")"
+    [[ -n "$ledger_lsn" ]] \
+        || die "manifest-binding[$artifact_id]: boundary_xid=$m_boundary_xid not found in the decoded WAL commit ledger -- refusing to restore"
+    [[ "$ledger_lsn" == "$m_boundary_lsn" ]] \
+        || die "manifest-binding[$artifact_id]: manifest boundary_lsn=$m_boundary_lsn != decoded ledger lsn=$ledger_lsn for xid=$m_boundary_xid -- refusing to restore"
+}
+
 # heap_v1's restore must pay a real, comparable cost, not be measured as a
 # no-op alias for the artifact table itself. A real DROP-recovery restore
 # from a retained heap artifact requires materializing a genuinely separate,
@@ -915,11 +982,7 @@ restore_in_db_logged_zstd() {
     local artifact_id=$1 restored_tbl=$2
     local state; state="$(q "$DB" "SELECT state FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
     [[ "$state" == "available" ]] || die "restore-in_db[$artifact_id]: artifact state is '$state', not 'available' -- refusing to restore"
-    local manifest_pg_major manifest_sysid
-    manifest_pg_major="$(q "$DB" "SELECT pg_major FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
-    manifest_sysid="$(q "$DB" "SELECT system_identifier FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
-    [[ "$manifest_pg_major" == "$PG_MAJOR_RUNTIME" ]] || die "restore-in_db[$artifact_id]: manifest pg_major=$manifest_pg_major != runtime pg_major=$PG_MAJOR_RUNTIME -- refusing to restore"
-    [[ "$manifest_sysid" == "$SYSTEM_IDENTIFIER_RUNTIME" ]] || die "restore-in_db[$artifact_id]: manifest system_identifier=$manifest_sysid != runtime system_identifier=$SYSTEM_IDENTIFIER_RUNTIME -- refusing to restore"
+    validate_manifest_binding "$artifact_id" "in_db_logged_zstd"
     local expected_hash actual_hash
     expected_hash="$(q "$DB" "SELECT raw_stream_sha256 FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
     local chunk_count; chunk_count="$(q "$DB" "SELECT chunk_count FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
@@ -963,7 +1026,7 @@ persist_external_zstd() {
 
     local db_oid schema_fp
     db_oid="$(q "$DB" "SELECT oid FROM pg_database WHERE datname='$DB';")"
-    schema_fp="$(q "$DB" "SELECT md5(string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position)) FROM information_schema.columns WHERE table_name='$tbl';")"
+    schema_fp="$(compute_schema_fingerprint "$tbl")"
     # See the matching comment in persist_in_db_logged_zstd: this must
     # hard-fail via die() (not silently continue) for duplicate_retry's
     # collision detection to actually work.
@@ -1047,14 +1110,13 @@ restore_external_zstd() {
     m_hash="$(jq -r .raw_stream_sha256 "$manifest_final")"
     local db_root; db_root="$(q "$DB" "SELECT manifest_root_digest FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
     [[ "$m_root" == "$db_root" ]] || die "restore-external[$artifact_id]: on-disk manifest_root_digest ($m_root) != DB manifest_root_digest ($db_root) -- refusing to restore"
-    local m_pg_major m_sysid db_pg_major db_sysid
+    local m_pg_major m_sysid
     m_pg_major="$(jq -r .pg_major "$manifest_final")"; m_sysid="$(jq -r .system_identifier "$manifest_final")"
-    db_pg_major="$(q "$DB" "SELECT pg_major FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
-    db_sysid="$(q "$DB" "SELECT system_identifier FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
-    [[ "$m_pg_major" == "$PG_MAJOR_RUNTIME" && "$db_pg_major" == "$PG_MAJOR_RUNTIME" ]] \
-        || die "restore-external[$artifact_id]: pg_major mismatch (manifest=$m_pg_major db=$db_pg_major runtime=$PG_MAJOR_RUNTIME) -- refusing to restore"
-    [[ "$m_sysid" == "$SYSTEM_IDENTIFIER_RUNTIME" && "$db_sysid" == "$SYSTEM_IDENTIFIER_RUNTIME" ]] \
-        || die "restore-external[$artifact_id]: system_identifier mismatch (manifest=$m_sysid db=$db_sysid runtime=$SYSTEM_IDENTIFIER_RUNTIME) -- refusing to restore"
+    [[ "$m_pg_major" == "$PG_MAJOR_RUNTIME" ]] \
+        || die "restore-external[$artifact_id]: on-disk manifest pg_major=$m_pg_major != runtime $PG_MAJOR_RUNTIME -- refusing to restore"
+    [[ "$m_sysid" == "$SYSTEM_IDENTIFIER_RUNTIME" ]] \
+        || die "restore-external[$artifact_id]: on-disk manifest system_identifier=$m_sysid != runtime $SYSTEM_IDENTIFIER_RUNTIME -- refusing to restore"
+    validate_manifest_binding "$artifact_id" "external_zstd"
 
     local restore_dir="$WORK_ROOT/restore_${artifact_id}"
     mkdir -p "$restore_dir"
@@ -1096,14 +1158,19 @@ verify_restore() {
     gt_fp="$(fingerprint_table "$GT_TBL")"; r_fp="$(fingerprint_table "$restored_tbl")"
     [[ "$gt_fp" == "$r_fp" ]] || die "verify[$restored_tbl]: semantic fingerprint mismatch ground_truth=$gt_fp restored=$r_fp"
     local gt_schema r_schema
-    gt_schema="$(q "$DB" "SELECT string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='$GT_TBL';")"
-    r_schema="$(q "$DB" "SELECT string_agg(column_name||':'||data_type, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name='$restored_tbl';")"
-    [[ "$gt_schema" == "$r_schema" ]] || die "verify[$restored_tbl]: schema mismatch ground_truth=[$gt_schema] restored=[$r_schema]"
+    gt_schema="$(compute_schema_fingerprint "$GT_TBL")"
+    r_schema="$(compute_schema_fingerprint "$restored_tbl")"
+    [[ "$gt_schema" == "$r_schema" ]] || die "verify[$restored_tbl]: canonical schema fingerprint mismatch (column order/type/typmod/collation) ground_truth=$gt_schema restored=$r_schema"
     if [[ "$shape" == "toast_bad" ]]; then
         local gt_th r_th
         gt_th="$(toast_hash "$GT_TBL" blob)"; r_th="$(toast_hash "$restored_tbl" blob)"
         [[ "$gt_th" == "$r_th" ]] || die "verify[$restored_tbl]: TOAST byte-equality hash mismatch ground_truth=$gt_th restored=$r_th"
     fi
+    local gt_owner r_owner gt_acl r_acl
+    gt_owner="$(table_owner "$GT_TBL")"; r_owner="$(table_owner "$restored_tbl")"
+    [[ "$gt_owner" == "$r_owner" ]] || die "verify[$restored_tbl]: owner mismatch ground_truth=$gt_owner restored=$r_owner"
+    gt_acl="$(table_acl "$GT_TBL")"; r_acl="$(table_acl "$restored_tbl")"
+    [[ "$gt_acl" == "$r_acl" ]] || die "verify[$restored_tbl]: ACL mismatch ground_truth=[$gt_acl] restored=[$r_acl]"
     return 0
 }
 
