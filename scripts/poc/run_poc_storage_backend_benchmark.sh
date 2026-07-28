@@ -1265,8 +1265,8 @@ run_backup_footprint() {
     # nonzero delta. DROP TABLE fully releases the underlying relation
     # file, same discipline heap_v1's DROP TABLE artifact table above
     # already gets right.
-    q "$DB" "DELETE FROM poc_bench_manifest WHERE artifact_id='$indb_artifact_id';
-             DROP TABLE poc_bench_chunks;
+    q "$DB" "DROP TABLE poc_bench_chunks;
+             DELETE FROM poc_bench_manifest WHERE artifact_id='$indb_artifact_id';
              CREATE TABLE poc_bench_chunks (
                  artifact_id text NOT NULL REFERENCES poc_bench_manifest(artifact_id),
                  chunk_seq int NOT NULL,
