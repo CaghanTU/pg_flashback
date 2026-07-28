@@ -747,7 +747,11 @@ load_ground_truth_from_rawfile() {
     RAW_STREAM_SHA256="$(sha256_file "$rawfile")"
     local t0 t1
     t0=$(now_ms)
-    q "$DB" "CREATE TABLE ${tbl}_ground_truth (LIKE $tbl);" >/dev/null
+    # DROP IF EXISTS: crash-mode call sites load ground truth twice against
+    # the same $tbl within one run (once for the crashed attempt, once for
+    # the clean retry) -- same re-callability requirement as the oracle
+    # shadow bookkeeping above.
+    q "$DB" "DROP TABLE IF EXISTS ${tbl}_ground_truth; CREATE TABLE ${tbl}_ground_truth (LIKE $tbl);" >/dev/null
     "${PSQL[@]}" -d "$DB" -v ON_ERROR_STOP=1 -c "\\copy ${tbl}_ground_truth FROM '$rawfile' (FORMAT binary)" >/dev/null
     t1=$(now_ms)
     GT_LOAD_MS=$((t1-t0))
