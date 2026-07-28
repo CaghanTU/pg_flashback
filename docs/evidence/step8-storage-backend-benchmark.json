@@ -1,6 +1,6 @@
 {
   "step": 8,
-  "status": "1_GIB_COMPLETE_10_GIB_BLOCKED_BY_CAPACITY",
+  "status": "PARTIAL_NOT_COMPLETE",
   "generated_at": "2026-07-28T04:25:00Z",
   "harness": "scripts/poc/run_poc_storage_backend_benchmark.sh",
   "harness_commit_range": "526391b..a117ce2",
@@ -823,5 +823,6 @@
       "./scripts/poc/run_poc_storage_backend_benchmark.sh bench external_zstd toast_bad 10240 rep1",
       "(repeat each with rep2 for the required second trial; run sequentially, not in parallel, so the harness's own cleanup() reclaims disk between runs)"
     ]
-  }
+  },
+  "partial_notice": "This round mixed PASS results from different executable harness commits into one matrix (9 runs on 833ed33, 3 on b03243f, 6 heap_v1 reruns on a117ce2; crash matrix on b03243f) -- not a valid basis for a COMPLETE determination regardless of whether intervening fixes were correctness-relevant. Additionally: commits_replayed>=copy_window_commits relaxed a real SIGTERM race instead of eliminating it; heap_v1 restore_ms was a no-op measurement, not real; WAL amplification and backup-footprint were inferred, not measured; manifest binding fields were recorded but mostly unvalidated at restore; in_db_logged_zstd was missing missing_chunk/manifest_mismatch adversarial runs. This record is kept as an accurate historical account of what actually ran, not deleted or rewritten. A new evidence record on one consistent commit supersedes it."
 }

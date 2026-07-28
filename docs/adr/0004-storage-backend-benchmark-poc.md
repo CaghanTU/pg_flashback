@@ -1,11 +1,33 @@
 # ADR 0004: Storage backend PoC benchmark (Step 8)
 
-## Status
+## Status: PARTIAL -- NOT COMPLETE
 
-1 GiB comparison COMPLETE. 10 GiB finalist round BLOCKED_BY_CAPACITY (not
-run). This ADR is a decision-gate report, not a production design: no
-production `SnapshotStore` backend was added, `storage_backend`'s CHECK
-constraint was not touched, and no public API/GUC changed.
+This round's own 1 GiB matrix was **not qualified against a single
+consistent executable harness commit**: 9 matrix runs were captured against
+harness commit `833ed33`, 3 against `b03243f`, only the 6 `heap_v1` reruns
+against the final commit of that round (`a117ce2`), and the 1 GiB crash
+matrix against `b03243f`. Mixing PASS results from different executable
+commits into one "COMPLETE" claim is not a valid qualification, regardless
+of whether any individual fix in between was correctness-relevant. This
+round's PASS/FAIL results below remain historically accurate for what was
+run and are not deleted or rewritten -- they are re-labeled as an interim,
+inconsistent state, not evidence for a COMPLETE determination.
+
+Separately, several measurement and invariant issues in that round's own
+methodology were identified and must be corrected before requalification:
+`commits_replayed >= copy_window_commits` relaxed a real race instead of
+eliminating it; `heap_v1`'s `restore_ms` was measured as a no-op instead of
+a real materialization; WAL amplification and backup-footprint claims were
+inferred from timing/architecture rather than directly measured; manifest
+binding fields were recorded but mostly never validated at restore time;
+`in_db_logged_zstd`'s adversarial matrix was missing `missing_chunk` and
+`manifest_mismatch` runs (the code path existed, they were simply never
+executed). See the correction log and requalification sections below.
+
+**A new decision-gate result, on one consistent commit, supersedes this
+document once available.** Until then: no production `SnapshotStore`
+backend, no `storage_backend` CHECK constraint change, no public API/GUC
+change, Step 9 not started, 10/25/50 GiB and the 24-hour run not started.
 
 ## Purpose
 
