@@ -399,29 +399,6 @@ run_selftest() {
     fi
 }
 
-# A tiny internal mode used only by run_selftest above: proves that a real
-# named step (cluster_bootstrap) whose work genuinely runs -- a real
-# candidate build, a real initdb/pg_ctl start, a real database -- but is
-# deliberately never marked complete, cannot yield status=PASS. cleanup()
-# (registered via the EXIT trap below) tears the real cluster back down and
-# writes the actual result.json that run_selftest inspects.
-if [[ "$MODE" == "__selftest_child_missing_named_step" ]]; then
-    MODE=dev
-    SIZE_MIB=1
-    RUN_ID="missing-step-child-$$"
-    WORK_ROOT="$ROOT/target/poc/online-snapshot-wal-alignment/$RUN_ID"
-    DATA="$WORK_ROOT/data"; LOG_DIR="$WORK_ROOT/log"; LOG="$LOG_DIR/postgresql.log"
-    PGLIB_DIR="$WORK_ROOT/pglib"; SOCKET="/tmp/pgfb-poc-$RUN_ID"; RESULT_JSON="$WORK_ROOT/result.json"
-    qst_init candidate_build cluster_bootstrap
-    trap 'qst_on_signal HUP' HUP; trap 'qst_on_signal INT' INT; trap 'qst_on_signal TERM' TERM
-    trap cleanup EXIT
-    build_and_verify_candidate || die "candidate build failed"
-    qst_mark_step "candidate_build" "pass" "sha256=$CANDIDATE_SO_SHA256"
-    bootstrap_cluster
-    install_oracle_sql
-    # cluster_bootstrap deliberately never marked -> must not be able to PASS.
-    exit 0
-fi
 if [[ "$MODE" == "__selftest_child_interrupt_target" ]]; then
     MODE=dev
     SIZE_MIB=1
@@ -817,6 +794,33 @@ echo "== PoC run $RUN_ID mode=$MODE size_mib=${SIZE_MIB:-} ==" >&2
 if [[ "$MODE" == "selftest" ]]; then
     run_selftest
     EXTRA_JSON='{}'
+    exit 0
+fi
+
+# A tiny internal mode used only by run_selftest above: proves that a real
+# named step (cluster_bootstrap) whose work genuinely runs -- a real
+# candidate build, a real initdb/pg_ctl start, a real database -- but is
+# deliberately never marked complete, cannot yield status=PASS. cleanup()
+# (registered via the EXIT trap below) tears the real cluster back down and
+# writes the actual result.json that run_selftest inspects. Placed here,
+# after bootstrap_cluster/install_oracle_sql are defined above, rather than
+# next to the other __selftest_child_* blocks earlier in the file, so the
+# functions it calls actually exist.
+if [[ "$MODE" == "__selftest_child_missing_named_step" ]]; then
+    MODE=dev
+    SIZE_MIB=1
+    RUN_ID="missing-step-child-$$"
+    WORK_ROOT="$ROOT/target/poc/online-snapshot-wal-alignment/$RUN_ID"
+    DATA="$WORK_ROOT/data"; LOG_DIR="$WORK_ROOT/log"; LOG="$LOG_DIR/postgresql.log"
+    PGLIB_DIR="$WORK_ROOT/pglib"; SOCKET="/tmp/pgfb-poc-$RUN_ID"; RESULT_JSON="$WORK_ROOT/result.json"
+    qst_init candidate_build cluster_bootstrap
+    trap 'qst_on_signal HUP' HUP; trap 'qst_on_signal INT' INT; trap 'qst_on_signal TERM' TERM
+    trap cleanup EXIT
+    build_and_verify_candidate || die "candidate build failed"
+    qst_mark_step "candidate_build" "pass" "sha256=$CANDIDATE_SO_SHA256"
+    bootstrap_cluster
+    install_oracle_sql
+    # cluster_bootstrap deliberately never marked -> must not be able to PASS.
     exit 0
 fi
 
