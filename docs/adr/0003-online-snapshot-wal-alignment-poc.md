@@ -595,3 +595,79 @@ variants replayed 225 and 231 commits with byte-equality checks intact.
 This requalification restores the ADR's use as evidence for Step 8 design.
 It does not production-wire either protocol and does not qualify 1/10/25/50
 GiB scale or a 24-hour run.
+
+## Step 7 closure at real 1 GiB scale
+
+The requalification above was harness-only, at dev-mode (64 MiB) scale, and
+said so explicitly. Before this round, no run in this repository's evidence
+-- historical or requalified -- had ever crashed a real 1 GiB CTAS mid-flight,
+measured DDL-queue or xmin/vacuum-horizon behavior against a real 1 GiB
+hold, or asserted `commits_replayed == copy_window_commits`. The only 1 GiB
+numbers on record (`runs.scale_*_1gib` in the checked-in evidence) predate
+Faz A's changes to `src/capture/wal_decoder.rs` and are marked stale by the
+evidence file's own `superseded_notice`.
+
+This round found and fixed five proven gaps in the harness itself (not the
+extension -- `production_code_changed: false` holds throughout; the built
+`.so` SHA-256 is unchanged from the requalification above):
+
+1. `missing_step_cannot_pass`'s selftest gate exercised the step tracker's
+   generic contract on synthetic `step_one`/`step_two` names only;
+   `POC_SELFTEST_FORCE_SKIP` was read nowhere in the script, so a real named
+   step's absence was never actually proven fail-closed.
+2. Protocol B recorded `copy_window_commits` (the writer's own counter) and
+   `commits_replayed` (the WAL-decoded count) as separate metrics but never
+   asserted they match.
+3. The fix for (1) initially called `bootstrap_cluster`/`install_oracle_sql`
+   from a point in the script earlier than their own function definitions
+   ("command not found") -- the selftest step still passed, but for the
+   wrong reason. Caught by inspecting the child's own stderr, not just its
+   exit status; fixed by relocating the block.
+4. `scale` mode (the actual 1 GiB run path) never crash-tested anything --
+   crash/restart/retry lived only in `dev` mode against synthetic 500-row
+   tables. Added `run_scale_crash_and_retry`.
+5. DDL-queue-policy and xmin/vacuum-horizon measurement used fixed-size
+   synthetic tables and an artificial `pg_sleep` stand-in for a held
+   snapshot -- exactly the limitation "Open risks for Step 8" below already
+   flagged as not extrapolating to a real 1 GiB+ hold. Added
+   `run_scale_operational_characteristics`.
+
+Against the resulting source identity (commit `205332cd35c78a7750db610f37f96becb2b79bb1`,
+tree `cbf43c4b892e18bf0ce54e1f5de19771a8b87178`, extension binary SHA-256
+`2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae`, unchanged
+from the requalification above): the harness self-test passed, then a real
+1 GiB ordinary run and a real 1 GiB TOAST-heavy run each passed in full --
+genuine incompressible on-disk payloads (1,178,648,576 and 1,133,445,120
+physical bytes respectively; 8,947,850 and 130,946 rows), not sparse files.
+Both runs proved, at that real scale and not a smaller stand-in:
+
+- Protocol B's existing-stream reanchor path is what ran, with marker
+  identity bound transactionally by marker text and XID;
+- `commits_replayed` equalled `copy_window_commits` exactly (311/311 both
+  runs), a real concurrent writer produced non-zero INSERT/UPDATE/DELETE
+  throughout the copy, and the TOAST run's byte-equality/hash check matched;
+- the historical WAL prefix advanced with zero historical payload events
+  replayed, and no duplicate/out-of-order replay occurred;
+- a real CTAS at the full 1 GiB size was crashed (`pg_ctl stop -m immediate`)
+  while `pg_stat_activity` proved it genuinely active; no partial artifact
+  was `to_regclass()`-visible after restart; a clean retry succeeded with
+  matching row count/fingerprint; and the shared slot stayed healthy for a
+  fresh table afterward;
+- a real `ALTER TABLE` queued behind the real CTAS's `AccessShareLock` for
+  ~2.6-2.9 s (not a simulated sleep), and `backend_xmin` age / dead-tuple
+  accumulation were sampled during that same real hold; and
+- both runs emitted PASS only after child reap, postmaster shutdown,
+  filesystem cleanup, and a zero-leftover audit (`cleanup_ok: true`).
+
+Full metrics for both runs are recorded under `step7_1gib_scale_closure` in
+the checked-in evidence file; the historical `runs` and `current_requalification`
+objects above are unchanged.
+
+**Step 7 status: COMPLETE**, on the basis of this real 1 GiB closure.
+Protocol B as proven here remains a PoC correctness/boundary demonstration
+only -- there is no production `SnapshotStore` backend implementing it, and
+nothing here is wired into pg_flashback's SQL functions, GUCs, or generated
+SQL. This closes out Step 7 and unblocks Step 8 (backend comparison design);
+it does not authorize a Step 9 production implementation, and it does not
+qualify 10/25/50 GiB scale or a 24-hour run -- those remain explicitly out
+of scope here, per "Open risks for Step 8" below.

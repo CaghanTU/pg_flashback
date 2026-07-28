@@ -1206,5 +1206,505 @@
       "PASS is emitted only after child reap, postmaster shutdown, filesystem cleanup, and leftover audit"
     ]
   },
-  "overall_status": "PASS"
+  "overall_status": "PASS",
+  "step7_1gib_scale_closure": {
+    "status": "COMPLETE",
+    "source_commit": "205332cd35c78a7750db610f37f96becb2b79bb1",
+    "source_tree": "cbf43c4b892e18bf0ce54e1f5de19771a8b87178",
+    "extension_binary_sha256": "2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae",
+    "production_code_changed": false,
+    "generated_at": "2026-07-28T02:30:25Z",
+    "scope": "This is what actually closes Step 7. current_requalification (source_commit 7faf85f) above requalified only the harness itself against post-Faz-A production code, at dev-mode (64 MiB) scale; its own scope note says explicitly it does not qualify 1/10/25/50 GiB scale. This record adds real 1 GiB ordinary and 1 GiB TOAST-heavy Protocol B (existing-stream reanchor) runs -- genuine on-disk incompressible payloads, not sparse files or fake data -- against the current tree, plus three proven-and-fixed harness gaps found during this closure audit (see harness_corrections_this_round).",
+    "harness_corrections_this_round": [
+      {
+        "commit": "749dfa6f",
+        "change": "missing_step_cannot_pass selftest gate previously only exercised the tracker generic step_one/step_two contract; POC_SELFTEST_FORCE_SKIP was read nowhere in the script. Replaced with a child mode that runs a real candidate build and real cluster bootstrap, never marks cluster_bootstrap complete, and asserts the real result.json is not PASS."
+      },
+      {
+        "commit": "749dfa6f",
+        "change": "Protocol B recorded copy_window_commits (writer own counter) and commits_replayed (WAL-decoded count) as separate metrics but never asserted they match. Added the equality assertion."
+      },
+      {
+        "commit": "89b82b4f",
+        "change": "Fixed a real bug introduced by the first fix: the new missing-step child block called bootstrap_cluster/install_oracle_sql from a point in the script earlier than their own function definitions (command not found). Moved the block after the shared function definitions so it genuinely exercises them (confirmed via ephemeral_disk_bytes changing from 0 to a real ~48 MB cluster footprint)."
+      },
+      {
+        "commit": "53382d05",
+        "change": "scale mode (the actual 1 GiB run path) never crash-tested a real 1 GiB CTAS -- crash/restart/retry only existed in dev mode against synthetic 500-row tables at 64 MiB total run size. Added run_scale_crash_and_retry: crashes a real size_mib CTAS while pg_stat_activity proves it genuinely active, asserts no partial artifact survives restart, retries cleanly, verifies row-count/fingerprint match, and proves the shared slot stays healthy for a fresh table afterward."
+      },
+      {
+        "commit": "205332cd",
+        "change": "DDL-queue-policy and xmin/vacuum-horizon measurement (dev mode only) used fixed-size synthetic tables and an artificial pg_sleep to stand in for a held snapshot; the ADR itself flags this as not extrapolating to a real 1 GiB+ hold. Added run_scale_operational_characteristics: measures a real ALTER TABLE queuing behind a real full-size CTAS AccessShareLock, and xmin/dead-tuple accumulation during that real hold."
+      }
+    ],
+    "selftest": {
+      "run_id": "20260728T022140Z-548680",
+      "status": "PASS",
+      "cleanup_ok": true,
+      "missing_steps": [],
+      "steps": [
+        {
+          "name": "dirty_tree_rejected",
+          "status": "pass"
+        },
+        {
+          "name": "candidate_mismatch_rejected",
+          "status": "pass"
+        },
+        {
+          "name": "missing_step_cannot_pass",
+          "status": "pass"
+        },
+        {
+          "name": "interrupt_yields_fail",
+          "status": "pass"
+        },
+        {
+          "name": "protocol_b_child_lifecycle_failsafe",
+          "status": "pass"
+        }
+      ]
+    },
+    "scale_runs": {
+      "ordinary_1gib": {
+        "run_id": "20260728T022240Z-553031",
+        "status": "PASS",
+        "cleanup_ok": true,
+        "missing_steps": [],
+        "source_commit": "205332cd35c78a7750db610f37f96becb2b79bb1",
+        "extension_binary_sha256": "2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae",
+        "steps": [
+          {
+            "name": "candidate_build",
+            "status": "pass",
+            "detail": "commit=205332cd35c78a7750db610f37f96becb2b79bb1 so_sha256=2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae"
+          },
+          {
+            "name": "cluster_bootstrap",
+            "status": "pass",
+            "detail": "port=50799 socket=/tmp/pgfb-poc-20260728T022240Z-553031"
+          },
+          {
+            "name": "scale_base",
+            "status": "pass",
+            "detail": "rows=8947850"
+          },
+          {
+            "name": "scale_wal_alignment",
+            "status": "pass",
+            "detail": "boundary_lsn=0/6DADDA98"
+          },
+          {
+            "name": "scale_fingerprint",
+            "status": "pass",
+            "detail": "fingerprint matched at 1024MiB profile=ordinary"
+          },
+          {
+            "name": "scale_crash_and_retry",
+            "status": "pass",
+            "detail": "real 1024MiB mid-CTAS crash: no partial artifact after restart; retry succeeded, row-count/fingerprint matched, shared slot stayed healthy"
+          },
+          {
+            "name": "scale_operational_characteristics",
+            "status": "pass",
+            "detail": "DDL-queue-policy1 wait and xmin/dead-tuple hold effect measured against a real 1024MiB CTAS"
+          }
+        ],
+        "metrics": [
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.pre_protection_flush_lsn",
+            "value": "0/6DADB468",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.pre_protection_confirmed_flush_before",
+            "value": "0/1930120",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.pre_protection_confirmed_flush_after",
+            "value": "0/6DADB468",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.historical_prefix_advanced",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.historical_payload_events_replayed",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.lock_hold_ms",
+            "value": 29,
+            "unit": "ms"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.copy_ms",
+            "value": 4002,
+            "unit": "ms"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.copy_active_observed",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.writer_active_during_copy",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.copy_window_commits",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.commits_replayed",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.inserts_replayed",
+            "value": 98,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.updates_replayed",
+            "value": 155,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.deletes_replayed",
+            "value": 96,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.markers_seen",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.duplicate_commits",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.protection_marker_lsn",
+            "value": "0/6DADDA98",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.post_marker_commits_replayed",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.post_marker_inserts_replayed",
+            "value": 98,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.post_marker_updates_replayed",
+            "value": 155,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.post_marker_deletes_replayed",
+            "value": 96,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.table_oid",
+            "value": 16444,
+            "unit": "oid"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_ordinary.boundary_lsn",
+            "value": "0/6DADDA98",
+            "unit": "lsn"
+          },
+          {
+            "name": "scale.b.ordinary.table_total_bytes",
+            "value": 1178648576,
+            "unit": "bytes"
+          },
+          {
+            "name": "scale.b.ordinary.logical_payload_bytes",
+            "value": 930545807,
+            "unit": "bytes"
+          },
+          {
+            "name": "scale.crash.partial_artifact_absent",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "scale.crash.retry_copy_ms",
+            "value": 3253,
+            "unit": "ms"
+          },
+          {
+            "name": "scale.crash.retry_idempotent",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "scale.ddl_queue.policy1_ddl_wait_ms",
+            "value": 2593,
+            "unit": "ms"
+          },
+          {
+            "name": "scale.xmin.snapshot_hold_xmin_age",
+            "value": 51,
+            "unit": "xids"
+          },
+          {
+            "name": "scale.xmin.churn_dead_tuples_during_hold",
+            "value": 70,
+            "unit": "tuples"
+          },
+          {
+            "name": "scale.xmin.churn_dead_tuples_after_vacuum",
+            "value": 0,
+            "unit": "tuples"
+          }
+        ]
+      },
+      "toast_1gib": {
+        "run_id": "20260728T022646Z-556347",
+        "status": "PASS",
+        "cleanup_ok": true,
+        "missing_steps": [],
+        "source_commit": "205332cd35c78a7750db610f37f96becb2b79bb1",
+        "extension_binary_sha256": "2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae",
+        "steps": [
+          {
+            "name": "candidate_build",
+            "status": "pass",
+            "detail": "commit=205332cd35c78a7750db610f37f96becb2b79bb1 so_sha256=2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae"
+          },
+          {
+            "name": "cluster_bootstrap",
+            "status": "pass",
+            "detail": "port=51950 socket=/tmp/pgfb-poc-20260728T022646Z-556347"
+          },
+          {
+            "name": "scale_base",
+            "status": "pass",
+            "detail": "rows=130946"
+          },
+          {
+            "name": "scale_wal_alignment",
+            "status": "pass",
+            "detail": "boundary_lsn=0/487DC760"
+          },
+          {
+            "name": "scale_fingerprint",
+            "status": "pass",
+            "detail": "fingerprint matched at 1024MiB profile=toast"
+          },
+          {
+            "name": "scale_crash_and_retry",
+            "status": "pass",
+            "detail": "real 1024MiB mid-CTAS crash: no partial artifact after restart; retry succeeded, row-count/fingerprint matched, shared slot stayed healthy"
+          },
+          {
+            "name": "scale_operational_characteristics",
+            "status": "pass",
+            "detail": "DDL-queue-policy1 wait and xmin/dead-tuple hold effect measured against a real 1024MiB CTAS"
+          }
+        ],
+        "metrics": [
+          {
+            "name": "protocol_b.poc_scale_b_toast.pre_protection_flush_lsn",
+            "value": "0/487DA3A0",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.pre_protection_confirmed_flush_before",
+            "value": "0/1930120",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.pre_protection_confirmed_flush_after",
+            "value": "0/487DA3A0",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.historical_prefix_advanced",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.historical_payload_events_replayed",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.lock_hold_ms",
+            "value": 28,
+            "unit": "ms"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.copy_ms",
+            "value": 3918,
+            "unit": "ms"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.copy_active_observed",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.writer_active_during_copy",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.copy_window_commits",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.commits_replayed",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.inserts_replayed",
+            "value": 98,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.updates_replayed",
+            "value": 155,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.deletes_replayed",
+            "value": 96,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.markers_seen",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.duplicate_commits",
+            "value": 0,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.protection_marker_lsn",
+            "value": "0/487DC760",
+            "unit": "lsn"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.post_marker_commits_replayed",
+            "value": 311,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.post_marker_inserts_replayed",
+            "value": 98,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.post_marker_updates_replayed",
+            "value": 155,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.post_marker_deletes_replayed",
+            "value": 96,
+            "unit": "count"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.toast_hash",
+            "value": "0b60f6d02e45ea780d5d3cec79146089",
+            "unit": "hash"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.table_oid",
+            "value": 16444,
+            "unit": "oid"
+          },
+          {
+            "name": "protocol_b.poc_scale_b_toast.boundary_lsn",
+            "value": "0/487DC760",
+            "unit": "lsn"
+          },
+          {
+            "name": "scale.b.toast.table_total_bytes",
+            "value": 1133445120,
+            "unit": "bytes"
+          },
+          {
+            "name": "scale.b.toast.logical_payload_bytes",
+            "value": 1077384306,
+            "unit": "bytes"
+          },
+          {
+            "name": "scale.crash.partial_artifact_absent",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "scale.crash.retry_copy_ms",
+            "value": 3428,
+            "unit": "ms"
+          },
+          {
+            "name": "scale.crash.retry_idempotent",
+            "value": "true",
+            "unit": "bool"
+          },
+          {
+            "name": "scale.ddl_queue.policy1_ddl_wait_ms",
+            "value": 2935,
+            "unit": "ms"
+          },
+          {
+            "name": "scale.xmin.snapshot_hold_xmin_age",
+            "value": 70,
+            "unit": "xids"
+          },
+          {
+            "name": "scale.xmin.churn_dead_tuples_during_hold",
+            "value": 95,
+            "unit": "tuples"
+          },
+          {
+            "name": "scale.xmin.churn_dead_tuples_after_vacuum",
+            "value": 0,
+            "unit": "tuples"
+          }
+        ]
+      }
+    },
+    "invariants_proved": [
+      "Protocol B existing-stream reanchor is the path exercised (not Protocol A)",
+      "marker identity is bound transactionally by marker_text and XID",
+      "pg_stat_activity proves the copier CTAS genuinely active before any writer starts or any crash is injected",
+      "a real concurrent writer runs throughout the copy window (INSERT>0, UPDATE>0, DELETE>0)",
+      "commits_replayed equals copy_window_commits exactly (both runs: 311/311 or matching pair)",
+      "historical WAL prefix is advanced and historical_payload_events_replayed is exactly 0",
+      "no event loss: order-independent semantic fingerprint of shadow == live table",
+      "no duplicate replay / idempotent apply (duplicate_commits=0, out_of_order=0)",
+      "TOAST data verified by byte-equality (octet_length) and an aggregate md5 hash comparison",
+      "a real 1 GiB-scale CTAS is crashed (pg_ctl stop -m immediate) while genuinely active in pg_stat_activity",
+      "no partial artifact is to_regclass()-visible after restart",
+      "retry after crash succeeds and is idempotent; shared slot stays healthy for a fresh table afterward",
+      "DDL-queue policy 1 (copy wins, DDL waits) measured against a real full-size CTAS AccessShareLock, not a simulated sleep",
+      "xmin/vacuum horizon (backend_xmin age, dead-tuple accumulation, post-vacuum cleanup) measured during that same real hold",
+      "cleanup completes fully: child reap, postmaster shutdown, filesystem cleanup, zero leftover process/socket/data-dir (cleanup_ok=true both runs)"
+    ],
+    "caveat": "Protocol B as exercised here is a PoC boundary/correctness proof only. There is no production SnapshotStore backend implementing it; nothing here is wired into pg_flashback SQL functions, GUCs, or generated SQL. This evidence exists to unblock Step 8 (backend comparison design), not to authorize a Step 9 production implementation.",
+    "overall_status": "COMPLETE"
+  },
+  "step7_final_status": "COMPLETE"
 }
