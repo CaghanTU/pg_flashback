@@ -760,6 +760,12 @@ SQL
 
     if [[ "$backend" == "heap_v1" ]]; then
         GT_TBL="${tbl}_artifact_heap"
+        # heap_v1 has no separate persist phase, so ARTIFACT_BYTES (set by
+        # persist_in_db_logged_zstd/persist_external_zstd for the other two
+        # backends) would otherwise stay 0 -- an unfair storage comparison,
+        # since heap_v1's artifact genuinely occupies real on-disk bytes.
+        ARTIFACT_BYTES="$(q "$DB" "SELECT pg_total_relation_size('${tbl}_artifact_heap');")"
+        CHUNK_COUNT=0
     fi
     return 0
 }
