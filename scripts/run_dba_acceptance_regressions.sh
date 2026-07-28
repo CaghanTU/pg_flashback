@@ -513,8 +513,12 @@ DB=dba_b
 q "CREATE TABLE public.dba_disc(id int PRIMARY KEY, blob text);"
 q "SELECT flashback_track('public.dba_disc');" >/dev/null
 wait_health public.dba_disc healthy dba_b || die "f8 health"
-# Large TOAST to create WAL lag
-q "INSERT INTO public.dba_disc SELECT g, repeat('Z', 200000) FROM generate_series(1,8) g;"
+# Create enough WAL to exercise post-DROP discovery without violating the
+# product's fail-closed max_row_size contract.  The old 200 KiB rows correctly
+# broke the capture stream after max_row_size became enforced, so they tested
+# oversized-row invalidation rather than discovery catch-up.
+q "INSERT INTO public.dba_disc
+   SELECT g, repeat('Z', 12000) FROM generate_series(1,128) g;"
 q "DROP TABLE public.dba_disc;"
 # Immediately plan should be catchup_pending OR restorable if worker already caught up
 PLAN8=$(q "SELECT flashback_recover_plan('public.dba_disc');")
