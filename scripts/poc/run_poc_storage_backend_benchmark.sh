@@ -726,7 +726,22 @@ SQL
     apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,duplicate_commits,out_of_order FROM poc_apply_shadow('$BOUNDARY_LSN'::pg_lsn, $oid);")"
     IFS='|' read -r COMMITS_REPLAYED BENCH_INS BENCH_UPD BENCH_DEL DUP_COMMITS OOO_COMMITS <<<"$apply_out"
     [[ "$DUP_COMMITS" == "0" && "$OOO_COMMITS" == "0" ]] || die "bench[$tbl]: duplicate_commits=$DUP_COMMITS out_of_order=$OOO_COMMITS"
-    [[ "$COMMITS_REPLAYED" == "$COPY_WINDOW_COMMITS" ]] || die "bench[$tbl]: commits_replayed=$COMMITS_REPLAYED != copy_window_commits=$COPY_WINDOW_COMMITS"
+    # >= , not strict equality: the writer loop only writes its counter
+    # file AFTER a statement has already committed (durably in WAL), then
+    # checks stop_file. stop_bench_children's SIGTERM can land in the
+    # narrow window between "last statement of an iteration committed" and
+    # "counter file updated for that iteration" -- bash delivers the
+    # untrapped TERM at the next command boundary, so the writer can exit
+    # having truly committed up to one iteration's worth of INSERT/UPDATE/
+    # DELETE (3 commits) that its own last-written counter never recorded.
+    # Confirmed empirically: an in_db_logged_zstd/good_compress/1024MiB
+    # run showed commits_replayed=64 vs copy_window_commits=61, exactly
+    # one full iteration's gap, no data loss (fingerprint/row-count still
+    # matched). commits_replayed < copy_window_commits would mean real
+    # data loss and must still fail closed; > is the writer's own
+    # bookkeeping legitimately lagging its true (fully durable) commit
+    # count, not a replay bug.
+    [[ "$COMMITS_REPLAYED" -ge "$COPY_WINDOW_COMMITS" ]] || die "bench[$tbl]: commits_replayed=$COMMITS_REPLAYED < copy_window_commits=$COPY_WINDOW_COMMITS -- real data loss"
     [[ "$BENCH_INS" -gt 0 && "$BENCH_UPD" -gt 0 && "$BENCH_DEL" -gt 0 ]] || die "bench[$tbl]: writer INSERT/UPDATE/DELETE not all >0 (ins=$BENCH_INS upd=$BENCH_UPD del=$BENCH_DEL)"
     HIST_REPLAYED="$(q "$DB" "SELECT count(*) FROM change_log WHERE oid=$oid AND applied=false;")"
 
