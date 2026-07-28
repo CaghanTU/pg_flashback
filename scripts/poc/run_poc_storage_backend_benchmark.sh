@@ -525,27 +525,52 @@ shape_schema_kind() { [[ "$1" == "toast_bad" ]] && echo "toast" || echo "ordinar
 
 # ── concurrent writer, same idiom as Step 7's run_protocol_b_writer_loop,
 # generalized across the ordinary/good_compress schema and the toast schema.
+# Every writer statement is wrapped BEGIN;...;INSERT INTO the durable
+# ledger;COMMIT; in the SAME transaction as its own DML. This makes
+# "how many writer transactions actually committed" a plain SQL COUNT
+# against a durable table, with no bash-side counter/file involved at
+# all: if psql reports success, both the DML and the ledger row are
+# durably committed together; if the process is killed before COMMIT,
+# neither lands. The previous design (a bash variable incremented after
+# each statement, written to a counter file) raced against
+# stop_bench_children's untrapped SIGTERM: bash delivers the signal at
+# the next command boundary, so the writer could exit having truly
+# committed a statement whose counter-file update never happened,
+# undercounting the true, fully durable commit count by up to one
+# iteration (observed empirically at 1 GiB: commits_replayed=64 vs
+# copy_window_commits=61). Counting via the ledger table removes that
+# race structurally rather than loosening the equality check.
 run_bench_writer_loop() {
-    local tbl=$1 schema_kind=$2 stop_file=$3 ready_file=$4 counter_file=$5
-    local i=0 commits=0
+    local tbl=$1 schema_kind=$2 stop_file=$3 ready_file=$4
+    local i=0
     while [[ ! -f "$stop_file" ]]; do
         i=$((i+1))
         if [[ "$schema_kind" == "toast" ]]; then
-            q "$DB" "INSERT INTO $tbl VALUES (-$i, decode(repeat('00',200),'hex'));" >/dev/null 2>&1 \
-                && commits=$((commits+1))
-            q "$DB" "UPDATE $tbl SET blob = (SELECT decode(string_agg(md5((g||'-$i')::text), ''), 'hex')
-                       FROM generate_series(1,64) g) WHERE id = 1;" >/dev/null 2>&1 \
-                && commits=$((commits+1))
+            q "$DB" "BEGIN;
+                     INSERT INTO $tbl VALUES (-$i, decode(repeat('00',200),'hex'));
+                     INSERT INTO poc_bench_writer_ledger(op) VALUES ('ins');
+                     COMMIT;" >/dev/null 2>&1
+            q "$DB" "BEGIN;
+                     UPDATE $tbl SET blob = (SELECT decode(string_agg(md5((g||'-$i')::text), ''), 'hex')
+                       FROM generate_series(1,64) g) WHERE id = 1;
+                     INSERT INTO poc_bench_writer_ledger(op) VALUES ('upd');
+                     COMMIT;" >/dev/null 2>&1
         else
-            q "$DB" "INSERT INTO $tbl VALUES (-$i, 'writer-'||$i, $i, clock_timestamp());" >/dev/null 2>&1 \
-                && commits=$((commits+1))
-            q "$DB" "UPDATE $tbl SET payload = 'updated-'||$i WHERE id = 1;" >/dev/null 2>&1 \
-                && commits=$((commits+1))
+            q "$DB" "BEGIN;
+                     INSERT INTO $tbl VALUES (-$i, 'writer-'||$i, $i, clock_timestamp());
+                     INSERT INTO poc_bench_writer_ledger(op) VALUES ('ins');
+                     COMMIT;" >/dev/null 2>&1
+            q "$DB" "BEGIN;
+                     UPDATE $tbl SET payload = 'updated-'||$i WHERE id = 1;
+                     INSERT INTO poc_bench_writer_ledger(op) VALUES ('upd');
+                     COMMIT;" >/dev/null 2>&1
         fi
         if (( i > 2 )); then
-            q "$DB" "DELETE FROM $tbl WHERE id = $(( -(i-2) ));" >/dev/null 2>&1 && commits=$((commits+1))
+            q "$DB" "BEGIN;
+                     DELETE FROM $tbl WHERE id = $(( -(i-2) ));
+                     INSERT INTO poc_bench_writer_ledger(op) VALUES ('del');
+                     COMMIT;" >/dev/null 2>&1
         fi
-        echo "$commits" >"$counter_file"
         touch "$ready_file"
         [[ -f "$stop_file" ]] && break
         sleep 0.02
@@ -584,7 +609,9 @@ establish_boundary_and_materialize() {
     q "$DB" "INSERT INTO poc_table_map VALUES ($oid, '${tbl}_oracle_shadow', 'id')
              ON CONFLICT (oid) DO UPDATE SET shadow_regclass = EXCLUDED.shadow_regclass;
              DROP TABLE IF EXISTS ${tbl}_oracle_shadow;
-             CREATE TABLE ${tbl}_oracle_shadow AS SELECT * FROM $tbl WHERE false;" >/dev/null
+             CREATE TABLE ${tbl}_oracle_shadow AS SELECT * FROM $tbl WHERE false;
+             DROP TABLE IF EXISTS poc_bench_writer_ledger;
+             CREATE TABLE poc_bench_writer_ledger (seq bigserial PRIMARY KEY, op text NOT NULL, committed_at timestamptz NOT NULL DEFAULT clock_timestamp());" >/dev/null
 
     local marker_uuid; marker_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
     local txn_started_file="$WORK_ROOT/${tbl}_txn_started"
@@ -595,10 +622,9 @@ establish_boundary_and_materialize() {
     local copier_exit_code_file="$WORK_ROOT/${tbl}_copier_exit_code"
     local writer_stop_file="$WORK_ROOT/${tbl}_writer_stop"
     local writer_ready_file="$WORK_ROOT/${tbl}_writer_ready"
-    local writer_counter_file="$WORK_ROOT/${tbl}_writer_counter"
     rm -f "$txn_started_file" "$lock_acquired_file" "$snapshot_fixed_file" "$go_file" \
           "$copier_finished_file" "$copier_exit_code_file" \
-          "$writer_stop_file" "$writer_ready_file" "$writer_counter_file"
+          "$writer_stop_file" "$writer_ready_file"
 
     local materialize_sql app_pattern
     if [[ "$backend" == "heap_v1" ]]; then
@@ -689,7 +715,7 @@ SQL
     fi
 
     run_bench_writer_loop "$tbl" "$(shape_schema_kind "$SHAPE")" "$writer_stop_file" \
-        "$writer_ready_file" "$writer_counter_file" &
+        "$writer_ready_file" &
     writer_pid=$!
     register_child_pid "$writer_pid"
     deadline=$(( $(date +%s) + 20 ))
@@ -725,7 +751,9 @@ SQL
         die "bench[$tbl]: copier session error (exit=$copier_exit_code): $(cat "$WORK_ROOT/${tbl}_copier.out" 2>/dev/null)"
     fi
 
-    COPY_WINDOW_COMMITS="$(cat "$writer_counter_file" 2>/dev/null || echo 0)"
+    # Durable ledger count, not a bash-side file: race-free by construction
+    # (see run_bench_writer_loop's comment above).
+    COPY_WINDOW_COMMITS="$(q "$DB" "SELECT count(*) FROM poc_bench_writer_ledger;")"
     (( COPY_WINDOW_COMMITS > 0 )) || die "bench[$tbl]: copy_window_commits is 0 -- no proven concurrent churn"
 
     consume_slot_to_events "$slot" "$oid"
@@ -739,22 +767,15 @@ SQL
     apply_out="$(q "$DB" "SELECT commits,inserts,updates,deletes,duplicate_commits,out_of_order FROM poc_apply_shadow('$BOUNDARY_LSN'::pg_lsn, $oid);")"
     IFS='|' read -r COMMITS_REPLAYED BENCH_INS BENCH_UPD BENCH_DEL DUP_COMMITS OOO_COMMITS <<<"$apply_out"
     [[ "$DUP_COMMITS" == "0" && "$OOO_COMMITS" == "0" ]] || die "bench[$tbl]: duplicate_commits=$DUP_COMMITS out_of_order=$OOO_COMMITS"
-    # >= , not strict equality: the writer loop only writes its counter
-    # file AFTER a statement has already committed (durably in WAL), then
-    # checks stop_file. stop_bench_children's SIGTERM can land in the
-    # narrow window between "last statement of an iteration committed" and
-    # "counter file updated for that iteration" -- bash delivers the
-    # untrapped TERM at the next command boundary, so the writer can exit
-    # having truly committed up to one iteration's worth of INSERT/UPDATE/
-    # DELETE (3 commits) that its own last-written counter never recorded.
-    # Confirmed empirically: an in_db_logged_zstd/good_compress/1024MiB
-    # run showed commits_replayed=64 vs copy_window_commits=61, exactly
-    # one full iteration's gap, no data loss (fingerprint/row-count still
-    # matched). commits_replayed < copy_window_commits would mean real
-    # data loss and must still fail closed; > is the writer's own
-    # bookkeeping legitimately lagging its true (fully durable) commit
-    # count, not a replay bug.
-    [[ "$COMMITS_REPLAYED" -ge "$COPY_WINDOW_COMMITS" ]] || die "bench[$tbl]: commits_replayed=$COMMITS_REPLAYED < copy_window_commits=$COPY_WINDOW_COMMITS -- real data loss"
+    # Strict equality, not >=: copy_window_commits is now a durable-ledger
+    # COUNT (see run_bench_writer_loop), not a bash counter file racing
+    # against SIGTERM, so there is no legitimate reason for these two
+    # independently-derived counts (writer's own durable ledger vs
+    # WAL-decoded replay) to differ at all. A previous version of this
+    # harness relaxed this to >= to paper over exactly that race; the race
+    # is now eliminated at its root (the ledger insert and the DML commit
+    # atomically together), so the strict invariant is restored.
+    [[ "$COMMITS_REPLAYED" == "$COPY_WINDOW_COMMITS" ]] || die "bench[$tbl]: commits_replayed=$COMMITS_REPLAYED != copy_window_commits=$COPY_WINDOW_COMMITS"
     [[ "$BENCH_INS" -gt 0 && "$BENCH_UPD" -gt 0 && "$BENCH_DEL" -gt 0 ]] || die "bench[$tbl]: writer INSERT/UPDATE/DELETE not all >0 (ins=$BENCH_INS upd=$BENCH_UPD del=$BENCH_DEL)"
     HIST_REPLAYED="$(q "$DB" "SELECT count(*) FROM change_log WHERE oid=$oid AND applied=false;")"
 
