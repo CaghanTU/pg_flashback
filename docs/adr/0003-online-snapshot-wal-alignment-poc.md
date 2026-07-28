@@ -562,3 +562,36 @@ identity, hash, and pass/fail record. The harness's own
 `dirty_tree_rejected`/`candidate_mismatch_rejected` selftest gates already
 fail closed on exactly this kind of drift; this note exists so the
 checked-in prose does not silently claim otherwise in the meantime.
+
+## Requalification after Faz A
+
+The stale-evidence condition above was closed against executable source
+commit `7faf85f669ea5dcd1dc97e31a8dc03e33fefb0e5` (tree
+`d5211667a511c09449c60a02c8a2cc1249e780b1`, extension binary SHA-256
+`2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae`).
+The original evidence remains unchanged as a historical record; the
+`current_requalification` object in the checked-in evidence binds the fresh
+proof.
+
+The harness self-test passed, including dirty-tree and candidate-mismatch
+rejection, missing-step and interrupt honesty, and child-process cleanup on
+copier failure. Two consecutive 64 MiB development runs then passed from the
+same clean source identity. Both runs:
+
+- bound marker identity transactionally by marker text and XID;
+- observed an active CTAS before injecting an immediate postmaster crash;
+- proved the partial artifact absent after restart and the retry successful;
+- ran a real concurrent writer throughout Protocol B copy and replayed
+  non-zero INSERT, UPDATE, and DELETE counts;
+- advanced the historical WAL prefix while replaying zero historical table
+  payload events; and
+- emitted PASS only after child reap, postmaster shutdown, filesystem
+  cleanup, and a zero-leftover audit.
+
+The two primary Protocol B runs replayed 298 and 302 commits respectively.
+Their INSERT/UPDATE/DELETE counts were 94/148/92 and 95/152/93. The TOAST
+variants replayed 225 and 231 commits with byte-equality checks intact.
+
+This requalification restores the ADR's use as evidence for Step 8 design.
+It does not production-wire either protocol and does not qualify 1/10/25/50
+GiB scale or a 24-hour run.

@@ -1148,5 +1148,63 @@
       "result_sha256": "dbd4e979043f9218f81cca5140616a68450d047ae3557b8463a2e9d33408c558"
     }
   },
+  "current_requalification": {
+    "status": "PASS",
+    "source_commit": "7faf85f669ea5dcd1dc97e31a8dc03e33fefb0e5",
+    "source_tree": "d5211667a511c09449c60a02c8a2cc1249e780b1",
+    "extension_binary_sha256": "2d3421a77e893213740aa3454c8e1098e50828b3e8cb98558f5f69d0fc66ebae",
+    "scope": "Harness requalification after Faz A production changes; the original runs above remain an immutable historical record.",
+    "selftest": {
+      "run_id": "20260728T000315Z-437300",
+      "status": "PASS",
+      "cleanup_ok": true,
+      "missing_steps": [],
+      "proved": [
+        "dirty tree rejected before cluster creation",
+        "candidate hash mismatch rejected before cluster creation",
+        "missing required step cannot produce PASS",
+        "interrupt produces FAIL",
+        "copier failure reaps all owned processes"
+      ]
+    },
+    "development_runs": [
+      {
+        "run_id": "20260728T000409Z-441782",
+        "status": "PASS",
+        "cleanup_ok": true,
+        "missing_steps": [],
+        "protocol_b_table1_commits_replayed": 298,
+        "protocol_b_table1_inserts_replayed": 94,
+        "protocol_b_table1_updates_replayed": 148,
+        "protocol_b_table1_deletes_replayed": 92,
+        "protocol_b_toast_commits_replayed": 225,
+        "protocol_b_historical_payload_events_replayed": 0,
+        "mid_ctas_crash_observed": true,
+        "mid_ctas_retry_passed": true
+      },
+      {
+        "run_id": "20260728T000452Z-453212",
+        "status": "PASS",
+        "cleanup_ok": true,
+        "missing_steps": [],
+        "protocol_b_table1_commits_replayed": 302,
+        "protocol_b_table1_inserts_replayed": 95,
+        "protocol_b_table1_updates_replayed": 152,
+        "protocol_b_table1_deletes_replayed": 93,
+        "protocol_b_toast_commits_replayed": 231,
+        "protocol_b_historical_payload_events_replayed": 0,
+        "mid_ctas_crash_observed": true,
+        "mid_ctas_retry_passed": true
+      }
+    ],
+    "invariants": [
+      "marker identity is bound transactionally by marker text and XID",
+      "Protocol B copies while a real concurrent writer commits INSERT, UPDATE, and DELETE",
+      "historical WAL prefix advancement replays zero historical table payload events",
+      "crash is injected only after pg_stat_activity proves CTAS is active",
+      "partial artifact is absent after restart and idempotent retry succeeds",
+      "PASS is emitted only after child reap, postmaster shutdown, filesystem cleanup, and leftover audit"
+    ]
+  },
   "overall_status": "PASS"
 }
