@@ -1474,6 +1474,41 @@ run_crash_tamper() {
                 local mf="$EXTERNAL_ARTIFACT_ROOT/$artifact_id/manifest.json"
                 jq '.system_identifier = "deliberately-wrong-identity"' "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
             fi ;;
+        row_count_mismatch)
+            # Deliberately does NOT also tamper manifest_root_digest (unlike
+            # manifest_mismatch above), so this isolates and proves
+            # specifically the row_count cross-check added to
+            # validate_manifest_binding, not the chunk-hash path.
+            q "$DB" "UPDATE poc_bench_manifest SET row_count = row_count + 12345 WHERE artifact_id='$artifact_id';" >/dev/null
+            if [[ "$BACKEND" == "external_zstd" ]]; then
+                local mf="$EXTERNAL_ARTIFACT_ROOT/$artifact_id/manifest.json"
+                jq '.row_count += 12345' "$mf" > "$mf.tmp" && mv "$mf.tmp" "$mf"
+            fi ;;
+        chunk_order_mismatch)
+            # Swap chunk_seq 0 and 1's identity so reconstruction concatenates
+            # them in the wrong order. This should already be caught by the
+            # raw_stream_sha256 check during reconstruction (a scrambled
+            # byte order changes the hash) -- this test proves that
+            # empirically for this specific tamper shape, rather than relying
+            # on the general chunk-hash/stream-hash checks to have coincidentally
+            # covered it. Requires at least 2 chunks to be meaningful.
+            local n_chunks
+            if [[ "$BACKEND" == "in_db_logged_zstd" ]]; then
+                n_chunks="$(q "$DB" "SELECT chunk_count FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
+            else
+                n_chunks="$(jq -r .chunk_count "$EXTERNAL_ARTIFACT_ROOT/$artifact_id/manifest.json")"
+            fi
+            (( n_chunks >= 2 )) || die "crash[chunk_order_mismatch]: artifact has only $n_chunks chunk(s), need >=2 to test order tampering"
+            if [[ "$BACKEND" == "in_db_logged_zstd" ]]; then
+                q "$DB" "UPDATE poc_bench_chunks SET chunk_seq = -1 WHERE artifact_id='$artifact_id' AND chunk_seq=0;
+                         UPDATE poc_bench_chunks SET chunk_seq = 0 WHERE artifact_id='$artifact_id' AND chunk_seq=1;
+                         UPDATE poc_bench_chunks SET chunk_seq = 1 WHERE artifact_id='$artifact_id' AND chunk_seq=-1;" >/dev/null
+            else
+                local art_dir="$EXTERNAL_ARTIFACT_ROOT/$artifact_id"
+                mv "$art_dir/chunk_0.zst" "$art_dir/chunk_tmp.zst"
+                mv "$art_dir/chunk_1.zst" "$art_dir/chunk_0.zst"
+                mv "$art_dir/chunk_tmp.zst" "$art_dir/chunk_1.zst"
+            fi ;;
     esac
     qst_mark_step "crash_postcheck" "pass" "tampered artifact prepared ($point)"
 
@@ -1573,7 +1608,7 @@ run_crash() {
         manifest_fsync_before|manifest_fsync_after|manifest_rename_before|manifest_rename_after|parent_dir_fsync_after)
             run_crash_persist_point "$tbl" "$artifact_id" "$rawfile" ;;
         duplicate_retry) run_crash_duplicate_retry "$tbl" "$artifact_id" "$rawfile" ;;
-        corrupt_chunk|missing_chunk|manifest_mismatch|wrong_identity_binding)
+        corrupt_chunk|missing_chunk|manifest_mismatch|wrong_identity_binding|row_count_mismatch|chunk_order_mismatch)
             run_crash_tamper "$tbl" "$artifact_id" "$rawfile" "$CRASH_POINT" ;;
         file_without_metadata|metadata_without_file) run_crash_split_state "$tbl" "$artifact_id" "$rawfile" "$CRASH_POINT" ;;
         orphan_gc_safety) run_crash_orphan_gc "$tbl" "$artifact_id" "$rawfile" ;;
