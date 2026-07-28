@@ -886,6 +886,21 @@ persist_in_db_logged_zstd() {
     return 0
 }
 
+# heap_v1's restore must pay a real, comparable cost, not be measured as a
+# no-op alias for the artifact table itself. A real DROP-recovery restore
+# from a retained heap artifact requires materializing a genuinely separate,
+# freshly queryable table (or renaming the artifact into place, but that
+# throws away the artifact as a retained copy -- this PoC always keeps the
+# artifact around, matching the other two backends' retention model), so
+# time a real CREATE TABLE ... AS SELECT FROM the artifact, exactly
+# analogous to the other backends' "reconstruct a fresh table from the
+# persisted representation" restore step.
+restore_heap_v1() {
+    local tbl=$1 restored_tbl=$2
+    q "$DB" "CREATE TABLE $restored_tbl AS SELECT * FROM ${tbl}_artifact_heap;" >/dev/null \
+        || die "restore-heap[$tbl]: failed to materialize restored table from artifact"
+}
+
 restore_in_db_logged_zstd() {
     local artifact_id=$1 restored_tbl=$2
     local state; state="$(q "$DB" "SELECT state FROM poc_bench_manifest WHERE artifact_id='$artifact_id';")"
@@ -1125,7 +1140,7 @@ run_bench() {
     local t_restore0 t_restore1
     t_restore0=$(now_ms)
     case "$BACKEND" in
-        heap_v1) restored_tbl="$GT_TBL" ;;
+        heap_v1) restore_heap_v1 "$tbl" "$restored_tbl" ;;
         in_db_logged_zstd) restore_in_db_logged_zstd "$artifact_id" "$restored_tbl" ;;
         external_zstd) restore_external_zstd "$artifact_id" "$restored_tbl" ;;
     esac
@@ -1215,7 +1230,7 @@ run_crash_materialize_point() {
     esac
     local restored_tbl=poc_bench_restored_retry
     case "$BACKEND" in
-        heap_v1) restored_tbl="$GT_TBL" ;;
+        heap_v1) restore_heap_v1 "$tbl" "$restored_tbl" ;;
         in_db_logged_zstd) restore_in_db_logged_zstd "$retry_id" "$restored_tbl" ;;
         external_zstd) restore_external_zstd "$retry_id" "$restored_tbl" ;;
     esac
@@ -1305,7 +1320,7 @@ run_crash_duplicate_retry() {
 
     local restored_tbl=poc_bench_restored
     case "$BACKEND" in
-        heap_v1) restored_tbl="${tbl}_artifact_heap" ;;
+        heap_v1) restore_heap_v1 "$tbl" "$restored_tbl" ;;
         in_db_logged_zstd) restore_in_db_logged_zstd "$artifact_id" "$restored_tbl" ;;
         external_zstd) restore_external_zstd "$artifact_id" "$restored_tbl" ;;
     esac
