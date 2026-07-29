@@ -1021,6 +1021,7 @@ name = "pg_flashback"
 version = "0.2.0"
 dependencies = [
  "fs2",
+ "libc",
  "pgrx",
  "pgrx-tests",
  "serde_json",
