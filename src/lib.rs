@@ -234,6 +234,10 @@ mod tests {
         "../tests/sql/integration/ddl_exact_oid_routing.sql"
     );
     sql_test!(
+        it_multi_target_destructive_ddl_ordering,
+        "../tests/sql/integration/multi_target_destructive_ddl_ordering.sql"
+    );
+    sql_test!(
         it_pitr_time_filtering,
         "../tests/sql/integration/pitr_time_filtering.sql"
     );

@@ -196,6 +196,10 @@
       "class": "infra",
       "reason": "incoming FK compatibility rejection"
     },
+    "multi_target_destructive_ddl_ordering.sql": {
+      "class": "supported-core",
+      "reason": "single multi-target DROP statement must batch-prepare in deterministic rel_oid order and capture/restore every target without losing or duplicating an event"
+    },
     "multi_three_tables_restore.sql": {
       "class": "supported-core",
       "reason": "three-table restore via seam"
