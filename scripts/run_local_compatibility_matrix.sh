@@ -5,6 +5,10 @@ set -Eeuo pipefail
 
 PSQL_BIN="${PSQL_BIN:-psql}"
 psqlq() { "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -qAt "$@"; }
+command -v jq >/dev/null || {
+    echo "FAIL: jq is required" >&2
+    exit 1
+}
 
 if [[ "${REQUIRE_LIVE:-0}" != "1" && -z "${PGDATABASE:-}" && -z "${PGHOST:-}" ]]; then
     echo "SKIP: set PG* / REQUIRE_LIVE=1 for live local-compatibility matrix" >&2
@@ -12,16 +16,24 @@ if [[ "${REQUIRE_LIVE:-0}" != "1" && -z "${PGDATABASE:-}" && -z "${PGHOST:-}" ]]
 fi
 
 FAILED=0
+BTREE_GIST_INSTALLED_BY_TEST=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILED=1; }
 
 cleanup() {
     local t
-    for t in lc_ok lc_gen lc_part lc_excl lc_infk lc_expridx lc_partidx lc_unlogged; do
+    for t in lc_ok lc_gen lc_part lc_excl lc_infk lc_expridx lc_partidx \
+             lc_unlogged lc_storage lc_compression lc_seqmeta lc_seqacl \
+             lc_extseq lc_owned_nodefault lc_infk_child lc_part_p1; do
         psqlq -c "SELECT flashback_unprotect('public.$t');" >/dev/null 2>&1 || true
         psqlq -c "DROP TABLE IF EXISTS public.$t CASCADE;" >/dev/null 2>&1 || true
     done
     psqlq -c "DROP TABLE IF EXISTS public.lc_ref CASCADE;" >/dev/null 2>&1 || true
+    psqlq -c "DROP SEQUENCE IF EXISTS public.lc_external_seq;" >/dev/null 2>&1 || true
+    psqlq -c "DROP SEQUENCE IF EXISTS public.lc_owned_nodefault_seq;" >/dev/null 2>&1 || true
+    if [[ "$BTREE_GIST_INSTALLED_BY_TEST" == 1 ]]; then
+        psqlq -c "DROP EXTENSION IF EXISTS btree_gist;" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -118,6 +130,9 @@ assert_rejected lc_part partitioned_table
 # Exclusion constraint: rejected. Skipped if btree_gist isn't installed on
 # this cluster (optional contrib extension, not a pg_flashback dependency).
 if psqlq -c "SELECT 1 FROM pg_available_extensions WHERE name = 'btree_gist';" | grep -q 1; then
+    if [[ "$(psqlq -c "SELECT count(*) FROM pg_extension WHERE extname='btree_gist';")" == 0 ]]; then
+        BTREE_GIST_INSTALLED_BY_TEST=1
+    fi
     psqlq <<'SQL' >/dev/null
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 DROP TABLE IF EXISTS public.lc_excl CASCADE;
@@ -164,6 +179,59 @@ DROP TABLE IF EXISTS public.lc_unlogged CASCADE;
 CREATE UNLOGGED TABLE public.lc_unlogged(id int PRIMARY KEY);
 SQL
 assert_rejected lc_unlogged unlogged_table
+
+# Per-column storage/compression overrides are not recreated. Reject rather
+# than silently resetting them to the type default.
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_storage CASCADE;
+CREATE TABLE public.lc_storage(id int PRIMARY KEY, payload text);
+ALTER TABLE public.lc_storage ALTER COLUMN payload SET STORAGE EXTERNAL;
+SQL
+assert_rejected lc_storage column_storage_or_compression
+
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_compression CASCADE;
+CREATE TABLE public.lc_compression(id int PRIMARY KEY, payload text);
+ALTER TABLE public.lc_compression ALTER COLUMN payload SET COMPRESSION pglz;
+SQL
+assert_rejected lc_compression column_storage_or_compression
+
+# Sequence options/state are preserved, but custom ACL/owner/comment metadata
+# is outside the ordinary owned-sequence contract.
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_seqmeta CASCADE;
+CREATE TABLE public.lc_seqmeta(id serial PRIMARY KEY);
+COMMENT ON SEQUENCE public.lc_seqmeta_id_seq IS 'custom sequence metadata';
+SQL
+assert_rejected lc_seqmeta custom_owned_sequence_metadata
+
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_seqacl CASCADE;
+CREATE TABLE public.lc_seqacl(id serial PRIMARY KEY);
+GRANT USAGE ON SEQUENCE public.lc_seqacl_id_seq TO PUBLIC;
+SQL
+assert_rejected lc_seqacl custom_owned_sequence_metadata
+
+# A standalone sequence referenced by nextval() is not owned by the table and
+# therefore cannot be part of a self-contained table DROP artifact.
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_extseq CASCADE;
+DROP SEQUENCE IF EXISTS public.lc_external_seq;
+CREATE SEQUENCE public.lc_external_seq;
+CREATE TABLE public.lc_extseq(
+  id bigint PRIMARY KEY DEFAULT nextval('public.lc_external_seq'::regclass)
+);
+SQL
+assert_rejected lc_extseq external_sequence_default
+
+psqlq <<'SQL' >/dev/null
+DROP TABLE IF EXISTS public.lc_owned_nodefault CASCADE;
+CREATE TABLE public.lc_owned_nodefault(id bigint PRIMARY KEY);
+CREATE SEQUENCE public.lc_owned_nodefault_seq;
+ALTER SEQUENCE public.lc_owned_nodefault_seq
+  OWNED BY public.lc_owned_nodefault.id;
+SQL
+assert_rejected lc_owned_nodefault owned_sequence_without_column_default
 
 if [[ $FAILED -ne 0 ]]; then
     echo "FAIL: local compatibility matrix"
