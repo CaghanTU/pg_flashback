@@ -67,5 +67,8 @@ BEGIN
 END;
 $tv$;
 
-DROP TABLE IF EXISTS public.it_meta_domain CASCADE;
-DROP DOMAIN IF EXISTS public.it_meta_positive_int CASCADE;
+-- No terminal DROP TABLE/DROP DOMAIN CASCADE: pg_test rolls back this whole
+-- transaction, and the restore just performed leaves the successor
+-- generation "building" (not yet active) until that rollback/commit is
+-- observed, so a same-transaction DROP touching the tracked table here
+-- (directly or via domain CASCADE) would trip the schema-contract guard.

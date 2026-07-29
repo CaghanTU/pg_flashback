@@ -77,17 +77,17 @@ BEGIN
         )
     );
 
-    PERFORM public.flashback_capture_drop_dependency_manifest(
-        'public', 'it_fb_query_drop', false
-    );
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_fb_query_drop;
-    PERFORM public.flashback_test_inject_ddl_commit(
+    PERFORM public.flashback_test_inject_commit(
         v_tracking_drop,
         v_drop_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        '[]'::jsonb
     );
     PERFORM public.flashback_bind_drop_dependency_manifests();
 

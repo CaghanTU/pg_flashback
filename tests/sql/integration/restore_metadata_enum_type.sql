@@ -74,5 +74,8 @@ BEGIN
 END;
 $tv$;
 
-DROP TABLE IF EXISTS public.it_meta_enum CASCADE;
-DROP TYPE IF EXISTS public.it_meta_status CASCADE;
+-- No terminal DROP TABLE/DROP TYPE CASCADE: pg_test rolls back this whole
+-- transaction, and the restore just performed leaves the successor
+-- generation "building" (not yet active) until that rollback/commit is
+-- observed, so a same-transaction DROP touching the tracked table here
+-- (directly or via type CASCADE) would trip the schema-contract guard.

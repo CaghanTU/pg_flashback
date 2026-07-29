@@ -30,17 +30,17 @@ BEGIN
         )
     );
 
-    PERFORM flashback_capture_drop_dependency_manifest(
-        'public', 'it_restore_dropped', false
-    );
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_restore_dropped CASCADE;
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM flashback_test_inject_commit(
         v_tracking_id,
         '0/3000'::pg_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        '[]'::jsonb
     );
     PERFORM flashback_bind_drop_dependency_manifests();
 

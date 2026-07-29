@@ -66,6 +66,9 @@ BEGIN
         RAISE EXCEPTION 'sequence not advanced: new id % should be > 3', v_new_id;
     END IF;
 
-    DROP TABLE IF EXISTS public.it_seq CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;

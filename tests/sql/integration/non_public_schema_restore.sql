@@ -66,7 +66,10 @@ BEGIN
         RAISE EXCEPTION 'wrong customer data after restore: got ''%''', v_val;
     END IF;
 
-    DROP TABLE IF EXISTS it_ns.orders CASCADE;
-    DROP SCHEMA IF EXISTS it_ns CASCADE;
+    -- No terminal DROP TABLE/DROP SCHEMA CASCADE: pg_test rolls back this
+    -- whole transaction, and the restore just performed leaves the successor
+    -- generation "building" (not yet active) until that rollback/commit is
+    -- observed, so a same-transaction DROP touching the tracked table here
+    -- (directly or via schema CASCADE) would trip the schema-contract guard.
 END;
 $tv$;

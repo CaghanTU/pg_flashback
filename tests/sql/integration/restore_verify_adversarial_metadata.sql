@@ -94,10 +94,12 @@ DECLARE
 BEGIN
     SELECT tracking_id INTO v_tid FROM flashback.tracked_tables WHERE table_name = 'it_adv_index';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_index', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_index;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, '0/9300'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, '0/9300'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_drop_index', true);
@@ -140,10 +142,12 @@ DECLARE
 BEGIN
     SELECT tracking_id INTO v_tid FROM flashback.tracked_tables WHERE table_name = 'it_adv_acl';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_acl', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_acl;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, '0/9400'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, '0/9400'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_revoke_acl', true);
@@ -182,10 +186,12 @@ DECLARE
 BEGIN
     SELECT tracking_id INTO v_tid FROM flashback.tracked_tables WHERE table_name = 'it_adv_comment';
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_comment', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_comment;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, '0/9500'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, '0/9500'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM flashback_test_restore_lsn('public.it_adv_comment', '0/1140'::pg_lsn);
@@ -230,10 +236,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_pk', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_pk;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_drop_pk', true);
@@ -287,10 +295,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_constraint', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_constraint;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_drop_constraint', true);
@@ -345,10 +355,12 @@ BEGIN
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
     v_orig_owner := (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.it_adv_owner'::regclass);
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_owner', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_owner;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_change_owner', true);
@@ -400,10 +412,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_rls', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_rls;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_disable_rls', true);
@@ -454,10 +468,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_force_rls', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_force_rls;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_disable_force_rls', true);
@@ -510,10 +526,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_replident', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_replident;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_change_replica_identity', true);
@@ -565,10 +583,12 @@ BEGIN
     v_target_lsn := pg_current_wal_insert_lsn() + 500000;
     v_drop_lsn := pg_current_wal_insert_lsn() + 1000000;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_adv_comment2', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_adv_comment2;
-    PERFORM flashback_test_inject_ddl_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid, v_drop_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     PERFORM set_config('pg_flashback.test_restore_failpoint', 'after_swap_drop_comment', true);

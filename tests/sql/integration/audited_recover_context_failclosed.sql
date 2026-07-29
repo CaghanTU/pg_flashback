@@ -203,8 +203,10 @@ BEGIN
     SELECT tracking_id, boundary_lsn INTO v_tid_b, v_boundary_b FROM it_audit_boot WHERE label = 'b';
 
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- See the "happy" scenario above: finalize the hook's own pending DROP
+    -- capture rather than staging a second, competing one.
     DROP TABLE public.it_audit_a;
-    PERFORM flashback_test_inject_ddl_commit(v_tid_a, '0/9100'::pg_lsn, clock_timestamp(), v_xid, 'DROP');
+    PERFORM flashback_test_inject_commit(v_tid_a, '0/9100'::pg_lsn, clock_timestamp(), v_xid, '[]'::jsonb);
     PERFORM flashback_bind_drop_dependency_manifests();
 
     SELECT disaster_event_id INTO v_drop_a_id

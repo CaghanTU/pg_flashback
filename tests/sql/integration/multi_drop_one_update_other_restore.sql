@@ -22,17 +22,19 @@ BEGIN
     v_tracking_b := (v_boot_b->>'tracking_id')::bigint;
     v_boundary_b := (v_boot_b->>'boundary_lsn')::pg_lsn;
 
-    PERFORM flashback_capture_drop_dependency_manifest('public', 'it_multi_drop_a', false);
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_multi_drop_a;
     UPDATE public.it_multi_drop_b SET v = 'b1' WHERE id = 1;
 
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM flashback_test_inject_commit(
         v_tracking_a,
         '0/2000'::pg_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        '[]'::jsonb
     );
     PERFORM flashback_test_inject_commit(
         v_tracking_b,

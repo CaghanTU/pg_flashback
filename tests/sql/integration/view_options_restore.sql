@@ -71,6 +71,9 @@ BEGIN
 
     DROP VIEW IF EXISTS public.it_vopts_check;
     DROP VIEW IF EXISTS public.it_vopts_secure;
-    DROP TABLE IF EXISTS public.it_vopts_base CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;

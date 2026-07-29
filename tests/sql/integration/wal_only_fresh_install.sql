@@ -64,17 +64,17 @@ BEGIN
         )
     );
 
-    PERFORM flashback_capture_drop_dependency_manifest(
-        'public', 'it_wal_fresh', false
-    );
     v_xid := (txid_current() % 4294967296)::bigint;
+    -- The DDL hook already captures this literal DROP for real (manifest +
+    -- pending event under the current transaction's real xid); only finalize
+    -- that pending event here, never restage a second, competing one.
     DROP TABLE public.it_wal_fresh CASCADE;
-    PERFORM flashback_test_inject_ddl_commit(
+    PERFORM flashback_test_inject_commit(
         v_tracking_id,
         '0/3000'::pg_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        '[]'::jsonb
     );
     PERFORM flashback_bind_drop_dependency_manifests();
 
@@ -120,7 +120,9 @@ BEGIN
         RAISE EXCEPTION 'ordinary trigger definition not restored: %', v_def;
     END IF;
 
-    DROP TABLE IF EXISTS public.it_wal_fresh CASCADE;
-    DROP FUNCTION IF EXISTS public.it_wal_fresh_trg_fn() CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;

@@ -82,7 +82,10 @@ BEGIN
         RAISE EXCEPTION 'RLS policy it_rls_owner_policy was lost after restore';
     END IF;
 
-    DROP TABLE IF EXISTS public.it_rls CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
     DROP ROLE IF EXISTS it_rls_alice;
     DROP ROLE IF EXISTS it_rls_bob;
 END;

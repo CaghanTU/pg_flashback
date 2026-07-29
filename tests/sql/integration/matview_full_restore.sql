@@ -74,6 +74,9 @@ BEGIN
     END IF;
 
     DROP MATERIALIZED VIEW IF EXISTS public.it_mview_summary;
-    DROP TABLE IF EXISTS public.it_mview_base CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;

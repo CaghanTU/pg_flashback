@@ -83,6 +83,9 @@ BEGIN
         RAISE EXCEPTION 'stale rows from first tracking session leaked into restore';
     END IF;
 
-    DROP TABLE IF EXISTS public.it_retrack CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;
