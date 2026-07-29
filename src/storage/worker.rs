@@ -65,6 +65,47 @@ static SLOT_LAG_WARNING_BYTES_GUC: GucSetting<Option<CString>> =
 static SLOT_LAG_AT_RISK_BYTES_GUC: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+// ---- Step 9: external_zstd SnapshotStore backend ----
+/// Absolute directory outside PGDATA and every tablespace where external_zstd
+/// artifacts are stored. Must already exist, be owned by the running OS user,
+/// mode 0700. Empty = the external backend is unavailable. POSTMASTER context:
+/// changing the artifact root while the server is running is never safe, so
+/// this can only be set at server start (config file/command line), never by
+/// ALTER SYSTEM + reload and never by an in-session SET.
+static EXTERNAL_SNAPSHOT_ROOT_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Backend used for the NEXT artifact reservation, cluster-wide: 'heap_v1'
+/// (default) or 'external_zstd'. SIGHUP, not SUSET: a single session must
+/// never be able to silently change which backend the next generation of a
+/// protected table uses -- only an explicit, cluster-visible config file
+/// change + reload can. The backend actually used for a given generation is
+/// resolved once, at reservation time, and frozen on that generation's own
+/// row from then on; this GUC is never re-read afterward.
+static SNAPSHOT_STORAGE_BACKEND_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"heap_v1"));
+/// Minimum external_snapshot_root filesystem free space that must remain
+/// after a projected persist. Accepted by pg_size_bytes(). Empty/0 fails closed.
+static EXTERNAL_SNAPSHOT_MIN_FREE_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Extra safety reserve included in external persist capacity estimates.
+/// Accepted by pg_size_bytes(). Empty/0 fails closed.
+static EXTERNAL_SNAPSHOT_SAFETY_RESERVE_BYTES_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+/// Row-batch size for the SPI cursor driving external_zstd persist/restore
+/// streaming, and the cadence at which the bounded PostgreSQL memory context
+/// used for FFI encode/decode calls is reset.
+static EXTERNAL_SNAPSHOT_BATCH_ROWS_GUC: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+/// Hard ceiling on one row's serialized (pre-compression) byte size during
+/// external_zstd persist/restore; a larger row fails the operation closed.
+static EXTERNAL_SNAPSHOT_MAX_ROW_BYTES_GUC: GucSetting<i32> = GucSetting::<i32>::new(67_108_864);
+/// zstd compression level used for external_zstd artifacts.
+static EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC: GucSetting<i32> = GucSetting::<i32>::new(3);
+/// Test-only external_zstd failpoint name. Empty = disabled (release default).
+/// Superuser-only (SUSET). Not a production control plane. Same shape as
+/// test_restore_failpoint/test_consume_wal_failpoint above.
+static TEST_EXTERNAL_ZSTD_FAILPOINT_GUC: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(None);
+
 pub fn is_capture_enabled() -> bool {
     ENABLED_GUC.get()
 }
@@ -92,6 +133,13 @@ const EFFECTIVE_SLOT_NAME_SQL: &str = "COALESCE(
 fn effective_worker_batch_size() -> usize {
     WORKER_BATCH_SIZE_GUC.get().clamp(128, 50_000) as usize
 }
+
+// Step 9 external_zstd GUC accessors (EXTERNAL_SNAPSHOT_ROOT_GUC,
+// SNAPSHOT_STORAGE_BACKEND_GUC, EXTERNAL_SNAPSHOT_BATCH_ROWS_GUC,
+// EXTERNAL_SNAPSHOT_MAX_ROW_BYTES_GUC, EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC,
+// TEST_EXTERNAL_ZSTD_FAILPOINT_GUC) are added alongside src/storage/
+// external_zstd.rs (Stage 2), their first real caller, rather than as
+// unused stubs here.
 
 pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
@@ -342,6 +390,84 @@ pub fn register_worker_and_guc() {
         c"Slot retained-WAL at-risk threshold for flashback_health()",
         c"Accepted by pg_size_bytes(). Default when unset: 1GB. Also compared with safe_wal_size when PostgreSQL provides it.",
         &SLOT_LAG_AT_RISK_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.external_snapshot_root",
+        c"Directory outside PGDATA/tablespaces for external_zstd SnapshotStore artifacts",
+        c"Must already exist, be owned by the PostgreSQL OS user, and be mode 0700; the extension never creates it. Empty disables the external backend. POSTMASTER context: server-start only, never SUSET/SIGHUP -- changing the artifact root while the server is running is never safe.",
+        &EXTERNAL_SNAPSHOT_ROOT_GUC,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.snapshot_storage_backend",
+        c"SnapshotStore backend for newly reserved artifacts: heap_v1 or external_zstd",
+        c"SIGHUP, not SUSET: only an explicit config file change + reload can change which backend the next generation of a protected table uses, never a single session's in-transaction SET. The backend actually used for a given generation is resolved once at reservation time and frozen on that generation's own row afterward.",
+        &SNAPSHOT_STORAGE_BACKEND_GUC,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.external_snapshot_min_free_bytes",
+        c"Minimum external_snapshot_root filesystem free space after a projected persist",
+        c"Accepted by pg_size_bytes(). Empty or 0 fails closed for the external_zstd profile, mirroring pg_flashback.local_min_filesystem_bytes.",
+        &EXTERNAL_SNAPSHOT_MIN_FREE_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.external_snapshot_safety_reserve_bytes",
+        c"Safety reserve included in external_zstd persist capacity estimates",
+        c"Accepted by pg_size_bytes(). Empty or 0 fails closed, mirroring pg_flashback.local_safety_reserve_bytes.",
+        &EXTERNAL_SNAPSHOT_SAFETY_RESERVE_BYTES_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.external_snapshot_batch_rows",
+        c"Row-batch size for external_zstd persist/restore SPI cursor streaming",
+        c"Also the cadence at which the bounded PostgreSQL memory context used for per-row FFI encode/decode is reset. Default 10000.",
+        &EXTERNAL_SNAPSHOT_BATCH_ROWS_GUC,
+        100,
+        1_000_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.external_snapshot_max_row_bytes",
+        c"Hard ceiling on one row's serialized size during external_zstd persist/restore",
+        c"A row whose encoded frame would exceed this fails the operation closed rather than allow unbounded per-row memory growth. Default 64MB.",
+        &EXTERNAL_SNAPSHOT_MAX_ROW_BYTES_GUC,
+        1024,
+        1_073_741_824,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_flashback.external_snapshot_zstd_level",
+        c"zstd compression level for external_zstd artifacts",
+        c"Standard zstd level range. Default 3.",
+        &EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC,
+        1,
+        19,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_flashback.test_external_zstd_failpoint",
+        c"TEST ONLY: named external_zstd failpoint/barrier (empty disables)",
+        c"Superuser-only. Release default is empty/off. Valid names are checked inside the external_zstd persist/restore/finalize path for deterministic crash/retry regression tests. Never enable in production.",
+        &TEST_EXTERNAL_ZSTD_FAILPOINT_GUC,
         GucContext::Suset,
         GucFlags::default(),
     );

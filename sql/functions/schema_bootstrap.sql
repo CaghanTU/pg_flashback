@@ -672,7 +672,7 @@ BEGIN
             rel_oid          OID NOT NULL,
             tracking_id      BIGINT,
             snapshot_table   TEXT NOT NULL,
-            snapshot_lsn     PG_LSN NOT NULL,
+            snapshot_lsn     PG_LSN,
             schema_def       JSONB NOT NULL,
             row_count        BIGINT NOT NULL,
             captured_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -681,6 +681,13 @@ BEGIN
             storage_backend  TEXT NOT NULL DEFAULT ''heap_v1'',
             locator          JSONB,
             available_at     TIMESTAMPTZ,
+            external_codec                TEXT,
+            external_format_version       INT,
+            external_uncompressed_bytes   BIGINT,
+            external_compressed_bytes     BIGINT,
+            external_checksum_sha256      TEXT,
+            external_column_contract      JSONB,
+            schema_def_sha256             TEXT,
             CONSTRAINT snapshots_payload_state_check
                 CHECK (payload_state IN (
                     ''creating'', ''available'', ''retiring'',
@@ -694,11 +701,33 @@ BEGIN
                          AND retired_at IS NOT NULL)
                 ),
             CONSTRAINT snapshots_storage_backend_check
-                CHECK (storage_backend = ''heap_v1''),
+                CHECK (storage_backend IN (''heap_v1'', ''external_zstd'')),
             CONSTRAINT snapshots_available_shape_check
                 CHECK (
                     payload_state <> ''available''
                     OR (locator IS NOT NULL AND available_at IS NOT NULL)
+                ),
+            -- NULL is legal only for a still-creating external_zstd artifact,
+            -- whose exact boundary LSN is unknowable until the transactional
+            -- marker''s COMMIT is decoded (flashback_internal_snapshot_refine_boundary).
+            -- Every available row, any backend, must have an exact LSN.
+            CONSTRAINT snapshots_lsn_shape_check
+                CHECK (
+                    snapshot_lsn IS NOT NULL
+                    OR (payload_state = ''creating'' AND storage_backend = ''external_zstd'')
+                ),
+            CONSTRAINT snapshots_external_available_shape_check
+                CHECK (
+                    NOT (payload_state = ''available'' AND storage_backend = ''external_zstd'')
+                    OR (
+                        external_codec IS NOT NULL
+                        AND external_format_version IS NOT NULL
+                        AND external_uncompressed_bytes IS NOT NULL
+                        AND external_compressed_bytes IS NOT NULL
+                        AND external_checksum_sha256 IS NOT NULL
+                        AND external_column_contract IS NOT NULL
+                        AND schema_def_sha256 IS NOT NULL
+                    )
                 ),
             CONSTRAINT snapshots_snapshot_tracking_key UNIQUE (snapshot_id, tracking_id),
             CONSTRAINT snapshots_snapshot_tracking_lsn_key
@@ -725,6 +754,31 @@ BEGIN
         ADD COLUMN IF NOT EXISTS locator JSONB;
     ALTER TABLE flashback.snapshots
         ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ;
+    -- external_zstd artifact metadata (Step 9): NULL for every heap_v1 row,
+    -- required together for an available external_zstd row (see
+    -- snapshots_external_available_shape_check below).
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_codec TEXT;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_format_version INT;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_uncompressed_bytes BIGINT;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_compressed_bytes BIGINT;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_checksum_sha256 TEXT;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS external_column_contract JSONB;
+    ALTER TABLE flashback.snapshots
+        ADD COLUMN IF NOT EXISTS schema_def_sha256 TEXT;
+
+    -- snapshot_lsn was NOT NULL prior to Step 9. A still-creating
+    -- external_zstd artifact's exact boundary LSN is unknowable until the
+    -- transactional marker's COMMIT is decoded, so the column becomes
+    -- nullable; snapshots_lsn_shape_check (below) enforces every other case
+    -- (any available row, any backend) still requires an exact value.
+    ALTER TABLE flashback.snapshots
+        ALTER COLUMN snapshot_lsn DROP NOT NULL;
 
     IF EXISTS (
         SELECT 1 FROM pg_constraint
@@ -776,6 +830,15 @@ BEGIN
             VALIDATE CONSTRAINT snapshots_payload_state_shape_check;
     END IF;
 
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_storage_backend_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%external_zstd%'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            DROP CONSTRAINT snapshots_storage_backend_check;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'flashback.snapshots'::regclass
@@ -783,7 +846,7 @@ BEGIN
     ) THEN
         ALTER TABLE flashback.snapshots
             ADD CONSTRAINT snapshots_storage_backend_check
-            CHECK (storage_backend = 'heap_v1') NOT VALID;
+            CHECK (storage_backend IN ('heap_v1', 'external_zstd')) NOT VALID;
         ALTER TABLE flashback.snapshots
             VALIDATE CONSTRAINT snapshots_storage_backend_check;
     END IF;
@@ -800,6 +863,47 @@ BEGIN
             ) NOT VALID;
         -- Validated only after the backfill below has populated locator for
         -- every currently-available row (or downgraded it to missing).
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_lsn_shape_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_lsn_shape_check
+            CHECK (
+                snapshot_lsn IS NOT NULL
+                OR (payload_state = 'creating' AND storage_backend = 'external_zstd')
+            ) NOT VALID;
+        -- Every pre-existing row is heap_v1 with an already-populated
+        -- snapshot_lsn (it was NOT NULL until this upgrade), so this
+        -- validates trivially true for all of them regardless of table size.
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_lsn_shape_check;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_external_available_shape_check'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            ADD CONSTRAINT snapshots_external_available_shape_check
+            CHECK (
+                NOT (payload_state = 'available' AND storage_backend = 'external_zstd')
+                OR (
+                    external_codec IS NOT NULL
+                    AND external_format_version IS NOT NULL
+                    AND external_uncompressed_bytes IS NOT NULL
+                    AND external_compressed_bytes IS NOT NULL
+                    AND external_checksum_sha256 IS NOT NULL
+                    AND external_column_contract IS NOT NULL
+                    AND schema_def_sha256 IS NOT NULL
+                )
+            ) NOT VALID;
+        -- Every pre-existing row has storage_backend='heap_v1', so the NOT(...)
+        -- disjunct is trivially true for all of them regardless of table size.
+        ALTER TABLE flashback.snapshots
+            VALIDATE CONSTRAINT snapshots_external_available_shape_check;
     END IF;
 END
 $$;
@@ -953,12 +1057,21 @@ BEGIN
         END IF;
     END IF;
 
-    -- snapshot_lsn and captured_at can only be refined when resolving a building generation boundary
+    -- snapshot_lsn and captured_at can only be refined when resolving a
+    -- building generation boundary. 'available' is the heap_v1 case (its
+    -- snapshot is already available by the time WAL-consume observes the
+    -- marker). 'creating' is the external_zstd case (Step 9): its manifest
+    -- cannot be published with a provisional LSN, so the exact boundary must
+    -- be known and bound to the still-creating row before it is ever
+    -- published -- the EXISTS proof below (a real, matching, currently-
+    -- building generation's real decoded WAL commit coordinate) is what
+    -- keeps this a monotonic, single, proven refinement rather than an
+    -- arbitrary update, identically for both preconditions.
     IF NEW.snapshot_lsn IS DISTINCT FROM OLD.snapshot_lsn
        OR NEW.captured_at IS DISTINCT FROM OLD.captured_at
     THEN
-        IF OLD.payload_state <> 'available' THEN
-            RAISE EXCEPTION 'pg_flashback: snapshot_lsn and captured_at can only be refined on available artifacts'
+        IF OLD.payload_state NOT IN ('available', 'creating') THEN
+            RAISE EXCEPTION 'pg_flashback: snapshot_lsn and captured_at can only be refined on available or creating artifacts'
                 USING ERRCODE = 'integrity_constraint_violation';
         END IF;
         IF NOT EXISTS (
@@ -977,7 +1090,8 @@ BEGIN
         END IF;
     END IF;
 
-    -- Backend, locator, snapshot_table, schema_def, row_count are frozen once created
+    -- Backend, locator, snapshot_table, schema_def, row_count, and (Step 9)
+    -- every external_zstd artifact-evidence field are frozen once created.
     IF OLD.payload_state <> 'creating'
        AND (
            NEW.storage_backend IS DISTINCT FROM OLD.storage_backend
@@ -985,6 +1099,13 @@ BEGIN
            OR NEW.snapshot_table IS DISTINCT FROM OLD.snapshot_table
            OR NEW.schema_def IS DISTINCT FROM OLD.schema_def
            OR NEW.row_count IS DISTINCT FROM OLD.row_count
+           OR NEW.external_codec IS DISTINCT FROM OLD.external_codec
+           OR NEW.external_format_version IS DISTINCT FROM OLD.external_format_version
+           OR NEW.external_uncompressed_bytes IS DISTINCT FROM OLD.external_uncompressed_bytes
+           OR NEW.external_compressed_bytes IS DISTINCT FROM OLD.external_compressed_bytes
+           OR NEW.external_checksum_sha256 IS DISTINCT FROM OLD.external_checksum_sha256
+           OR NEW.external_column_contract IS DISTINCT FROM OLD.external_column_contract
+           OR NEW.schema_def_sha256 IS DISTINCT FROM OLD.schema_def_sha256
        )
     THEN
         RAISE EXCEPTION 'pg_flashback: snapshot artifact % identity/evidence is immutable once created',
@@ -1298,6 +1419,13 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
                            CHECK (recovery_profile = 'local_delta'),
     state                  TEXT NOT NULL DEFAULT 'building'
                            CHECK (state IN ('building', 'active', 'sealed', 'retired', 'aborted')),
+    -- Step 9: which SnapshotStore backend this generation's boundary
+    -- snapshot is being/was captured with. Frozen at reservation time
+    -- (flashback_internal_reserve_online_generation / the existing
+    -- flashback_internal_create_coverage_generation, which always leaves
+    -- this at its 'heap_v1' default); never re-read from a GUC afterward.
+    storage_backend        TEXT NOT NULL DEFAULT 'heap_v1'
+                           CHECK (storage_backend IN ('heap_v1', 'external_zstd')),
     boundary_kind          TEXT NOT NULL CHECK (btrim(boundary_kind) <> ''),
     rel_oid_at_boundary    OID NOT NULL,
     boundary_snapshot_id   BIGINT,
@@ -1520,15 +1648,23 @@ CREATE TABLE IF NOT EXISTS flashback.generation_payload_retirements (
             AND removed_by IS NOT NULL
         )
     ),
+    -- A heap_v1 evidence row always has a physical relation OID; an
+    -- external_zstd artifact has no relation at all -- its identity lives
+    -- entirely in snapshot_locator (checked by the backend_identity_check
+    -- below), so snapshot_rel_oid is legitimately NULL for it, not missing
+    -- evidence.
     CONSTRAINT generation_payload_retirements_snapshot_identity_check CHECK (
-        state = 'removed' OR snapshot_rel_oid IS NOT NULL
+        state = 'removed'
+        OR snapshot_rel_oid IS NOT NULL
+        OR snapshot_storage_backend = 'external_zstd'
     ),
     CONSTRAINT generation_payload_retirements_backend_identity_check CHECK (
         state = 'removed'
         OR (snapshot_storage_backend IS NOT NULL AND snapshot_locator IS NOT NULL)
     ),
     CONSTRAINT generation_payload_retirements_storage_backend_check CHECK (
-        snapshot_storage_backend IS NULL OR snapshot_storage_backend = 'heap_v1'
+        snapshot_storage_backend IS NULL
+        OR snapshot_storage_backend IN ('heap_v1', 'external_zstd')
     ),
     CONSTRAINT generation_payload_retirements_lsn_order_check CHECK (
         first_delta_lsn IS NULL OR last_delta_lsn IS NULL
@@ -1575,6 +1711,15 @@ BEGIN
      WHERE r.snapshot_rel_oid IS NULL
        AND r.state = 'retiring';
 
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
+          AND conname = 'generation_payload_retirements_snapshot_identity_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%external_zstd%'
+    ) THEN
+        ALTER TABLE flashback.generation_payload_retirements
+            DROP CONSTRAINT generation_payload_retirements_snapshot_identity_check;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
@@ -1582,7 +1727,13 @@ BEGIN
     ) THEN
         ALTER TABLE flashback.generation_payload_retirements
             ADD CONSTRAINT generation_payload_retirements_snapshot_identity_check
-            CHECK (state = 'removed' OR snapshot_rel_oid IS NOT NULL) NOT VALID;
+            CHECK (
+                state = 'removed'
+                OR snapshot_rel_oid IS NOT NULL
+                OR snapshot_storage_backend = 'external_zstd'
+            ) NOT VALID;
+        ALTER TABLE flashback.generation_payload_retirements
+            VALIDATE CONSTRAINT generation_payload_retirements_snapshot_identity_check;
     END IF;
 END
 $$;
@@ -1644,6 +1795,15 @@ BEGIN
         ALTER TABLE flashback.generation_payload_retirements
             VALIDATE CONSTRAINT generation_payload_retirements_backend_identity_check;
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
+          AND conname = 'generation_payload_retirements_storage_backend_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%external_zstd%'
+    ) THEN
+        ALTER TABLE flashback.generation_payload_retirements
+            DROP CONSTRAINT generation_payload_retirements_storage_backend_check;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'flashback.generation_payload_retirements'::regclass
@@ -1651,7 +1811,10 @@ BEGIN
     ) THEN
         ALTER TABLE flashback.generation_payload_retirements
             ADD CONSTRAINT generation_payload_retirements_storage_backend_check
-            CHECK (snapshot_storage_backend IS NULL OR snapshot_storage_backend = 'heap_v1')
+            CHECK (
+                snapshot_storage_backend IS NULL
+                OR snapshot_storage_backend IN ('heap_v1', 'external_zstd')
+            )
             NOT VALID;
         ALTER TABLE flashback.generation_payload_retirements
             VALIDATE CONSTRAINT generation_payload_retirements_storage_backend_check;
@@ -1797,6 +1960,20 @@ BEGIN
         ALTER TABLE flashback.coverage_generations
             ADD COLUMN aborted_at TIMESTAMPTZ;
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback'
+          AND table_name = 'coverage_generations'
+          AND column_name = 'storage_backend'
+    ) THEN
+        ALTER TABLE flashback.coverage_generations
+            ADD COLUMN storage_backend TEXT NOT NULL DEFAULT 'heap_v1';
+    END IF;
+    ALTER TABLE flashback.coverage_generations
+        DROP CONSTRAINT IF EXISTS coverage_generations_storage_backend_check;
+    ALTER TABLE flashback.coverage_generations
+        ADD CONSTRAINT coverage_generations_storage_backend_check
+        CHECK (storage_backend IN ('heap_v1', 'external_zstd'));
 
     -- Keep failed, never-qualified boundaries as immutable audit tombstones.
     -- Older installs used an inline state check that did not know `aborted`.
