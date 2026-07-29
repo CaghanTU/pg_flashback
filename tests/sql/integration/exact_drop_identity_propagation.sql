@@ -19,6 +19,7 @@ DECLARE
     v_notes text[];
     v_dml_op bigint;
     v_dml_proof jsonb;
+    v_pre_drop_schema jsonb;
 BEGIN
     DROP TABLE IF EXISTS public.it_exact_drop_id CASCADE;
     DROP FUNCTION IF EXISTS public.it_exact_drop_id_trg_fn() CASCADE;
@@ -47,6 +48,16 @@ BEGIN
         BEFORE INSERT ON public.it_exact_drop_id
         FOR EACH ROW EXECUTE FUNCTION public.it_exact_drop_id_trg_fn();
 
+    -- CREATE TRIGGER is metadata DDL outside the captured table-DDL epoch
+    -- (not an ALTER TABLE ProcessUtility node), so the schema contract must
+    -- be explicitly re-anchored before the DROP below re-validates it.
+    -- flashback_reanchor() needs a real physical replication slot that
+    -- pg_test's synthetic bootstrap stream does not provide, so advance the
+    -- epoch the same way the schema_* tests do: a synthetic ALTER commit.
+    PERFORM public.flashback_test_inject_ddl_commit(
+        v_tid, '0/1500'::pg_lsn, clock_timestamp(), 90901, 'ALTER'
+    );
+
     PERFORM public.flashback_capture_drop_dependency_manifest(
         'public', 'it_exact_drop_id', false
     );
@@ -55,13 +66,24 @@ BEGIN
        SET source_xid = v_xid
      WHERE tracking_id = v_tid
        AND disaster_event_id IS NULL;
+    -- Two DROPs share one real pg_test transaction xid, so the manifest
+    -- binding below needs its own distinguishable synthetic source_xid per
+    -- DROP (see file header) -- the hook's real-xid capture can't serve that
+    -- role here. Restage under the synthetic xid, but with the live schema
+    -- (captured immediately pre-DROP, already re-anchored above) as the
+    -- ddl_info, so the restaged event matches the current schema contract
+    -- instead of a stale/empty recompute.
+    v_pre_drop_schema := public.flashback_collect_schema_def(
+        'public.it_exact_drop_id'::regclass::oid
+    );
     DROP TABLE public.it_exact_drop_id CASCADE;
     PERFORM public.flashback_test_inject_ddl_commit(
         v_tid,
         '0/2000'::pg_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        'DROP',
+        v_pre_drop_schema
     );
     PERFORM public.flashback_bind_drop_dependency_manifests();
 
@@ -95,6 +117,13 @@ BEGIN
         BEFORE INSERT ON public.it_exact_drop_id
         FOR EACH ROW EXECUTE FUNCTION public.it_exact_drop_id_trg_fn();
 
+    -- Same re-anchor as DROP#1: CREATE TRIGGER is metadata DDL outside the
+    -- captured table-DDL epoch, so advance the schema contract with a
+    -- synthetic ALTER commit before the DROP below re-validates it.
+    PERFORM public.flashback_test_inject_ddl_commit(
+        v_tid, '0/2900'::pg_lsn, clock_timestamp(), 90902, 'ALTER'
+    );
+
     PERFORM public.flashback_capture_drop_dependency_manifest(
         'public', 'it_exact_drop_id', false
     );
@@ -103,13 +132,19 @@ BEGIN
        SET source_xid = v_xid
      WHERE tracking_id = v_tid
        AND disaster_event_id IS NULL;
+    -- See DROP#1 above: restage under the synthetic xid with the live
+    -- (already re-anchored) schema as ddl_info.
+    v_pre_drop_schema := public.flashback_collect_schema_def(
+        'public.it_exact_drop_id'::regclass::oid
+    );
     DROP TABLE public.it_exact_drop_id CASCADE;
     PERFORM public.flashback_test_inject_ddl_commit(
         v_tid,
         '0/3000'::pg_lsn,
         clock_timestamp(),
         v_xid,
-        'DROP'
+        'DROP',
+        v_pre_drop_schema
     );
     PERFORM public.flashback_bind_drop_dependency_manifests();
 
@@ -281,7 +316,9 @@ BEGIN
         RAISE EXCEPTION 'exact_drop_identity: pg_monitor EXECUTE not revoked on new core signature';
     END IF;
 
-    DROP TABLE IF EXISTS public.it_exact_drop_id CASCADE;
-    DROP FUNCTION IF EXISTS public.it_exact_drop_id_trg_fn() CASCADE;
+    -- No terminal DROP TABLE: pg_test rolls back this whole transaction, and
+    -- the restore just performed leaves the successor generation "building"
+    -- (not yet active) until that rollback/commit is observed, so a
+    -- same-transaction DROP here would trip the schema-contract guard.
 END;
 $tv$;
