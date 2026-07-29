@@ -464,16 +464,23 @@ pass "exact DROP recovery preserved data, TOAST bytes and canonical metadata"
             WHERE idx.relname='orders_note_idx'
               AND i.indrelid='public.orders'::regclass;")" == t ]] \
     || die "secondary btree index missing or invalid"
+# These three probes must each supply an explicit ticket_no. Omitting it
+# lets PostgreSQL evaluate the column default -- nextval('orders_ticket_seq')
+# -- before the constraint violation aborts the INSERT; a sequence advance is
+# non-transactional, so even a failed/rolled-back INSERT still permanently
+# consumes one descending value from the very sequence the later edge
+# assertion below checks. Three silently-consumed probes here is exactly
+# the 3*3=9 gap the edge assertion used to catch as a false "drift".
 expect_sqlstate "UNIQUE constraint probe" 23505 \
-    "INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
-     VALUES (-9001,1,'key-2',1,'dup','{}','{}','smoke_app');"
+    "INSERT INTO public.orders(id,ticket_no,parent_id,external_key,qty,note,payload,tags,tenant)
+     VALUES (-9001,-9001,1,'key-2',1,'dup','{}','{}','smoke_app');"
 expect_sqlstate "CHECK constraint probe" 23514 \
-    "INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
-     VALUES (-9002,1,'bad-check',101,'bad','{}','{}','smoke_app');"
+    "INSERT INTO public.orders(id,ticket_no,parent_id,external_key,qty,note,payload,tags,tenant)
+     VALUES (-9002,-9002,1,'bad-check',101,'bad','{}','{}','smoke_app');"
 expect_sqlstate "outgoing FK probe" 23503 \
     "SET CONSTRAINTS orders_parent_fk IMMEDIATE;
-     INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
-     VALUES (-9003,999999,'bad-fk',1,'bad','{}','{}','smoke_app');"
+     INSERT INTO public.orders(id,ticket_no,parent_id,external_key,qty,note,payload,tags,tenant)
+     VALUES (-9003,-9003,999999,'bad-fk',1,'bad','{}','{}','smoke_app');"
 pass "PK, UNIQUE, CHECK, outgoing FK and secondary index are behaviorally valid"
 
 [[ "$(q "SELECT relrowsecurity AND relforcerowsecurity
