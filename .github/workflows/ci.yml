@@ -63,6 +63,7 @@ jobs:
         run: |
           bash -n scripts/*.sh
           shellcheck -S warning scripts/*.sh
+          scripts/run_schema_dump_normalize_selftest.sh
 
       - name: Whitespace check
         run: git diff --check

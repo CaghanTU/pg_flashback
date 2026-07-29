@@ -7,6 +7,8 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/acl_order_canon.sh
 source "$ROOT/scripts/lib/acl_order_canon.sh"
+# shellcheck source=scripts/lib/schema_dump_normalize.sh
+source "$ROOT/scripts/lib/schema_dump_normalize.sh"
 
 CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
 PG_BIN="${PG_BIN:?PG_BIN is required}"
@@ -228,13 +230,7 @@ schema_dump_of_orders() {
         --table=public.orders_id_seq \
         --table=public.orders_ticket_seq \
         >"$output"
-    sed -i \
-        -e '/^\\\\restrict /d' \
-        -e '/^\\\\unrestrict /d' \
-        -e '/^-- Dumped /d' \
-        -e '/^-- Started /d' \
-        -e '/^-- Completed /d' \
-        "$output"
+    normalize_schema_dump_in_place "$output"
 }
 q "CREATE EXTENSION pg_flashback;"
 for _ in $(seq 1 200); do
