@@ -1415,17 +1415,93 @@ BEGIN
     END LOOP;
 
     -- Handoff after drain: pin the canonical outer stream key first, without
-    -- blocking while SHARE is held. This freezes stream/config state through
-    -- manifest/event staging and preserves stream→lifecycle→relation order.
-    IF NOT pg_try_advisory_xact_lock(
-        public.flashback_internal_lock_ns_stream(),
-        v_database_oid::integer
-    ) THEN
-        RAISE EXCEPTION
-            'pg_flashback: destructive DDL could not pin the WAL stream after drain'
-            USING ERRCODE = 'serialization_failure',
-                  HINT = 'The capture worker or another lifecycle operation is active; retry the DDL.';
-    END IF;
+    -- *unboundedly* blocking while SHARE is held (pg_advisory_xact_lock is
+    -- forbidden here for that reason -- see lock-order note above). This
+    -- freezes stream/config state through manifest/event staging and
+    -- preserves stream→lifecycle→relation order.
+    --
+    -- A single pg_try_advisory_xact_lock attempt races the capture worker's
+    -- own session-scoped lock/unlock bracket around every WAL-consume batch
+    -- (storage/worker.rs consume_wal_changes): the worker re-acquires that
+    -- session lock on essentially every poll cycle, so a lone attempt taken
+    -- the instant the drain loop above releases its own last session lock
+    -- collides often enough to force the caller to hand-retry ordinary DROPs
+    -- under any sustained DDL load. That is not a real conflict -- the
+    -- worker's hold is momentary and the target relations already cannot
+    -- accumulate new relevant WAL, since SHARE has blocked new writers since
+    -- before the drain loop even started -- so absorb it internally with a
+    -- bounded retry against the SAME v_deadline the drain loop already
+    -- computed, rather than starting a fresh timer: worst-case latency for
+    -- drain+handoff together must never exceed the single write-stall budget
+    -- the caller sized this whole prepare() call against.
+    --
+    -- A REAL competing holder -- flashback_internal_lock_database_stream()'s
+    -- xact-scoped blocking lock, taken by protect/track/reconcile/retention
+    -- paths that are allowed to wait -- still only yields the key at their
+    -- own transaction end, so this loop still fails closed once v_deadline
+    -- passes exactly as the previous single-shot attempt did; it can only
+    -- ever wait up to the same bounded budget, never indefinitely.
+    LOOP
+        EXIT WHEN pg_try_advisory_xact_lock(
+            public.flashback_internal_lock_ns_stream(),
+            v_database_oid::integer
+        );
+        IF clock_timestamp() >= v_deadline THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL could not pin the WAL stream after drain'
+                USING ERRCODE = 'serialization_failure',
+                      HINT = 'The capture worker or another lifecycle operation is active; retry the DDL.';
+        END IF;
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+
+    -- The stream key is now held exclusively for the rest of this
+    -- transaction (pg_advisory_xact_lock and the worker's pg_advisory_lock
+    -- contend for the same locktag regardless of session/xact scope), so no
+    -- further worker lock/consume cycle can interleave from here on -- the
+    -- worker's own next pg_advisory_lock call simply waits behind us. SHARE
+    -- has provably kept every target's pre-barrier WAL empty this whole time
+    -- (a target cannot gain new relevant WAL while nothing can write to it),
+    -- so this re-peek cannot find anything the drain loop didn't already
+    -- rule out; it exists to turn that invariant into an enforced fact
+    -- rather than an assumption spanning the retry above.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        SELECT COALESCE((cs.details->>'no_physical_slot')::boolean, false)
+          INTO v_synthetic_stream
+        FROM flashback.coverage_generations cg
+        JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
+        WHERE cg.tracking_id = target.tracking_id
+          AND cg.state = 'active';
+        IF NOT FOUND OR COALESCE(v_synthetic_stream, false) THEN
+            CONTINUE;
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM pg_logical_slot_peek_changes(
+                v_slot_name,
+                v_barrier_lsn,
+                1,
+                'tracked_oids',
+                target.rel_oid::text,
+                'metadata_only',
+                'true'
+            ) AS ch(lsn, xid, data)
+            WHERE ch.data LIKE '{%'
+        ) THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL barrier drain invalidated for % after pinning the WAL stream',
+                format('%I.%I', target.schema_name, target.table_name)
+                USING ERRCODE = 'serialization_failure',
+                      HINT = 'Retry the DDL.';
+        END IF;
+    END LOOP;
 
     -- Never block on a lifecycle while holding SHARE.
     -- A restore can own lifecycle and wait for ACCESS EXCLUSIVE; blocking here
