@@ -46,6 +46,10 @@
 #   POC_KEEP=1                 keep cluster/work dir even on PASS (debugging)
 #   POC_PG_BIN=...              override PostgreSQL bin dir (default /usr/local/pgsql-17/bin)
 #   POC_EXPECTED_SO_SHA256=...  abort before any cluster if built .so does not match
+#   POC_MAX_WAL_SIZE=...         benchmark-cluster max_wal_size (default 16GB)
+#   POC_MATERIALIZE_TIMEOUT_S=N  explicit materialization timeout override
+#   POC_MATERIALIZE_TIMEOUT_PER_GIB_S=N
+#                                scaled timeout per GiB (default 120s, min 180s)
 #
 # Evidence: target/poc/storage-backend-benchmark/<run-id>/result.json
 # (gitignored; never committed). status is PASS only when every step this
@@ -89,6 +93,17 @@ PG_BIN="${POC_PG_BIN:-/usr/local/pgsql-17/bin}"
     || { echo "FAIL: PostgreSQL 17 binaries not found under $PG_BIN" >&2; exit 2; }
 which zstd >/dev/null 2>&1 || { echo "FAIL: zstd CLI not found on PATH" >&2; exit 2; }
 which python3 >/dev/null 2>&1 || { echo "FAIL: python3 not found on PATH (used for hex decode)" >&2; exit 2; }
+
+POC_MAX_WAL_SIZE="${POC_MAX_WAL_SIZE:-16GB}"
+POC_MATERIALIZE_TIMEOUT_MIN_S="${POC_MATERIALIZE_TIMEOUT_MIN_S:-180}"
+POC_MATERIALIZE_TIMEOUT_PER_GIB_S="${POC_MATERIALIZE_TIMEOUT_PER_GIB_S:-120}"
+POC_MATERIALIZE_TIMEOUT_S="${POC_MATERIALIZE_TIMEOUT_S:-}"
+[[ "$POC_MATERIALIZE_TIMEOUT_MIN_S" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: POC_MATERIALIZE_TIMEOUT_MIN_S must be a positive integer" >&2; exit 2; }
+[[ "$POC_MATERIALIZE_TIMEOUT_PER_GIB_S" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: POC_MATERIALIZE_TIMEOUT_PER_GIB_S must be a positive integer" >&2; exit 2; }
+[[ -z "$POC_MATERIALIZE_TIMEOUT_S" || "$POC_MATERIALIZE_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: POC_MATERIALIZE_TIMEOUT_S must be empty or a positive integer" >&2; exit 2; }
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 WORK_ROOT="$ROOT/target/poc/storage-backend-benchmark/$RUN_ID"
@@ -295,6 +310,10 @@ max_wal_senders = 16
 max_worker_processes = 16
 fsync = on
 full_page_writes = on
+min_wal_size = '2GB'
+max_wal_size = '$POC_MAX_WAL_SIZE'
+checkpoint_timeout = '15min'
+checkpoint_completion_target = 0.9
 listen_addresses = ''
 log_min_messages = warning
 EOF
@@ -321,6 +340,18 @@ row_count() { local tbl=$1; q "$DB" "SELECT count(*) FROM $tbl;"; }
 table_oid() { local tbl=$1; q "$DB" "SELECT '$tbl'::regclass::oid;"; }
 fingerprint_table() { local tbl=$1; q "$DB" "SELECT md5(COALESCE(string_agg(h, '|' ORDER BY h), '')) FROM (SELECT md5(t::text) h FROM $tbl t) x;"; }
 toast_hash() { local tbl=$1 col=$2; q "$DB" "SELECT md5(string_agg(md5(COALESCE($col::text,'')), '' ORDER BY id)) FROM $tbl;"; }
+materialize_timeout_for_size() {
+    if [[ -n "$POC_MATERIALIZE_TIMEOUT_S" ]]; then
+        echo "$POC_MATERIALIZE_TIMEOUT_S"
+        return 0
+    fi
+    local gib timeout_s
+    gib=$(( (SIZE_MIB + 1023) / 1024 ))
+    timeout_s=$(( gib * POC_MATERIALIZE_TIMEOUT_PER_GIB_S ))
+    (( timeout_s >= POC_MATERIALIZE_TIMEOUT_MIN_S )) \
+        || timeout_s=$POC_MATERIALIZE_TIMEOUT_MIN_S
+    echo "$timeout_s"
+}
 consume_slot_to_events() {
     local slot=$1 oids=$2
     q "$DB" "INSERT INTO decoded_events(data)
@@ -643,7 +674,7 @@ echo "== PoC run $RUN_ID mode=$MODE backend=${BACKEND:-} shape=${SHAPE:-} size_m
 # WAL-replay commit/event counts) is identical across all three.
 BOUNDARY_LSN="" MARKER_XID="" COPY_WINDOW_COMMITS=0 COMMITS_REPLAYED=0
 BENCH_INS=0 BENCH_UPD=0 BENCH_DEL=0 HIST_REPLAYED=0 DUP_COMMITS=0 OOO_COMMITS=0
-MATERIALIZE_MS=0 LOCK_HOLD_MS=0 GT_TBL="" CRASHED_MID_MATERIALIZE=0
+MATERIALIZE_MS=0 MATERIALIZE_TIMEOUT_S_USED=0 LOCK_HOLD_MS=0 GT_TBL="" CRASHED_MID_MATERIALIZE=0
 
 establish_boundary_and_materialize() {
     local tbl=$1 slot=$2 backend=$3 rawfile=$4 crash_point=$5
@@ -790,9 +821,13 @@ SQL
 
     local t_copy0 t_copy1
     t_copy0=$(now_ms)
-    deadline=$(( $(date +%s) + 180 ))
+    MATERIALIZE_TIMEOUT_S_USED="$(materialize_timeout_for_size)"
+    deadline=$(( $(date +%s) + MATERIALIZE_TIMEOUT_S_USED ))
     while [[ ! -f "$copier_finished_file" ]]; do
-        (( $(date +%s) < deadline )) || { stop_bench_children; die "bench[$tbl]: materialization did not finish in time"; }
+        (( $(date +%s) < deadline )) || {
+            stop_bench_children
+            die "bench[$tbl]: materialization did not finish within ${MATERIALIZE_TIMEOUT_S_USED}s"
+        }
         sleep 0.1
     done
     t_copy1=$(now_ms)
@@ -1333,6 +1368,21 @@ run_bench() {
     record_metric "bench.${BACKEND}.${SHAPE}.source_table_bytes" "$source_table_bytes" "bytes"
     record_metric "bench.${BACKEND}.${SHAPE}.source_logical_bytes" "$source_logical_bytes" "bytes"
 
+    # Data generation is setup, not part of snapshot/recovery RTO. Finish
+    # setup-originated checkpoint I/O before timing either backend so a
+    # large fixture cannot randomly penalize whichever backend runs first.
+    local t_setup_checkpoint0 t_setup_checkpoint1 setup_checkpoint_ms
+    local max_wal_size_bytes checkpoint_timeout_s
+    t_setup_checkpoint0=$(now_ms)
+    q "$DB" "CHECKPOINT;" >/dev/null
+    t_setup_checkpoint1=$(now_ms)
+    setup_checkpoint_ms=$((t_setup_checkpoint1-t_setup_checkpoint0))
+    max_wal_size_bytes="$(q "$DB" "SELECT pg_size_bytes(current_setting('max_wal_size'));")"
+    checkpoint_timeout_s="$(q "$DB" "SELECT extract(epoch FROM current_setting('checkpoint_timeout')::interval)::bigint;")"
+    record_metric "bench.${BACKEND}.${SHAPE}.setup_checkpoint_ms_excluded_from_rto" "$setup_checkpoint_ms" "ms"
+    record_metric "bench.${BACKEND}.${SHAPE}.max_wal_size_bytes" "$max_wal_size_bytes" "bytes"
+    record_metric "bench.${BACKEND}.${SHAPE}.checkpoint_timeout_s" "$checkpoint_timeout_s" "seconds"
+
     local artifact_id="bench-${BACKEND}-${SHAPE}-${SIZE_MIB}-${REP_LABEL}-$$"
     local rawfile="$WORK_ROOT/rawstream_${artifact_id}.bin"
 
@@ -1389,6 +1439,7 @@ run_bench() {
     record_metric "bench.${BACKEND}.${SHAPE}.snapshot_create_ms" "$((t_snap1-t_snap0))" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.lock_hold_ms" "$LOCK_HOLD_MS" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.materialize_ms" "$MATERIALIZE_MS" "ms"
+    record_metric "bench.${BACKEND}.${SHAPE}.materialize_timeout_s" "$MATERIALIZE_TIMEOUT_S_USED" "seconds"
     record_metric "bench.${BACKEND}.${SHAPE}.persist_ms" "$((t_persist1-t_persist0))" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.restore_ms" "$restore_ms" "ms"
     record_metric "bench.${BACKEND}.${SHAPE}.verify_ms" "$verify_ms" "ms"
