@@ -293,6 +293,10 @@
       "class": "supported-core",
       "reason": "RLS restore via seam"
     },
+    "schema_collation_roundtrip.sql": {
+      "class": "supported-core",
+      "reason": "qualified column collation capture, recreation and independent catalog verification"
+    },
     "schema_add_column_restore_old_time.sql": {
       "class": "supported-core",
       "reason": "add column restore via seam"

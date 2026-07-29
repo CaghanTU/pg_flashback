@@ -45,9 +45,9 @@ epoch being recovered to is outside it.
 
 | Feature | Behavior |
 |---|---|
-| Ordinary columns | Preserved |
+| Ordinary columns | Preserved, including qualified column collation |
 | Identity and serial columns | Preserved; original names restored |
-| Primary key, `UNIQUE`, `CHECK` constraints | Preserved |
+| Primary key, `UNIQUE`, `CHECK` constraints | Preserved; primary-key name and deferrability are verified |
 | Outgoing foreign keys | Preserved |
 | Plain btree indexes | Preserved |
 | Owner and table-level ACL | Preserved |

@@ -57,6 +57,15 @@ AS $$
                     'type_oid', a.atttypid,
                     'typmod', a.atttypmod,
                     'type', pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    -- COPY BINARY carries values, not column collation.
+                    -- Persist the qualified catalog identity for every
+                    -- collatable column so a non-default COLLATE clause is
+                    -- never silently replaced by the target database default.
+                    'collation', CASE
+                        WHEN a.attcollation <> 0
+                        THEN format('%I.%I', coll_n.nspname, coll.collname)
+                        ELSE NULL
+                    END,
                     'not_null', a.attnotnull,
                     'default_expr', pg_get_expr(d.adbin, d.adrelid),
                     'generated', a.attgenerated,
@@ -94,6 +103,10 @@ AS $$
             LEFT JOIN pg_attrdef d
                 ON d.adrelid = a.attrelid
                AND d.adnum = a.attnum
+            LEFT JOIN pg_collation coll
+                ON coll.oid = a.attcollation
+            LEFT JOIN pg_namespace coll_n
+                ON coll_n.oid = coll.collnamespace
             WHERE a.attrelid = c.oid
               AND a.attnum > 0
               AND NOT a.attisdropped
@@ -106,6 +119,16 @@ AS $$
             WHERE i.indrelid = c.oid
               AND i.indisprimary
         ), '[]'::jsonb),
+        'primary_key_constraint', (
+            SELECT jsonb_build_object(
+                'name', con.conname,
+                'def', pg_get_constraintdef(con.oid, true)
+            )
+            FROM pg_constraint con
+            WHERE con.conrelid = c.oid
+              AND con.contype = 'p'
+            LIMIT 1
+        ),
         'constraints', COALESCE((
             SELECT jsonb_agg(
                 jsonb_build_object(

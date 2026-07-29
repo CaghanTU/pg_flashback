@@ -52,7 +52,9 @@ The local recovery path supports:
 
 - PostgreSQL 15, 16, 17, and 18;
 - ordinary permanent `LOGGED` tables;
-- primary and secondary indexes, unique and check constraints;
+- primary and secondary indexes, named/deferrable primary keys, unique and
+  check constraints;
+- qualified column collations;
 - identity/serial sequences, TOAST values, quoted identifiers, and
   non-`public` schemas;
 - `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and ordinary `DROP TABLE`;

@@ -126,7 +126,16 @@ BEGIN
                     'identity', COALESCE(elem->>'identity', ''),
                     'generated', COALESCE(elem->>'generated', ''),
                     'default', COALESCE(elem->>'default_expr', '')
-                )
+                ) || CASE
+                    -- Old retained schema_def payloads predate explicit
+                    -- collation capture.  Absence means "not proven", not
+                    -- "expect an empty/default collation".
+                    WHEN elem ? 'collation'
+                    THEN jsonb_build_object(
+                        'collation', COALESCE(elem->>'collation', '')
+                    )
+                    ELSE '{}'::jsonb
+                END
                 ORDER BY COALESCE((elem->>'attnum')::int, 0), elem->>'name'
             )
             FROM jsonb_array_elements(COALESCE(p_schema_def->'columns', '[]'::jsonb)) elem
@@ -144,7 +153,14 @@ BEGIN
         'replica_identity', COALESCE(p_schema_def->>'replica_identity', 'd'),
         'tablespace', p_schema_def->>'tablespace',
         'reloptions', COALESCE(p_schema_def->'reloptions', '[]'::jsonb)
-    );
+    ) || CASE
+        WHEN p_schema_def ? 'primary_key_constraint'
+        THEN jsonb_build_object(
+            'primary_key_constraint',
+            COALESCE(p_schema_def->'primary_key_constraint', 'null'::jsonb)
+        )
+        ELSE '{}'::jsonb
+    END;
 END;
 $$;
 
@@ -181,11 +197,26 @@ BEGIN
               ON att.attrelid = i.indrelid AND att.attnum = k.attnum
             WHERE i.indrelid = v_oid AND i.indisprimary
         ), '[]'::jsonb),
+        'primary_key_constraint', COALESCE((
+            SELECT jsonb_build_object(
+                'name', con.conname,
+                'def', pg_get_constraintdef(con.oid, true)
+            )
+            FROM pg_constraint con
+            WHERE con.conrelid = v_oid
+              AND con.contype = 'p'
+            LIMIT 1
+        ), 'null'::jsonb),
         'columns', COALESCE((
             SELECT jsonb_agg(
                 jsonb_build_object(
                     'name', a.attname,
                     'type', format_type(a.atttypid, a.atttypmod),
+                    'collation', CASE
+                        WHEN a.attcollation <> 0
+                        THEN format('%I.%I', coll_n.nspname, coll.collname)
+                        ELSE ''
+                    END,
                     'not_null', a.attnotnull,
                     'identity', a.attidentity::text,
                     'generated', a.attgenerated::text,
@@ -196,6 +227,10 @@ BEGIN
             FROM pg_attribute a
             LEFT JOIN pg_attrdef ad
               ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+            LEFT JOIN pg_collation coll
+              ON coll.oid = a.attcollation
+            LEFT JOIN pg_namespace coll_n
+              ON coll_n.oid = coll.collnamespace
             WHERE a.attrelid = v_oid
               AND a.attnum > 0
               AND NOT a.attisdropped
@@ -620,6 +655,31 @@ BEGIN
 
     v_data_fp := public.flashback_relation_full_data_fingerprint(p_live, p_order_spec);
     v_inventory := public.flashback_canonical_inventory_from_relation(p_live);
+    -- Compare newly captured metadata exactly, while keeping old retained
+    -- schema_def payloads restorable.  A historical payload cannot prove a
+    -- field that did not exist in its contract, so remove only those new
+    -- actual-side fields when the target schema_def lacks them.
+    IF NOT p_schema_def ? 'primary_key_constraint' THEN
+        v_inventory := v_inventory - 'primary_key_constraint';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(
+            COALESCE(p_schema_def->'columns', '[]'::jsonb)
+        ) AS col
+        WHERE col ? 'collation'
+    ) THEN
+        v_inventory := jsonb_set(
+            v_inventory,
+            '{columns}',
+            COALESCE((
+                SELECT jsonb_agg(col - 'collation')
+                FROM jsonb_array_elements(
+                    COALESCE(v_inventory->'columns', '[]'::jsonb)
+                ) AS col
+            ), '[]'::jsonb)
+        );
+    END IF;
     v_seq_states := public.flashback_expected_sequence_states(p_live, p_schema_def);
     -- Actual sequence_states compared against the edge contract (not raw pg_sequences
     -- alone), so restore setval positioning is the verified semantic.

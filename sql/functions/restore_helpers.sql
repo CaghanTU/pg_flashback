@@ -493,9 +493,14 @@ BEGIN
     -- Build column definitions (skip nextval defaults — restored later)
     SELECT string_agg(
         format(
-            '%I %s%s%s',
+            '%I %s%s%s%s',
             col->>'name',
             col->>'type',
+            CASE
+                WHEN NULLIF(col->>'collation', '') IS NOT NULL
+                THEN format(' COLLATE %s', col->>'collation')
+                ELSE ''
+            END,
             CASE
                 WHEN COALESCE((col->>'not_null')::boolean, false) THEN ' NOT NULL'
                 ELSE ''
@@ -614,10 +619,23 @@ BEGIN
     IF NOT v_is_shadow THEN
         -- Non-shadow: create PK immediately
         IF pk_cols IS NOT NULL AND pk_cols <> '' THEN
-            EXECUTE format(
-                'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
-                v_tgt_schema, v_tgt_table, pk_cols
-            );
+            IF ddl_info->'primary_key_constraint' IS NOT NULL
+               AND ddl_info->'primary_key_constraint' <> 'null'::jsonb
+            THEN
+                EXECUTE format(
+                    'ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+                    v_tgt_schema, v_tgt_table,
+                    ddl_info#>>'{primary_key_constraint,name}',
+                    ddl_info#>>'{primary_key_constraint,def}'
+                );
+            ELSE
+                -- Backward compatibility for stored schema_def payloads
+                -- created before the PK constraint identity was captured.
+                EXECUTE format(
+                    'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
+                    v_tgt_schema, v_tgt_table, pk_cols
+                );
+            END IF;
         END IF;
     END IF;
     -- Shadow mode: PK is deferred — caller adds it after snapshot load
@@ -745,10 +763,21 @@ BEGIN
         PERFORM set_config('maintenance_work_mem',
             COALESCE(NULLIF(current_setting('pg_flashback.index_build_work_mem', true), ''), '512MB'),
             true);
-        EXECUTE format(
-            'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
-            p_shadow_schema, p_shadow_table, pk_cols
-        );
+        IF ddl_info->'primary_key_constraint' IS NOT NULL
+           AND ddl_info->'primary_key_constraint' <> 'null'::jsonb
+        THEN
+            EXECUTE format(
+                'ALTER TABLE %I.%I ADD CONSTRAINT %I %s',
+                p_shadow_schema, p_shadow_table,
+                ddl_info#>>'{primary_key_constraint,name}',
+                ddl_info#>>'{primary_key_constraint,def}'
+            );
+        ELSE
+            EXECUTE format(
+                'ALTER TABLE %I.%I ADD PRIMARY KEY (%s)',
+                p_shadow_schema, p_shadow_table, pk_cols
+            );
+        END IF;
     END IF;
 
     -- Also apply deferred UNIQUE constraints

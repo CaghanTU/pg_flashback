@@ -303,6 +303,10 @@ mod tests {
         "../tests/sql/integration/identity_schema_roundtrip.sql"
     );
     sql_test!(
+        it_schema_collation_roundtrip,
+        "../tests/sql/integration/schema_collation_roundtrip.sql"
+    );
+    sql_test!(
         it_wal_payload_type_replay,
         "../tests/sql/integration/wal_payload_type_replay.sql"
     );
