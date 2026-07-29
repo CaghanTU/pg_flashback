@@ -127,7 +127,7 @@ register_child_pid() { RUN_CHILD_PIDS+=("$1"); }
 
 case "$MODE" in
     selftest)
-        qst_init dirty_tree_rejected candidate_mismatch_rejected cleanup_after_pass
+        qst_init dirty_tree_rejected candidate_mismatch_rejected streaming_fingerprint_verified cleanup_after_pass
         ;;
     bench)
         qst_init candidate_build cluster_bootstrap bench_base bench_persist bench_restore bench_verify bench_metrics
@@ -338,8 +338,34 @@ crash_restart_cluster() {
 now_ms() { date +%s%3N; }
 row_count() { local tbl=$1; q "$DB" "SELECT count(*) FROM $tbl;"; }
 table_oid() { local tbl=$1; q "$DB" "SELECT '$tbl'::regclass::oid;"; }
-fingerprint_table() { local tbl=$1; q "$DB" "SELECT md5(COALESCE(string_agg(h, '|' ORDER BY h), '')) FROM (SELECT md5(t::text) h FROM $tbl t) x;"; }
-toast_hash() { local tbl=$1 col=$2; q "$DB" "SELECT md5(string_agg(md5(COALESCE($col::text,'')), '' ORDER BY id)) FROM $tbl;"; }
+stream_query_sha256() {
+    local sql=$1 digest
+    # Do not aggregate all row hashes into one PostgreSQL datum. PostgreSQL
+    # varlena values are limited to about 1 GiB; the old string_agg()
+    # fingerprint therefore failed during the 10 GiB qualification even
+    # though snapshot persistence and restore had completed successfully.
+    #
+    # COPY BINARY preserves a deterministic, typed byte stream while
+    # sha256sum consumes it incrementally outside the server. ORDER BY keeps
+    # the semantic table fingerprint independent of physical row order.
+    digest="$("${PSQL[@]}" -X -qAt -d "$DB" \
+        -c "COPY ($sql) TO STDOUT (FORMAT binary)" \
+        | sha256sum | awk '{print $1}')" \
+        || die "streaming fingerprint query failed"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] \
+        || die "streaming fingerprint returned invalid digest: $digest"
+    printf '%s\n' "$digest"
+}
+fingerprint_table() {
+    local tbl=$1
+    stream_query_sha256 "SELECT md5(t::text) AS row_hash FROM $tbl t ORDER BY row_hash"
+}
+toast_hash() {
+    local tbl=$1 col=$2
+    # Hash the actual typed values in primary-key order rather than building
+    # one giant concatenated text value inside PostgreSQL.
+    stream_query_sha256 "SELECT id, $col FROM $tbl ORDER BY id"
+}
 materialize_timeout_for_size() {
     if [[ -n "$POC_MATERIALIZE_TIMEOUT_S" ]]; then
         echo "$POC_MATERIALIZE_TIMEOUT_S"
@@ -1836,6 +1862,29 @@ run_selftest() {
     bootstrap_cluster
     install_oracle_sql
     [[ -f "$DATA/postmaster.pid" ]] || die "cluster did not start"
+
+    q "$DB" "
+        CREATE TABLE poc_fingerprint_source(id bigint PRIMARY KEY, payload text);
+        INSERT INTO poc_fingerprint_source
+        SELECT g, repeat(md5(g::text), 4)
+          FROM generate_series(1, 1000) AS g;
+        CREATE TABLE poc_fingerprint_copy AS TABLE poc_fingerprint_source;
+    " >/dev/null
+    local source_fp copy_fp changed_fp source_toast copy_toast changed_toast
+    source_fp="$(fingerprint_table poc_fingerprint_source)"
+    copy_fp="$(fingerprint_table poc_fingerprint_copy)"
+    source_toast="$(toast_hash poc_fingerprint_source payload)"
+    copy_toast="$(toast_hash poc_fingerprint_copy payload)"
+    [[ "$source_fp" == "$copy_fp" && "$source_toast" == "$copy_toast" ]] \
+        || die "streaming fingerprint rejected identical table contents"
+    q "$DB" "UPDATE poc_fingerprint_copy SET payload = payload || '-changed' WHERE id = 500;" >/dev/null
+    changed_fp="$(fingerprint_table poc_fingerprint_copy)"
+    changed_toast="$(toast_hash poc_fingerprint_copy payload)"
+    [[ "$source_fp" != "$changed_fp" && "$source_toast" != "$changed_toast" ]] \
+        || die "streaming fingerprint failed to detect one changed row"
+    qst_mark_step "streaming_fingerprint_verified" "pass" \
+        "identical copies match; one-row semantic and ordered-payload changes are detected"
+
     qst_mark_step "cleanup_after_pass" "pass" "real cluster bootstrapped; cleanup() on exit must leave zero leftovers (checked by the process-level leftover audit in cleanup)"
 }
 
