@@ -230,6 +230,10 @@ mod tests {
         "../tests/sql/integration/nested_ddl_capture.sql"
     );
     sql_test!(
+        it_ddl_exact_oid_routing,
+        "../tests/sql/integration/ddl_exact_oid_routing.sql"
+    );
+    sql_test!(
         it_pitr_time_filtering,
         "../tests/sql/integration/pitr_time_filtering.sql"
     );
@@ -305,6 +309,10 @@ mod tests {
     sql_test!(
         it_schema_collation_roundtrip,
         "../tests/sql/integration/schema_collation_roundtrip.sql"
+    );
+    sql_test!(
+        it_pre_drop_schema_drift_failclosed,
+        "../tests/sql/integration/pre_drop_schema_drift_failclosed.sql"
     );
     sql_test!(
         it_wal_payload_type_replay,

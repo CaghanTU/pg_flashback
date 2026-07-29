@@ -535,6 +535,7 @@ BEGIN
             ('schema_versions', 'source_xid'),
             ('schema_versions', 'committed_at'),
             ('schema_versions', 'commit_lsn'),
+            ('schema_versions', 'schema_def'),
             ('generation_payload_retirements', 'tracking_id'),
             ('generation_payload_retirements', 'generation_id'),
             ('generation_payload_retirements', 'snapshot_id'),

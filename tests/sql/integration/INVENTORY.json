@@ -62,6 +62,10 @@
       "class": "supported-core",
       "reason": "drop restore via seam/pending DDL"
     },
+    "ddl_exact_oid_routing.sql": {
+      "class": "supported-core",
+      "reason": "unqualified DROP/TRUNCATE/ALTER bind to exact caller-search_path relation OID"
+    },
     "ddl_truncate_restore.sql": {
       "class": "supported-core",
       "reason": "truncate restore via seam/pending DDL"
@@ -276,6 +280,10 @@
     "restore_metadata_no_pk_table.sql": {
       "class": "supported-core",
       "reason": "primary-key-less table metadata cache coverage via seam"
+    },
+    "pre_drop_schema_drift_failclosed.sql": {
+      "class": "supported-core",
+      "reason": "uncaptured related-object metadata drift must abort DROP before stale-schema recovery can be promised"
     },
     "restore_verify_adversarial_metadata.sql": {
       "class": "infra",

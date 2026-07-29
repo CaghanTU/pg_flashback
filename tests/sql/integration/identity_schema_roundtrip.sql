@@ -7,6 +7,9 @@ DECLARE
     v_always "char";
     v_default "char";
     v_options record;
+    v_expected_state jsonb;
+    v_actual_state jsonb;
+    v_seq regclass;
 BEGIN
     DROP TABLE IF EXISTS public.it_identity_schema CASCADE;
     CREATE TABLE public.it_identity_schema (
@@ -62,6 +65,45 @@ BEGIN
         WHERE id_always=100 AND id_default=200 AND payload='historical'
     ) THEN
         RAISE EXCEPTION 'identity shadow rejected explicit historical values';
+    END IF;
+
+    -- Expected state comes from table contents; actual state must come from
+    -- the sequence relation itself.  Prove a wrong setval is observable
+    -- rather than allowing both proof sides to derive the same value.
+    INSERT INTO public.it_identity_schema(payload) VALUES ('state-proof');
+    PERFORM setval(
+        to_regclass(pg_get_serial_sequence(
+            'public.it_identity_schema', 'id_always'
+        )),
+        (SELECT max(id_always) FROM public.it_identity_schema),
+        true
+    );
+    PERFORM setval(
+        to_regclass(pg_get_serial_sequence(
+            'public.it_identity_schema', 'id_default'
+        )),
+        (SELECT max(id_default) FROM public.it_identity_schema),
+        true
+    );
+    v_expected_state := flashback_expected_sequence_states(
+        'public.it_identity_schema'::regclass, v_schema
+    );
+    v_actual_state := flashback_actual_sequence_states(
+        'public.it_identity_schema'::regclass, v_schema
+    );
+    IF v_expected_state IS DISTINCT FROM v_actual_state THEN
+        RAISE EXCEPTION 'healthy identity state proof disagrees: expected=% actual=%',
+            v_expected_state, v_actual_state;
+    END IF;
+    v_seq := to_regclass(pg_get_serial_sequence(
+        'public.it_identity_schema', 'id_always'
+    ));
+    PERFORM setval(v_seq, 500, true);
+    v_actual_state := flashback_actual_sequence_states(
+        'public.it_identity_schema'::regclass, v_schema
+    );
+    IF v_expected_state IS NOT DISTINCT FROM v_actual_state THEN
+        RAISE EXCEPTION 'sequence-state verifier did not detect wrong live setval';
     END IF;
 
     DROP TABLE public.it_identity_schema CASCADE;
