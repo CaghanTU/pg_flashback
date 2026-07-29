@@ -46,20 +46,59 @@ RESULT_JSON="${PGFB_RESTART_ADV_RESULT:-$ROOT/target/qualification/exact-wal-res
 LOG="$WORK_ROOT/postgresql.log"
 DB=postgres
 PASSED=0
-FAILED=0
 EC_BOUND=0
 PREFIX_INSTALLED=0
 PRIMARY_STARTED=0
 declare -a CASE_RESULTS=()
+# Every case this script can produce evidence for, declared up front so a
+# case that never ran (early exit, interrupt, a die() before it started)
+# cannot simply be absent from the result JSON -- cleanup() below fills in an
+# explicit not_run entry for anything missing from CASE_RESULTS.
+declare -a PLANNED_CASES=(A1 A2 B)
+CURRENT_CASE=""
+HARNESS_ERROR=""
+CLEANUP_ERROR=""
 
-die() { echo "FAIL: $*" >&2; exit 1; }
-pass() { echo "  PASS: $*"; PASSED=$((PASSED + 1)); CASE_RESULTS+=("{\"name\":$(jq -Rn --arg s "$*" '$s'),\"pass\":true}"); }
+# A die() while CURRENT_CASE is set is that named case's product assertion
+# failing -- record it as such. A die() before any begin_case (candidate
+# bind/install, initial extension/worker bring-up) is harness/environment
+# failure, not a product result, and is never attributed to a case name.
+die() {
+    local msg="$*"
+    echo "FAIL: $msg" >&2
+    if [[ -n "$CURRENT_CASE" ]]; then
+        CASE_RESULTS+=("$(jq -n --arg n "$CURRENT_CASE" --arg r "$msg" \
+            '{name:$n,pass:false,kind:"product",reason:$r}')")
+    else
+        HARNESS_ERROR="$msg"
+    fi
+    exit 1
+}
+begin_case() { CURRENT_CASE="$1"; }
+pass() {
+    local detail="$*"
+    echo "  PASS: $CURRENT_CASE: $detail"
+    PASSED=$((PASSED + 1))
+    CASE_RESULTS+=("$(jq -n --arg n "$CURRENT_CASE" --arg d "$detail" \
+        '{name:$n,pass:true,detail:$d}')")
+    CURRENT_CASE=""
+}
 
 cleanup() {
     local rc=$?
     set +e
     if [[ "$PRIMARY_STARTED" == 1 ]]; then
-        "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1
+        local stop_log="$WORK_ROOT/cleanup-stop.log"
+        mkdir -p "$WORK_ROOT"
+        if ! "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >"$stop_log" 2>&1; then
+            # "server is not running" (or the data dir already having been
+            # removed by an aborted earlier stage) is expected whenever a
+            # case already stopped/restarted postgres itself; only a stop
+            # that fails for some OTHER reason is a genuine cleanup problem.
+            if ! grep -qiE 'is not running|no such file or directory' "$stop_log"; then
+                CLEANUP_ERROR="pg_ctl stop failed: $(tail -c 400 "$stop_log" | tr '\n' ' ')"
+            fi
+        fi
     fi
     if [[ "${PGFB_RESTART_ADV_KEEP:-0}" != "1" ]]; then
         rm -rf "$DATA" "$SOCKET"
@@ -67,21 +106,40 @@ cleanup() {
         echo "PGFB_RESTART_ADV_KEEP=1: leaving $WORK_ROOT" >&2
     fi
     if [[ "$PREFIX_INSTALLED" == 1 ]]; then
-        exact_candidate_restore_prefix || true
+        if ! exact_candidate_restore_prefix; then
+            CLEANUP_ERROR="${CLEANUP_ERROR:+$CLEANUP_ERROR; }exact_candidate_restore_prefix failed"
+        fi
     fi
+
+    local recorded name already
+    recorded="$(printf '%s\n' "${CASE_RESULTS[@]:-}" | jq -s 'map(.name)')"
+    for name in "${PLANNED_CASES[@]}"; do
+        already=$(jq -n --argjson r "$recorded" --arg n "$name" '$r | index($n) != null')
+        if [[ "$already" != "true" ]]; then
+            CASE_RESULTS+=("$(jq -n --arg n "$name" \
+                '{name:$n,pass:false,kind:"not_run",reason:"case never reached a pass or fail result"}')")
+        fi
+    done
+
     mkdir -p "$(dirname "$RESULT_JSON")"
-    local arr
+    local arr failed_count overall_ok=1
     arr=$(printf '%s\n' "${CASE_RESULTS[@]:-}" | jq -s '.')
+    failed_count=$(jq -n --argjson c "$arr" '[$c[] | select(.pass==false)] | length')
+    [[ "$failed_count" == "0" && "$rc" == "0" && -z "$HARNESS_ERROR" && -z "$CLEANUP_ERROR" ]] || overall_ok=0
+
     jq -n \
-        --arg run_id "$RUN_ID" --argjson passed "$PASSED" --argjson failed "$FAILED" \
+        --arg run_id "$RUN_ID" --argjson passed "$PASSED" --argjson failed "$failed_count" \
         --argjson cases "$arr" --argjson exit_code "$rc" \
+        --arg harness_error "${HARNESS_ERROR:-}" --arg cleanup_error "${CLEANUP_ERROR:-}" \
         --argjson identity "$([[ "$EC_BOUND" == 1 ]] && exact_candidate_identity_json || echo '{}')" \
         '{run_id:$run_id,passed:$passed,failed:$failed,cases:$cases,exit_code:$exit_code,
+          harness_error:(if $harness_error=="" then null else $harness_error end),
+          cleanup_error:(if $cleanup_error=="" then null else $cleanup_error end),
           identity:$identity,
-          status:(if $failed==0 and $exit_code==0 then "PASS" else "FAIL" end)}' \
+          status:(if $failed==0 and $exit_code==0 and $harness_error=="" and $cleanup_error=="" then "PASS" else "FAIL" end)}' \
         >"$RESULT_JSON"
-    echo "exact-WAL restart adversarial: $([[ $FAILED -eq 0 && $rc -eq 0 ]] && echo PASS || echo FAIL) ($RESULT_JSON)"
-    [[ $FAILED -eq 0 && $rc -eq 0 ]] || exit 1
+    echo "exact-WAL restart adversarial: $([[ "$overall_ok" == 1 ]] && echo PASS || echo FAIL) ($RESULT_JSON)"
+    [[ "$overall_ok" == 1 ]] || exit 1
     exit 0
 }
 trap cleanup EXIT
@@ -219,6 +277,7 @@ restart_pg || die "initial restart after target_databases"
 wait_worker || die "worker did not attach"
 
 # ── Case A: idled-worker lag refuses DROP; retry survives full restart ─────
+begin_case A1
 q "CREATE TABLE public.radv_lagdrop(id int PRIMARY KEY, payload text);"
 q "SELECT flashback_track('public.radv_lagdrop');" >/dev/null
 wait_health public.radv_lagdrop healthy || die "A: initial health"
@@ -244,12 +303,24 @@ set -e
     || die "A: DROP refusal did not report the fail-closed pre-drain contract: $DROP_REFUSAL"
 [[ "$(q "SELECT to_regclass('public.radv_lagdrop') IS NOT NULL;")" == "t" ]] \
     || die "A: refused DROP changed the live table"
-pass "A1: DROP is fail-closed while committed relation WAL cannot drain"
+pass "DROP is fail-closed while committed relation WAL cannot drain"
 
+begin_case A2
 # Resume the worker and retry the exact same DROP. The pre-DROP SHARE fence
 # lets the independent worker consume the committed UPDATE while preventing
 # new writers, then the real DROP upgrades to ACCESS EXCLUSIVE.
 kill -CONT "$WORKER_PID" >/dev/null 2>&1 || true
+
+# Harness-selftest-only deterministic failpoint (never set in a real
+# qualification run): proves result-JSON integrity end to end -- a genuine
+# mid-run die() must leave A1 recorded pass:true, A2 recorded pass:false
+# with a reason, B recorded not_run, and top-level failed/status/exit_code
+# all agreeing. See run_exact_wal_restart_adversarial_harness_selftest.sh.
+# Placed after kill -CONT so the worker is never left SIGSTOPped into
+# cleanup's immediate-mode shutdown.
+if [[ "${PGFB_RESTART_ADV_FORCE_FAIL:-}" == "A2" ]]; then
+    die "A2: forced failure for harness selftest (PGFB_RESTART_ADV_FORCE_FAIL=A2)"
+fi
 q "DROP TABLE public.radv_lagdrop;"
 
 # The full stop/start proves the admitted pre-DROP history and the DROP marker
@@ -267,9 +338,10 @@ recover_begin_execute public.radv_lagdrop >/dev/null
 wait_health public.radv_lagdrop healthy || die "A: post-recover health"
 FP_AFTER=$(q "SELECT md5(string_agg(id::text||':'||payload, ',' ORDER BY id)) FROM public.radv_lagdrop;")
 [[ "$FP_AFTER" == "$FP_BEFORE" ]] || die "A: fingerprint mismatch after restart-survived DROP recovery ($FP_AFTER vs $FP_BEFORE)"
-pass "A2: retried DROP recovers exactly across a full PostgreSQL restart"
+pass "retried DROP recovers exactly across a full PostgreSQL restart"
 
 # ── Case B: restore failpoint crash, then a full restart, then reconcile+retry ──
+begin_case B
 q "CREATE TABLE public.radv_failcrash(id int PRIMARY KEY, v text);"
 q "SELECT flashback_track('public.radv_failcrash');" >/dev/null
 wait_health public.radv_failcrash healthy || die "B: initial health"
@@ -331,6 +403,6 @@ recover_begin_execute public.radv_failcrash >/dev/null
 wait_health public.radv_failcrash healthy || die "B: retry health after reconcile"
 FP_B_AFTER=$(q "SELECT md5(string_agg(id::text||':'||v, ',' ORDER BY id)) FROM public.radv_failcrash;")
 [[ "$FP_B_AFTER" == "$FP_B_BEFORE" ]] || die "B: fingerprint mismatch after post-restart reconcile+retry"
-pass "B: restore failpoint crash reconciles and retries exactly across a full PostgreSQL restart"
+pass "restore failpoint crash reconciles and retries exactly across a full PostgreSQL restart"
 
 echo "exact-WAL restart adversarial: all cases passed"
