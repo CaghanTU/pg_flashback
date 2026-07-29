@@ -207,7 +207,7 @@ expect_sqlstate() {
        BEGIN
          BEGIN
            $sql
-           RAISE EXCEPTION 'probe unexpectedly succeeded'
+           RAISE EXCEPTION '$label: probe unexpectedly succeeded'
              USING ERRCODE = 'P0001';
          EXCEPTION WHEN OTHERS THEN
            IF SQLSTATE = 'P0001' THEN
@@ -471,7 +471,8 @@ expect_sqlstate "CHECK constraint probe" 23514 \
     "INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
      VALUES (-9002,1,'bad-check',101,'bad','{}','{}','smoke_app');"
 expect_sqlstate "outgoing FK probe" 23503 \
-    "INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
+    "SET CONSTRAINTS orders_parent_fk IMMEDIATE;
+     INSERT INTO public.orders(id,parent_id,external_key,qty,note,payload,tags,tenant)
      VALUES (-9003,999999,'bad-fk',1,'bad','{}','{}','smoke_app');"
 pass "PK, UNIQUE, CHECK, outgoing FK and secondary index are behaviorally valid"
 
@@ -483,7 +484,7 @@ pass "PK, UNIQUE, CHECK, outgoing FK and secondary index are behaviorally valid"
                AND polname='orders_tenant_policy';")" == t ]] \
     || die "RLS policy missing"
 [[ "$(q "SELECT ARRAY(
-                  SELECT r.rolname
+                  SELECT r.rolname::text
                   FROM pg_policy p
                   JOIN pg_roles r ON r.oid=ANY(p.polroles)
                   WHERE p.polrelid='public.orders'::regclass
