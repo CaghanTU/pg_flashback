@@ -4,10 +4,13 @@
 # no external backup dependency.
 set -Eeuo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/acl_order_canon.sh
+source "$ROOT/scripts/lib/acl_order_canon.sh"
+
 CANDIDATE_DIR="${CANDIDATE_DIR:?CANDIDATE_DIR is required}"
 PG_BIN="${PG_BIN:?PG_BIN is required}"
 KEEP="${KEEP:-0}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 WORK="${CLEAN_HOST_WORK:-/tmp/pgfb-clean-host-$RUN_ID}"
 # Persistent by default: transient WORK is removed on a completed, non-KEEP
@@ -429,10 +432,14 @@ LATEST_DROP_ID="$(q "SELECT event_id FROM flashback.delta_log
                AND a.attname='external_key';")" == "$EXPECTED_COLLATION" ]] \
     || die "column collation mismatch"
 schema_dump_of_orders "$SCHEMA_DUMP_AFTER"
-if ! cmp -s "$SCHEMA_DUMP_BEFORE" "$SCHEMA_DUMP_AFTER"; then
-    diff -u "$SCHEMA_DUMP_BEFORE" "$SCHEMA_DUMP_AFTER" \
+SCHEMA_DUMP_BEFORE_CANON="$WORK/orders-schema-before.acl-canon.sql"
+SCHEMA_DUMP_AFTER_CANON="$WORK/orders-schema-after.acl-canon.sql"
+canonicalize_acl_order "$SCHEMA_DUMP_BEFORE" "$SCHEMA_DUMP_BEFORE_CANON"
+canonicalize_acl_order "$SCHEMA_DUMP_AFTER" "$SCHEMA_DUMP_AFTER_CANON"
+if ! cmp -s "$SCHEMA_DUMP_BEFORE_CANON" "$SCHEMA_DUMP_AFTER_CANON"; then
+    diff -u "$SCHEMA_DUMP_BEFORE_CANON" "$SCHEMA_DUMP_AFTER_CANON" \
         >"$WORK/orders-schema.diff" || true
-    die "independent schema-only pg_dump manifest mismatch (see $WORK/orders-schema.diff)"
+    die "independent schema-only pg_dump manifest mismatch after ACL-order canonicalization (see $WORK/orders-schema.diff)"
 fi
 pass "exact DROP recovery preserved data, TOAST bytes and canonical metadata"
 
