@@ -46,7 +46,7 @@ epoch being recovered to is outside it.
 | Feature | Behavior |
 |---|---|
 | Ordinary columns | Preserved, including qualified column collation |
-| Identity and serial columns | Preserved; original names restored |
+| Identity and serial columns | Type, mode, owned-sequence name/options/ownership and a collision-safe post-restore edge are preserved. The historical cached/current sequence value is not promised; recovery positions the sequence after the recovered data edge. |
 | Primary key, `UNIQUE`, `CHECK` constraints | Preserved; primary-key name and deferrability are verified |
 | Outgoing foreign keys | Preserved |
 | Plain btree indexes | Preserved |
@@ -55,9 +55,9 @@ epoch being recovered to is outside it.
 | Replica identity | Preserved; forced to `FULL` while actively tracked, restored to the original setting on untrack |
 | Basic row-level security policies | Preserved |
 | `FORCE ROW LEVEL SECURITY` | Preserved |
-| Ordinary (non-internal) triggers | Preserved |
+| Ordinary (non-internal) triggers | Definition and enabled mode (`ENABLE`, `DISABLE`, `ENABLE REPLICA`, `ENABLE ALWAYS`) are preserved |
 | Comments (table and column) | Preserved |
-| Owned sequences | Preserved |
+| Ordinary owned sequences | Name, type, options and ownership are preserved; state resumes from the safe recovered-data edge |
 | Quoted names and non-`public` schemas | Supported |
 
 ### Rejected (fail closed)
@@ -80,6 +80,10 @@ epoch being recovered to is outside it.
 | Column-level ACL | Rejected (only table-level ACL is captured/restored) |
 | Non-default tablespace | Rejected |
 | Non-empty storage `reloptions` | Rejected |
+| Per-column `STORAGE` or `COMPRESSION` override | Rejected |
+| Custom owner, ACL, or comment on an owned sequence | Rejected (the ordinary table-owned sequence contract does not include independent sequence metadata) |
+| `nextval()` default backed by an external/unowned sequence | Rejected (the external sequence is outside the table artifact and cannot make DROP recovery self-contained) |
+| Sequence marked `OWNED BY` a column but not used by that column's identity/`nextval()` default | Rejected (the sequence is not part of the proven column reconstruction path) |
 
 ## Incidents
 

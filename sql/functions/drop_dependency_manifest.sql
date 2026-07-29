@@ -221,6 +221,71 @@ BEGIN
 END;
 $$;
 
+-- Exact-OID production entry point used by the ProcessUtility hook. The OID
+-- is resolved under the caller's search_path before switching to the
+-- extension owner, so a SECURITY DEFINER lookup can never drift to a
+-- same-named relation in another schema.
+CREATE OR REPLACE FUNCTION flashback_capture_drop_dependency_manifest(
+    input_rel_oid oid,
+    cascade_requested boolean DEFAULT false
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    tracked record;
+    v_manifest jsonb;
+BEGIN
+    IF input_rel_oid IS NULL OR input_rel_oid = 0 THEN
+        RETURN;
+    END IF;
+
+    SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name, tt.recovery_profile
+      INTO tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.rel_oid = input_rel_oid
+      AND tt.recovery_profile = 'local_delta'
+      AND tt.is_active
+    ORDER BY tt.tracked_since DESC
+    LIMIT 1;
+
+    IF tracked.tracking_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- The caller holds ACCESS EXCLUSIVE for destructive DDL. Recheck that the
+    -- immutable OID still names the tracked relation before reading its
+    -- dependency graph.
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_class c
+        WHERE c.oid = input_rel_oid
+    ) THEN
+        RAISE EXCEPTION
+            'pg_flashback: DROP dependency manifest target OID % disappeared',
+            input_rel_oid
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    v_manifest := flashback_build_dependency_manifest(input_rel_oid::regclass);
+
+    INSERT INTO flashback.drop_dependency_manifests (
+        tracking_id, rel_oid, schema_name, table_name,
+        cascade_requested, manifest, has_unsupported, source_xid
+    ) VALUES (
+        tracked.tracking_id, tracked.rel_oid, tracked.schema_name, tracked.table_name,
+        COALESCE(cascade_requested, false), v_manifest,
+        COALESCE((v_manifest->>'has_unsupported')::boolean, false),
+        (txid_current() % 4294967296)::bigint
+    );
+END;
+$$;
+
+-- Compatibility/test wrapper for explicit names. Production hooks never use
+-- this overload. Unqualified input is rejected because SECURITY DEFINER must
+-- never reinterpret a caller-relative name under its fixed search_path.
 CREATE OR REPLACE FUNCTION flashback_capture_drop_dependency_manifest(
     input_schema text,
     input_table text,
@@ -232,46 +297,22 @@ SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
-    tracked record;
-    v_rel regclass;
-    v_manifest jsonb;
+    v_rel oid;
 BEGIN
     IF input_table IS NULL OR input_table = '' THEN
         RETURN;
     END IF;
-
     IF input_schema IS NULL OR input_schema = '' THEN
-        v_rel := to_regclass(input_table);
-    ELSE
-        v_rel := to_regclass(format('%I.%I', input_schema, input_table));
+        RAISE EXCEPTION
+            'pg_flashback: dependency manifest capture requires an exact schema or OID'
+            USING ERRCODE = 'invalid_parameter_value';
     END IF;
+    v_rel := to_regclass(format('%I.%I', input_schema, input_table));
     IF v_rel IS NULL THEN
         RETURN;
     END IF;
-
-    SELECT tt.tracking_id, tt.rel_oid, tt.schema_name, tt.table_name, tt.recovery_profile
-      INTO tracked
-    FROM flashback.tracked_tables tt
-    WHERE tt.rel_oid = v_rel
-      AND tt.recovery_profile = 'local_delta'
-      AND tt.is_active
-    ORDER BY tt.tracked_since DESC
-    LIMIT 1;
-
-    IF tracked.tracking_id IS NULL THEN
-        RETURN;
-    END IF;
-
-    v_manifest := flashback_build_dependency_manifest(v_rel);
-
-    INSERT INTO flashback.drop_dependency_manifests (
-        tracking_id, rel_oid, schema_name, table_name,
-        cascade_requested, manifest, has_unsupported, source_xid
-    ) VALUES (
-        tracked.tracking_id, tracked.rel_oid, tracked.schema_name, tracked.table_name,
-        COALESCE(cascade_requested, false), v_manifest,
-        COALESCE((v_manifest->>'has_unsupported')::boolean, false),
-        (txid_current() % 4294967296)::bigint
+    PERFORM public.flashback_capture_drop_dependency_manifest(
+        v_rel, cascade_requested
     );
 END;
 $$;

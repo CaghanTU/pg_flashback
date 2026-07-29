@@ -115,7 +115,7 @@ BEGIN
         INSERT INTO flashback.schema_versions (
             rel_oid, tracking_id, generation_id, stream_id, source_xid,
             schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
-            columns, primary_key, constraints, helper_schema_sha256
+            columns, primary_key, constraints, schema_def, helper_schema_sha256
         ) VALUES (
             tracked.rel_oid, p_tracking_id, v_generation_id, v_stream_id, v_source_xid,
             v_new_version, v_event_time, v_event_lsn, NULL, NULL,
@@ -130,6 +130,7 @@ BEGIN
                 'rls_policies', COALESCE(v_ddl_info -> 'rls_policies', '[]'::jsonb),
                 'rls_enabled', COALESCE((v_ddl_info -> 'rls_enabled')::boolean, false)
             ),
+            v_ddl_info,
             CASE WHEN to_regclass(format('%I.%I', tracked.schema_name, tracked.table_name)) IS NOT NULL
                  THEN flashback_helper_schema_sha256(tracked.rel_oid)
                  ELSE NULL
@@ -145,6 +146,20 @@ BEGIN
             '{}'::jsonb
         );
         v_new_version := COALESCE(tracked.schema_version, 1);
+    END IF;
+
+    IF v_event_type IN ('DROP', 'TRUNCATE') THEN
+        -- Some metadata commands operate on objects related to the table
+        -- rather than on the table node itself (CREATE INDEX/TRIGGER/POLICY,
+        -- GRANT/COMMENT, ALTER SEQUENCE, ...).  Until every such command has
+        -- an exact table-identity mapping in the ProcessUtility hook, never
+        -- let a DROP silently recover from a stale schema epoch.  A table DDL
+        -- that was captured normally has already advanced tracked.schema_version
+        -- and therefore compares equal here; unrecorded drift aborts the same
+        -- user transaction before PostgreSQL can unlink the table.
+        PERFORM public.flashback_require_current_schema_contract(
+            p_tracking_id, v_ddl_info
+        );
     END IF;
 
     -- No inline full-table row snapshot is captured here. Restore never reads

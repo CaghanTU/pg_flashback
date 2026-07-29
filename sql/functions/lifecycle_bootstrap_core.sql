@@ -285,7 +285,7 @@ BEGIN
     INSERT INTO flashback.schema_versions (
         rel_oid, tracking_id, generation_id, stream_id, source_xid,
         schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
-        columns, primary_key, constraints, helper_schema_sha256
+        columns, primary_key, constraints, schema_def, helper_schema_sha256
     )
     SELECT
         p_rel_oid, v_tracking_id, v_generation_id, p_stream_id, v_boundary_xid,
@@ -302,6 +302,7 @@ BEGIN
             'rls_policies', COALESCE(schema_def -> 'rls_policies', '[]'::jsonb),
             'rls_enabled', COALESCE((schema_def -> 'rls_enabled')::boolean, false)
         ),
+        schema_def,
         flashback_helper_schema_sha256(p_rel_oid)
     FROM (
         SELECT COALESCE(flashback_collect_schema_def(p_rel_oid), '{}'::jsonb) AS schema_def

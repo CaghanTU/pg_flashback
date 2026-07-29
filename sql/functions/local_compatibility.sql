@@ -9,9 +9,9 @@
 -- Preserve set (supported, reconstructed/verified by the restore engine):
 --   ordinary columns; identity/serial columns; PRIMARY KEY/UNIQUE/CHECK
 --   constraints; outgoing FOREIGN KEY constraints; plain btree indexes;
---   owner; table/column ACL; TOAST; replica identity; basic RLS policies;
---   ordinary (non-internal) triggers; comments; tablespace/reloptions;
---   owned sequences.
+--   owner; table-level ACL; TOAST; replica identity; basic RLS policies;
+--   ordinary (non-internal) triggers; comments; ordinary owned sequences
+--   (identity/serial identity, options, ownership, and safe edge state).
 --
 -- Reject set (fail closed; table cannot be tracked / epoch cannot recover):
 --   partitioned tables and partitions; classical inheritance; foreign
@@ -19,7 +19,9 @@
 --   relations; exclusion constraints; rules; security labels;
 --   publications; INCOMING foreign keys; non-btree, expression, or
 --   partial indexes; generated columns (reconstruction is not proven —
---   rejected by default even for "simple" cases).
+--   rejected by default even for "simple" cases); column-level ACL;
+--   non-default tablespace/reloptions; per-column storage/compression
+--   overrides; custom owner/ACL/comment metadata on owned sequences.
 -- =================================================================
 
 -- Live-relation classifier index. Uses the catalog directly, so it can see
@@ -46,6 +48,9 @@ DECLARE
     v_detected jsonb;
     v_generated_cols text[];
     v_identity_cols text[];
+    v_external_sequence_cols text[];
+    v_owned_sequence_without_default_cols text[];
+    v_custom_storage_cols text[];
     v_pk_present boolean;
     v_unique_count integer;
     v_check_count integer;
@@ -68,6 +73,7 @@ DECLARE
     v_rls_enabled boolean;
     v_comment_count integer;
     v_sequence_count integer;
+    v_custom_sequence_metadata_count integer;
     v_toast boolean;
     v_replident "char";
     v_tablespace text;
@@ -169,6 +175,67 @@ BEGIN
       AND a.attidentity <> '';
     IF array_length(v_identity_cols, 1) > 0 THEN
         v_preserved := v_preserved || ARRAY['identity_or_serial_columns'];
+    END IF;
+
+    -- A nextval() default backed by a sequence that is not owned by this
+    -- table is an external dependency, not part of this table's artifact
+    -- set.  Do not promise a self-contained DROP recovery for it.
+    SELECT COALESCE(array_agg(a.attname ORDER BY a.attnum), ARRAY[]::text[])
+      INTO v_external_sequence_cols
+    FROM pg_attribute a
+    JOIN pg_attrdef ad
+      ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+    WHERE a.attrelid = v_oid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND pg_get_expr(ad.adbin, ad.adrelid) ~* '^nextval\('
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_depend d
+          JOIN pg_class seqc
+            ON seqc.oid = d.objid AND seqc.relkind = 'S'
+          WHERE d.classid = 'pg_class'::regclass
+            AND d.refclassid = 'pg_class'::regclass
+            AND d.refobjid = a.attrelid
+            AND d.refobjsubid = a.attnum
+            AND d.deptype IN ('a', 'i')
+      );
+    IF array_length(v_external_sequence_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['external_sequence_default'];
+    END IF;
+
+    SELECT COALESCE(array_agg(a.attname ORDER BY a.attnum), ARRAY[]::text[])
+      INTO v_owned_sequence_without_default_cols
+    FROM pg_depend d
+    JOIN pg_class seqc
+      ON seqc.oid = d.objid AND seqc.relkind = 'S'
+    JOIN pg_attribute a
+      ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+    LEFT JOIN pg_attrdef ad
+      ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+    WHERE d.classid = 'pg_class'::regclass
+      AND d.refclassid = 'pg_class'::regclass
+      AND d.refobjid = v_oid
+      AND d.deptype IN ('a', 'i')
+      AND a.attidentity = ''
+      AND COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') !~* '^nextval\(';
+    IF array_length(v_owned_sequence_without_default_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['owned_sequence_without_column_default'];
+    END IF;
+
+    SELECT COALESCE(array_agg(a.attname ORDER BY a.attnum), ARRAY[]::text[])
+      INTO v_custom_storage_cols
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = v_oid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND (
+          a.attstorage IS DISTINCT FROM t.typstorage
+          OR a.attcompression::text <> ''
+      );
+    IF array_length(v_custom_storage_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['column_storage_or_compression'];
     END IF;
 
     -- Constraints.
@@ -294,6 +361,21 @@ BEGIN
     IF v_sequence_count > 0 THEN
         v_preserved := v_preserved || ARRAY['owned_sequences'];
     END IF;
+    SELECT count(*) INTO v_custom_sequence_metadata_count
+    FROM pg_depend d
+    JOIN pg_class seqc ON seqc.oid = d.objid AND seqc.relkind = 'S'
+    JOIN pg_class tbl ON tbl.oid = d.refobjid
+    WHERE d.refclassid = 'pg_class'::regclass
+      AND d.refobjid = v_oid
+      AND d.deptype IN ('a', 'i')
+      AND (
+          seqc.relowner IS DISTINCT FROM tbl.relowner
+          OR seqc.relacl IS NOT NULL
+          OR obj_description(seqc.oid, 'pg_class') IS NOT NULL
+      );
+    IF v_custom_sequence_metadata_count > 0 THEN
+        v_rejected := v_rejected || ARRAY['custom_owned_sequence_metadata'];
+    END IF;
 
     -- Column-level ACL is never captured or restored (only the table-level
     -- ACL is); a table with any column GRANT cannot honestly be tracked.
@@ -335,6 +417,10 @@ BEGIN
         'owner', v_owner,
         'generated_columns', to_jsonb(v_generated_cols),
         'identity_columns', to_jsonb(v_identity_cols),
+        'external_sequence_columns', to_jsonb(v_external_sequence_cols),
+        'owned_sequence_without_default_columns',
+            to_jsonb(v_owned_sequence_without_default_cols),
+        'custom_storage_columns', to_jsonb(v_custom_storage_cols),
         'primary_key', v_pk_present,
         'unique_constraints', v_unique_count,
         'check_constraints', v_check_count,
@@ -357,6 +443,7 @@ BEGIN
         'rls_enabled', COALESCE(v_rls_enabled, false),
         'comments', v_comment_count,
         'owned_sequences', v_sequence_count,
+        'custom_owned_sequence_metadata', v_custom_sequence_metadata_count,
         'toast', v_toast,
         'replica_identity', v_replident,
         'tablespace', v_tablespace,
@@ -434,6 +521,10 @@ DECLARE
     v_preserved text[] := ARRAY[]::text[];
     v_generated_cols text[];
     v_identity_cols text[];
+    v_external_sequence_cols text[];
+    v_owned_sequence_without_default_cols text[];
+    v_custom_storage_cols text[];
+    v_custom_sequence_cols text[];
     v_pk_len integer;
     v_unique_count integer;
     v_check_count integer;
@@ -449,8 +540,30 @@ DECLARE
 BEGIN
     SELECT
         COALESCE(array_agg(col->>'name') FILTER (WHERE COALESCE(col->>'generated', '') <> ''), ARRAY[]::text[]),
-        COALESCE(array_agg(col->>'name') FILTER (WHERE COALESCE(col->>'identity', '') <> ''), ARRAY[]::text[])
-      INTO v_generated_cols, v_identity_cols
+        COALESCE(array_agg(col->>'name') FILTER (WHERE COALESCE(col->>'identity', '') <> ''), ARRAY[]::text[]),
+        COALESCE(array_agg(col->>'name') FILTER (
+            WHERE COALESCE((col->>'storage_custom')::boolean, false)
+        ), ARRAY[]::text[]),
+        COALESCE(array_agg(col->>'name') FILTER (
+            WHERE COALESCE((col#>>'{identity_options,custom_metadata}')::boolean, false)
+        ), ARRAY[]::text[]),
+        COALESCE(array_agg(col->>'name') FILTER (
+            WHERE COALESCE(col->>'default_expr', '') ~* '^nextval\('
+              AND (
+                  col->'identity_options' IS NULL
+                  OR col->'identity_options' = 'null'::jsonb
+              )
+        ), ARRAY[]::text[]),
+        COALESCE(array_agg(col->>'name') FILTER (
+            WHERE col->'identity_options' IS NOT NULL
+              AND col->'identity_options' <> 'null'::jsonb
+              AND COALESCE(col->>'identity', '') = ''
+              AND COALESCE(col->>'default_expr', '') !~* '^nextval\('
+        ), ARRAY[]::text[])
+      INTO v_generated_cols, v_identity_cols,
+           v_custom_storage_cols, v_custom_sequence_cols,
+           v_external_sequence_cols,
+           v_owned_sequence_without_default_cols
     FROM jsonb_array_elements(COALESCE(v_def->'columns', '[]'::jsonb)) col;
 
     IF array_length(v_generated_cols, 1) > 0 THEN
@@ -458,6 +571,18 @@ BEGIN
     END IF;
     IF array_length(v_identity_cols, 1) > 0 THEN
         v_preserved := v_preserved || ARRAY['identity_or_serial_columns'];
+    END IF;
+    IF array_length(v_custom_storage_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['column_storage_or_compression'];
+    END IF;
+    IF array_length(v_custom_sequence_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['custom_owned_sequence_metadata'];
+    END IF;
+    IF array_length(v_external_sequence_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['external_sequence_default'];
+    END IF;
+    IF array_length(v_owned_sequence_without_default_cols, 1) > 0 THEN
+        v_rejected := v_rejected || ARRAY['owned_sequence_without_column_default'];
     END IF;
 
     -- jsonb_array_length() errors on a scalar. schema_def stores JSON null
@@ -553,6 +678,11 @@ BEGIN
         'detected_features', jsonb_build_object(
             'generated_columns', to_jsonb(v_generated_cols),
             'identity_columns', to_jsonb(v_identity_cols),
+            'external_sequence_columns', to_jsonb(v_external_sequence_cols),
+            'owned_sequence_without_default_columns',
+                to_jsonb(v_owned_sequence_without_default_cols),
+            'custom_storage_columns', to_jsonb(v_custom_storage_cols),
+            'custom_sequence_metadata_columns', to_jsonb(v_custom_sequence_cols),
             'primary_key_columns', v_pk_len,
             'unique_constraints', COALESCE(v_unique_count, 0),
             'check_constraints', COALESCE(v_check_count, 0),
@@ -575,6 +705,75 @@ BEGIN
         END,
         'note', 'epoch check operates on the captured schema_def shape only; incoming FK, exclusion constraints, rules, security labels, publications and extension ownership are gated at protect-time by flashback_local_compatibility(regclass)'
     );
+END;
+$$;
+
+-- One authority for the "live catalog still matches the latest captured
+-- schema epoch" invariant. Related-object DDL is not always represented by
+-- an ALTER TABLE ProcessUtility node, so both destructive DDL and a live-table
+-- restore call this guard before they can consume a stale schema contract.
+CREATE OR REPLACE FUNCTION flashback_require_current_schema_contract(
+    p_tracking_id bigint,
+    p_current_schema_def jsonb DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel_oid oid;
+    v_schema_version bigint;
+    v_generation_id bigint;
+    v_expected jsonb;
+    v_current jsonb;
+BEGIN
+    SELECT tt.rel_oid, tt.schema_version, cg.generation_id
+      INTO v_rel_oid, v_schema_version, v_generation_id
+    FROM flashback.tracked_tables tt
+    JOIN flashback.coverage_generations cg
+      ON cg.tracking_id = tt.tracking_id
+     AND cg.state = 'active'
+    WHERE tt.tracking_id = p_tracking_id
+      AND tt.is_active
+    LIMIT 1;
+
+    IF v_rel_oid IS NULL OR v_generation_id IS NULL THEN
+        RAISE EXCEPTION
+            'pg_flashback: current schema contract cannot be proven for inactive lifecycle %',
+            p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT sv.schema_def
+      INTO v_expected
+    FROM flashback.schema_versions sv
+    WHERE sv.tracking_id = p_tracking_id
+      AND sv.generation_id = v_generation_id
+      AND sv.schema_version = COALESCE(v_schema_version, 1)
+    ORDER BY sv.commit_lsn DESC NULLS LAST,
+             sv.applied_lsn DESC,
+             sv.applied_at DESC
+    LIMIT 1;
+
+    IF v_expected IS NULL THEN
+        RAISE EXCEPTION
+            'pg_flashback: current protected schema epoch has no complete schema contract'
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Run pg_flashback maintain/reanchor for this table before destructive DDL or recovery.';
+    END IF;
+
+    v_current := COALESCE(
+        p_current_schema_def,
+        public.flashback_collect_schema_def(v_rel_oid)
+    );
+    IF v_current IS NULL OR v_current IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION
+            'pg_flashback: live schema metadata changed outside the captured table-DDL epoch'
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Run pg_flashback maintain/reanchor after index, trigger, policy, ACL/comment, or owned-sequence DDL.';
+    END IF;
 END;
 $$;
 

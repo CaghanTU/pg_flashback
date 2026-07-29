@@ -40,8 +40,7 @@ impl Drop for SecurityContextGuard {
 
 #[derive(Debug, Clone)]
 struct UtilityTarget {
-    schema: Option<String>,
-    table: String,
+    rel_oid: pg_sys::Oid,
 }
 
 pub fn install_process_utility_hook() {
@@ -150,10 +149,38 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
             | pg_sys::ProcessUtilityContext::PROCESS_UTILITY_QUERY_NONATOMIC
     );
 
+    // Resolve every post-utility table target while the original relation
+    // identity still exists and while the caller's search_path is still in
+    // force.  RENAME/SET SCHEMA keep the OID stable; after the utility runs we
+    // refresh only the human-readable schema/name from that exact OID.  This
+    // prevents an unqualified command from being re-resolved under the
+    // extension owner's fixed search_path and routed to a same-named table in
+    // another schema.
+    let post_capture = if capture_enabled && user_originated_context && !pstmt.is_null() {
+        match parse_post_utility_targets(pstmt) {
+            Ok(targets) => targets,
+            Err(err) => error!("pg_flashback: DDL target resolution failed: {}", err),
+        }
+    } else {
+        None
+    };
+
     if capture_enabled && user_originated_context && !pstmt.is_null() {
         // Do NOT use catch_unwind around SPI calls — it leaks the SPI
         // connection and corrupts the portal snapshot state (PG17 assertion).
-        if let Some((event_type, targets)) = parse_pre_utility_targets(pstmt) {
+        if let Some((event_type, targets)) = &post_capture {
+            if let Err(err) = prepare_metadata_ddl(targets) {
+                error!(
+                    "pg_flashback: {} pre-lock failed before table DDL: {}",
+                    event_type, err
+                );
+            }
+        }
+        let pre_capture = match parse_pre_utility_targets(pstmt) {
+            Ok(targets) => targets,
+            Err(err) => error!("pg_flashback: DDL target resolution failed: {}", err),
+        };
+        if let Some((event_type, targets)) = pre_capture {
             // Unchanged varlena values may remain external TOAST pointers in
             // logical WAL. Before destructive DDL unlinks the source files,
             // lock each protected relation and let the independent worker
@@ -217,7 +244,14 @@ unsafe extern "C-unwind" fn tv_process_utility_hook(
     }
 
     if capture_enabled && user_originated_context && !pstmt.is_null() {
-        if let Some((event_type, targets)) = parse_post_utility_targets(pstmt) {
+        if let Some((event_type, targets)) = post_capture {
+            let targets = match refresh_utility_targets(&targets) {
+                Ok(targets) => targets,
+                Err(err) => error!(
+                    "pg_flashback: DDL target identity refresh failed after {}: {}",
+                    event_type, err
+                ),
+            };
             if let Err(err) = capture_ddl_for_targets(event_type, &targets) {
                 // The post-utility hook is still part of the same user
                 // transaction.  Abort rather than allowing an uncaptured
@@ -273,10 +307,10 @@ unsafe fn is_table_related_utility(pstmt: *mut pg_sys::PlannedStmt) -> bool {
 
 unsafe fn parse_pre_utility_targets(
     pstmt: *mut pg_sys::PlannedStmt,
-) -> Option<(&'static str, Vec<UtilityTarget>)> {
+) -> Result<Option<(&'static str, Vec<UtilityTarget>)>, SpiError> {
     let utility_stmt = (*pstmt).utilityStmt;
     if utility_stmt.is_null() {
-        return None;
+        return Ok(None);
     }
 
     match (*utility_stmt).type_ {
@@ -295,19 +329,21 @@ unsafe fn parse_pre_utility_targets(
                 }
 
                 let schema = c_ptr_to_option_string((*range_var).schemaname);
-                targets.push(UtilityTarget { schema, table });
+                if let Some(target) = resolve_utility_target(schema, table)? {
+                    targets.push(target);
+                }
             }
 
             if targets.is_empty() {
-                None
+                Ok(None)
             } else {
-                Some(("TRUNCATE", targets))
+                Ok(Some(("TRUNCATE", targets)))
             }
         }
         pg_sys::NodeTag::T_DropStmt => {
             let stmt = utility_stmt as *mut pg_sys::DropStmt;
             if (*stmt).removeType != pg_sys::ObjectType::OBJECT_TABLE {
-                return None;
+                return Ok(None);
             }
 
             let mut targets = Vec::new();
@@ -329,67 +365,69 @@ unsafe fn parse_pre_utility_targets(
                     None
                 };
 
-                targets.push(UtilityTarget { schema, table });
+                if let Some(target) = resolve_utility_target(schema, table)? {
+                    targets.push(target);
+                }
             }
 
             if targets.is_empty() {
-                None
+                Ok(None)
             } else {
-                Some(("DROP", targets))
+                Ok(Some(("DROP", targets)))
             }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 unsafe fn parse_post_utility_targets(
     pstmt: *mut pg_sys::PlannedStmt,
-) -> Option<(&'static str, Vec<UtilityTarget>)> {
+) -> Result<Option<(&'static str, Vec<UtilityTarget>)>, SpiError> {
     let utility_stmt = (*pstmt).utilityStmt;
     if utility_stmt.is_null() {
-        return None;
+        return Ok(None);
     }
 
     match (*utility_stmt).type_ {
         pg_sys::NodeTag::T_AlterTableStmt => {
             let stmt = utility_stmt as *mut pg_sys::AlterTableStmt;
             if (*stmt).objtype != pg_sys::ObjectType::OBJECT_TABLE {
-                return None;
+                return Ok(None);
             }
 
             let relation = (*stmt).relation;
             if relation.is_null() {
-                return None;
+                return Ok(None);
             }
 
             let table = c_ptr_to_option_string((*relation).relname).unwrap_or_default();
             if table.is_empty() {
-                return None;
+                return Ok(None);
             }
 
             let schema = c_ptr_to_option_string((*relation).schemaname);
-            Some(("ALTER", vec![UtilityTarget { schema, table }]))
+            Ok(resolve_utility_target(schema, table)?.map(|target| ("ALTER", vec![target])))
         }
         pg_sys::NodeTag::T_RenameStmt => {
             let stmt = utility_stmt as *mut pg_sys::RenameStmt;
             if (*stmt).renameType != pg_sys::ObjectType::OBJECT_COLUMN
                 && (*stmt).renameType != pg_sys::ObjectType::OBJECT_TABLE
             {
-                return None;
+                return Ok(None);
             }
 
             let relation = (*stmt).relation;
             if relation.is_null() {
-                return None;
+                return Ok(None);
             }
 
             let table = c_ptr_to_option_string((*relation).relname).unwrap_or_default();
             if table.is_empty() {
-                return None;
+                return Ok(None);
             }
 
             let schema = c_ptr_to_option_string((*relation).schemaname);
-            Some(("ALTER", vec![UtilityTarget { schema, table }]))
+            Ok(resolve_utility_target(schema, table)?.map(|target| ("ALTER", vec![target])))
         }
         pg_sys::NodeTag::T_AlterObjectSchemaStmt => {
             // SET SCHEMA: relation holds the OLD schema/table name.
@@ -398,21 +436,72 @@ unsafe fn parse_post_utility_targets(
             // can detect the rename via OID lookup.
             let stmt = utility_stmt as *mut pg_sys::AlterObjectSchemaStmt;
             if (*stmt).objectType != pg_sys::ObjectType::OBJECT_TABLE {
-                return None;
+                return Ok(None);
             }
             let relation = (*stmt).relation;
             if relation.is_null() {
-                return None;
+                return Ok(None);
             }
             let table = c_ptr_to_option_string((*relation).relname).unwrap_or_default();
             if table.is_empty() {
-                return None;
+                return Ok(None);
             }
             let schema = c_ptr_to_option_string((*relation).schemaname);
-            Some(("ALTER", vec![UtilityTarget { schema, table }]))
+            Ok(resolve_utility_target(schema, table)?.map(|target| ("ALTER", vec![target])))
         }
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+/// Resolve a parser target under the caller's current search_path, before any
+/// switch to the extension owner.  From this point onward the OID and the
+/// canonical schema/name travel together; no SECURITY DEFINER routine is
+/// allowed to repeat an unqualified lookup.
+fn resolve_utility_target(
+    schema: Option<String>,
+    table: String,
+) -> Result<Option<UtilityTarget>, SpiError> {
+    let schema_arg = schema.as_deref().unwrap_or("");
+    let rel_oid = Spi::get_one_with_args::<pg_sys::Oid>(
+        "WITH target AS (
+                 SELECT CASE
+                     WHEN NULLIF($1, '') IS NULL
+                         THEN to_regclass(quote_ident($2))
+                     ELSE to_regclass(format('%I.%I', $1, $2))
+                 END AS rel_oid
+             )
+             SELECT (
+                 SELECT c.oid
+                 FROM target t
+                 JOIN pg_class c ON c.oid = t.rel_oid
+                 LIMIT 1
+             )",
+        &[schema_arg.into(), table.as_str().into()],
+    )?;
+
+    Ok(rel_oid.map(|rel_oid| UtilityTarget { rel_oid }))
+}
+
+/// RENAME and SET SCHEMA preserve the relation OID.  Refresh the displayed
+/// identity from that OID after standard_ProcessUtility instead of parsing or
+/// re-resolving a possibly stale/unqualified RangeVar.
+fn refresh_utility_targets(targets: &[UtilityTarget]) -> Result<Vec<UtilityTarget>, SpiError> {
+    let mut refreshed = Vec::with_capacity(targets.len());
+    for target in targets {
+        let still_exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = $1)",
+            &[target.rel_oid.into()],
+        )?
+        .unwrap_or(false);
+        if !still_exists {
+            error!(
+                "pg_flashback: relation OID {} disappeared during post-DDL capture",
+                target.rel_oid
+            );
+        }
+        refreshed.push(target.clone());
+    }
+    Ok(refreshed)
 }
 
 unsafe fn drop_stmt_requests_cascade(pstmt: *mut pg_sys::PlannedStmt) -> bool {
@@ -438,14 +527,9 @@ fn capture_drop_dependency_manifests(
     let _security_context = SecurityContextGuard::switch_to(extension_owner);
 
     for target in targets {
-        let schema = target.schema.as_deref().unwrap_or("");
         Spi::run_with_args(
-            "SELECT public.flashback_capture_drop_dependency_manifest(NULLIF($1, ''), $2, $3)",
-            &[
-                schema.into(),
-                target.table.as_str().into(),
-                cascade_requested.into(),
-            ],
+            "SELECT public.flashback_capture_drop_dependency_manifest($1, $2)",
+            &[target.rel_oid.into(), cascade_requested.into()],
         )?;
     }
     Ok(())
@@ -459,14 +543,9 @@ fn capture_ddl_for_targets(event_type: &str, targets: &[UtilityTarget]) -> Resul
     let _security_context = SecurityContextGuard::switch_to(extension_owner);
 
     for target in targets {
-        let schema = target.schema.as_deref().unwrap_or("");
         Spi::run_with_args(
-            "SELECT public.flashback_capture_ddl_event($1, NULLIF($2, ''), $3)",
-            &[
-                event_type.into(),
-                schema.into(),
-                target.table.as_str().into(),
-            ],
+            "SELECT public.flashback_capture_ddl_event($1, $2)",
+            &[event_type.into(), target.rel_oid.into()],
         )?;
     }
 
@@ -480,14 +559,25 @@ fn prepare_destructive_ddl(targets: &[UtilityTarget]) -> Result<(), SpiError> {
     .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
     let _security_context = SecurityContextGuard::switch_to(extension_owner);
 
-    for target in targets {
-        let schema = target.schema.as_deref().unwrap_or("");
-        Spi::run_with_args(
-            "SELECT public.flashback_internal_prepare_destructive_ddl(NULLIF($1, ''), $2)",
-            &[schema.into(), target.table.as_str().into()],
-        )?;
-    }
-    Ok(())
+    let rel_oids: Vec<pg_sys::Oid> = targets.iter().map(|target| target.rel_oid).collect();
+    Spi::run_with_args(
+        "SELECT public.flashback_internal_prepare_destructive_ddl($1)",
+        &[rel_oids.into()],
+    )
+}
+
+fn prepare_metadata_ddl(targets: &[UtilityTarget]) -> Result<(), SpiError> {
+    let extension_owner = Spi::get_one::<pg_sys::Oid>(
+        "SELECT extowner FROM pg_extension WHERE extname = 'pg_flashback'",
+    )?
+    .unwrap_or_else(|| error!("pg_flashback: extension owner could not be resolved"));
+    let _security_context = SecurityContextGuard::switch_to(extension_owner);
+
+    let rel_oids: Vec<pg_sys::Oid> = targets.iter().map(|target| target.rel_oid).collect();
+    Spi::run_with_args(
+        "SELECT public.flashback_internal_prepare_metadata_ddl($1)",
+        &[rel_oids.into()],
+    )
 }
 
 unsafe fn list_ptr_values(list: *mut pg_sys::List) -> Vec<*mut c_void> {

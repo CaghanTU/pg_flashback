@@ -886,7 +886,7 @@ BEGIN
     INSERT INTO flashback.schema_versions (
         rel_oid, tracking_id, generation_id, stream_id, source_xid,
         schema_version, applied_at, applied_lsn,
-        columns, primary_key, constraints, helper_schema_sha256
+        columns, primary_key, constraints, schema_def, helper_schema_sha256
     ) VALUES (
         v_rel_oid, v_tracking_id, v_generation_id, v_stream_id, v_boundary_xid,
         v_schema_version, clock_timestamp(), v_provisional_lsn,
@@ -901,6 +901,7 @@ BEGIN
             'rls_policies', COALESCE(v_schema_def->'rls_policies', '[]'::jsonb),
             'rls_enabled', COALESCE((v_schema_def->'rls_enabled')::boolean, false)
         ),
+        v_schema_def,
         public.flashback_helper_schema_sha256(v_rel_oid)
     );
 

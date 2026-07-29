@@ -45,6 +45,7 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_collect_schema_def(input_rel_oid oid)
 RETURNS jsonb
 LANGUAGE sql
+SET search_path = pg_catalog, flashback, public
 AS $$
     SELECT jsonb_build_object(
         'schema', n.nspname,
@@ -70,32 +71,42 @@ AS $$
                     'default_expr', pg_get_expr(d.adbin, d.adrelid),
                     'generated', a.attgenerated,
                     'identity', a.attidentity,
-                    'identity_options', CASE
-                        WHEN a.attidentity <> '' THEN (
-                            SELECT jsonb_build_object(
-                                'start', s.seqstart,
-                                'increment', s.seqincrement,
-                                'min', s.seqmin,
-                                'max', s.seqmax,
-                                'cache', s.seqcache,
-                                'cycle', s.seqcycle,
-                                'sequence_schema', nsp.nspname,
-                                'sequence_name', seqc.relname,
-                                'sequence_qualified', format('%I.%I', nsp.nspname, seqc.relname)
-                            )
-                            FROM pg_depend dep
-                            JOIN pg_class seqc ON seqc.oid = dep.objid AND seqc.relkind = 'S'
-                            JOIN pg_namespace nsp ON nsp.oid = seqc.relnamespace
-                            JOIN pg_sequence s ON s.seqrelid = dep.objid
-                            WHERE dep.classid = 'pg_class'::regclass
-                              AND dep.refclassid = 'pg_class'::regclass
-                              AND dep.refobjid = a.attrelid
-                              AND dep.refobjsubid = a.attnum
-                              AND dep.deptype = 'i'
-                            LIMIT 1
+                    'storage_custom', (
+                        a.attstorage IS DISTINCT FROM typ.typstorage
+                        OR a.attcompression::text <> ''
+                    ),
+                    -- Despite the historical key name, this is the complete
+                    -- owned-sequence contract for both IDENTITY (deptype=i)
+                    -- and SERIAL/nextval (deptype=a) columns.
+                    'identity_options', (
+                        SELECT jsonb_build_object(
+                            'start', s.seqstart,
+                            'increment', s.seqincrement,
+                            'min', s.seqmin,
+                            'max', s.seqmax,
+                            'cache', s.seqcache,
+                            'cycle', s.seqcycle,
+                            'data_type', format_type(s.seqtypid, NULL),
+                            'custom_metadata', (
+                                seqc.relowner IS DISTINCT FROM c.relowner
+                                OR seqc.relacl IS NOT NULL
+                                OR obj_description(seqc.oid, 'pg_class') IS NOT NULL
+                            ),
+                            'sequence_schema', nsp.nspname,
+                            'sequence_name', seqc.relname,
+                            'sequence_qualified', format('%I.%I', nsp.nspname, seqc.relname)
                         )
-                        ELSE NULL
-                    END
+                        FROM pg_depend dep
+                        JOIN pg_class seqc ON seqc.oid = dep.objid AND seqc.relkind = 'S'
+                        JOIN pg_namespace nsp ON nsp.oid = seqc.relnamespace
+                        JOIN pg_sequence s ON s.seqrelid = dep.objid
+                        WHERE dep.classid = 'pg_class'::regclass
+                          AND dep.refclassid = 'pg_class'::regclass
+                          AND dep.refobjid = a.attrelid
+                          AND dep.refobjsubid = a.attnum
+                          AND dep.deptype IN ('a', 'i')
+                        LIMIT 1
+                    )
                 )
                 ORDER BY a.attnum
             )
@@ -107,6 +118,8 @@ AS $$
                 ON coll.oid = a.attcollation
             LEFT JOIN pg_namespace coll_n
                 ON coll_n.oid = coll.collnamespace
+            JOIN pg_type typ
+                ON typ.oid = a.atttypid
             WHERE a.attrelid = c.oid
               AND a.attnum > 0
               AND NOT a.attisdropped
@@ -184,7 +197,8 @@ AS $$
             SELECT jsonb_agg(
                 jsonb_build_object(
                     'name', tg.tgname,
-                    'def', pg_get_triggerdef(tg.oid)
+                    'def', pg_get_triggerdef(tg.oid),
+                    'enabled', tg.tgenabled::text
                 )
                 ORDER BY tg.tgname
             )
@@ -206,7 +220,7 @@ AS $$
                     END,
                     'permissive', (pol.polpermissive),
                     'roles', COALESCE((
-                        SELECT jsonb_agg(rolname)
+                        SELECT jsonb_agg(rolname ORDER BY rolname)
                         FROM pg_roles r2
                         WHERE r2.oid = ANY(pol.polroles)
                     ), '[]'::jsonb),
@@ -234,7 +248,14 @@ AS $$
                     'privilege', ae.privilege_type,
                     'is_grantable', ae.is_grantable
                 )
-                ORDER BY ae.grantee, ae.privilege_type
+                -- Canonical order must be stable across clusters where role
+                -- OIDs differ.  The restore verifier orders the live side by
+                -- this same resolved identity, never by numeric role OID.
+                ORDER BY CASE
+                    WHEN ae.grantee = 0 THEN 'PUBLIC'
+                    ELSE (SELECT rolname FROM pg_roles WHERE oid = ae.grantee)
+                END,
+                ae.privilege_type
             )
             FROM aclexplode(c.relacl) AS ae(grantor, grantee, privilege_type, is_grantable)
         ), '[]'::jsonb),
@@ -1208,15 +1229,17 @@ $$;
 
 -- Destructive DDL removes heap/TOAST files that logical decoding can still
 -- need for an older UPDATE whose unchanged varlena values remain represented
--- by on-disk TOAST pointers. Lock the relation first, then let the independent
--- capture worker drain a fixed committed prefix while those files still exist.
+-- by on-disk TOAST pointers. The Rust hook resolves exact OIDs under the
+-- caller's search_path; this batch routine serializes every protected target
+-- in one deterministic order.
 --
 -- Do not call flashback_consume_wal() here: slot advancement would belong to
 -- the caller's open DDL transaction. The background worker owns the separate
 -- transaction required to advance durably while this transaction waits.
+DROP FUNCTION IF EXISTS flashback_internal_prepare_destructive_ddl(text, text);
+
 CREATE OR REPLACE FUNCTION flashback_internal_prepare_destructive_ddl(
-    input_schema text,
-    input_table text
+    p_rel_oids oid[]
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -1224,10 +1247,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
 DECLARE
-    v_rel_oid oid;
-    v_tracking_id bigint;
-    v_schema_name text;
-    v_table_name text;
+    target record;
     v_slot_name text;
     v_barrier_lsn pg_lsn;
     v_has_pending boolean;
@@ -1236,67 +1256,80 @@ DECLARE
     v_database_oid oid;
     v_drain_lock_acquired boolean;
     v_synthetic_stream boolean;
+    v_target_oids oid[];
+    v_tracking_ids bigint[];
+    v_schema_names text[];
+    v_table_names text[];
 BEGIN
-    IF input_table IS NULL OR input_table = '' THEN
+    IF p_rel_oids IS NULL OR cardinality(p_rel_oids) = 0 THEN
         RETURN;
     END IF;
 
-    IF input_schema IS NULL OR input_schema = '' THEN
-        v_rel_oid := to_regclass(quote_ident(input_table));
-    ELSE
-        v_rel_oid := to_regclass(format('%I.%I', input_schema, input_table));
-    END IF;
-    IF v_rel_oid IS NULL THEN
+    -- Materialize one immutable target set from the parser-resolved OIDs.
+    -- Every later phase operates on these same rows; separate READ COMMITTED
+    -- queries must not silently drain one lifecycle and lock/prove another.
+    SELECT array_agg(t.rel_oid ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.tracking_id ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.schema_name ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.table_name ORDER BY t.rel_oid, t.tracking_id)
+      INTO v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+    FROM (
+        SELECT DISTINCT tt.rel_oid, tt.tracking_id,
+               tt.schema_name, tt.table_name
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND tt.rel_oid = ANY(p_rel_oids)
+    ) t;
+    IF v_target_oids IS NULL OR cardinality(v_target_oids) = 0 THEN
         RETURN;
     END IF;
 
-    SELECT tt.tracking_id, n.nspname, c.relname
-      INTO v_tracking_id, v_schema_name, v_table_name
-    FROM flashback.tracked_tables tt
-    JOIN pg_class c ON c.oid = tt.rel_oid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-      AND tt.rel_oid = v_rel_oid;
-    IF NOT FOUND THEN
-        RETURN;
-    END IF;
+    -- Reconcile any caller-local capture disable before taking relation locks.
+    -- In the healthy case this is read-only; the broken-config case performs
+    -- its canonical stream→lifecycle transition and then this DDL is refused.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        IF NOT public.flashback_capture_configuration_guard(target.rel_oid) THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL refused because capture configuration is disabled or its WAL epoch is not active'
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Restore pg_flashback.enabled/capture_mode and reanchor before retrying.';
+        END IF;
+    END LOOP;
 
-    -- A stream established through the normal admission path is always
-    -- backed by a genuine physical replication slot; a stream explicitly
-    -- marked as having no physical slot backing it is not, and there is no
-    -- real WAL to drain in the first place for it -- the pre-drain wait
-    -- below exists to protect a real decoder against a real unlinked TOAST
-    -- pointer, which cannot happen without real WAL. Skip straight to the
-    -- destructive DDL rather than peeking a slot that was never created.
-    --
-    -- No matching active generation at all (NOT FOUND) is treated the same
-    -- way: there is no real backlog to protect either, and this is not a
-    -- silent gap -- flashback_capture_ddl_event's own
-    -- flashback_capture_configuration_guard check, immediately after this
-    -- function returns, independently re-verifies an active generation
-    -- exists and fails closed if a qualified lifecycle genuinely lacks one.
-    SELECT COALESCE((cs.details->>'no_physical_slot')::boolean, false)
-      INTO v_synthetic_stream
-    FROM flashback.coverage_generations cg
-    JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
-    WHERE cg.tracking_id = v_tracking_id
-      AND cg.state = 'active';
-    IF NOT FOUND OR COALESCE(v_synthetic_stream, false) THEN
-        RETURN;
-    END IF;
-
-    -- SHARE blocks INSERT/UPDATE/DELETE and competing destructive DDL, while
-    -- still allowing logical decoding to open the relation under ACCESS SHARE.
-    -- Once granted, the fixed barrier is stable because no new writer can
-    -- commit against this relation. The real DROP/TRUNCATE upgrades this to
-    -- ACCESS EXCLUSIVE only after the decoder has drained.
     v_timeout_ms := public.flashback_apply_local_boundary_lock_timeout();
-    EXECUTE format(
-        'LOCK TABLE %I.%I IN SHARE MODE',
-        v_schema_name,
-        v_table_name
-    );
+
+    -- SHARE every protected relation in OID order before draining any one of
+    -- them. This blocks new row writers but remains compatible with decoder
+    -- ACCESS SHARE. Verify the parser-resolved OID after each lock so a
+    -- concurrent rename/drop/replacement cannot redirect the command.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        EXECUTE format(
+            'LOCK TABLE %I.%I IN SHARE MODE',
+            target.schema_name,
+            target.table_name
+        );
+        IF to_regclass(format('%I.%I', target.schema_name, target.table_name))
+           IS DISTINCT FROM target.rel_oid
+        THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL target identity changed while acquiring SHARE lock (expected oid %, %.%)',
+                target.rel_oid, target.schema_name, target.table_name
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+    END LOOP;
 
     v_slot_name := public.flashback_effective_slot_name();
     SELECT oid INTO v_database_oid
@@ -1306,68 +1339,271 @@ BEGIN
     v_timeout_ms := GREATEST(v_timeout_ms, 1);
     v_deadline := clock_timestamp() + make_interval(secs => v_timeout_ms / 1000.0);
 
+    -- Drain each real-slot target to the same fixed barrier. Synthetic pg_test
+    -- streams have no physical WAL and deliberately skip only this loop; they
+    -- still take the same lifecycle/ACCESS EXCLUSIVE handoff below.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
     LOOP
-        -- Coordinate with the worker's session-scoped stream lock. Hold it
-        -- only for the metadata peek; release it whenever work remains so the
-        -- independent worker can consume and commit that prefix.
-        v_drain_lock_acquired := pg_try_advisory_lock(
-            public.flashback_internal_lock_ns_stream(),
-            v_database_oid::integer
-        );
-        IF v_drain_lock_acquired THEN
-            BEGIN
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM pg_logical_slot_peek_changes(
-                        v_slot_name,
-                        v_barrier_lsn,
-                        1,
-                        'tracked_oids',
-                        v_rel_oid::text,
-                        'metadata_only',
-                        'true'
-                    ) AS ch(lsn, xid, data)
-                    WHERE ch.data LIKE '{%'
-                )
-                  INTO v_has_pending;
-                PERFORM pg_advisory_unlock(
-                    public.flashback_internal_lock_ns_stream(),
-                    v_database_oid::integer
-                );
-                v_drain_lock_acquired := false;
-            EXCEPTION
-                WHEN OTHERS THEN
+        SELECT COALESCE((cs.details->>'no_physical_slot')::boolean, false)
+          INTO v_synthetic_stream
+        FROM flashback.coverage_generations cg
+        JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
+        WHERE cg.tracking_id = target.tracking_id
+          AND cg.state = 'active';
+        IF NOT FOUND OR COALESCE(v_synthetic_stream, false) THEN
+            CONTINUE;
+        END IF;
+
+        LOOP
+            -- Coordinate with the worker's session-scoped stream lock. Hold it
+            -- only for the metadata peek; release it whenever work remains so
+            -- the independent worker can consume and commit that prefix.
+            v_drain_lock_acquired := pg_try_advisory_lock(
+                public.flashback_internal_lock_ns_stream(),
+                v_database_oid::integer
+            );
+            IF v_drain_lock_acquired THEN
+                BEGIN
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_logical_slot_peek_changes(
+                            v_slot_name,
+                            v_barrier_lsn,
+                            1,
+                            'tracked_oids',
+                            target.rel_oid::text,
+                            'metadata_only',
+                            'true'
+                        ) AS ch(lsn, xid, data)
+                        WHERE ch.data LIKE '{%'
+                    )
+                      INTO v_has_pending;
                     PERFORM pg_advisory_unlock(
                         public.flashback_internal_lock_ns_stream(),
                         v_database_oid::integer
                     );
                     v_drain_lock_acquired := false;
-                    RAISE;
-            END;
-        ELSE
-            v_has_pending := true;
-        END IF;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        PERFORM pg_advisory_unlock(
+                            public.flashback_internal_lock_ns_stream(),
+                            v_database_oid::integer
+                        );
+                        v_drain_lock_acquired := false;
+                        RAISE;
+                END;
+            ELSE
+                v_has_pending := true;
+            END IF;
 
-        EXIT WHEN NOT v_has_pending;
+            EXIT WHEN NOT v_has_pending;
 
-        IF clock_timestamp() >= v_deadline THEN
+            IF clock_timestamp() >= v_deadline THEN
+                RAISE EXCEPTION
+                    'pg_flashback: destructive DDL refused because committed WAL for % did not drain before the % ms write-stall limit',
+                    format('%I.%I', target.schema_name, target.table_name), v_timeout_ms
+                    USING ERRCODE = 'lock_not_available',
+                          HINT = 'Let the capture worker catch up, inspect flashback_health(), then retry. The table was not changed.';
+            END IF;
+            PERFORM pg_sleep(0.05);
+        END LOOP;
+    END LOOP;
+
+    -- Handoff after drain: pin the canonical outer stream key first, without
+    -- blocking while SHARE is held. This freezes stream/config state through
+    -- manifest/event staging and preserves stream→lifecycle→relation order.
+    IF NOT pg_try_advisory_xact_lock(
+        public.flashback_internal_lock_ns_stream(),
+        v_database_oid::integer
+    ) THEN
+        RAISE EXCEPTION
+            'pg_flashback: destructive DDL could not pin the WAL stream after drain'
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'The capture worker or another lifecycle operation is active; retry the DDL.';
+    END IF;
+
+    -- Never block on a lifecycle while holding SHARE.
+    -- A restore can own lifecycle and wait for ACCESS EXCLUSIVE; blocking here
+    -- would deadlock it. A failed try-lock aborts this whole transaction,
+    -- releasing every SHARE lock so the competing operation can finish.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY tracking_id, rel_oid
+    LOOP
+        IF NOT public.flashback_internal_try_lock_lifecycle(target.tracking_id) THEN
             RAISE EXCEPTION
-                'pg_flashback: destructive DDL refused because committed WAL for % did not drain before the % ms write-stall limit',
-                format('%I.%I', v_schema_name, v_table_name), v_timeout_ms
-                USING ERRCODE = 'lock_not_available',
-                      HINT = 'Let the capture worker catch up, inspect flashback_health(), then retry. The table was not changed.';
+                'pg_flashback: destructive DDL could not pin lifecycle % after WAL drain',
+                target.tracking_id
+                USING ERRCODE = 'serialization_failure',
+                      HINT = 'A restore/maintenance operation is active; retry the DDL.';
         END IF;
-        PERFORM pg_sleep(0.05);
+    END LOOP;
+
+    -- The target set is now pinned. Refuse if lifecycle membership or active
+    -- WAL state changed during the drain; never silently omit a materialized
+    -- target from the final lock/proof phase.
+    IF EXISTS (
+        SELECT 1
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        LEFT JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = u.tracking_id
+         AND tt.rel_oid = u.rel_oid
+         AND tt.is_active
+         AND tt.recovery_profile = 'local_delta'
+        LEFT JOIN flashback.coverage_generations cg
+          ON cg.tracking_id = u.tracking_id
+         AND cg.state = 'active'
+        LEFT JOIN flashback.capture_streams cs
+          ON cs.stream_id = cg.stream_id
+         AND cs.state = 'active'
+        WHERE tt.tracking_id IS NULL
+           OR cg.generation_id IS NULL
+           OR cs.stream_id IS NULL
+    ) THEN
+        RAISE EXCEPTION
+            'pg_flashback: destructive DDL lifecycle changed during WAL drain'
+            USING ERRCODE = 'serialization_failure',
+                  HINT = 'Retry after the concurrent lifecycle operation completes.';
+    END IF;
+
+    -- Upgrade every relation in the same deterministic OID order. The losing
+    -- concurrent multi-target DDL has already aborted at the lifecycle
+    -- try-lock, so SHARE→ACCESS EXCLUSIVE upgrades cannot form a two-way
+    -- deadlock. Locks remain held through schema proof, manifest/event staging,
+    -- and standard DROP/TRUNCATE.
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        EXECUTE format(
+            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+            target.schema_name,
+            target.table_name
+        );
+        IF to_regclass(format('%I.%I', target.schema_name, target.table_name))
+           IS DISTINCT FROM target.rel_oid
+        THEN
+            RAISE EXCEPTION
+                'pg_flashback: destructive DDL target identity changed before ACCESS EXCLUSIVE proof (expected oid %, %.%)',
+                target.rel_oid, target.schema_name, target.table_name
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        PERFORM public.flashback_require_current_schema_contract(
+            target.tracking_id, NULL
+        );
     END LOOP;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION flashback_internal_prepare_destructive_ddl(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_internal_prepare_destructive_ddl(oid[]) FROM PUBLIC;
+
+-- ALTER/RENAME/SET SCHEMA do not need the pre-DROP WAL/TOAST drain, but they
+-- must still obey the canonical stream→lifecycle→relation order before
+-- standard_ProcessUtility takes table locks. Holding these locks through the
+-- post-utility capture makes that capture a pure, re-entrant state check.
+CREATE OR REPLACE FUNCTION flashback_internal_prepare_metadata_ddl(
+    p_rel_oids oid[]
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    target record;
+    v_database_oid oid;
+    v_target_oids oid[];
+    v_tracking_ids bigint[];
+    v_schema_names text[];
+    v_table_names text[];
+BEGIN
+    IF p_rel_oids IS NULL OR cardinality(p_rel_oids) = 0 THEN
+        RETURN;
+    END IF;
+
+    SELECT array_agg(t.rel_oid ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.tracking_id ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.schema_name ORDER BY t.rel_oid, t.tracking_id),
+           array_agg(t.table_name ORDER BY t.rel_oid, t.tracking_id)
+      INTO v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+    FROM (
+        SELECT DISTINCT tt.rel_oid, tt.tracking_id,
+               tt.schema_name, tt.table_name
+        FROM flashback.tracked_tables tt
+        WHERE tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND tt.rel_oid = ANY(p_rel_oids)
+    ) t;
+    IF v_target_oids IS NULL OR cardinality(v_target_oids) = 0 THEN
+        RETURN;
+    END IF;
+
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        IF NOT public.flashback_capture_configuration_guard(target.rel_oid) THEN
+            RAISE EXCEPTION
+                'pg_flashback: table DDL refused because capture configuration is disabled or its WAL epoch is not active'
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+    END LOOP;
+
+    SELECT oid INTO STRICT v_database_oid
+    FROM pg_database
+    WHERE datname = current_database();
+    PERFORM public.flashback_internal_lock_database_stream(v_database_oid);
+    PERFORM public.flashback_internal_lock_lifecycles(v_tracking_ids);
+    PERFORM public.flashback_apply_local_boundary_lock_timeout();
+
+    FOR target IN
+        SELECT *
+        FROM unnest(
+            v_target_oids, v_tracking_ids, v_schema_names, v_table_names
+        ) AS u(rel_oid, tracking_id, schema_name, table_name)
+        ORDER BY rel_oid, tracking_id
+    LOOP
+        EXECUTE format(
+            'LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE',
+            target.schema_name,
+            target.table_name
+        );
+        IF to_regclass(format('%I.%I', target.schema_name, target.table_name))
+           IS DISTINCT FROM target.rel_oid
+        THEN
+            RAISE EXCEPTION
+                'pg_flashback: table DDL target identity changed before capture (expected oid %, %.%)',
+                target.rel_oid, target.schema_name, target.table_name
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        PERFORM public.flashback_require_current_schema_contract(
+            target.tracking_id, NULL
+        );
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION flashback_internal_prepare_metadata_ddl(oid[]) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION flashback_capture_ddl_event(
     event_type text,
-    input_schema text,
-    input_table text
+    input_rel_oid oid
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -1378,66 +1614,63 @@ DECLARE
     v_generation_id bigint;
     v_stream_id bigint;
     v_stream_state text;
+    v_database_oid oid;
+    v_enabled boolean;
+    v_mode text;
 BEGIN
-    IF input_table IS NULL OR input_table = '' THEN RETURN; END IF;
+    IF input_rel_oid IS NULL OR input_rel_oid = 0 THEN RETURN; END IF;
 
-    -- After RENAME TABLE the hook fires with the NEW name.
-    -- tracked_tables still has the OLD name but same OID.
-    -- Try new name first; fall back to OID-based lookup.
-    IF input_schema IS NULL OR input_schema = '' THEN
-        SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
-          INTO tracked
-        FROM flashback.tracked_tables tt
-        WHERE tt.table_name = input_table
-          AND tt.is_active
-        ORDER BY tt.tracked_since DESC LIMIT 1;
-    ELSE
-        SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
-          INTO tracked
-        FROM flashback.tracked_tables tt
-        WHERE tt.schema_name = input_schema AND tt.table_name = input_table
-          AND tt.is_active
-        ORDER BY tt.tracked_since DESC
-        LIMIT 1;
-    END IF;
-
-    -- If not found by name, try by OID (handles RENAME TABLE: new name passed,
-    -- tracked_tables still has old name, but OID is stable).
-    IF tracked.rel_oid IS NULL THEN
-        DECLARE v_oid oid;
-        BEGIN
-            IF input_schema IS NOT NULL AND input_schema <> '' THEN
-                v_oid := to_regclass(format('%I.%I', input_schema, input_table));
-            ELSE
-                v_oid := to_regclass(input_table);
-            END IF;
-            IF v_oid IS NOT NULL THEN
-                SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name, tt.schema_version, tt.recovery_profile
-                  INTO tracked
-                FROM flashback.tracked_tables tt
-                WHERE tt.rel_oid = v_oid
-                  AND tt.is_active
-                ORDER BY tt.tracked_since DESC LIMIT 1;
-            END IF;
-        END;
-    END IF;
+    -- The ProcessUtility hook resolved this immutable OID under the caller's
+    -- security context/search_path. Never choose a lifecycle by a text name
+    -- (or recency) inside this fixed-search_path function.
+    SELECT tt.rel_oid, tt.tracking_id, tt.schema_name, tt.table_name,
+           tt.schema_version, tt.recovery_profile
+      INTO tracked
+    FROM flashback.tracked_tables tt
+    WHERE tt.rel_oid = input_rel_oid
+      AND tt.is_active
+    LIMIT 1;
 
     IF tracked.rel_oid IS NULL THEN RETURN; END IF;
 
     IF tracked.recovery_profile = 'local_delta' THEN
-        -- DDL has no row trigger to mediate a session-local SUSET override.
-        -- Reconcile it synchronously before routing the event; a refused guard
-        -- fails the hook closed so the DDL cannot commit against an unrecorded
-        -- qualified lifecycle.
-        IF NOT flashback_capture_configuration_guard(tracked.rel_oid) THEN
+        -- Pre-utility preparation owns the canonical stream→lifecycle locks.
+        -- Keep this post-utility path pure and nonblocking: attempting a
+        -- mutating reconcile or a blocking lifecycle lock after PostgreSQL has
+        -- taken relation locks would invert restore/worker lock order.
+        v_enabled := COALESCE(
+            current_setting('pg_flashback.enabled', true), 'on'
+        ) <> 'off';
+        v_mode := COALESCE(
+            NULLIF(btrim(COALESCE(
+                current_setting('pg_flashback.capture_mode', true), ''
+            )), ''),
+            'wal'
+        );
+        IF NOT v_enabled OR v_mode IS DISTINCT FROM 'wal' THEN
             RAISE EXCEPTION 'pg_flashback: DDL capture refused because capture configuration is disabled or no active WAL epoch exists'
                 USING HINT = 'Restore pg_flashback.enabled/capture_mode, then establish a new exact boundary with flashback_reanchor().';
         END IF;
 
-        -- Serialize DDL routing with stream breaks and generation retirement.
-        -- The configuration reconciler holds the database-stream key first
-        -- and then this key; this path never takes the outer database key.
-        PERFORM flashback_internal_lock_lifecycle(tracked.tracking_id);
+        SELECT oid INTO STRICT v_database_oid
+        FROM pg_database
+        WHERE datname = current_database();
+        IF NOT pg_try_advisory_xact_lock(
+            public.flashback_internal_lock_ns_stream(),
+            v_database_oid::integer
+        ) THEN
+            RAISE EXCEPTION
+                'pg_flashback: DDL capture could not pin the WAL stream'
+                USING ERRCODE = 'serialization_failure',
+                      HINT = 'Retry the DDL after the concurrent capture/lifecycle operation finishes.';
+        END IF;
+        IF NOT flashback_internal_try_lock_lifecycle(tracked.tracking_id) THEN
+            RAISE EXCEPTION
+                'pg_flashback: DDL capture could not pin lifecycle %',
+                tracked.tracking_id
+                USING ERRCODE = 'serialization_failure',
+                      HINT = 'Retry the DDL after the concurrent restore/maintenance operation finishes.';
+        END IF;
 
         -- An existing qualified lifecycle is routed by its durable generation
         -- binding, never by a caller's session-local capture_mode GUC. This
@@ -1477,6 +1710,33 @@ BEGIN
         NULL,   -- ddl_info: core collects from live relation
         true    -- emit logical commit marker
     );
+END;
+$$;
+
+-- Compatibility/test wrapper for explicit schema-qualified calls. Production
+-- hooks use the exact OID overload above. Unqualified text is rejected rather
+-- than being reinterpreted under this function's fixed search_path.
+CREATE OR REPLACE FUNCTION flashback_capture_ddl_event(
+    event_type text,
+    input_schema text,
+    input_table text
+)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel_oid oid;
+BEGIN
+    IF input_table IS NULL OR input_table = '' THEN RETURN; END IF;
+    IF input_schema IS NULL OR input_schema = '' THEN
+        RAISE EXCEPTION
+            'pg_flashback: DDL capture requires an exact schema or OID'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    v_rel_oid := to_regclass(format('%I.%I', input_schema, input_table));
+    IF v_rel_oid IS NULL THEN RETURN; END IF;
+    PERFORM public.flashback_capture_ddl_event(event_type, v_rel_oid);
 END;
 $$;
 

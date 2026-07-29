@@ -117,6 +117,7 @@ DECLARE
     admission record;
     rec record;
     v_schema_def jsonb;
+    v_has_full_schema_def boolean := false;
     v_skipped_defaults jsonb;
     v_dest_oid oid;
     v_col_list text;
@@ -141,21 +142,25 @@ BEGIN
     SELECT * INTO STRICT admission
     FROM flashback_admit_lsn_target(p_target_table, p_target_lsn);
 
-    SELECT jsonb_build_object(
-               'schema', admission.schema_name,
-               'table', admission.table_name,
-               'columns', COALESCE(sv.columns, '[]'::jsonb),
-               'primary_key', COALESCE(sv.primary_key, '[]'::jsonb),
-               'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
-               'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
-               'partition_by', sv.constraints -> 'partition_by',
-               'partitions', sv.constraints -> 'partitions',
-               'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
-               'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
-               'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false),
-               'force_rls', COALESCE((sv.constraints -> 'force_rls')::boolean, false)
-           )
-      INTO v_schema_def
+    SELECT COALESCE(
+               sv.schema_def,
+               jsonb_build_object(
+                   'schema', admission.schema_name,
+                   'table', admission.table_name,
+                   'columns', COALESCE(sv.columns, '[]'::jsonb),
+                   'primary_key', COALESCE(sv.primary_key, '[]'::jsonb),
+                   'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
+                   'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
+                   'partition_by', sv.constraints -> 'partition_by',
+                   'partitions', sv.constraints -> 'partitions',
+                   'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
+                   'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
+                   'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false),
+                   'force_rls', COALESCE((sv.constraints -> 'force_rls')::boolean, false)
+               )
+           ),
+           sv.schema_def IS NOT NULL
+      INTO v_schema_def, v_has_full_schema_def
     FROM flashback.schema_versions sv
     WHERE sv.tracking_id = admission.tracking_id
       AND sv.generation_id = admission.generation_id
@@ -169,10 +174,10 @@ BEGIN
         FROM flashback.snapshots snap
         WHERE snap.snapshot_id = admission.boundary_snapshot_id
           AND snap.tracking_id = admission.tracking_id;
-    ELSE
+    ELSIF NOT v_has_full_schema_def THEN
         -- schema_versions stores structural pieces only; ownership/ACL/comment
-        -- metadata for dropped-table reconstruct lives on the boundary
-        -- snapshot schema_def.
+        -- metadata for historical pre-schema_def rows lives on the boundary
+        -- snapshot. New rows use the complete canonical schema_def above.
         SELECT v_schema_def || jsonb_strip_nulls(jsonb_build_object(
                    'owner', snap.schema_def->>'owner',
                    'acl', snap.schema_def->'acl',
@@ -369,6 +374,11 @@ BEGIN
     v_query := format('SELECT * FROM pg_temp.%I', v_tmp);
 
     RETURN QUERY EXECUTE v_query;
+    -- RETURN QUERY has already copied the rows into the function's tuplestore.
+    -- Drop the materialization immediately so a second query in the same
+    -- backend can preserve the original named PK/index identities without
+    -- colliding with objects left behind by the first call.
+    EXECUTE format('DROP TABLE pg_temp.%I', v_tmp);
 END;
 $$;
 
@@ -434,6 +444,7 @@ BEGIN
         admission.schema_name, admission.table_name, v_pk_condition
     );
     GET DIAGNOSTICS v_recovered = ROW_COUNT;
+    EXECUTE format('DROP TABLE pg_temp.%I', v_tmp);
     RETURN v_recovered;
 END;
 $$;
@@ -476,7 +487,6 @@ DECLARE
     v_seq_name text;
     v_seq_schema text;
     v_seq_bare text;
-    v_max_val bigint;
     v_identity_edge bigint;
     v_identity_start bigint;
     v_identity_increment bigint;
@@ -509,7 +519,6 @@ BEGIN
             admission.schema_name, admission.table_name, v_live_oid, admission.rel_oid
             USING HINT = 'Rename or move the newer table before recover; pg_flashback will not silently overwrite an identity-mismatched relation.';
     END IF;
-
     -- Exact event-bound DROP dependency manifests are mandatory for DROP
     -- reconstruction (live relation gone) and for audited recover selections
     -- whose disaster is a DROP. Pure DML/schema point-in-time restore against
@@ -646,6 +655,28 @@ BEGIN
                 USING ERRCODE = 'lock_not_available',
                       HINT = 'Retry when the table is idle or raise the write-stall budget.';
         END;
+
+        -- Re-resolve identity and compare the live metadata only after the
+        -- final-strength relation lock is held. A concurrent rename/drop and
+        -- replacement or related-object DDL must not fit between the proof
+        -- and the eventual swap.
+        v_live_oid := to_regclass(
+            format('%I.%I', admission.schema_name, admission.table_name)
+        );
+        IF v_live_oid IS NULL OR v_live_oid IS DISTINCT FROM admission.rel_oid THEN
+            RAISE EXCEPTION
+                'pg_flashback: refusing restore of %.% because relation identity changed while acquiring the restore lock (live oid %, tracked oid %)',
+                admission.schema_name, admission.table_name, v_live_oid, admission.rel_oid
+                USING ERRCODE = 'object_not_in_prerequisite_state',
+                      HINT = 'Retry after resolving the concurrent DDL; pg_flashback will not restore across an identity race.';
+        END IF;
+        -- A live-table PITR must not swap in a schema derived from a stale
+        -- epoch after related-object DDL that the table-node hook could not
+        -- map. DROP/TRUNCATE run the same authority while holding the same
+        -- ACCESS EXCLUSIVE strength.
+        PERFORM public.flashback_require_current_schema_contract(
+            admission.tracking_id, NULL
+        );
     END IF;
 
     out_tracking_id := admission.tracking_id;
@@ -695,7 +726,6 @@ DECLARE
     v_seq_name text;
     v_seq_schema text;
     v_seq_bare text;
-    v_max_val bigint;
     v_identity_edge bigint;
     v_identity_start bigint;
     v_identity_increment bigint;
@@ -703,6 +733,7 @@ DECLARE
     v_cur_name text;
     v_want_schema text;
     v_want_name text;
+    v_table_owner text;
     v_restored_rel regclass;
     v_expected_proof jsonb;
     v_restore_verification jsonb;
@@ -831,36 +862,95 @@ BEGIN
 
     EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL',
                    materialized.source_schema_name, materialized.source_table_name);
+    SELECT pg_get_userbyid(c.relowner)
+      INTO STRICT v_table_owner
+    FROM pg_class c
+    WHERE c.oid = v_new_rel_oid;
 
     FOR def_rec IN
-        SELECT elem->>'col' AS col_name, elem->>'default_expr' AS default_expr
+        SELECT elem->>'col' AS col_name,
+               elem->>'default_expr' AS default_expr,
+               elem->'sequence_options' AS sequence_options
         FROM jsonb_array_elements(COALESCE(materialized.skipped_defaults, '[]'::jsonb)) elem
     LOOP
-        v_seq_name := substring(def_rec.default_expr FROM $re$nextval\('([^']+)'$re$);
-        IF v_seq_name IS NOT NULL THEN
-            v_seq_name := regexp_replace(v_seq_name, '::[a-zA-Z_ ]+$', '');
-            IF position('.' IN v_seq_name) > 0 THEN
-                v_seq_schema := split_part(v_seq_name, '.', 1);
-                v_seq_bare := split_part(v_seq_name, '.', 2);
+        IF def_rec.sequence_options IS NOT NULL
+           AND def_rec.sequence_options <> 'null'::jsonb
+        THEN
+            v_seq_schema := def_rec.sequence_options->>'sequence_schema';
+            v_seq_bare := def_rec.sequence_options->>'sequence_name';
+            IF v_seq_schema IS NULL OR v_seq_bare IS NULL THEN
+                RAISE EXCEPTION 'pg_flashback: owned sequence identity missing for column %',
+                    def_rec.col_name;
+            END IF;
+            IF to_regclass(format('%I.%I', v_seq_schema, v_seq_bare)) IS NOT NULL THEN
+                RAISE EXCEPTION
+                    'pg_flashback: cannot restore owned sequence %.%; name is occupied',
+                    v_seq_schema, v_seq_bare
+                    USING ERRCODE = 'duplicate_table';
+            END IF;
+            EXECUTE format(
+                'CREATE SEQUENCE %I.%I AS %s START WITH %s INCREMENT BY %s '
+                'MINVALUE %s MAXVALUE %s CACHE %s %s',
+                v_seq_schema,
+                v_seq_bare,
+                COALESCE(def_rec.sequence_options->>'data_type', 'bigint'),
+                def_rec.sequence_options->>'start',
+                def_rec.sequence_options->>'increment',
+                def_rec.sequence_options->>'min',
+                def_rec.sequence_options->>'max',
+                def_rec.sequence_options->>'cache',
+                CASE
+                    WHEN COALESCE((def_rec.sequence_options->>'cycle')::boolean, false)
+                    THEN 'CYCLE'
+                    ELSE 'NO CYCLE'
+                END
+            );
+            v_identity_increment := COALESCE(
+                (def_rec.sequence_options->>'increment')::bigint, 1
+            );
+            v_identity_start := COALESCE(
+                (def_rec.sequence_options->>'start')::bigint, 1
+            );
+            IF v_identity_increment < 0 THEN
+                EXECUTE format('SELECT min(%I) FROM %I.%I',
+                               def_rec.col_name,
+                               materialized.source_schema_name,
+                               materialized.source_table_name)
+                  INTO v_identity_edge;
             ELSE
-                v_seq_schema := materialized.source_schema_name;
-                v_seq_bare := v_seq_name;
+                EXECUTE format('SELECT max(%I) FROM %I.%I',
+                               def_rec.col_name,
+                               materialized.source_schema_name,
+                               materialized.source_table_name)
+                  INTO v_identity_edge;
             END IF;
-            IF to_regclass(format('%I.%I', v_seq_schema, v_seq_bare)) IS NULL THEN
-                EXECUTE format('CREATE SEQUENCE %I.%I', v_seq_schema, v_seq_bare);
-            END IF;
-            EXECUTE format('SELECT COALESCE(max(%I), 0) FROM %I.%I',
-                           def_rec.col_name,
-                           materialized.source_schema_name, materialized.source_table_name)
-              INTO v_max_val;
-            IF v_max_val > 0 THEN
+            IF v_identity_edge IS NULL THEN
                 PERFORM setval(format('%I.%I', v_seq_schema, v_seq_bare)::regclass,
-                               v_max_val, true);
+                               v_identity_start, false);
+            ELSE
+                PERFORM setval(format('%I.%I', v_seq_schema, v_seq_bare)::regclass,
+                               v_identity_edge, true);
             END IF;
+            -- OWNED BY requires the sequence and table to have the same
+            -- owner. The sequence is created by this SECURITY DEFINER
+            -- routine, while finalize has already restored the table's
+            -- application owner.
+            EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO %I',
+                           v_seq_schema, v_seq_bare, v_table_owner);
             EXECUTE format('ALTER SEQUENCE %I.%I OWNED BY %I.%I.%I',
                            v_seq_schema, v_seq_bare,
                            materialized.source_schema_name,
                            materialized.source_table_name, def_rec.col_name);
+        ELSE
+            -- An unowned external sequence is not part of this table's
+            -- artifact set. It must still exist; never fabricate it.
+            v_seq_name := substring(def_rec.default_expr FROM $re$nextval\('([^']+)'$re$);
+            v_seq_name := regexp_replace(v_seq_name, '::[a-zA-Z_ ]+$', '');
+            IF v_seq_name IS NULL OR to_regclass(v_seq_name) IS NULL THEN
+                RAISE EXCEPTION
+                    'pg_flashback: external sequence default for column % cannot be resolved',
+                    def_rec.col_name;
+            END IF;
         END IF;
         EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I SET DEFAULT %s',
                        materialized.source_schema_name, materialized.source_table_name,
@@ -1100,7 +1190,7 @@ BEGIN
     INSERT INTO flashback.schema_versions (
         rel_oid, tracking_id, generation_id, stream_id, source_xid,
         schema_version, applied_at, applied_lsn,
-        columns, primary_key, constraints, helper_schema_sha256
+        columns, primary_key, constraints, schema_def, helper_schema_sha256
     ) VALUES (
         v_new_rel_oid, admission.tracking_id, v_new_generation_id,
         v_new_stream_id, v_boundary_xid,
@@ -1116,6 +1206,7 @@ BEGIN
             'rls_policies', COALESCE(materialized.target_schema_def->'rls_policies', '[]'::jsonb),
             'rls_enabled', COALESCE((materialized.target_schema_def->'rls_enabled')::boolean, false)
         ),
+        materialized.target_schema_def,
         flashback_helper_schema_sha256(v_new_rel_oid)
     );
 

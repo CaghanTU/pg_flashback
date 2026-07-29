@@ -556,7 +556,11 @@ BEGIN
     -- Collect nextval defaults to defer
     SELECT COALESCE(
         jsonb_agg(
-            jsonb_build_object('col', col->>'name', 'default_expr', col->>'default_expr')
+            jsonb_build_object(
+                'col', col->>'name',
+                'default_expr', col->>'default_expr',
+                'sequence_options', col->'identity_options'
+            )
             ORDER BY ord
         ) FILTER (
             WHERE col ? 'default_expr'
@@ -676,10 +680,25 @@ BEGIN
     -- Non-shadow mode: restore triggers, RLS, ACL
     IF NOT v_is_shadow THEN
         FOR v_trig IN
-            SELECT trig->>'def' AS def
+            SELECT trig->>'name' AS name,
+                   trig->>'def' AS def,
+                   COALESCE(trig->>'enabled', 'O') AS enabled
             FROM jsonb_array_elements(COALESCE(ddl_info->'triggers', '[]'::jsonb)) AS trig
         LOOP
             EXECUTE v_trig.def;
+            IF v_trig.enabled = 'D' THEN
+                EXECUTE format('ALTER TABLE %I.%I DISABLE TRIGGER %I',
+                    v_tgt_schema, v_tgt_table, v_trig.name);
+            ELSIF v_trig.enabled = 'R' THEN
+                EXECUTE format('ALTER TABLE %I.%I ENABLE REPLICA TRIGGER %I',
+                    v_tgt_schema, v_tgt_table, v_trig.name);
+            ELSIF v_trig.enabled = 'A' THEN
+                EXECUTE format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER %I',
+                    v_tgt_schema, v_tgt_table, v_trig.name);
+            ELSIF v_trig.enabled <> 'O' THEN
+                RAISE EXCEPTION 'flashback: unknown trigger enabled state % for %',
+                    v_trig.enabled, v_trig.name;
+            END IF;
         END LOOP;
 
         IF COALESCE((ddl_info->>'rls_enabled')::boolean, false) THEN
@@ -693,7 +712,7 @@ BEGIN
                    pol->>'qual' AS qual,
                    pol->>'with_check' AS with_check,
                    COALESCE((
-                       SELECT string_agg(r::text, ', ')
+                       SELECT string_agg(format('%I', r), ', ' ORDER BY r)
                        FROM jsonb_array_elements_text(COALESCE(pol->'roles', '[]'::jsonb)) r
                    ), 'PUBLIC') AS roles
             FROM jsonb_array_elements(COALESCE(ddl_info->'rls_policies', '[]'::jsonb)) AS pol
@@ -1318,11 +1337,26 @@ BEGIN
 
     -- Restore user triggers
     FOR v_trig IN
-        SELECT trig->>'def' AS def
+        SELECT trig->>'name' AS name,
+               trig->>'def' AS def,
+               COALESCE(trig->>'enabled', 'O') AS enabled
         FROM jsonb_array_elements(COALESCE(ddl_info->'triggers', '[]'::jsonb)) AS trig
     LOOP
         BEGIN
             EXECUTE v_trig.def;
+            IF v_trig.enabled = 'D' THEN
+                EXECUTE format('ALTER TABLE %I.%I DISABLE TRIGGER %I',
+                    p_orig_schema, p_orig_table, v_trig.name);
+            ELSIF v_trig.enabled = 'R' THEN
+                EXECUTE format('ALTER TABLE %I.%I ENABLE REPLICA TRIGGER %I',
+                    p_orig_schema, p_orig_table, v_trig.name);
+            ELSIF v_trig.enabled = 'A' THEN
+                EXECUTE format('ALTER TABLE %I.%I ENABLE ALWAYS TRIGGER %I',
+                    p_orig_schema, p_orig_table, v_trig.name);
+            ELSIF v_trig.enabled <> 'O' THEN
+                RAISE EXCEPTION 'flashback: unknown trigger enabled state % for %',
+                    v_trig.enabled, v_trig.name;
+            END IF;
         EXCEPTION WHEN OTHERS THEN
             RAISE EXCEPTION 'flashback: trigger restore failed: %', SQLERRM;
         END;
@@ -1345,7 +1379,7 @@ BEGIN
                pol->>'qual' AS qual,
                pol->>'with_check' AS with_check,
                COALESCE((
-                   SELECT string_agg(r::text, ', ')
+                   SELECT string_agg(format('%I', r), ', ' ORDER BY r)
                    FROM jsonb_array_elements_text(COALESCE(pol->'roles', '[]'::jsonb)) r
                ), 'PUBLIC') AS roles
         FROM jsonb_array_elements(COALESCE(ddl_info->'rls_policies', '[]'::jsonb)) AS pol

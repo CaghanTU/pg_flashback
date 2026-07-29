@@ -51,7 +51,11 @@ BEGIN
         jsonb_build_object(
             'name', elem->>'name',
             'def', COALESCE(elem->>'def', elem->>'definition', '')
-        )
+        ) || CASE
+            WHEN elem ? 'enabled'
+            THEN jsonb_build_object('enabled', elem->>'enabled')
+            ELSE '{}'::jsonb
+        END
         ORDER BY COALESCE(elem->>'name', '')
     ), '[]'::jsonb)
       INTO v_triggers
@@ -102,13 +106,14 @@ BEGIN
         SELECT elem
         FROM jsonb_array_elements(COALESCE(p_schema_def->'columns', '[]'::jsonb)) elem
         WHERE elem->>'identity' IN ('a', 'd')
-           OR COALESCE(elem->>'default', '') ~* 'nextval'
+           OR COALESCE(elem->>'default_expr', '') ~* '^nextval\('
     LOOP
         v_sequences := v_sequences || jsonb_build_array(jsonb_build_object(
             'column', v_elem->>'name',
             'identity', COALESCE(v_elem->>'identity', ''),
             'sequence_schema', v_elem->'identity_options'->>'sequence_schema',
             'sequence_name', v_elem->'identity_options'->>'sequence_name',
+            'data_type', v_elem->'identity_options'->>'data_type',
             'increment', COALESCE((v_elem->'identity_options'->>'increment')::bigint, 1),
             'start', COALESCE((v_elem->'identity_options'->>'start')::bigint, 1),
             'state_policy', 'edge_after_restore'
@@ -269,7 +274,8 @@ BEGIN
             SELECT jsonb_agg(
                 jsonb_build_object(
                     'name', t.tgname,
-                    'def', pg_get_triggerdef(t.oid)
+                    'def', pg_get_triggerdef(t.oid),
+                    'enabled', t.tgenabled::text
                 )
                 ORDER BY t.tgname
             )
@@ -316,7 +322,14 @@ BEGIN
                     'privilege', ae.privilege_type,
                     'is_grantable', ae.is_grantable
                 )
-                ORDER BY ae.grantee, ae.privilege_type
+                -- Role OIDs are cluster-local and do not define the logical
+                -- ACL set.  Match schema_def's name-based canonical order so
+                -- identical grants hash identically after restore.
+                ORDER BY CASE
+                    WHEN ae.grantee = 0 THEN 'PUBLIC'
+                    ELSE (SELECT rolname FROM pg_roles WHERE oid = ae.grantee)
+                END,
+                ae.privilege_type
             )
             FROM aclexplode(c.relacl) AS ae(grantor, grantee, privilege_type, is_grantable)
         ), '[]'::jsonb),
@@ -342,6 +355,7 @@ BEGIN
             )
             FROM pg_description d
             WHERE d.objoid = v_oid
+              AND d.classoid = 'pg_class'::regclass
         ), '[]'::jsonb),
         'sequences', COALESCE((
             SELECT jsonb_agg(
@@ -493,6 +507,7 @@ DECLARE
     v_inc bigint;
     v_start bigint;
     v_col text;
+    v_state jsonb;
 BEGIN
     SELECT n.nspname, c.relname INTO v_schema, v_name
     FROM pg_class c
@@ -503,6 +518,7 @@ BEGIN
         SELECT elem
         FROM jsonb_array_elements(COALESCE(p_schema_def->'columns', '[]'::jsonb)) elem
         WHERE elem->>'identity' IN ('a', 'd')
+           OR COALESCE(elem->>'default_expr', '') ~* '^nextval\('
     LOOP
         v_col := v_elem->>'name';
         v_inc := COALESCE((v_elem->'identity_options'->>'increment')::bigint, 1);
@@ -513,21 +529,149 @@ BEGIN
             EXECUTE format('SELECT max(%I) FROM %I.%I', v_col, v_schema, v_name) INTO v_edge;
         END IF;
         IF v_edge IS NULL THEN
-            v_out := v_out || jsonb_build_array(jsonb_build_object(
+            v_state := jsonb_build_object(
                 'column', v_col,
                 'last_value', v_start,
                 'is_called', false,
                 'state_policy', 'edge_after_restore'
-            ));
+            );
         ELSE
-            v_out := v_out || jsonb_build_array(jsonb_build_object(
+            v_state := jsonb_build_object(
                 'column', v_col,
                 'last_value', v_edge,
                 'is_called', true,
                 'state_policy', 'edge_after_restore'
+            );
+        END IF;
+        IF v_elem->'identity_options' IS NOT NULL
+           AND v_elem->'identity_options' <> 'null'::jsonb
+        THEN
+            v_state := v_state || jsonb_strip_nulls(jsonb_build_object(
+                'sequence_schema', CASE WHEN v_elem->'identity_options' ? 'sequence_schema'
+                                        THEN v_elem#>>'{identity_options,sequence_schema}' END,
+                'sequence_name', CASE WHEN v_elem->'identity_options' ? 'sequence_name'
+                                      THEN v_elem#>>'{identity_options,sequence_name}' END,
+                'data_type', CASE WHEN v_elem->'identity_options' ? 'data_type'
+                                  THEN v_elem#>>'{identity_options,data_type}' END,
+                'start', CASE WHEN v_elem->'identity_options' ? 'start'
+                              THEN (v_elem#>>'{identity_options,start}')::bigint END,
+                'increment', CASE WHEN v_elem->'identity_options' ? 'increment'
+                                  THEN (v_elem#>>'{identity_options,increment}')::bigint END,
+                'min', CASE WHEN v_elem->'identity_options' ? 'min'
+                            THEN (v_elem#>>'{identity_options,min}')::bigint END,
+                'max', CASE WHEN v_elem->'identity_options' ? 'max'
+                            THEN (v_elem#>>'{identity_options,max}')::bigint END,
+                'cache', CASE WHEN v_elem->'identity_options' ? 'cache'
+                              THEN (v_elem#>>'{identity_options,cache}')::bigint END,
+                'cycle', CASE WHEN v_elem->'identity_options' ? 'cycle'
+                              THEN (v_elem#>>'{identity_options,cycle}')::boolean END
             ));
         END IF;
+        v_out := v_out || jsonb_build_array(v_state);
     END LOOP;
+    RETURN v_out;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_actual_sequence_states(
+    p_relation regclass,
+    p_schema_def jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_schema text;
+    v_name text;
+    v_out jsonb := '[]'::jsonb;
+    v_elem jsonb;
+    v_col text;
+    v_seq_reg regclass;
+    v_seq_schema text;
+    v_seq_name text;
+    v_last_value bigint;
+    v_is_called boolean;
+    v_state jsonb;
+    v_seq_options record;
+BEGIN
+    SELECT n.nspname, c.relname INTO v_schema, v_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = p_relation::oid;
+
+    FOR v_elem IN
+        SELECT elem
+        FROM jsonb_array_elements(COALESCE(p_schema_def->'columns', '[]'::jsonb)) elem
+        WHERE elem->>'identity' IN ('a', 'd')
+           OR COALESCE(elem->>'default_expr', '') ~* '^nextval\('
+    LOOP
+        v_col := v_elem->>'name';
+        v_seq_reg := to_regclass(pg_get_serial_sequence(
+            format('%I.%I', v_schema, v_name), v_col
+        ));
+        IF v_seq_reg IS NULL THEN
+            RAISE EXCEPTION
+                'flashback_actual_sequence_states: owned sequence missing for %.%.%',
+                v_schema, v_name, v_col;
+        END IF;
+        SELECT n.nspname, c.relname
+          INTO v_seq_schema, v_seq_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = v_seq_reg::oid
+          AND c.relkind = 'S';
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'flashback_actual_sequence_states: sequence identity invalid for %.%.%',
+                v_schema, v_name, v_col;
+        END IF;
+
+        EXECUTE format(
+            'SELECT last_value::bigint, is_called FROM %I.%I',
+            v_seq_schema, v_seq_name
+        ) INTO v_last_value, v_is_called;
+
+        v_state := jsonb_build_object(
+            'column', v_col,
+            'last_value', v_last_value,
+            'is_called', v_is_called,
+            'state_policy', 'edge_after_restore'
+        );
+        IF v_elem->'identity_options' IS NOT NULL
+           AND v_elem->'identity_options' <> 'null'::jsonb
+        THEN
+            SELECT s.seqstart, s.seqincrement, s.seqmin, s.seqmax,
+                   s.seqcache, s.seqcycle, format_type(s.seqtypid, NULL) AS data_type
+              INTO v_seq_options
+            FROM pg_sequence s
+            WHERE s.seqrelid = v_seq_reg::oid;
+            v_state := v_state || jsonb_strip_nulls(jsonb_build_object(
+                'sequence_schema', CASE WHEN v_elem->'identity_options' ? 'sequence_schema'
+                                        THEN v_seq_schema END,
+                'sequence_name', CASE WHEN v_elem->'identity_options' ? 'sequence_name'
+                                      THEN v_seq_name END,
+                'data_type', CASE WHEN v_elem->'identity_options' ? 'data_type'
+                                  THEN v_seq_options.data_type END,
+                'start', CASE WHEN v_elem->'identity_options' ? 'start'
+                              THEN v_seq_options.seqstart END,
+                'increment', CASE WHEN v_elem->'identity_options' ? 'increment'
+                                  THEN v_seq_options.seqincrement END,
+                'min', CASE WHEN v_elem->'identity_options' ? 'min'
+                            THEN v_seq_options.seqmin END,
+                'max', CASE WHEN v_elem->'identity_options' ? 'max'
+                            THEN v_seq_options.seqmax END,
+                'cache', CASE WHEN v_elem->'identity_options' ? 'cache'
+                              THEN v_seq_options.seqcache END,
+                'cycle', CASE WHEN v_elem->'identity_options' ? 'cycle'
+                              THEN v_seq_options.seqcycle END
+            ));
+        END IF;
+        v_out := v_out || jsonb_build_array(v_state);
+    END LOOP;
+
     RETURN v_out;
 END;
 $$;
@@ -680,9 +824,28 @@ BEGIN
             ), '[]'::jsonb)
         );
     END IF;
-    v_seq_states := public.flashback_expected_sequence_states(p_live, p_schema_def);
-    -- Actual sequence_states compared against the edge contract (not raw pg_sequences
-    -- alone), so restore setval positioning is the verified semantic.
+    IF NOT EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(
+            COALESCE(p_schema_def->'triggers', '[]'::jsonb)
+        ) AS trig
+        WHERE trig ? 'enabled'
+    ) THEN
+        v_inventory := jsonb_set(
+            v_inventory,
+            '{triggers}',
+            COALESCE((
+                SELECT jsonb_agg(trig - 'enabled' ORDER BY trig->>'name')
+                FROM jsonb_array_elements(
+                    COALESCE(v_inventory->'triggers', '[]'::jsonb)
+                ) AS trig
+            ), '[]'::jsonb)
+        );
+    END IF;
+    v_seq_states := public.flashback_actual_sequence_states(p_live, p_schema_def);
+    -- This side reads each live sequence relation's last_value/is_called.
+    -- The expected side derives the edge contract independently from table
+    -- contents, so a wrong setval can no longer verify itself.
     v_inventory := v_inventory || jsonb_build_object('sequence_states', v_seq_states);
 
     RETURN jsonb_build_object(

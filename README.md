@@ -55,7 +55,8 @@ The local recovery path supports:
 - primary and secondary indexes, named/deferrable primary keys, unique and
   check constraints;
 - qualified column collations;
-- identity/serial sequences, TOAST values, quoted identifiers, and
+- identity/serial sequences (restored to a safe recovered-data edge), TOAST
+  values, quoted identifiers, and
   non-`public` schemas;
 - `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and ordinary `DROP TABLE`;
 - PostgreSQL restart and background-worker restart without losing confirmed

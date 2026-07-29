@@ -1019,6 +1019,7 @@ BEGIN
             columns         JSONB NOT NULL,
             primary_key     JSONB NOT NULL DEFAULT ''[]''::jsonb,
             constraints     JSONB NOT NULL DEFAULT ''{}''::jsonb,
+            schema_def      JSONB,
             helper_schema_sha256 TEXT,
             UNIQUE(rel_oid, schema_version)
         )';
@@ -1094,6 +1095,16 @@ BEGIN
           AND column_name = 'commit_lsn'
     ) THEN
         ALTER TABLE flashback.schema_versions ADD COLUMN commit_lsn PG_LSN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback' AND table_name = 'schema_versions'
+          AND column_name = 'schema_def'
+    ) THEN
+        -- New schema epochs persist the complete canonical contract.  NULL
+        -- remains legal only for historical rows created before this field;
+        -- restore_lsn keeps its legacy structural reconstruction for them.
+        ALTER TABLE flashback.schema_versions ADD COLUMN schema_def JSONB;
     END IF;
 
     -- Legacy snapshot ownership stays NULL. An OID may have been recycled

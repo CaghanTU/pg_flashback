@@ -278,18 +278,22 @@ BEGIN
     -- schema_versions row at/under the DROP's safe target LSN; fall back to
     -- the generation's boundary snapshot schema_def.
     IF v_row.generation_id IS NOT NULL THEN
-        SELECT jsonb_build_object(
-                   'schema', split_part(v_canonical, '.', 1),
-                   'table', split_part(v_canonical, '.', 2),
-                   'columns', COALESCE(sv.columns, '[]'::jsonb),
-                   'primary_key', COALESCE(sv.primary_key, '[]'::jsonb),
-                   'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
-                   'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
-                   'partition_by', sv.constraints -> 'partition_by',
-                   'partitions', sv.constraints -> 'partitions',
-                   'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
-                   'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
-                   'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false)
+        SELECT COALESCE(
+                   sv.schema_def,
+                   jsonb_build_object(
+                       'schema', split_part(v_canonical, '.', 1),
+                       'table', split_part(v_canonical, '.', 2),
+                       'columns', COALESCE(sv.columns, '[]'::jsonb),
+                       'primary_key', COALESCE(sv.primary_key, '[]'::jsonb),
+                       'constraints', COALESCE(sv.constraints -> 'check_unique_fk', '[]'::jsonb),
+                       'indexes', COALESCE(sv.constraints -> 'indexes', '[]'::jsonb),
+                       'partition_by', sv.constraints -> 'partition_by',
+                       'partitions', sv.constraints -> 'partitions',
+                       'triggers', COALESCE(sv.constraints -> 'triggers', '[]'::jsonb),
+                       'rls_policies', COALESCE(sv.constraints -> 'rls_policies', '[]'::jsonb),
+                       'rls_enabled', COALESCE((sv.constraints -> 'rls_enabled')::boolean, false),
+                       'force_rls', COALESCE((sv.constraints -> 'force_rls')::boolean, false)
+                   )
                )
           INTO v_epoch_schema_def
         FROM flashback.schema_versions sv
