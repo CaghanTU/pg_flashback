@@ -37,6 +37,14 @@ pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum
     storage::worker::pg_flashback_maintenance_worker_main(arg);
 }
 
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_flashback_external_zstd_handoff_selftest_worker_main(
+    arg: pg_sys::Datum,
+) {
+    storage::external_zstd_handoff::pg_flashback_external_zstd_handoff_selftest_worker_main(arg);
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
