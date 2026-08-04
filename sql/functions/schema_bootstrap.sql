@@ -1426,6 +1426,18 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
     -- this at its 'heap_v1' default); never re-read from a GUC afterward.
     storage_backend        TEXT NOT NULL DEFAULT 'heap_v1'
                            CHECK (storage_backend IN ('heap_v1', 'external_zstd')),
+    -- Step 9: set only by flashback_internal_reserve_online_generation, one
+    -- per online-create attempt. The UNIQUE constraint below is the actual
+    -- enforcement of nonce uniqueness (binding guardrail: a collision must
+    -- be caught by the database, not merely assumed unlikely from the
+    -- caller's random-generation quality) -- it is what every later step of
+    -- the online-snapshot protocol (DSM handoff correlation, staging
+    -- directory naming, the online_pending:/online_external: boundary_
+    -- marker text) trusts to unambiguously identify exactly one
+    -- (tracking_id, generation_id, snapshot_id, storage_backend) tuple.
+    -- NULL for every non-online-create row; multiple NULLs never conflict
+    -- under standard UNIQUE semantics.
+    operation_nonce        BIGINT,
     boundary_kind          TEXT NOT NULL CHECK (btrim(boundary_kind) <> ''),
     rel_oid_at_boundary    OID NOT NULL,
     boundary_snapshot_id   BIGINT,
@@ -1454,6 +1466,8 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
     state_reason           TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     details                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT coverage_generations_operation_nonce_key
+        UNIQUE (operation_nonce),
     CONSTRAINT coverage_generations_tracking_number_key
         UNIQUE (tracking_id, generation_no),
     CONSTRAINT coverage_generations_generation_tracking_key
@@ -1974,6 +1988,25 @@ BEGIN
     ALTER TABLE flashback.coverage_generations
         ADD CONSTRAINT coverage_generations_storage_backend_check
         CHECK (storage_backend IN ('heap_v1', 'external_zstd'));
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'flashback'
+          AND table_name = 'coverage_generations'
+          AND column_name = 'operation_nonce'
+    ) THEN
+        ALTER TABLE flashback.coverage_generations
+            ADD COLUMN operation_nonce BIGINT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.coverage_generations'::regclass
+          AND conname = 'coverage_generations_operation_nonce_key'
+    ) THEN
+        ALTER TABLE flashback.coverage_generations
+            ADD CONSTRAINT coverage_generations_operation_nonce_key
+            UNIQUE (operation_nonce);
+    END IF;
 
     -- Keep failed, never-qualified boundaries as immutable audit tombstones.
     -- Older installs used an inline state check that did not know `aborted`.

@@ -257,6 +257,10 @@
       "class": "infra",
       "reason": "centralized state/progress/lock/journal authority regressions"
     },
+    "online_reservation_authority.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 5: online-reservation authority (snapshot+generation atomic bind, admission check, operation_nonce uniqueness) regressions"
+    },
     "tracked_table_resolver_search_path.sql": {
       "class": "infra",
       "reason": "tracked-table name resolution without writable search_path"

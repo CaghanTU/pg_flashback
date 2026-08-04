@@ -762,6 +762,241 @@ BEGIN
 END;
 $$;
 
+-- ------------------------------------------------------------------
+-- Step 9 / Stage 5: reserve a snapshot artifact row without copying any
+-- data now. This is the INSERT-only half of flashback_internal_snapshot_
+-- create -- no CTAS, no relation, no row count -- for backends whose
+-- artifact creation cannot happen atomically inside the reservation's own
+-- transaction (external_zstd's copy is a separate, later transaction; see
+-- flashback_internal_reserve_online_generation below). snapshot_lsn is
+-- left NULL (legal only for a still-creating external_zstd row, per
+-- snapshots_lsn_shape_check) and schema_def is left as an honest empty
+-- placeholder -- both are filled in later, while still 'creating', by
+-- flashback_internal_bind_online_boundary (Stage 6), under the table
+-- lock, once the real boundary is known. heap_v1 never calls this
+-- function; flashback_internal_snapshot_create is unaffected and remains
+-- its only construction path.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_reserve(
+    p_tracking_id bigint,
+    p_rel_oid oid,
+    p_storage_backend text
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_snapshot_id bigint;
+BEGIN
+    IF p_tracking_id IS NULL OR p_rel_oid IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot reserve requires tracking_id and rel_oid'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    -- snapshots_lsn_shape_check only permits a NULL snapshot_lsn on a
+    -- still-creating external_zstd row; any other backend inserted here
+    -- with no LSN would simply fail that constraint, but rejecting it
+    -- explicitly gives a clear, named error instead of an opaque
+    -- constraint violation.
+    IF p_storage_backend IS DISTINCT FROM 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot reserve (no-copy reservation) is only defined for external_zstd, got %',
+            p_storage_backend
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    INSERT INTO flashback.snapshots (
+        rel_oid, tracking_id, snapshot_table, snapshot_lsn,
+        schema_def, row_count, captured_at, storage_backend
+    ) VALUES (
+        p_rel_oid, p_tracking_id, '', NULL,
+        '{}'::jsonb, 0, clock_timestamp(), p_storage_backend
+    ) RETURNING snapshot_id INTO v_snapshot_id;
+
+    RETURN v_snapshot_id;
+END;
+$$;
+
+-- ------------------------------------------------------------------
+-- Step 9 / Stage 5: centralized online-reservation authority (plan §1a).
+-- Atomically binds tracking_id, rel_oid, stream_id, the newly-reserved
+-- snapshot_id, generation_id, generation_no, parent_generation_id,
+-- operation_nonce and storage_backend in one durably-committed
+-- transaction -- durably visible via ordinary MVCC to the later marker,
+-- copy, finalizer and reconciler transactions of the online-snapshot
+-- protocol, none of which exist as a single transaction with this one.
+--
+-- Reuses, verbatim in effect, the same stream/lifecycle/parent-generation
+-- validation flashback_internal_create_coverage_generation already
+-- performs (that function itself is NOT modified: every existing caller
+-- keeps requiring an already-available boundary snapshot, unchanged), and
+-- the same durable 'building'-row admission check flashback_reanchor
+-- already relies on today -- this durable row, not the session-level
+-- lock taken by the caller before this call, is the exclusivity invariant
+-- for the entire (much longer, external-copy-spanning) online-create
+-- window; see plan §1i.
+--
+-- storage_backend is currently restricted to external_zstd: heap_v1's
+-- boundary snapshot is always already available by construction (CTAS is
+-- atomic), so it has no use for a no-copy reservation and continues to
+-- use flashback_internal_create_coverage_generation directly, completely
+-- unaffected by this function's existence.
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_reserve_online_generation(
+    p_tracking_id bigint,
+    p_rel_oid oid,
+    p_stream_id bigint,
+    p_generation_no bigint,
+    p_parent_generation_id bigint,
+    p_storage_backend text,
+    p_operation_nonce bigint,
+    p_recovery_profile text DEFAULT 'local_delta',
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS TABLE(generation_id bigint, snapshot_id bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_stream flashback.capture_streams%ROWTYPE;
+    v_lifecycle_retired_at timestamptz;
+    v_parent_tracking_id bigint;
+    v_snapshot_id bigint;
+    v_gen_id bigint;
+    v_marker text;
+BEGIN
+    IF p_tracking_id IS NULL OR p_rel_oid IS NULL OR p_stream_id IS NULL
+       OR p_generation_no IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: online generation reservation requires tracking_id, rel_oid, stream_id, generation_no'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_operation_nonce IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: online generation reservation requires operation_nonce'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_storage_backend IS DISTINCT FROM 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: online generation reservation is only defined for external_zstd, got %',
+            p_storage_backend
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Same stream/lifecycle validation flashback_internal_create_coverage_
+    -- generation already performs (reused logic, not a weaker copy).
+    SELECT * INTO v_stream
+    FROM flashback.capture_streams
+    WHERE stream_id = p_stream_id
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: stream % does not exist', p_stream_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_stream.database_oid IS DISTINCT FROM (
+        SELECT oid FROM pg_database WHERE datname = current_database()
+    ) OR v_stream.database_name IS DISTINCT FROM current_database()::name THEN
+        RAISE EXCEPTION 'pg_flashback: stream % belongs to database % (oid %), not current database %',
+            p_stream_id, v_stream.database_name, v_stream.database_oid, current_database()
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_stream.state IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'pg_flashback: cannot reserve online generation on stream % in state %',
+            p_stream_id, v_stream.state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    PERFORM public.flashback_internal_lock_database_stream(v_stream.database_oid);
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+
+    SELECT retired_at INTO v_lifecycle_retired_at
+    FROM flashback.tracking_lifecycles
+    WHERE tracking_id = p_tracking_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % does not exist', p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_lifecycle_retired_at IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % is retired', p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF p_parent_generation_id IS NOT NULL THEN
+        -- This function RETURNS TABLE(generation_id bigint, snapshot_id
+        -- bigint), which makes generation_id/snapshot_id plpgsql OUT-
+        -- parameter variable names for the rest of this function body --
+        -- an unqualified `generation_id` column reference here would
+        -- collide with that OUT parameter (plpgsql.variable_conflict
+        -- defaults to 'error': ambiguous column reference at runtime), so
+        -- the column is qualified explicitly, unlike the otherwise-
+        -- identical check in flashback_internal_create_coverage_generation
+        -- (which has no such OUT parameter and does not need this).
+        SELECT cg.tracking_id INTO v_parent_tracking_id
+        FROM flashback.coverage_generations cg
+        WHERE cg.generation_id = p_parent_generation_id;
+        IF NOT FOUND OR v_parent_tracking_id IS DISTINCT FROM p_tracking_id THEN
+            RAISE EXCEPTION 'pg_flashback: parent generation % does not belong to tracking %',
+                p_parent_generation_id, p_tracking_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+    END IF;
+
+    -- Durable admission check flashback_reanchor already relies on today:
+    -- under the same lifecycle lock just taken above, a second concurrent
+    -- reservation attempt for this tracking_id must fail here. This
+    -- durable 'building' row -- not the caller's session-level lock, which
+    -- only serializes the brief reservation call itself -- is what
+    -- protects the entire, much longer, online-create window that
+    -- follows (plan §1i).
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_generations
+        WHERE tracking_id = p_tracking_id AND state = 'building'
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: lifecycle % already has a pending generation',
+            p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    v_snapshot_id := public.flashback_internal_snapshot_reserve(
+        p_tracking_id, p_rel_oid, p_storage_backend
+    );
+
+    -- Non-null placeholder boundary_marker: satisfies coverage_generations_
+    -- state_shape_check's 'building' requirement honestly -- a real,
+    -- recognizable "reservation pending" value, not a fake coordinate.
+    -- Replaced with the real online_external:... marker by
+    -- flashback_internal_bind_online_boundary (Stage 6) once the marker
+    -- transaction resolves a real boundary_xid under the table lock.
+    -- boundary_xid and boundary_lsn stay NULL until then (the FK to
+    -- flashback.snapshots(snapshot_id, tracking_id, snapshot_lsn) is
+    -- MATCH SIMPLE, so a NULL boundary_lsn paired with this reservation's
+    -- NULL snapshot_lsn is not enforced -- not a dangling reference).
+    v_marker := 'online_pending:' || p_operation_nonce::text;
+
+    -- operation_nonce is bound here via the dedicated, UNIQUE-constrained
+    -- column (coverage_generations_operation_nonce_key) -- this INSERT is
+    -- the actual enforcement point for the uniqueness guardrail; a
+    -- colliding p_operation_nonce raises a clear unique_violation instead
+    -- of silently aliasing two different online-create attempts. Also
+    -- mirrored into details for uniform observability alongside every
+    -- other generation row's details, but the column is authoritative.
+    INSERT INTO flashback.coverage_generations (
+        tracking_id, generation_no, stream_id, recovery_profile, state,
+        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
+        boundary_marker, parent_generation_id, storage_backend,
+        operation_nonce, details
+    ) VALUES (
+        p_tracking_id, p_generation_no, p_stream_id, COALESCE(p_recovery_profile, 'local_delta'), 'building',
+        'online_external', p_rel_oid, v_snapshot_id,
+        v_marker, p_parent_generation_id, p_storage_backend,
+        p_operation_nonce,
+        COALESCE(p_details, '{}'::jsonb) || jsonb_build_object('operation_nonce', p_operation_nonce)
+    )
+    RETURNING coverage_generations.generation_id INTO v_gen_id;
+
+    RETURN QUERY SELECT v_gen_id, v_snapshot_id;
+END;
+$$;
+
 COMMENT ON FUNCTION flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb)
     IS '[Internal] SnapshotStore: sole mutation authority for flashback.snapshots.payload_state (CAS).';
 COMMENT ON FUNCTION flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb)
@@ -782,6 +1017,10 @@ COMMENT ON FUNCTION flashback_internal_snapshot_refine_boundary(bigint, bigint, 
     IS '[Internal] SnapshotStore: refine snapshot_lsn and captured_at when resolving a building generation boundary.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire_legacy(bigint, text)
     IS '[Internal] SnapshotStore: safely retire legacy (tracking_id IS NULL) snapshot artifact payload.';
+COMMENT ON FUNCTION flashback_internal_snapshot_reserve(bigint, oid, text)
+    IS '[Internal] SnapshotStore: reserve a creating snapshot artifact row without copying data (external_zstd only).';
+COMMENT ON FUNCTION flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb)
+    IS '[Internal] SnapshotStore: atomically reserve a building generation + creating snapshot for an online (non-blocking) external_zstd create.';
 
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb) FROM PUBLIC;
@@ -793,6 +1032,8 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) 
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM PUBLIC;
 
 DO $$
 BEGIN
@@ -807,6 +1048,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM pg_monitor';
@@ -819,6 +1062,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM pg_monitor';
     END IF;
 END
 $$;

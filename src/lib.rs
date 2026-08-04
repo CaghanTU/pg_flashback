@@ -222,6 +222,10 @@ mod tests {
         "../tests/sql/integration/state_authority_transitions.sql"
     );
     sql_test!(
+        it_online_reservation_authority,
+        "../tests/sql/integration/online_reservation_authority.sql"
+    );
+    sql_test!(
         it_tracked_table_resolver_search_path,
         "../tests/sql/integration/tracked_table_resolver_search_path.sql"
     );
