@@ -445,35 +445,46 @@ pub fn read_trailer<R: Read>(r: &mut R) -> io::Result<u64> {
 /// This guard does **not** cover every unbalancing path by itself -- see
 /// the safety note below.
 ///
-/// # What this guard does not protect against, and why that is still sound
+/// # What this guard protects against, verified empirically, not assumed
 ///
 /// A genuine PostgreSQL `ERROR` raised *inside* a raw FFI call made while
-/// this guard is live (e.g. `SPI_execute_with_args` itself failing) is a
-/// C-level `sigsetjmp`/`siglongjmp`, not a Rust panic -- it does not run
-/// Rust `Drop` glue for stack frames between the raise point and whatever
-/// `PG_TRY` catches it, because a raw longjmp does not walk Rust's unwind
-/// tables at all. This guard's `Drop` impl is therefore not reached in
-/// that case. Balance across *that* path is guaranteed by a different,
-/// independent mechanism instead: PostgreSQL's own transaction/
-/// subtransaction abort processing (`AtSubAbort_Snapshot` /
-/// `AtEOXact_Snapshot`) unconditionally resets the active-snapshot stack
-/// to what it was before the (sub)transaction began, regardless of what
-/// was pushed inside it -- this is exactly why ordinary PostgreSQL C code
-/// does not defensively `PG_CATCH` + pop around every `PushActiveSnapshot`
-/// call either.
+/// this guard is live (e.g. `SPI_execute` itself failing) was originally
+/// assumed here to bypass `Drop` entirely, on the theory that it is a
+/// C-level `sigsetjmp`/`siglongjmp` rather than a Rust panic. That
+/// assumption was wrong, and left uncorrected until tested directly:
+/// `tests/sql/integration/snapshot_stack_abort_regression.sql` drives
+/// `tests::test_guarded_push_then_force_error` (this module) through a
+/// real PL/pgSQL `BEGIN`/`EXCEPTION` block -- a genuine
+/// `SELECT 1/0`-triggered `division_by_zero`, raised deep inside a raw
+/// `SPI_execute` call, with this guard alive -- and observes, via
+/// `tests::test_guard_drop_observed()`, that **`Drop` does run**. On this
+/// pgrx version (0.16.1), a C-level error raised through a raw FFI call
+/// while an enclosing PL/pgSQL exception handler (or any other subtxn-
+/// establishing catch point) exists is delivered as a real Rust panic
+/// that respects normal unwind semantics, not a bare longjmp that skips
+/// them. That test asserts this as a locked-in regression specifically so
+/// a future pgrx/PostgreSQL change that broke it would fail loudly here,
+/// rather than this comment silently drifting from reality again.
 ///
-/// This places a hard, binding requirement on every caller of this guard,
+/// This does **not** mean balance can be taken for granted regardless of
+/// structure, only that this specific, previously-doubted mechanism is
+/// confirmed sound. Two things remain true and are still worth stating
+/// plainly: (1) the same regression file also proves the *backstop*
+/// that made this guard's design safe even under the original, more
+/// pessimistic assumption -- a **raw, unguarded** `PushActiveSnapshot`
+/// (`tests::test_raw_push_then_force_error`, no Rust cleanup involved at
+/// all) is *also* correctly unwound by PostgreSQL's own transaction/
+/// subtransaction abort processing (`AtSubAbort_Snapshot` /
+/// `AtEOXact_Snapshot`), so the design was never actually relying on
+/// Drop being the only safety net; (2) every caller of this guard,
 /// present and future (including the Stage 7 online-snapshot copier this
-/// primitive exists to support): an error raised while this guard is live
-/// must always be allowed to propagate all the way to a (sub)transaction
-/// abort. Never catch it and continue executing further statements in the
-/// *same* (sub)transaction without first re-establishing a clean snapshot
-/// stack (e.g. via an explicit subtransaction boundary). The design this
-/// guard is built for already satisfies this: the online-snapshot copy
-/// transaction either completes normally or aborts as a whole on any
-/// error (plan §1h's failure table), with the reconciler resuming in a
-/// fresh transaction afterward -- never a catch-and-continue within the
-/// same transaction.
+/// primitive exists to support), should still treat "catch an error here
+/// and continue in the same (sub)transaction without re-establishing a
+/// clean snapshot stack" as the thing to avoid -- not because Drop won't
+/// run, but because the design this guard is built for has no need to do
+/// that anyway: the online-snapshot copy transaction either completes
+/// normally or aborts as a whole on any error (plan §1h's failure table),
+/// with the reconciler resuming in a fresh transaction afterward.
 pub(crate) struct PushedSnapshotGuard;
 
 impl PushedSnapshotGuard {
@@ -500,6 +511,90 @@ mod tests {
     use std::io::Cursor;
 
     const DEFAULT_MAX_ROW_BYTES: i64 = 64 * 1024 * 1024;
+
+    // ── Stage 6: real PG ERROR/cancel snapshot-stack regression ─────────
+    //
+    // The Rust-panic test for PushedSnapshotGuard (test_pushed_snapshot_
+    // guard_pops_across_rust_panic, above in the parent module) only proves
+    // Drop runs across *Rust* unwinding. A genuine PostgreSQL ERROR raised
+    // by a raw FFI call uses a C-level sigsetjmp/siglongjmp instead, which
+    // is a materially different mechanism -- these functions and the SQL
+    // integration test that drives them (tests/sql/integration/
+    // snapshot_stack_abort_regression.sql) settle empirically, not just by
+    // argument, whether that difference actually matters in practice: not
+    // "does Drop run" in isolation, but "is the active-snapshot stack
+    // correctly balanced after a real transaction/subtransaction abort" --
+    // the property the design's safety actually depends on. All of these
+    // deliberately never pop/finish anything themselves and always raise;
+    // they exist solely for this regression and must only ever be called
+    // wrapped in a subtransaction (PL/pgSQL BEGIN/EXCEPTION) by the caller.
+
+    static GUARD_DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[pg_extern]
+    fn test_reset_guard_drop_flag() {
+        GUARD_DROPPED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[pg_extern]
+    fn test_guard_drop_observed() -> bool {
+        GUARD_DROPPED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    unsafe fn force_real_pg_error_via_spi() {
+        pg_sys::SPI_connect();
+        let c_query = std::ffi::CString::new("SELECT 1/0").expect("no NUL byte");
+        // A genuine C-level ereport(ERROR) (division_by_zero) raised deep
+        // inside SPI -- not pgrx's own ereport!/error! macro, not a Rust
+        // panic. Never returns.
+        pg_sys::SPI_execute(c_query.as_ptr(), false, 0);
+    }
+
+    /// `PushedSnapshotGuard` alive when the real ERROR fires. Whether
+    /// `test_guard_drop_observed()` reads true or false afterward is the
+    /// direct, empirical answer to what `PushedSnapshotGuard`'s own doc
+    /// comment claims -- see the SQL test for the observed result and the
+    /// guard's doc comment for how that result is reflected there.
+    #[pg_extern]
+    unsafe fn test_guarded_push_then_force_error() {
+        struct RecordingGuard(super::PushedSnapshotGuard);
+        impl Drop for RecordingGuard {
+            fn drop(&mut self) {
+                GUARD_DROPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = RecordingGuard(super::PushedSnapshotGuard::new());
+        force_real_pg_error_via_spi();
+    }
+
+    /// No guard at all -- isolates PostgreSQL's own transaction/
+    /// subtransaction-abort cleanup (`AtSubAbort_Snapshot`) from any
+    /// Rust-side mechanism, proving the load-bearing property directly:
+    /// the backend recovers correctly even with zero Rust-side cleanup
+    /// participation.
+    #[pg_extern]
+    unsafe fn test_raw_push_then_force_error() {
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        force_real_pg_error_via_spi();
+    }
+
+    /// The "cancel" half: sets the exact flags a real `pg_cancel_backend()`
+    /// / `statement_timeout` sets (`InterruptPending`, `QueryCancelPending`)
+    /// and calls the exact function (`ProcessInterrupts`) that a periodic
+    /// `CHECK_FOR_INTERRUPTS()` would call to service them -- this is the
+    /// real production code path a cancel takes, not a simulation via a
+    /// different error type, and it is interrupt-flag-driven rather than a
+    /// synchronous `ereport` call, a meaningfully different trigger
+    /// mechanism from `force_real_pg_error_via_spi` even though both
+    /// ultimately raise via the same C-level ERROR machinery.
+    #[pg_extern]
+    unsafe fn test_raw_push_then_force_cancel() {
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        // sig_atomic_t binds as a plain C int, not bool.
+        pg_sys::InterruptPending = 1;
+        pg_sys::QueryCancelPending = 1;
+        pg_sys::ProcessInterrupts();
+    }
 
     /// Execute a read-only SELECT and return, for each result row, the raw
     /// Datum (or None if NULL) for each of the first `ncols` columns in

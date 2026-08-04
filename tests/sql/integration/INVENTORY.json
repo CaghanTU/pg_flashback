@@ -261,6 +261,14 @@
       "class": "infra",
       "reason": "Step 9 Stage 5: online-reservation authority (snapshot+generation atomic bind, admission check, operation_nonce uniqueness) regressions"
     },
+    "snapshot_stack_abort_regression.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 6: real PostgreSQL ERROR/cancel regression proving PushActiveSnapshot/PopActiveSnapshot balance after a genuine transaction/subtransaction abort"
+    },
+    "online_boundary_bind.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 6: flashback_internal_bind_online_boundary marker-transaction authority regressions (happy path, CAS/no-bypass, marker rollback with durable reservation, adversarial DDL drift)"
+    },
     "tracked_table_resolver_search_path.sql": {
       "class": "infra",
       "reason": "tracked-table name resolution without writable search_path"

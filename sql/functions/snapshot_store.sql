@@ -997,6 +997,202 @@ BEGIN
 END;
 $$;
 
+-- ------------------------------------------------------------------
+-- Step 9 / Stage 6: the materializable-column contract for the external_
+-- zstd binary artifact format (plan §5). Narrower than flashback_collect_
+-- schema_def (api_track_capture.sql), which captures the full DDL-fidelity
+-- shape (constraints, indexes, generated columns, sequences) for restore.
+-- This returns exactly the fields src/storage/external_zstd_format.rs's
+-- ColumnDescriptor needs to encode/decode one row's binary representation,
+-- for exactly the columns that format can carry: attnum > 0, not dropped,
+-- not generated (generated column values are recomputed on restore, never
+-- carried in the artifact -- matching flashback_collect_schema_def's own
+-- documented rule for attgenerated elsewhere in this codebase).
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_materializable_columns(p_rel_oid oid)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+    SELECT COALESCE(jsonb_agg(
+        jsonb_build_object(
+            'attnum', a.attnum,
+            'atttypid', a.atttypid,
+            'atttypmod', a.atttypmod,
+            'attcollation', a.attcollation,
+            'attnotnull', a.attnotnull,
+            'attidentity', a.attidentity::text,
+            'name', a.attname
+        )
+        ORDER BY a.attnum
+    ), '[]'::jsonb)
+    FROM pg_attribute a
+    WHERE a.attrelid = p_rel_oid
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND a.attgenerated = ''
+$$;
+
+-- ------------------------------------------------------------------
+-- Step 9 / Stage 6: flashback_internal_bind_online_boundary (plan §1d,
+-- marker-transaction step M4). Captures the schema_def/column_contract
+-- for an online external_zstd reservation *under the caller's already-held
+-- table lock* -- reservation time (Stage 5) is too early, since nothing
+-- has locked the target table yet at that point, so any DDL committed
+-- between reservation and the marker transaction's lock acquisition would
+-- otherwise go unnoticed. The caller is responsible for having already
+-- locked the target relation (SHARE ROW EXCLUSIVE, plan §1e M2) and
+-- revalidated its identity under that lock (the existing pattern
+-- flashback_reanchor already performs after acquiring its own lock) --
+-- this function cannot itself verify a lock is held (no portable SQL-level
+-- introspection for "do I hold this lock"), so that precondition is
+-- enforced by caller discipline, the same way every other authority
+-- function in this file documents its own "caller must already hold X"
+-- preconditions.
+--
+-- CAS-shaped like every other SnapshotStore/state-authority mutation in
+-- this codebase: FOR UPDATE, expected-state check (state='building' AND
+-- boundary_xid IS NULL on the generation row; payload_state='creating' on
+-- the snapshot row), WHERE-clause CAS on the UPDATEs, ROW_COUNT
+-- verification. A second call against an already-bound generation (or any
+-- other state-shape violation) fails closed with object_not_in_
+-- prerequisite_state rather than silently re-stamping a new boundary --
+-- this IS the "no raw UPDATE bypass" guarantee: the only way to move
+-- boundary_xid/boundary_marker/schema_def/external_column_contract out of
+-- their Stage-5 placeholder values is this one authority call, exactly
+-- once, and flashback.coverage_generations/flashback.snapshots grant no
+-- direct table-level INSERT/UPDATE/DELETE to any delegated role (verified
+-- generically, for every table in the flashback schema, by
+-- rbac_enforcement.sql).
+-- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_bind_online_boundary(
+    p_generation_id bigint,
+    p_tracking_id bigint,
+    p_snapshot_id bigint,
+    p_rel_oid oid
+)
+RETURNS TABLE(boundary_xid bigint, boundary_marker text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_gen flashback.coverage_generations%ROWTYPE;
+    v_snap flashback.snapshots%ROWTYPE;
+    v_xid bigint;
+    v_marker text;
+    v_schema_def jsonb;
+    v_column_contract jsonb;
+    v_n integer;
+BEGIN
+    IF p_generation_id IS NULL OR p_tracking_id IS NULL
+       OR p_snapshot_id IS NULL OR p_rel_oid IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: bind online boundary requires generation_id, tracking_id, snapshot_id, rel_oid'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT * INTO v_gen
+    FROM flashback.coverage_generations
+    WHERE generation_id = p_generation_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % (tracking %) does not exist',
+            p_generation_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_gen.storage_backend IS DISTINCT FROM 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: bind_online_boundary is only defined for external_zstd generations'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_gen.state IS DISTINCT FROM 'building' THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % is not building (state=%)',
+            p_generation_id, v_gen.state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF v_gen.boundary_xid IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % boundary is already bound (xid=%)',
+            p_generation_id, v_gen.boundary_xid
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF v_gen.rel_oid_at_boundary IS DISTINCT FROM p_rel_oid THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % rel_oid mismatch (expected %, got %)',
+            p_generation_id, v_gen.rel_oid_at_boundary, p_rel_oid
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_gen.boundary_snapshot_id IS DISTINCT FROM p_snapshot_id THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % does not reference snapshot %',
+            p_generation_id, p_snapshot_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT * INTO v_snap
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % (tracking %) does not exist',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_snap.payload_state IS DISTINCT FROM 'creating' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % is not creating (state=%)',
+            p_snapshot_id, v_snap.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF v_snap.storage_backend IS DISTINCT FROM 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % is not external_zstd', p_snapshot_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    v_xid := txid_current();
+    v_marker := format('online_external:%s:%s:%s', p_tracking_id, v_gen.generation_no, v_xid);
+    v_schema_def := public.flashback_collect_schema_def(p_rel_oid);
+    v_column_contract := public.flashback_internal_materializable_columns(p_rel_oid);
+
+    IF v_column_contract = '[]'::jsonb THEN
+        RAISE EXCEPTION 'pg_flashback: relation % has no materializable columns', p_rel_oid
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- This function's own RETURNS TABLE(boundary_xid, boundary_marker)
+    -- makes those names plpgsql OUT-parameter variables for the rest of
+    -- this function body -- the WHERE clause below qualifies the column
+    -- explicitly (coverage_generations.boundary_xid) to avoid the exact
+    -- ambiguous-column-reference bug fixed in flashback_internal_reserve_
+    -- online_generation (Stage 5).
+    UPDATE flashback.coverage_generations
+       SET boundary_xid = v_xid,
+           boundary_marker = v_marker
+     WHERE generation_id = p_generation_id
+       AND tracking_id = p_tracking_id
+       AND state = 'building'
+       AND coverage_generations.boundary_xid IS NULL;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> 1 THEN
+        RAISE EXCEPTION 'pg_flashback: online generation % boundary bind raced (expected exactly 1 row)',
+            p_generation_id
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    UPDATE flashback.snapshots
+       SET schema_def = v_schema_def,
+           external_column_contract = v_column_contract
+     WHERE snapshot_id = p_snapshot_id
+       AND tracking_id = p_tracking_id
+       AND payload_state = 'creating';
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> 1 THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % boundary bind raced (expected exactly 1 row)',
+            p_snapshot_id
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    RETURN QUERY SELECT v_xid, v_marker;
+END;
+$$;
+
 COMMENT ON FUNCTION flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb)
     IS '[Internal] SnapshotStore: sole mutation authority for flashback.snapshots.payload_state (CAS).';
 COMMENT ON FUNCTION flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb)

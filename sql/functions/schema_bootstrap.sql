@@ -2188,14 +2188,39 @@ BEGIN
            OR NEW.boundary_kind IS DISTINCT FROM OLD.boundary_kind
            OR NEW.rel_oid_at_boundary IS DISTINCT FROM OLD.rel_oid_at_boundary
            OR NEW.boundary_snapshot_id IS DISTINCT FROM OLD.boundary_snapshot_id
-           OR NEW.boundary_xid IS DISTINCT FROM OLD.boundary_xid
-           OR NEW.boundary_marker IS DISTINCT FROM OLD.boundary_marker
            OR NEW.restored_target_time IS DISTINCT FROM OLD.restored_target_time
            OR NEW.restored_target_lsn IS DISTINCT FROM OLD.restored_target_lsn
            OR NEW.created_at IS DISTINCT FROM OLD.created_at
         THEN
             RAISE EXCEPTION 'pg_flashback: generation % ownership/lineage is immutable', OLD.generation_id
                 USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+
+        -- Step 9: an online (external_zstd) reservation's boundary_xid/
+        -- boundary_marker start as a placeholder (NULL xid, a non-null
+        -- 'online_pending:<nonce>' marker -- see flashback_internal_
+        -- reserve_online_generation) and are refined to their real value
+        -- exactly once, while still 'building', by flashback_internal_
+        -- bind_online_boundary under the caller's table lock. That is the
+        -- *only* legal window for this change. heap_v1 rows always have
+        -- both set atomically at INSERT (flashback_internal_create_
+        -- coverage_generation, unmodified) -- OLD.boundary_xid is never
+        -- NULL for them, so this exception can never fire and heap_v1's
+        -- behavior is byte-for-byte unchanged: still fully immutable.
+        IF NEW.boundary_xid IS DISTINCT FROM OLD.boundary_xid
+           OR NEW.boundary_marker IS DISTINCT FROM OLD.boundary_marker
+        THEN
+            IF NOT (
+                OLD.storage_backend = 'external_zstd'
+                AND OLD.state = 'building'
+                AND OLD.boundary_xid IS NULL
+                AND NEW.boundary_xid IS NOT NULL
+                AND NEW.boundary_marker IS NOT NULL
+            ) THEN
+                RAISE EXCEPTION 'pg_flashback: generation % boundary identity (xid/marker) is immutable once bound',
+                    OLD.generation_id
+                    USING ERRCODE = 'integrity_constraint_violation';
+            END IF;
         END IF;
 
         IF OLD.boundary_time IS NOT NULL

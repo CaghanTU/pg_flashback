@@ -234,6 +234,14 @@ mod tests {
         "../tests/sql/integration/online_reservation_authority.sql"
     );
     sql_test!(
+        it_snapshot_stack_abort_regression,
+        "../tests/sql/integration/snapshot_stack_abort_regression.sql"
+    );
+    sql_test!(
+        it_online_boundary_bind,
+        "../tests/sql/integration/online_boundary_bind.sql"
+    );
+    sql_test!(
         it_tracked_table_resolver_search_path,
         "../tests/sql/integration/tracked_table_resolver_search_path.sql"
     );
