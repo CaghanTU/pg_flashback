@@ -433,6 +433,66 @@ pub fn read_trailer<R: Read>(r: &mut R) -> io::Result<u64> {
     read_u64_be(r)
 }
 
+/// RAII guard for `PushActiveSnapshot`/`PopActiveSnapshot` balance. A real
+/// heap scan via raw SPI (unlike a constant expression or an aggregate's
+/// single output row) needs a *current* MVCC snapshot pushed for the
+/// duration of the call; this guarantees the matching pop happens exactly
+/// once, including when a Rust panic unwinds between construction and the
+/// point where the caller would otherwise have popped it explicitly (e.g.
+/// an `assert!`/`.expect()`/slice-index panic added later in a longer
+/// streaming loop, not just the single FFI call this module uses today).
+///
+/// This guard does **not** cover every unbalancing path by itself -- see
+/// the safety note below.
+///
+/// # What this guard does not protect against, and why that is still sound
+///
+/// A genuine PostgreSQL `ERROR` raised *inside* a raw FFI call made while
+/// this guard is live (e.g. `SPI_execute_with_args` itself failing) is a
+/// C-level `sigsetjmp`/`siglongjmp`, not a Rust panic -- it does not run
+/// Rust `Drop` glue for stack frames between the raise point and whatever
+/// `PG_TRY` catches it, because a raw longjmp does not walk Rust's unwind
+/// tables at all. This guard's `Drop` impl is therefore not reached in
+/// that case. Balance across *that* path is guaranteed by a different,
+/// independent mechanism instead: PostgreSQL's own transaction/
+/// subtransaction abort processing (`AtSubAbort_Snapshot` /
+/// `AtEOXact_Snapshot`) unconditionally resets the active-snapshot stack
+/// to what it was before the (sub)transaction began, regardless of what
+/// was pushed inside it -- this is exactly why ordinary PostgreSQL C code
+/// does not defensively `PG_CATCH` + pop around every `PushActiveSnapshot`
+/// call either.
+///
+/// This places a hard, binding requirement on every caller of this guard,
+/// present and future (including the Stage 7 online-snapshot copier this
+/// primitive exists to support): an error raised while this guard is live
+/// must always be allowed to propagate all the way to a (sub)transaction
+/// abort. Never catch it and continue executing further statements in the
+/// *same* (sub)transaction without first re-establishing a clean snapshot
+/// stack (e.g. via an explicit subtransaction boundary). The design this
+/// guard is built for already satisfies this: the online-snapshot copy
+/// transaction either completes normally or aborts as a whole on any
+/// error (plan §1h's failure table), with the reconciler resuming in a
+/// fresh transaction afterward -- never a catch-and-continue within the
+/// same transaction.
+pub(crate) struct PushedSnapshotGuard;
+
+impl PushedSnapshotGuard {
+    /// # Safety
+    /// Must be called from a backend with a valid transaction context in
+    /// which `GetTransactionSnapshot()` is legal to call (i.e. inside an
+    /// active transaction, not during startup/shutdown).
+    pub(crate) unsafe fn new() -> Self {
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        PushedSnapshotGuard
+    }
+}
+
+impl Drop for PushedSnapshotGuard {
+    fn drop(&mut self) {
+        unsafe { pg_sys::PopActiveSnapshot() };
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -465,7 +525,10 @@ mod tests {
         // command-counter semantics) around the raw SPI_execute_with_args
         // call, exactly as the executor would for a normal query, rather
         // than relying on whatever snapshot happened to already be active.
-        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        // PushedSnapshotGuard (see its doc comment for exactly what it does
+        // and does not cover) guarantees the matching pop runs even if a
+        // Rust panic unwinds before the end of this function.
+        let _snapshot_guard = PushedSnapshotGuard::new();
         let c_query = std::ffi::CString::new(query).expect("query must not contain a NUL byte");
         let rc = pg_sys::SPI_execute_with_args(
             c_query.as_ptr(),
@@ -476,7 +539,6 @@ mod tests {
             true,
             0,
         );
-        pg_sys::PopActiveSnapshot();
         assert_eq!(
             rc,
             pg_sys::SPI_OK_SELECT as i32,
@@ -593,6 +655,60 @@ mod tests {
         write_trailer(&mut buf, 42).unwrap();
         let mut cur = Cursor::new(buf);
         assert_eq!(read_trailer(&mut cur).unwrap(), 42);
+    }
+
+    /// Proves `PushedSnapshotGuard`'s `Drop` runs even when a Rust panic
+    /// unwinds between construction and the point where a caller would
+    /// otherwise have popped it explicitly -- the case this guard exists
+    /// to cover (a genuine PostgreSQL `ERROR`/longjmp is a different,
+    /// independently-sound path; see the guard's own doc comment). A thin
+    /// wrapper records, via a plain (non-atomic -- single-threaded,
+    /// same-backend) flag, whether the pop actually executed, so this test
+    /// observes the mechanism directly rather than inferring it indirectly
+    /// from unrelated later SPI behavior.
+    #[pg_test]
+    fn test_pushed_snapshot_guard_pops_across_rust_panic() {
+        struct RecordingGuard {
+            inner: PushedSnapshotGuard,
+            popped: *mut bool,
+        }
+        impl Drop for RecordingGuard {
+            fn drop(&mut self) {
+                // `inner`'s own Drop (the real PopActiveSnapshot call) runs
+                // after this body per Rust's field-drop order, but the
+                // side effect we need to observe is "did this guard's Drop
+                // run at all" -- sufficient to prove the panic did not
+                // bypass Drop glue for this frame (which is exactly what a
+                // raw C longjmp would do, and exactly what a Rust panic
+                // does not do).
+                unsafe { *self.popped = true };
+                let _ = &self.inner;
+            }
+        }
+
+        let mut popped = false;
+        let popped_ptr: *mut bool = &mut popped;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _guard = RecordingGuard {
+                inner: PushedSnapshotGuard::new(),
+                popped: popped_ptr,
+            };
+            panic!("intentional test panic while a snapshot is pushed");
+        }));
+        assert!(result.is_err(), "the panic must have actually unwound");
+        assert!(
+            popped,
+            "PushedSnapshotGuard::drop (and therefore PopActiveSnapshot) must run \
+             even when a Rust panic unwinds through it"
+        );
+
+        // Same transaction, immediately after: a real SPI query must still
+        // work correctly, proving no corrupted/imbalanced state was left
+        // for subsequent statements in this backend.
+        Spi::connect(|_c| {
+            let rows = unsafe { spi_select_raw_rows("SELECT 1", 1) };
+            assert_eq!(rows.len(), 1);
+        });
     }
 
     #[pg_test]
