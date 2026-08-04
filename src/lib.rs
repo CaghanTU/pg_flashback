@@ -494,6 +494,16 @@ pub mod pg_test {
             "pg_flashback.local_safety_reserve_bytes='16MB'",
             "pg_flashback.local_boundary_write_stall_ms=60000",
             "pg_flashback.allow_unaudited_restore=on",
+            // Step 9 Stage 6 completion's coordinator tests each launch
+            // several real, short-lived dynamic background workers
+            // (commit-sql setup/teardown helpers, the real copier) per
+            // test, sequentially -- the default max_worker_processes=8,
+            // shared with the extension's own always-on delta/maintenance
+            // workers, was found to starve later launches (wait_for_
+            // startup timing out) once several tests had run in the same
+            // instance. Raised generously; this is a test-instance-only
+            // GUC, not a production default.
+            "max_worker_processes=24",
         ]
     }
 }

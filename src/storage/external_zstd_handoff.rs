@@ -122,6 +122,7 @@
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker};
 use pgrx::pg_sys;
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -152,12 +153,67 @@ impl HandoffPhase {
     }
 }
 
+/// Bound on the quoted, comma-separated column list carried in
+/// `HandoffShared.column_list`. A fixed-size buffer, not a fully dynamic
+/// variable-length payload (that is Stage 7's job, alongside the rest of
+/// the real streaming copy) -- sufficient to prove the property Stage 6
+/// completion actually needs: the copier's real SELECT list reflects
+/// whatever column_contract the coordinator captured under the lock,
+/// including columns added between reservation and lock. Exceeding it is
+/// a hard, fail-closed error (`write_column_list`), never silent
+/// truncation.
+const COLUMN_LIST_CAP: usize = 8192;
+
+/// Bound on the schema-qualified, quoted target relation name carried in
+/// `HandoffShared.target_relation` (e.g. `"public"."my_table"`) -- same
+/// write-before-publish contract as `column_list`.
+const TARGET_RELATION_CAP: usize = 256;
+
 #[repr(C)]
 struct HandoffShared {
     state: u32,
     cv: pg_sys::ConditionVariable,
     operation_nonce: u64,
+    /// Written once, in full, by the coordinator strictly before the
+    /// `LockHeldGoAhead` atomic store (see `signal`) -- its visibility to
+    /// the copier is a consequence of that store's Release ordering and
+    /// the copier's own Acquire load before ever reading this field,
+    /// exactly like `operation_nonce` (module doc's "Memory ordering"
+    /// section). Never mutated again for the lifetime of the segment.
+    column_list_len: u32,
+    column_list: [u8; COLUMN_LIST_CAP],
+    target_relation_len: u32,
+    target_relation: [u8; TARGET_RELATION_CAP],
+    /// The reverse direction: written once by the copier, strictly before
+    /// its `SnapshotPinned` atomic store, read by the coordinator only
+    /// after observing `SnapshotPinned` -- the row count its real cursor
+    /// fetch actually saw. Used to prove the copier's snapshot was pinned
+    /// strictly before a witness row the coordinator inserts after
+    /// observing `SnapshotPinned` (the row can never appear in this
+    /// count, by construction: the count is finalized, by causality,
+    /// before the insert could possibly have happened).
+    fetched_row_count: u64,
+    /// The reverse direction, alongside `fetched_row_count`: `pg_current_
+    /// wal_insert_lsn()` as observed by the copier immediately after its
+    /// cursor fetch pins the snapshot, strictly before its `SnapshotPinned`
+    /// atomic store. WAL LSNs are a single, cluster-wide, strictly
+    /// monotonically non-decreasing sequence -- comparing this value
+    /// against the LSN `pg_logical_emit_message` (M7) returns gives
+    /// externally observable, non-structural corroboration that the pin
+    /// happened before the boundary message, independent of trusting this
+    /// module's own call-order argument.
+    pinned_wal_lsn: u64,
+    /// Diagnostic only: written by whichever side signals `Failed`,
+    /// strictly before that signal, describing why. Operationally useful
+    /// (the coordinator can log a real reason instead of just "the peer
+    /// failed") and not load-bearing for correctness -- a failure to write
+    /// or read this never changes the `Failed`/`PeerFailed` outcome
+    /// itself, only how legible the reason is afterward.
+    error_message_len: u32,
+    error_message: [u8; ERROR_MESSAGE_CAP],
 }
+
+const ERROR_MESSAGE_CAP: usize = 512;
 
 /// Error outcomes for a bounded wait on the handoff.
 #[derive(Debug, PartialEq, Eq)]
@@ -221,6 +277,11 @@ impl HandoffSegment {
         (*shared).state = HandoffPhase::WaitingForLock as u32;
         pg_sys::ConditionVariableInit(&mut (*shared).cv);
         (*shared).operation_nonce = operation_nonce;
+        (*shared).column_list_len = 0;
+        (*shared).target_relation_len = 0;
+        (*shared).fetched_row_count = 0;
+        (*shared).pinned_wal_lsn = 0;
+        (*shared).error_message_len = 0;
         HandoffSegment { seg, shared }
     }
 
@@ -263,6 +324,78 @@ impl HandoffSegment {
         unsafe { (*self.shared).operation_nonce }
     }
 
+    /// Coordinator side only: write the quoted, comma-separated column
+    /// list. Must be called strictly before [`HandoffSegment::signal`]
+    /// with [`HandoffPhase::LockHeldGoAhead`] -- writing after signaling
+    /// would race the copier's read with no defined visibility (the
+    /// module doc's "Memory ordering" section covers exactly why the
+    /// write-before-publish ordering is what makes this safe without a
+    /// second synchronization mechanism for the payload itself).
+    pub fn write_column_list(&self, list: &str) -> Result<(), String> {
+        let bytes = list.as_bytes();
+        if bytes.len() > COLUMN_LIST_CAP {
+            return Err(format!(
+                "column list ({} bytes) exceeds the {COLUMN_LIST_CAP}-byte handoff payload bound",
+                bytes.len()
+            ));
+        }
+        unsafe {
+            let dst = std::ptr::addr_of_mut!((*self.shared).column_list);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*dst).as_mut_ptr(), bytes.len());
+            (*self.shared).column_list_len = bytes.len() as u32;
+        }
+        Ok(())
+    }
+
+    /// Copier side only: read the column list written by the coordinator.
+    /// Callers must have already observed `LockHeldGoAhead` (via
+    /// `wait_for_state`, whose Acquire load is what makes this read
+    /// well-defined) before calling this -- reading beforehand would
+    /// observe whatever was there before publication (zero-length,
+    /// harmlessly, since `coordinator_create` zero-initializes
+    /// `column_list_len`, but still not the real payload).
+    pub fn read_column_list(&self) -> String {
+        unsafe {
+            let len = (*self.shared).column_list_len as usize;
+            let len = len.min(COLUMN_LIST_CAP);
+            let src = std::ptr::addr_of!((*self.shared).column_list);
+            let slice = std::slice::from_raw_parts((*src).as_ptr(), len);
+            String::from_utf8_lossy(slice).into_owned()
+        }
+    }
+
+    /// Coordinator side only: write the schema-qualified, quoted target
+    /// relation name. Same write-before-publish contract as
+    /// `write_column_list`.
+    pub fn write_target_relation(&self, qualified_name: &str) -> Result<(), String> {
+        let bytes = qualified_name.as_bytes();
+        if bytes.len() > TARGET_RELATION_CAP {
+            return Err(format!(
+                "target relation name ({} bytes) exceeds the {TARGET_RELATION_CAP}-byte handoff payload bound",
+                bytes.len()
+            ));
+        }
+        unsafe {
+            let dst = std::ptr::addr_of_mut!((*self.shared).target_relation);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*dst).as_mut_ptr(), bytes.len());
+            (*self.shared).target_relation_len = bytes.len() as u32;
+        }
+        Ok(())
+    }
+
+    /// Copier side only: read the target relation name written by the
+    /// coordinator. Same post-LockHeldGoAhead-only contract as
+    /// `read_column_list`.
+    pub fn read_target_relation(&self) -> String {
+        unsafe {
+            let len = (*self.shared).target_relation_len as usize;
+            let len = len.min(TARGET_RELATION_CAP);
+            let src = std::ptr::addr_of!((*self.shared).target_relation);
+            let slice = std::slice::from_raw_parts((*src).as_ptr(), len);
+            String::from_utf8_lossy(slice).into_owned()
+        }
+    }
+
     fn atomic_state(&self) -> &AtomicU32 {
         // SAFETY: `state` is the first field of a #[repr(C)] struct backed
         // by DSM shared memory for the entire lifetime of this handle;
@@ -281,6 +414,60 @@ impl HandoffSegment {
         self.atomic_state().store(phase as u32, Ordering::Release);
         unsafe {
             pg_sys::ConditionVariableBroadcast(std::ptr::addr_of_mut!((*self.shared).cv));
+        }
+    }
+
+    /// Copier side only: record the row count its real cursor fetch saw.
+    /// Must be called strictly before `signal(SnapshotPinned)`.
+    pub fn write_fetched_row_count(&self, count: u64) {
+        unsafe {
+            (*self.shared).fetched_row_count = count;
+        }
+    }
+
+    /// Coordinator/observer side: read the row count the copier recorded.
+    /// Only well-defined after observing `SnapshotPinned`.
+    pub fn read_fetched_row_count(&self) -> u64 {
+        unsafe { (*self.shared).fetched_row_count }
+    }
+
+    /// Copier side only: record the WAL LSN observed at pin time. Must be
+    /// called strictly before `signal(SnapshotPinned)`.
+    pub fn write_pinned_wal_lsn(&self, lsn: u64) {
+        unsafe {
+            (*self.shared).pinned_wal_lsn = lsn;
+        }
+    }
+
+    /// Coordinator/observer side: read the WAL LSN the copier recorded at
+    /// pin time. Only well-defined after observing `SnapshotPinned`.
+    pub fn read_pinned_wal_lsn(&self) -> u64 {
+        unsafe { (*self.shared).pinned_wal_lsn }
+    }
+
+    /// Either side: record a diagnostic message, truncated (never panics)
+    /// to fit. Must be called strictly before `signal(Failed)` to be
+    /// visible to the other side under the same acquire-after-load
+    /// discipline as every other payload field.
+    pub fn write_error_message(&self, msg: &str) {
+        let bytes = msg.as_bytes();
+        let len = bytes.len().min(ERROR_MESSAGE_CAP);
+        unsafe {
+            let dst = std::ptr::addr_of_mut!((*self.shared).error_message);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*dst).as_mut_ptr(), len);
+            (*self.shared).error_message_len = len as u32;
+        }
+    }
+
+    /// Read whatever diagnostic message the failing side recorded. Only
+    /// meaningful after observing `Failed`/`PeerFailed`; empty otherwise.
+    pub fn read_error_message(&self) -> String {
+        unsafe {
+            let len = (*self.shared).error_message_len as usize;
+            let len = len.min(ERROR_MESSAGE_CAP);
+            let src = std::ptr::addr_of!((*self.shared).error_message);
+            let slice = std::slice::from_raw_parts((*src).as_ptr(), len);
+            String::from_utf8_lossy(slice).into_owned()
         }
     }
 
@@ -535,20 +722,52 @@ fn lock_order_probe_worker_body(arg: pg_sys::Datum) {
         Ok(()) => {
             let lock_query =
                 format!("LOCK TABLE {LOCK_ORDER_PROBE_TABLE} IN ACCESS EXCLUSIVE MODE NOWAIT");
-            // A real ereport(ERROR) (lock_not_available) raised here is the
-            // *expected* outcome -- catch_unwind observes it without this
-            // worker process itself dying uncaught.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                BackgroundWorker::transaction(|| Spi::run(&lock_query))
-            }));
+            // Classify precisely by SQLSTATE, not "any error/panic means
+            // the conflict was detected" -- that blanket classification
+            // previously made this test pass for the wrong reason (the
+            // table wasn't durably visible to this worker at all, so the
+            // NOWAIT lock failed with undefined_table, not lock_not_
+            // available, and both were being treated as the same "good"
+            // outcome). See test_support's module doc.
+            #[derive(Debug)]
+            enum ProbeOutcome {
+                Conflicted,
+                Acquired,
+                UnexpectedError(String),
+            }
+            // Every SPI call in a background worker must run inside a real
+            // transaction (BackgroundWorker::transaction, which calls
+            // StartTransactionCommand() first) -- calling Spi::run with no
+            // transaction started crashes the backend outright rather
+            // than merely erroring (found directly while building the
+            // Stage 6 completion coordinator's own worker).
+            let outcome = PgTryBuilder::new(|| {
+                match BackgroundWorker::transaction(|| Spi::run(&lock_query)) {
+                    Ok(()) => ProbeOutcome::Acquired,
+                    Err(e) => ProbeOutcome::UnexpectedError(e.to_string()),
+                }
+            })
+            .catch_when(PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE, |_| {
+                ProbeOutcome::Conflicted
+            })
+            .catch_others(|e| {
+                let msg = match &e {
+                    CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => {
+                        r.message().to_string()
+                    }
+                    CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+                };
+                ProbeOutcome::UnexpectedError(msg)
+            })
+            .execute();
             match outcome {
-                Err(_) => {
-                    // Panicked -- the NOWAIT lock genuinely conflicted, i.e.
-                    // the coordinator's lock was really held. Correct,
-                    // expected outcome.
+                ProbeOutcome::Conflicted => {
+                    // The NOWAIT lock genuinely conflicted (SQLSTATE
+                    // lock_not_available) -- the coordinator's lock was
+                    // really held. Correct, expected outcome.
                     segment.signal(HandoffPhase::SnapshotPinned);
                 }
-                Ok(Ok(())) => {
+                ProbeOutcome::Acquired => {
                     // No conflict at all -- the coordinator's lock was NOT
                     // actually held when this worker was told to proceed.
                     // An ordering violation.
@@ -556,16 +775,19 @@ fn lock_order_probe_worker_body(arg: pg_sys::Datum) {
                         "pg_flashback lock-order probe worker: ACQUIRED a conflicting lock -- \
                          ordering violation, coordinator's lock was not actually held"
                     );
+                    segment.write_error_message("acquired a conflicting lock (ordering violation)");
                     segment.signal(HandoffPhase::Failed);
                 }
-                Ok(Err(e)) => {
-                    log!("pg_flashback lock-order probe worker: unexpected SPI error: {e}");
+                ProbeOutcome::UnexpectedError(msg) => {
+                    log!("pg_flashback lock-order probe worker: unexpected error (not lock_not_available): {msg}");
+                    segment.write_error_message(&msg);
                     segment.signal(HandoffPhase::Failed);
                 }
             }
         }
         Err(e) => {
             log!("pg_flashback lock-order probe worker: wait failed: {e:?}");
+            segment.write_error_message(&format!("wait failed: {e:?}"));
             segment.signal(HandoffPhase::Failed);
         }
     }
@@ -602,6 +824,186 @@ fn launch_lock_order_probe_worker(
         .set_notify_pid(unsafe { pg_sys::MyProcPid })
         .enable_spi_access()
         .load_dynamic()
+}
+
+// ── Test-only: commit-via-worker (fixes a real cross-session-visibility
+// gap in this crate's own test suite) ───────────────────────────────────
+//
+// pgrx's own #[pg_test] harness wraps every test function in one
+// postgres-client-side transaction and *unconditionally* rolls it back at
+// the end, pass or fail (pgrx-tests' framework.rs: "and abort the
+// transaction when complete"). Anything a #[pg_test] function creates via
+// ordinary `Spi::run` -- a table, a tracked_tables row, a reservation --
+// is therefore *never* durably committed, and is consequently invisible
+// to any genuinely separate session, including a dynamically-launched
+// background worker connecting via its own SPI connection: MVCC only
+// exposes committed data across sessions, and this data is never
+// committed. A worker attempting to touch such a table sees "relation
+// does not exist", not whatever the test intended to exercise.
+//
+// This was found directly, not anticipated: a lock-order-probe test
+// (external_zstd_handoff.rs's own test_copier_cannot_observe_go_ahead_
+// before_lock_is_held, and independently while building the Stage 6
+// completion coordinator tests) both create their target table via plain
+// `Spi::run` inside the test function, then have a worker interact with
+// it. Both were passing, but for the wrong reason: the worker's `LOCK
+// TABLE ... NOWAIT` (or, in the coordinator tests, `SELECT ... FROM
+// target`) was failing with `undefined_table`, not the condition the test
+// actually meant to exercise (`lock_not_available` / a real cursor read)
+// -- and the worker's blanket "any error/panic here means the thing I was
+// testing for happened" classification silently absorbed the difference.
+//
+// `run_sql_committed` fixes this at the root: it runs arbitrary setup SQL
+// inside a *real* background worker (via `BackgroundWorker::transaction`,
+// which genuinely calls `CommitTransactionCommand()`), so anything it
+// creates is durably visible to every subsequent session for the rest of
+// the test, including the #[pg_test] function's own later reads (a
+// session that never commits its own writes can still *see* what another
+// session committed, via ordinary MVCC). This is test-only infrastructure
+// -- real production code never needs to work around its own test
+// harness -- and is cfg-gated out of every non-test build accordingly.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) mod test_support {
+    use super::{HandoffPhase, HandoffSegment};
+    use pgrx::bgworkers::{
+        BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker, SignalWakeFlags,
+    };
+    use pgrx::pg_sys;
+    use pgrx::pg_sys::panic::CaughtError;
+    use pgrx::prelude::*;
+    use std::time::Duration;
+
+    fn commit_sql_worker_body(arg: pg_sys::Datum) {
+        BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGTERM);
+        let raw = unsafe { i64::from_datum(arg, false) }.unwrap_or(0);
+        let dsm_h = (raw & 0xFFFF_FFFF) as u32;
+        let db_oid = pg_sys::Oid::from(((raw >> 32) & 0xFFFF_FFFF) as u32);
+
+        let segment = unsafe { HandoffSegment::attach(dsm_h) };
+        let segment = match segment {
+            Some(s) => s,
+            None => {
+                log!("pg_flashback test commit-sql worker: dsm_attach failed, exiting");
+                return;
+            }
+        };
+
+        BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid), None);
+        // column_list is repurposed here to carry arbitrary setup SQL
+        // rather than a column list -- test-only use of the same bounded
+        // payload mechanism, not a second protocol meaning layered onto
+        // the real one.
+        let sql = segment.read_column_list();
+        // A genuine lock conflict against another still-open session (the
+        // calling #[pg_test] function's own session is never committed/
+        // rolled back until the test ends, so it can hold locks for the
+        // rest of the test) would otherwise block here for the full
+        // duration of whatever bound the caller is using to wait on this
+        // worker, surfacing only as an opaque Timeout with no indication
+        // of what was actually blocked. A short lock_timeout turns that
+        // into an immediate, diagnosable lock_not_available naming the
+        // conflicting relation instead.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            BackgroundWorker::transaction(|| {
+                Spi::run("SET lock_timeout = '5s'")?;
+                Spi::run(&sql)
+            })
+        }));
+        match result {
+            Ok(Ok(())) => segment.signal(HandoffPhase::SnapshotPinned),
+            Ok(Err(e)) => {
+                log!("pg_flashback test commit-sql worker: SQL failed: {e}");
+                segment.write_error_message(&e.to_string());
+                segment.signal(HandoffPhase::Failed);
+            }
+            Err(e) => {
+                // BackgroundWorker::transaction uses PgTryBuilder
+                // internally; an uncaught PostgreSQL ERROR it has no
+                // handler for is re-thrown as resume_unwind(Box::new(
+                // CaughtError)), not a plain string payload.
+                let msg = e
+                    .downcast_ref::<CaughtError>()
+                    .map(|ce| match ce {
+                        CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => {
+                            r.message().to_string()
+                        }
+                        CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+                    })
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<unrecognized panic payload type>".to_string());
+                log!("pg_flashback test commit-sql worker: SQL panicked: {msg}");
+                segment.write_error_message(&format!("panic: {msg}"));
+                segment.signal(HandoffPhase::Failed);
+            }
+        }
+    }
+
+    /// The real, exported symbol this crate's `lib.rs` `#[unsafe(no_mangle)]`
+    /// wrapper delegates to -- see the Stage 4 selftest worker's identical
+    /// requirement.
+    pub extern "C-unwind" fn pg_flashback_test_commit_sql_worker_main(arg: pg_sys::Datum) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commit_sql_worker_body(arg);
+        }));
+        if let Err(e) = result {
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            log!("pg_flashback test commit-sql worker: top-level PANICKED: {msg}");
+        }
+    }
+
+    /// Run `sql` to completion in a real, separate, committing background
+    /// worker, and only return once it has -- so that anything `sql`
+    /// creates is durably visible to every session for the rest of the
+    /// test (see the module doc for exactly why this is necessary and
+    /// what it fixes). Panics with the worker's own reported error on
+    /// failure.
+    /// Launch the commit-sql worker with `sql` and return immediately,
+    /// without waiting for it to finish -- exposed separately from
+    /// `run_sql_committed` so callers that need a genuinely alive-but-
+    /// never-signaling peer (e.g. a rollback-point regression exercising
+    /// M6's plain timeout path with a real, live process rather than a
+    /// dead one) can drive the wait themselves.
+    pub fn launch_commit_sql_worker(sql: &str) -> (HandoffSegment, DynamicBackgroundWorker) {
+        let db_oid = unsafe { pg_sys::MyDatabaseId };
+        let segment = unsafe { HandoffSegment::coordinator_create(db_oid.to_u32() as u64) };
+        segment
+            .write_column_list(sql)
+            .expect("setup SQL exceeds the handoff payload bound");
+        let packed: i64 = (segment.handle() as i64) | ((db_oid.to_u32() as i64) << 32);
+        let worker = BackgroundWorkerBuilder::new("pg_flashback test commit-sql worker")
+            .set_function("pg_flashback_test_commit_sql_worker_main")
+            .set_library("pg_flashback")
+            .set_argument(packed.into_datum())
+            .set_notify_pid(unsafe { pg_sys::MyProcPid })
+            .enable_spi_access()
+            .load_dynamic()
+            .expect("failed to launch commit-sql worker");
+        worker
+            .wait_for_startup()
+            .expect("commit-sql worker did not start");
+        (segment, worker)
+    }
+
+    pub fn run_sql_committed(sql: &str) {
+        let (segment, worker) = launch_commit_sql_worker(sql);
+        let result = segment.wait_for_state(
+            HandoffPhase::SnapshotPinned,
+            Duration::from_secs(30),
+            Some(&worker),
+        );
+        if result.is_err() {
+            panic!(
+                "run_sql_committed failed: {result:?} ({})",
+                segment.read_error_message()
+            );
+        }
+        segment.detach();
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -838,10 +1240,17 @@ mod tests {
     /// managed to acquire a conflicting lock.
     #[pg_test]
     fn test_copier_cannot_observe_go_ahead_before_lock_is_held() {
-        Spi::run(&format!(
+        // Must be durably committed, not just run in this #[pg_test]
+        // function's own (always-rolled-back) session -- otherwise the
+        // probe worker's separate session cannot see the table at all
+        // ("relation does not exist"), which its own blanket error
+        // handling would silently misclassify as "conflict correctly
+        // detected". See test_support's module doc for the full story
+        // (found directly, not anticipated, while building the Stage 6
+        // completion coordinator tests).
+        test_support::run_sql_committed(&format!(
             "CREATE TABLE IF NOT EXISTS {LOCK_ORDER_PROBE_TABLE} (id int)"
-        ))
-        .expect("failed to create lock-order probe table");
+        ));
 
         let db_oid = unsafe { pg_sys::MyDatabaseId }.to_u32() as u64;
         let seg = unsafe { HandoffSegment::coordinator_create(db_oid) };
