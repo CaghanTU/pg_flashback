@@ -53,6 +53,19 @@ pub extern "C-unwind" fn pg_flashback_external_zstd_lock_order_probe_worker_main
     storage::external_zstd_handoff::pg_flashback_external_zstd_lock_order_probe_worker_main(arg);
 }
 
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_flashback_external_zstd_copier_worker_main(arg: pg_sys::Datum) {
+    storage::external_zstd_coordinator::pg_flashback_external_zstd_copier_worker_main(arg);
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_flashback_test_commit_sql_worker_main(arg: pg_sys::Datum) {
+    storage::external_zstd_handoff::test_support::pg_flashback_test_commit_sql_worker_main(arg);
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
