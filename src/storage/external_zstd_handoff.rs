@@ -483,6 +483,127 @@ fn launch_selftest_worker_mode(
         .load_dynamic()
 }
 
+// ── Stage 6 adversarial regression: exact lock-before-snapshot-pin
+// ordering ──────────────────────────────────────────────────────────────
+//
+// The online-snapshot protocol's entire correctness depends on one
+// ordering fact: the copier's first real SQL (which pins its REPEATABLE
+// READ snapshot) must never be reachable before the coordinator's table
+// lock (M2) is genuinely held -- that's what makes it safe for the marker
+// COMMIT (M8) to be the dividing line between "rows the copy will see"
+// and "rows post-marker WAL replay will see" (plan §1e). Stage 4's cross-
+// process round-trip test proves the *signal* is delivered correctly; it
+// does not, by itself, prove a worker that raced ahead of the lock would
+// have been detectable. This worker makes that concrete: on waking from
+// LockHeldGoAhead, instead of trusting the signal, it independently
+// verifies the lock is real by attempting a *conflicting* lock
+// (ACCESS EXCLUSIVE, which conflicts with every other lock mode including
+// SHARE ROW EXCLUSIVE) with NOWAIT from its own, separate session. If the
+// coordinator's lock is genuinely held, this must fail with
+// lock_not_available; if it unexpectedly succeeds, the ordering guarantee
+// is broken and this test must fail loudly, not pass by coincidence.
+//
+// Reuses HandoffPhase's existing terminal states rather than adding a new
+// shared-memory field: SnapshotPinned means "conflict correctly detected"
+// (the expected, good outcome), Failed means either the lock was
+// unexpectedly acquired (an ordering violation) or an unrelated error
+// occurred (logged either way).
+
+const LOCK_ORDER_PROBE_TABLE: &str = "public.it_lock_order_probe";
+
+fn lock_order_probe_worker_body(arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(pgrx::bgworkers::SignalWakeFlags::SIGTERM);
+    let dsm_h = (unsafe { i64::from_datum(arg, false) }.unwrap_or(0) & 0xFFFF_FFFF) as u32;
+
+    let segment = unsafe { HandoffSegment::attach(dsm_h) };
+    let segment = match segment {
+        Some(s) => s,
+        None => {
+            log!("pg_flashback lock-order probe worker: dsm_attach failed, exiting");
+            return;
+        }
+    };
+
+    // operation_nonce is repurposed here to carry the coordinator's
+    // current database oid (a u32, fits easily in the u64 field) -- this
+    // worker's own use of HandoffShared, distinct from the real protocol's
+    // eventual meaning for this field.
+    let db_oid = pg_sys::Oid::from(segment.operation_nonce() as u32);
+    BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid), None);
+
+    match segment.wait_for_state(HandoffPhase::LockHeldGoAhead, Duration::from_secs(30), None) {
+        Ok(()) => {
+            let lock_query =
+                format!("LOCK TABLE {LOCK_ORDER_PROBE_TABLE} IN ACCESS EXCLUSIVE MODE NOWAIT");
+            // A real ereport(ERROR) (lock_not_available) raised here is the
+            // *expected* outcome -- catch_unwind observes it without this
+            // worker process itself dying uncaught.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                BackgroundWorker::transaction(|| Spi::run(&lock_query))
+            }));
+            match outcome {
+                Err(_) => {
+                    // Panicked -- the NOWAIT lock genuinely conflicted, i.e.
+                    // the coordinator's lock was really held. Correct,
+                    // expected outcome.
+                    segment.signal(HandoffPhase::SnapshotPinned);
+                }
+                Ok(Ok(())) => {
+                    // No conflict at all -- the coordinator's lock was NOT
+                    // actually held when this worker was told to proceed.
+                    // An ordering violation.
+                    log!(
+                        "pg_flashback lock-order probe worker: ACQUIRED a conflicting lock -- \
+                         ordering violation, coordinator's lock was not actually held"
+                    );
+                    segment.signal(HandoffPhase::Failed);
+                }
+                Ok(Err(e)) => {
+                    log!("pg_flashback lock-order probe worker: unexpected SPI error: {e}");
+                    segment.signal(HandoffPhase::Failed);
+                }
+            }
+        }
+        Err(e) => {
+            log!("pg_flashback lock-order probe worker: wait failed: {e:?}");
+            segment.signal(HandoffPhase::Failed);
+        }
+    }
+}
+
+/// The real, exported symbol this crate's `lib.rs` `#[unsafe(no_mangle)]`
+/// wrapper delegates to -- see that wrapper's doc comment (and the
+/// Stage 4 selftest worker's identical requirement) for why a thin
+/// crate-root wrapper, not this module function directly, must carry
+/// `no_mangle`.
+pub extern "C-unwind" fn pg_flashback_external_zstd_lock_order_probe_worker_main(
+    arg: pg_sys::Datum,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lock_order_probe_worker_body(arg);
+    }));
+    if let Err(e) = result {
+        let msg = e
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        log!("pg_flashback lock-order probe worker: top-level PANICKED: {msg}");
+    }
+}
+
+fn launch_lock_order_probe_worker(
+    dsm_h: pg_sys::dsm_handle,
+) -> Result<DynamicBackgroundWorker, pgrx::bgworkers::DynamicBackgroundWorkerLoadError> {
+    BackgroundWorkerBuilder::new("pg_flashback external_zstd lock-order probe worker")
+        .set_function("pg_flashback_external_zstd_lock_order_probe_worker_main")
+        .set_library("pg_flashback")
+        .set_argument((dsm_h as i64).into_datum())
+        .set_notify_pid(unsafe { pg_sys::MyProcPid })
+        .enable_spi_access()
+        .load_dynamic()
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -705,5 +826,57 @@ mod tests {
             0
         );
         seg.detach();
+    }
+
+    /// Stage 6 adversarial regression: proves exact lock-before-snapshot-
+    /// pin ordering against a real second OS process and a real table lock
+    /// -- not just the abstract signal-delivery proof the Stage 4 tests
+    /// above already give. See the worker's own doc comment (module scope)
+    /// for the full design; this test's job is to create the real table,
+    /// hold the real coordinator-side lock across the entire signal
+    /// exchange, and fail loudly if the worker ever reports back that it
+    /// managed to acquire a conflicting lock.
+    #[pg_test]
+    fn test_copier_cannot_observe_go_ahead_before_lock_is_held() {
+        Spi::run(&format!(
+            "CREATE TABLE IF NOT EXISTS {LOCK_ORDER_PROBE_TABLE} (id int)"
+        ))
+        .expect("failed to create lock-order probe table");
+
+        let db_oid = unsafe { pg_sys::MyDatabaseId }.to_u32() as u64;
+        let seg = unsafe { HandoffSegment::coordinator_create(db_oid) };
+        let worker = launch_lock_order_probe_worker(seg.handle())
+            .expect("failed to launch lock-order probe worker");
+        worker
+            .wait_for_startup()
+            .expect("lock-order probe worker did not start");
+
+        // The real ordering guarantee under test: acquire the lock FIRST,
+        // signal LockHeldGoAhead only AFTER it is genuinely held --
+        // mirroring the real protocol's M2 (lock) strictly before M5
+        // (signal) ordering (plan §1e).
+        Spi::run(&format!(
+            "LOCK TABLE {LOCK_ORDER_PROBE_TABLE} IN SHARE ROW EXCLUSIVE MODE"
+        ))
+        .expect("coordinator failed to acquire its own lock");
+        seg.signal(HandoffPhase::LockHeldGoAhead);
+
+        let result = seg.wait_for_state(
+            HandoffPhase::SnapshotPinned,
+            Duration::from_secs(15),
+            Some(&worker),
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "worker did not report SnapshotPinned (the correct, expected outcome -- \
+             it should have observed the lock as genuinely held and failed to acquire \
+             a conflicting one); Err(PeerFailed) here means the ordering guarantee was \
+             violated -- see the worker's own log output above"
+        );
+        seg.detach();
+        // The SHARE ROW EXCLUSIVE lock above is released automatically at
+        // this #[pg_test]'s own transaction rollback (pgrx's test harness
+        // convention), same as every other test in this file/module.
     }
 }

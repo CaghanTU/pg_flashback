@@ -463,7 +463,7 @@ mod tests {
     fn test_validate_root_os_level_accepts_good_root() {
         let dir = std::env::temp_dir().join(format!("fb-ext-zstd-test4-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE as u32)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
         assert!(validate_root_os_level(dir.to_str().unwrap()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -472,7 +472,7 @@ mod tests {
     fn test_validate_root_os_level_rejects_symlink() {
         let dir = std::env::temp_dir().join(format!("fb-ext-zstd-test5-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE as u32)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
         let link =
             std::env::temp_dir().join(format!("fb-ext-zstd-test5-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
