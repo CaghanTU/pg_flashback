@@ -37,6 +37,83 @@
 //! payload fields' visibility a consequence of the state transition's own
 //! ordering, rather than needing separate synchronization for them.
 //!
+//! ## Safety assumptions, made explicit
+//!
+//! This module is the single highest-risk piece of new `unsafe` code in
+//! Step 9. Four distinct assumptions are relied on; each is stated here
+//! precisely, and each has a corresponding test below (`ordering`/
+//! `visibility`/`alignment` are properties a single test run on one
+//! strongly-ordered ISA cannot *prove* in the general sense -- the repeated
+//! stress test empirically exercises them; the argument for correctness is
+//! this doc comment, not the test alone).
+//!
+//! **Alignment.** `AtomicU32::from_ptr`'s safety contract requires the
+//! pointer to be valid for reads and writes and to have `u32`'s natural
+//! (4-byte) alignment for its entire liveness. `shared` is always exactly
+//! `dsm_segment_address(seg)` with no offset applied, and `state` is the
+//! first field of `#[repr(C)] struct HandoffShared` (`repr(C)` guarantees
+//! the first field starts at offset 0). `dsm_segment_address` returns a
+//! pointer into memory obtained by `mmap`/`shmat`, which the platform
+//! guarantees is at least page-aligned (4096 bytes on every target this
+//! extension builds for) -- far in excess of the 4-byte requirement. Both
+//! `coordinator_create` and `attach` assert this at runtime (not just
+//! `debug_assert!`, since the check is O(1) and this is exactly the kind
+//! of assumption that must fail loudly, not silently compile away in a
+//! release build, if it is ever wrong).
+//!
+//! **Memory ordering.** Two distinct publication mechanisms are in play,
+//! not one:
+//! 1. *Steady-state signaling* (`signal`/`wait_for_state`, used for every
+//!    phase transition after the segment exists): `Ordering::Release` on
+//!    the store, `Ordering::Acquire` on the load. Standard
+//!    release-acquire message passing -- any non-atomic write made by the
+//!    signaling side strictly before its `store` is guaranteed visible to
+//!    the waiting side strictly after its `load` observes that value.
+//! 2. *Initial publication* (`operation_nonce`, `cv`'s own internal
+//!    state): written once, non-atomically, inside `coordinator_create`,
+//!    entirely *before* the segment's handle is ever handed to anything
+//!    that could read it. The handle only becomes reachable by the copier
+//!    through `BackgroundWorkerBuilder::set_argument` + `load_dynamic`,
+//!    which crosses a real process-launch boundary (registration through
+//!    shared memory the postmaster itself synchronizes, plus the fork
+//!    that creates the worker process) -- an unconditionally stronger
+//!    barrier than a single atomic release/acquire pair. This is a
+//!    distinct argument from (1), not an instance of it, so it is called
+//!    out separately rather than folded into "the atomic ordering handles
+//!    it." To avoid leaning on that argument implicitly anywhere reads
+//!    happen post-attach, `operation_nonce()` still performs an
+//!    `Ordering::Acquire` load of `state` first and discards it purely as
+//!    a synchronization fence -- every payload read in this module goes
+//!    through an acquire, without exception, rather than two different
+//!    reasoning paths depending on which field is being read.
+//!
+//! **Process death.** Three distinct death windows, three distinct
+//! detections, none of which is "wait until the bounded timeout and hope":
+//! coordinator dies before the copier's `dsm_attach` (handle invalid or
+//! segment torn down -> `attach` returns `None`, tested directly below
+//! without needing to actually kill a process); copier dies or exits
+//! without ever reaching `Failed`/`SnapshotPinned` while the coordinator
+//! waits (`wait_for_state`'s `peer.pid().is_err()` check, re-evaluated
+//! every `POLL_INTERVAL`, tested below via a worker that exits immediately
+//! with no signal at all -- distinct from the existing explicit-`Failed`
+//! peer test, which exercises a *live* peer reporting its own failure, not
+//! an actually-dead one); postmaster itself dies (`ConditionVariableTimedSleep`
+//! is built on `WaitLatch`, which wakes on postmaster death unconditionally
+//! -- no separate `WL_POSTMASTER_DEATH` plumbing is needed).
+//!
+//! **Cross-process visibility.** `AtomicU32::from_ptr` on DSM-segment
+//! memory relies on x86_64/aarch64 hardware cache coherency operating at
+//! the physical-memory/cache-line level, not the virtual-address or
+//! process level -- two processes each `mmap`ing the same physical page
+//! observe each other's atomic stores exactly as two threads in one
+//! process would, because the CPU's coherency protocol has no notion of
+//! "process" at all. This is the identical guarantee PostgreSQL's own
+//! `pg_atomic_uint32` (used across postmaster/backends today) already
+//! depends on; using `std::sync::atomic::AtomicU32` instead of the
+//! `pg_atomic_*` C API changes only which language's atomic-intrinsics
+//! syntax is used to emit the same hardware instructions, not the
+//! underlying guarantee.
+//!
 //! Stage 4 of a staged implementation (see the Step 9 plan, §15): exercised
 //! directly by the `#[pg_test]`s below (including a real cross-process
 //! round trip); the real online-snapshot coordinator/copier land in Stage
@@ -135,6 +212,12 @@ impl HandoffSegment {
         pg_sys::dsm_pin_mapping(seg);
         pg_sys::dsm_pin_segment(seg);
         let shared = pg_sys::dsm_segment_address(seg).cast::<HandoffShared>();
+        assert_eq!(
+            (shared as usize) % std::mem::align_of::<HandoffShared>(),
+            0,
+            "DSM segment address is not aligned for HandoffShared -- AtomicU32::from_ptr's \
+             safety contract would be violated"
+        );
         (*shared).state = HandoffPhase::WaitingForLock as u32;
         pg_sys::ConditionVariableInit(&mut (*shared).cv);
         (*shared).operation_nonce = operation_nonce;
@@ -160,10 +243,23 @@ impl HandoffSegment {
             return None;
         }
         let shared = pg_sys::dsm_segment_address(seg).cast::<HandoffShared>();
+        assert_eq!(
+            (shared as usize) % std::mem::align_of::<HandoffShared>(),
+            0,
+            "DSM segment address is not aligned for HandoffShared -- AtomicU32::from_ptr's \
+             safety contract would be violated"
+        );
         Some(HandoffSegment { seg, shared })
     }
 
+    /// `operation_nonce` is written once, non-atomically, before the
+    /// segment is ever published (see the module doc's "Memory ordering"
+    /// section) -- but every payload read in this module still goes
+    /// through an explicit acquire first, rather than relying on that
+    /// argument implicitly. The loaded value itself is discarded; only
+    /// the acquire fence it establishes matters here.
     pub fn operation_nonce(&self) -> u64 {
+        let _ = self.atomic_state().load(Ordering::Acquire);
         unsafe { (*self.shared).operation_nonce }
     }
 
@@ -297,14 +393,47 @@ pub extern "C-unwind" fn pg_flashback_external_zstd_handoff_selftest_worker_main
     }
 }
 
+/// Selftest worker behavior, packed into the high bits of the launch
+/// argument alongside the `dsm_handle`. `Crash` exists specifically to
+/// exercise the *actually dead peer* path (`HandoffWaitError::PeerDead`,
+/// detected via `peer.pid().is_err()`) as distinct from `Fail`, which
+/// exercises a *live* peer explicitly reporting `HandoffPhase::Failed`
+/// (`HandoffWaitError::PeerFailed`) -- two different code paths in
+/// `wait_for_state` that must not be conflated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelftestMode {
+    Normal = 0,
+    Fail = 1,
+    /// Exit immediately without attaching or signaling anything, simulating
+    /// a hard crash before the copier ever reaches the handoff protocol.
+    Crash = 2,
+}
+
+impl SelftestMode {
+    fn from_u8(v: u8) -> SelftestMode {
+        match v {
+            1 => SelftestMode::Fail,
+            2 => SelftestMode::Crash,
+            _ => SelftestMode::Normal,
+        }
+    }
+}
+
 fn worker_body(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(pgrx::bgworkers::SignalWakeFlags::SIGTERM);
-    // Low 32 bits: dsm_handle. High bit (bit 32, i.e. bit 0 of the upper
-    // word): fail-mode flag. Packed into one i64 argument since
-    // set_argument takes a single Option<Datum>.
+    // Low 32 bits: dsm_handle. Bits 32-39: SelftestMode. Packed into one
+    // i64 argument since set_argument takes a single Option<Datum>.
     let raw = unsafe { i64::from_datum(arg, false) }.unwrap_or(0);
     let dsm_h = (raw & 0xFFFF_FFFF) as u32;
-    let fail_mode = (raw >> 32) != 0;
+    let mode = SelftestMode::from_u8(((raw >> 32) & 0xFF) as u8);
+
+    if mode == SelftestMode::Crash {
+        // Deliberately exit without attaching to the segment at all -- the
+        // coordinator must detect this as a dead peer via its own
+        // DynamicBackgroundWorker handle, never by any signal through the
+        // DSM segment (there is none).
+        return;
+    }
 
     let segment = unsafe { HandoffSegment::attach(dsm_h) };
     let segment = match segment {
@@ -315,7 +444,7 @@ fn worker_body(arg: pg_sys::Datum) {
         }
     };
 
-    if fail_mode {
+    if mode == SelftestMode::Fail {
         segment.signal(HandoffPhase::Failed);
         return;
     }
@@ -333,11 +462,11 @@ fn worker_body(arg: pg_sys::Datum) {
 
 /// Launch the Stage 4 selftest copier as a dynamic background worker,
 /// tracked (`set_notify_pid`) so the caller can `wait_for_startup`/`pid()`.
-pub fn launch_selftest_worker(
+fn launch_selftest_worker_mode(
     dsm_h: pg_sys::dsm_handle,
-    fail_mode: bool,
+    mode: SelftestMode,
 ) -> Result<DynamicBackgroundWorker, pgrx::bgworkers::DynamicBackgroundWorkerLoadError> {
-    let packed: i64 = (dsm_h as i64) | ((fail_mode as i64) << 32);
+    let packed: i64 = (dsm_h as i64) | ((mode as i64) << 32);
     BackgroundWorkerBuilder::new("pg_flashback external_zstd handoff selftest worker")
         .set_function("pg_flashback_external_zstd_handoff_selftest_worker_main")
         .set_library("pg_flashback")
@@ -429,7 +558,7 @@ mod tests {
     #[pg_test]
     fn test_cross_process_handoff_round_trip() {
         let seg = unsafe { HandoffSegment::coordinator_create(777) };
-        let worker = launch_selftest_worker(seg.handle(), false)
+        let worker = launch_selftest_worker_mode(seg.handle(), SelftestMode::Normal)
             .expect("failed to launch selftest worker (max_worker_processes exhausted?)");
         worker
             .wait_for_startup()
@@ -453,19 +582,52 @@ mod tests {
         seg.detach();
     }
 
+    /// Empirical stress pass for the memory-ordering/cross-process-
+    /// visibility argument in the module doc comment: a single run cannot
+    /// *prove* an ordering guarantee, but a real cross-process round trip
+    /// repeated many times, each with a fresh segment and a fresh process,
+    /// is the practical bar this codebase already uses elsewhere for
+    /// concurrency-sensitive primitives -- any latent ordering bug (e.g. a
+    /// missing acquire/release pairing) is expected to surface as a flake
+    /// under repetition, not just in theory.
+    #[pg_test]
+    fn test_cross_process_handoff_repeated_round_trips() {
+        for i in 0..20u64 {
+            let seg = unsafe { HandoffSegment::coordinator_create(1000 + i) };
+            let worker = launch_selftest_worker_mode(seg.handle(), SelftestMode::Normal)
+                .unwrap_or_else(|e| panic!("iteration {i}: failed to launch worker: {e:?}"));
+            worker
+                .wait_for_startup()
+                .unwrap_or_else(|e| panic!("iteration {i}: worker did not start: {e:?}"));
+            seg.signal(HandoffPhase::LockHeldGoAhead);
+            let result = seg.wait_for_state(
+                HandoffPhase::SnapshotPinned,
+                Duration::from_secs(10),
+                Some(&worker),
+            );
+            assert_eq!(result, Ok(()), "iteration {i} failed");
+            seg.detach();
+        }
+    }
+
     /// Death-window test: the coordinator's wait must detect a confirmed-
     /// dead peer promptly (bounded by the poll interval, not the full
-    /// timeout) rather than only ever timing out.
+    /// timeout) rather than only ever timing out. This exercises a *live*
+    /// peer explicitly reporting its own failure (`HandoffPhase::Failed`),
+    /// which is the `PeerFailed` path -- see
+    /// `test_wait_detects_dead_peer_via_process_exit` below for the
+    /// distinct `PeerDead` path (a peer that is actually gone, never
+    /// having signaled anything).
     #[pg_test]
     fn test_wait_detects_dead_peer_before_full_timeout() {
         let seg = unsafe { HandoffSegment::coordinator_create(999) };
-        let worker = launch_selftest_worker(seg.handle(), true) // fail_mode
+        let worker = launch_selftest_worker_mode(seg.handle(), SelftestMode::Fail)
             .expect("failed to launch selftest worker");
         worker
             .wait_for_startup()
             .expect("selftest worker did not start");
 
-        // fail_mode signals Failed immediately without waiting for
+        // Fail mode signals Failed immediately without waiting for
         // LockHeldGoAhead -- proves the PeerFailed path, distinct from the
         // PeerDead (process actually gone) path.
         let result = seg.wait_for_state(
@@ -474,6 +636,74 @@ mod tests {
             Some(&worker),
         );
         assert_eq!(result, Err(HandoffWaitError::PeerFailed));
+        seg.detach();
+    }
+
+    /// The other death path: a peer that exits immediately, without ever
+    /// attaching to the segment or signaling anything -- a hard crash
+    /// simulation. `wait_for_state` must detect this via the peer's own
+    /// `DynamicBackgroundWorker` handle (`pid().is_err()`), not by any
+    /// signal through shared memory (there is none), and must not wait out
+    /// the full bounded timeout to do so.
+    #[pg_test]
+    fn test_wait_detects_dead_peer_via_process_exit() {
+        let seg = unsafe { HandoffSegment::coordinator_create(1234) };
+        let worker = launch_selftest_worker_mode(seg.handle(), SelftestMode::Crash)
+            .expect("failed to launch selftest worker");
+        worker
+            .wait_for_startup()
+            .expect("selftest worker did not start");
+
+        let started = Instant::now();
+        let result = seg.wait_for_state(
+            HandoffPhase::LockHeldGoAhead,
+            Duration::from_secs(30),
+            Some(&worker),
+        );
+        assert_eq!(result, Err(HandoffWaitError::PeerDead));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a genuinely dead peer must be detected well before the 30s bound, \
+             not only by exhausting it"
+        );
+        seg.detach();
+    }
+
+    /// Coordinator-death-before-attach direction: `dsm_attach` against a
+    /// handle that does not correspond to any live segment must fail
+    /// cleanly (`None`), never panic or hang -- this is what lets the
+    /// copier's own `worker_body` exit quietly instead of waiting on
+    /// memory that was never valid.
+    #[pg_test]
+    fn test_attach_with_invalid_handle_returns_none() {
+        let bogus: pg_sys::dsm_handle = 0xDEAD_0001;
+        let result = unsafe { HandoffSegment::attach(bogus) };
+        assert!(
+            result.is_none(),
+            "attaching a handle with no corresponding live segment must return None"
+        );
+    }
+
+    /// Alignment assumption, made concrete: `coordinator_create` must hand
+    /// back a `HandoffShared` pointer meeting `AtomicU32::from_ptr`'s
+    /// alignment requirement. The runtime `assert_eq!` inside both
+    /// `coordinator_create` and `attach` already enforces this
+    /// unconditionally for every segment either constructor ever hands
+    /// out (including every `attach` call the cross-process tests above
+    /// make from the copier's own process -- a single backend cannot
+    /// `dsm_attach` a segment it already holds a second time, so `attach`'s
+    /// path is exercised there, not by a same-process double-attach here);
+    /// this test additionally checks the `coordinator_create` path
+    /// explicitly from the outside so the property has its own named,
+    /// readable failure rather than only ever surfacing as an assertion
+    /// panic deep inside segment creation.
+    #[pg_test]
+    fn test_segment_address_is_aligned_for_atomic_access() {
+        let seg = unsafe { HandoffSegment::coordinator_create(55) };
+        assert_eq!(
+            (seg.shared as usize) % std::mem::align_of::<HandoffShared>(),
+            0
+        );
         seg.detach();
     }
 }
