@@ -23,6 +23,7 @@ extension_sql_file!(
     name = "flashback_snapshot_store",
     requires = [
         "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
         "flashback_payload_ownership_helpers"
     ],
 );

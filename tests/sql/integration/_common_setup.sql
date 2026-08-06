@@ -11,6 +11,7 @@ TRUNCATE
     flashback.capture_commits,
     flashback.capture_streams,
     flashback.delta_log,
+    flashback.snapshot_health_audits,
     flashback.snapshots,
     flashback.tracked_tables,
     flashback.tracking_lifecycles,

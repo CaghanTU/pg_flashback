@@ -444,6 +444,228 @@ AS $$
       AND s.payload_state = ANY (p_payload_states);
 $$;
 
+-- Read-only SnapshotStore health projection. Shallow mode verifies physical
+-- identity/manifest/size; deep mode additionally decompresses and validates
+-- the complete framed stream. Mutation belongs to the reconciler, never here.
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_payload_healthy(
+    p_snapshot_id bigint,
+    p_tracking_id bigint,
+    p_deep boolean DEFAULT false
+)
+RETURNS TABLE(status text, reason text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_snapshot record;
+    v_result jsonb;
+BEGIN
+    SELECT * INTO v_snapshot
+    FROM public.flashback_internal_snapshot_resolve(p_snapshot_id, p_tracking_id);
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT 'unhealthy'::text, 'snapshot_not_found'::text;
+        RETURN;
+    END IF;
+    IF v_snapshot.payload_state <> 'available' THEN
+        RETURN QUERY SELECT 'unhealthy'::text,
+            format('snapshot_state_%s', v_snapshot.payload_state)::text;
+        RETURN;
+    END IF;
+
+    IF v_snapshot.storage_backend = 'external_zstd' THEN
+        v_result := public.flashback_internal_external_snapshot_health(
+            p_snapshot_id, p_tracking_id, p_deep
+        );
+        RETURN QUERY SELECT v_result->>'status', v_result->>'reason';
+        RETURN;
+    END IF;
+
+    IF v_snapshot.storage_backend = 'heap_v1'
+       AND v_snapshot.payload_relid IS NOT NULL
+       AND public.flashback_payload_is_owned(v_snapshot.payload_relid)
+       AND public.flashback_payload_kind(v_snapshot.payload_relid)
+             IN ('base_snapshot', 'checkpoint_snapshot')
+    THEN
+        RETURN QUERY SELECT 'healthy'::text, NULL::text;
+    ELSE
+        RETURN QUERY SELECT 'unhealthy'::text, 'heap_payload_missing_or_unowned'::text;
+    END IF;
+END;
+$$;
+
+-- Mutating counterpart to the read-only probe. The lifecycle lock and the
+-- second probe prevent stale observations from changing state. Once failure
+-- is confirmed, snapshot availability and coverage invalidation commit in the
+-- same database transaction.
+CREATE OR REPLACE FUNCTION flashback_internal_reconcile_snapshot_health(
+    p_snapshot_id bigint,
+    p_tracking_id bigint,
+    p_deep boolean DEFAULT true
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_snapshot flashback.snapshots%ROWTYPE;
+    v_health record;
+    v_generation record;
+    v_changed integer := 0;
+BEGIN
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+    SELECT * INTO v_snapshot
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown snapshot artifact % (tracking %)',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_snapshot.payload_state <> 'available' THEN
+        RETURN jsonb_build_object(
+            'changed', false, 'snapshot_id', p_snapshot_id,
+            'status', v_snapshot.payload_state
+        );
+    END IF;
+
+    SELECT * INTO v_health
+    FROM public.flashback_internal_snapshot_payload_healthy(
+        p_snapshot_id, p_tracking_id, p_deep
+    );
+    IF v_health.status = 'healthy' THEN
+        RETURN jsonb_build_object(
+            'changed', false, 'snapshot_id', p_snapshot_id, 'status', 'healthy'
+        );
+    END IF;
+
+    PERFORM public.flashback_internal_snapshot_transition(
+        p_snapshot_id, p_tracking_id, ARRAY['available'], 'missing'
+    );
+    FOR v_generation IN
+        SELECT generation_id
+        FROM flashback.coverage_generations
+        WHERE tracking_id = p_tracking_id
+          AND boundary_snapshot_id = p_snapshot_id
+          AND state IN ('building', 'active', 'sealed')
+        ORDER BY generation_id
+    LOOP
+        IF public.flashback_internal_freeze_generation_missing_snapshot(
+            v_generation.generation_id,
+            p_tracking_id,
+            'snapshot_payload_missing_or_corrupt',
+            jsonb_build_object(
+                'snapshot_id', p_snapshot_id,
+                'health_reason', v_health.reason,
+                'deep_check', p_deep
+            )
+        ) THEN
+            v_changed := v_changed + 1;
+        END IF;
+    END LOOP;
+    RETURN jsonb_build_object(
+        'changed', true,
+        'snapshot_id', p_snapshot_id,
+        'status', 'missing',
+        'reason', v_health.reason,
+        'affected_generations', v_changed
+    );
+END;
+$$;
+
+-- Bounded maintenance entrypoint: shallow-check every available external
+-- artifact and deep-check only the least-recently audited subset. This keeps
+-- ordinary maintenance independent of total retained uncompressed size.
+CREATE OR REPLACE FUNCTION flashback_internal_reconcile_external_snapshot_scan(
+    p_deep_limit integer DEFAULT 1
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    r record;
+    v_health record;
+    v_shallow bigint := 0;
+    v_deep bigint := 0;
+    v_unhealthy bigint := 0;
+BEGIN
+    IF p_deep_limit < 0 OR p_deep_limit > 16 THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot deep-check limit must be between 0 and 16'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    FOR r IN
+        SELECT snapshot_id, tracking_id
+        FROM flashback.snapshots
+        WHERE storage_backend = 'external_zstd' AND payload_state = 'available'
+        ORDER BY snapshot_id
+    LOOP
+        SELECT * INTO v_health
+        FROM public.flashback_internal_snapshot_payload_healthy(
+            r.snapshot_id, r.tracking_id, false
+        );
+        v_shallow := v_shallow + 1;
+        INSERT INTO flashback.snapshot_health_audits AS a (
+            snapshot_id, tracking_id, shallow_checked_at, status, reason
+        ) VALUES (
+            r.snapshot_id, r.tracking_id, clock_timestamp(),
+            v_health.status, v_health.reason
+        )
+        ON CONFLICT (snapshot_id, tracking_id) DO UPDATE
+          SET shallow_checked_at = EXCLUDED.shallow_checked_at,
+              status = EXCLUDED.status,
+              reason = EXCLUDED.reason;
+        IF v_health.status <> 'healthy' THEN
+            PERFORM public.flashback_internal_reconcile_snapshot_health(
+                r.snapshot_id, r.tracking_id, false
+            );
+            v_unhealthy := v_unhealthy + 1;
+        END IF;
+    END LOOP;
+
+    FOR r IN
+        SELECT s.snapshot_id, s.tracking_id
+        FROM flashback.snapshots s
+        LEFT JOIN flashback.snapshot_health_audits a
+          ON a.snapshot_id = s.snapshot_id AND a.tracking_id = s.tracking_id
+        WHERE s.storage_backend = 'external_zstd' AND s.payload_state = 'available'
+        ORDER BY a.deep_checked_at NULLS FIRST, s.snapshot_id
+        LIMIT p_deep_limit
+    LOOP
+        SELECT * INTO v_health
+        FROM public.flashback_internal_snapshot_payload_healthy(
+            r.snapshot_id, r.tracking_id, true
+        );
+        v_deep := v_deep + 1;
+        INSERT INTO flashback.snapshot_health_audits AS a (
+            snapshot_id, tracking_id, deep_checked_at, status, reason
+        ) VALUES (
+            r.snapshot_id, r.tracking_id, clock_timestamp(),
+            v_health.status, v_health.reason
+        )
+        ON CONFLICT (snapshot_id, tracking_id) DO UPDATE
+          SET deep_checked_at = EXCLUDED.deep_checked_at,
+              status = EXCLUDED.status,
+              reason = EXCLUDED.reason;
+        IF v_health.status <> 'healthy' THEN
+            PERFORM public.flashback_internal_reconcile_snapshot_health(
+                r.snapshot_id, r.tracking_id, true
+            );
+            v_unhealthy := v_unhealthy + 1;
+        END IF;
+    END LOOP;
+    RETURN jsonb_build_object(
+        'shallow_checked', v_shallow,
+        'deep_checked', v_deep,
+        'unhealthy_reconciled', v_unhealthy
+    );
+END;
+$$;
+
 -- ------------------------------------------------------------------
 -- retire: drop the exact artifact's physical payload and transition it
 -- to a terminal state (retired for planned retention/cleanup, missing
@@ -1507,6 +1729,12 @@ COMMENT ON FUNCTION flashback_internal_snapshot_materialize(bigint, bigint, text
     IS '[Internal] SnapshotStore: copy an available artifact''s rows into an already-created destination relation.';
 COMMENT ON FUNCTION flashback_internal_snapshot_sizes(bigint, text[])
     IS '[Internal] SnapshotStore: per-artifact byte size for capacity/monitoring/health.';
+COMMENT ON FUNCTION flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean)
+    IS '[Internal] SnapshotStore: read-only shallow/deep artifact health probe; never mutates coverage.';
+COMMENT ON FUNCTION flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean)
+    IS '[Internal] SnapshotStore: recheck an unhealthy artifact under lifecycle lock, then mark it missing and freeze coverage atomically.';
+COMMENT ON FUNCTION flashback_internal_reconcile_external_snapshot_scan(integer)
+    IS '[Internal] SnapshotStore: bounded shallow/deep maintenance scan with durable audit rotation.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire(bigint, bigint, text)
     IS '[Internal] SnapshotStore: drop the exact artifact''s payload and transition to retired or missing.';
 COMMENT ON FUNCTION flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz)
@@ -1529,6 +1757,9 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_resolve(bigint, bigint
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_require_available(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM PUBLIC;
@@ -1547,6 +1778,9 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_require_available(bigint, bigint) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM flashback_admin';
@@ -1563,6 +1797,9 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_require_available(bigint, bigint) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_materialize(bigint, bigint, text, text, text, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM pg_monitor';

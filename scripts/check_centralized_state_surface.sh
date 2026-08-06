@@ -117,6 +117,7 @@ require 'flashback_internal_create_capture_stream'
 require 'flashback_internal_create_coverage_generation'
 require 'flashback_internal_create_online_generation_reservation'
 require 'flashback_internal_create_retirement_intent'
+require 'flashback_internal_freeze_generation_missing_snapshot'
 require 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_capture_stream'
 
 echo "OK: centralized state surface verification complete"

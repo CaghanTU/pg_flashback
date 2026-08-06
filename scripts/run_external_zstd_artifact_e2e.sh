@@ -178,5 +178,79 @@ RESTORED_FP=$(q "SELECT md5(string_agg(id::text||':'||note,',' ORDER BY id)) FRO
     echo "FAIL: restored row count mismatch"; exit 1;
 }
 
+[[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,false)")" == healthy ]] || {
+    echo "FAIL: shallow health rejected valid artifact"; exit 1;
+}
+[[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,true)")" == healthy ]] || {
+    echo "FAIL: deep health rejected valid artifact"; exit 1;
+}
+SCAN=$(q "SELECT public.flashback_internal_reconcile_external_snapshot_scan(1)")
+[[ "$(jq -r .deep_checked <<<"$SCAN")" == 1 ]] || {
+    echo "FAIL: maintenance health scan did not deep-check one artifact: $SCAN"; exit 1;
+}
+[[ "$(q "SELECT status||'|'||(deep_checked_at IS NOT NULL)::text FROM flashback.snapshot_health_audits WHERE snapshot_id=$SNAPSHOT AND tracking_id=$TRACKING")" == "healthy|true" ]] || {
+    echo "FAIL: maintenance health audit was not persisted"; exit 1;
+}
+
+# A missing payload and one-byte corruption must be visible to the read-only
+# health probe, and the restore reader must fail closed without leaving rows.
+mv "$FINAL_DIR/artifact.zst" "$FINAL_DIR/artifact.zst.missing"
+[[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,false)")" == unhealthy ]] || {
+    echo "FAIL: shallow health accepted missing artifact"; exit 1;
+}
+mv "$FINAL_DIR/artifact.zst.missing" "$FINAL_DIR/artifact.zst"
+
+cp "$FINAL_DIR/artifact.zst" "$FINAL_DIR/artifact.zst.good"
+python3 - "$FINAL_DIR/artifact.zst" <<'PY'
+import os, sys
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    size = os.fstat(f.fileno()).st_size
+    pos = max(1, size // 2)
+    f.seek(pos)
+    old = f.read(1)
+    f.seek(pos)
+    f.write(bytes([old[0] ^ 0x01]))
+    f.flush()
+    os.fsync(f.fileno())
+PY
+[[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,true)")" == unhealthy ]] || {
+    echo "FAIL: deep health accepted corrupted artifact"; exit 1;
+}
+q "CREATE TABLE public.ext_artifact_corrupt_target
+     (LIKE public.ext_artifact_e2e INCLUDING ALL)" >/dev/null
+set +e
+CORRUPT_ERROR=$("$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d postgres -qAtc "SELECT public.flashback_internal_snapshot_materialize(
+  $SNAPSHOT,$TRACKING,'public','ext_artifact_corrupt_target','\"id\",\"note\"',''
+)" 2>&1)
+CORRUPT_RC=$?
+set -e
+[[ "$CORRUPT_RC" -ne 0 ]] || { echo "FAIL: corrupted artifact restore succeeded"; exit 1; }
+grep -Eq 'external artifact|zstd|checksum|integrity|decode' <<<"$CORRUPT_ERROR" || {
+    echo "FAIL: corrupted artifact failed for an unrelated reason: $CORRUPT_ERROR"; exit 1;
+}
+[[ "$(q "SELECT count(*) FROM public.ext_artifact_corrupt_target")" == 0 ]] || {
+    echo "FAIL: corrupted artifact left partial rows"; exit 1;
+}
+RECONCILE=$(q "SELECT public.flashback_internal_reconcile_snapshot_health(
+  $SNAPSHOT,$TRACKING,true
+)")
+[[ "$(jq -r .changed <<<"$RECONCILE")" == true ]] || {
+    echo "FAIL: corrupt artifact reconciliation did not change state: $RECONCILE"; exit 1;
+}
+[[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == missing ]] || {
+    echo "FAIL: reconciliation did not mark corrupt artifact missing"; exit 1;
+}
+[[ "$(q "SELECT count(*) FROM flashback.coverage_gaps WHERE tracking_id=$TRACKING AND source_generation_id=$GENERATION AND reason='snapshot_payload_missing_or_corrupt'")" == 1 ]] || {
+    echo "FAIL: reconciliation did not persist exactly one coverage gap"; exit 1;
+}
+[[ "$(q "SELECT state_reason FROM flashback.coverage_generations WHERE generation_id=$GENERATION")" == snapshot_payload_missing_or_corrupt ]] || {
+    echo "FAIL: reconciliation did not freeze generation health"; exit 1;
+}
+mv -f "$FINAL_DIR/artifact.zst.good" "$FINAL_DIR/artifact.zst"
+[[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,true)")" == unhealthy ]] || {
+    echo "FAIL: terminal missing state was silently healed by replacing files"; exit 1;
+}
+
 echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS"
 echo "tracking_id=$TRACKING generation_id=$GENERATION snapshot_id=$SNAPSHOT rows=$ROW_COUNT fingerprint=$RESTORED_FP"

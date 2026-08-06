@@ -908,6 +908,23 @@ BEGIN
 END
 $$;
 
+-- Monitoring-only schedule/result cache for external artifact verification.
+-- It is never consulted for restore admission; restore always verifies the
+-- artifact directly. The maintenance worker uses checked_at only to rotate
+-- bounded deep checks across large payloads.
+CREATE TABLE IF NOT EXISTS flashback.snapshot_health_audits (
+    snapshot_id        BIGINT NOT NULL,
+    tracking_id        BIGINT NOT NULL,
+    shallow_checked_at TIMESTAMPTZ,
+    deep_checked_at    TIMESTAMPTZ,
+    status             TEXT NOT NULL CHECK (status IN ('healthy', 'unhealthy')),
+    reason             TEXT,
+    PRIMARY KEY (snapshot_id, tracking_id),
+    FOREIGN KEY (snapshot_id, tracking_id)
+        REFERENCES flashback.snapshots(snapshot_id, tracking_id)
+        ON DELETE CASCADE
+);
+
 -- Backfill: every pre-existing row is a heap_v1 artifact. No payload data is
 -- copied or moved; only catalog metadata is derived. snapshot_table is
 -- parsed with pg_catalog.parse_ident() (never string-split) since it may

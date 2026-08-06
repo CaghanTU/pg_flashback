@@ -1145,6 +1145,201 @@ fn flashback_internal_finalize_external_snapshot(
     }))
 }
 
+fn external_snapshot_health_check(
+    snapshot_id: i64,
+    tracking_id: i64,
+    deep: bool,
+) -> Result<(), String> {
+    let (locator, expected) = Spi::connect(
+        |client| -> Result<(serde_json::Value, FinalManifest), String> {
+            let table = client
+                .select(
+                    &format!(
+                        "SELECT s.locator::text AS locator, s.row_count, s.snapshot_lsn::text, \
+                                s.external_codec, s.external_format_version, \
+                                s.external_uncompressed_bytes, s.external_compressed_bytes, \
+                                s.external_checksum_sha256, s.external_column_contract::text, \
+                                s.schema_def_sha256 \
+                         FROM flashback.snapshots s \
+                         WHERE s.snapshot_id={snapshot_id}::bigint \
+                           AND s.tracking_id={tracking_id}::bigint \
+                           AND s.payload_state='available' \
+                           AND s.storage_backend='external_zstd'",
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|e| e.to_string())?;
+            let row = table.first();
+            let required_string = |name: &str| -> Result<String, String> {
+                row.get_by_name::<String, _>(name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("external snapshot evidence {name} is missing"))
+            };
+            let locator: serde_json::Value = serde_json::from_str(&required_string("locator")?)
+                .map_err(|e| format!("invalid external locator: {e}"))?;
+            let parse_locator_u32 = |name: &str| -> Result<u32, String> {
+                locator
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| format!("external locator {name} is invalid"))
+            };
+            let contract: serde_json::Value =
+                serde_json::from_str(&required_string("external_column_contract")?)
+                    .map_err(|e| format!("invalid external column contract: {e}"))?;
+            let expected = FinalManifest {
+                format_version: row
+                    .get_by_name::<i32, _>("external_format_version")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external format version is missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external format version is negative".to_string())?,
+                codec: required_string("external_codec")?,
+                system_identifier: locator
+                    .get("system_identifier")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "external locator system_identifier is missing".to_string())?
+                    .to_string(),
+                database_oid: parse_locator_u32("database_oid")?,
+                tracking_id,
+                snapshot_id,
+                boundary_lsn: required_string("snapshot_lsn")?,
+                schema_def_sha256: required_string("schema_def_sha256")?,
+                column_contract: contract,
+                row_count: row
+                    .get_by_name::<i64, _>("row_count")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external row_count is missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external row_count is negative".to_string())?,
+                external_uncompressed_bytes: row
+                    .get_by_name::<i64, _>("external_uncompressed_bytes")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external uncompressed bytes are missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external uncompressed bytes are negative".to_string())?,
+                external_compressed_bytes: row
+                    .get_by_name::<i64, _>("external_compressed_bytes")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external compressed bytes are missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external compressed bytes are negative".to_string())?,
+                external_checksum_sha256: required_string("external_checksum_sha256")?,
+                pg_major: pg_sys::PG_VERSION_NUM / 10_000,
+            };
+            Ok((locator, expected))
+        },
+    )?;
+
+    let system_identifier = unsafe { pg_sys::GetSystemIdentifier() };
+    let database_oid = unsafe { pg_sys::MyDatabaseId }.to_u32();
+    let locator_string = |name: &str| -> Result<&str, String> {
+        locator
+            .get(name)
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("external locator is missing {name}"))
+    };
+    if locator_string("system_identifier")? != system_identifier.to_string()
+        || locator_string("database_oid")? != database_oid.to_string()
+        || locator_string("tracking_id")? != tracking_id.to_string()
+        || locator_string("snapshot_id")? != snapshot_id.to_string()
+    {
+        return Err("external locator does not belong to this database/lifecycle".to_string());
+    }
+    let operation_nonce: u64 = locator_string("nonce")?
+        .parse()
+        .map_err(|_| "external locator nonce is invalid".to_string())?;
+    let root = crate::storage::worker::external_snapshot_root()?;
+    crate::storage::external_zstd::validate_root_os_level(&root)?;
+    crate::storage::external_zstd::validate_root_spi_level(&root)?;
+    let (artifact, disk_manifest) = open_published_artifact(
+        std::path::Path::new(&root),
+        system_identifier,
+        database_oid,
+        tracking_id,
+        snapshot_id,
+        operation_nonce,
+    )?;
+    if disk_manifest != expected {
+        return Err("external artifact manifest conflicts with database evidence".to_string());
+    }
+    let compressed_len = artifact
+        .metadata()
+        .map_err(|e| format!("stat external artifact: {e}"))?
+        .len();
+    if compressed_len != expected.external_compressed_bytes {
+        return Err(format!(
+            "external artifact compressed length {compressed_len} does not match manifest {}",
+            expected.external_compressed_bytes
+        ));
+    }
+    if !deep {
+        return Ok(());
+    }
+
+    let columns = parse_column_contract(&expected.column_contract.to_string())?;
+    let decoder = zstd::stream::read::Decoder::new(artifact)
+        .map_err(|e| format!("external zstd decoder failed: {e}"))?;
+    let mut reader = CountingHashReader::new(decoder);
+    let header = read_header(&mut reader)
+        .map_err(|e| format!("external artifact header is invalid: {e}"))?;
+    if header != columns {
+        return Err("external artifact header does not match column contract".to_string());
+    }
+    let max_row_bytes = crate::storage::worker::external_snapshot_max_row_bytes();
+    for _ in 0..expected.row_count {
+        read_row(&mut reader, columns.len(), max_row_bytes as i64)
+            .map_err(|e| format!("external artifact row is invalid: {e}"))?;
+        pg_sys::check_for_interrupts!();
+    }
+    let trailer = read_trailer(&mut reader)
+        .map_err(|e| format!("external artifact trailer is invalid: {e}"))?;
+    if trailer != expected.row_count {
+        return Err(format!(
+            "external artifact trailer row count {trailer} does not match manifest {}",
+            expected.row_count
+        ));
+    }
+    let mut extra = [0_u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|e| format!("external artifact EOF check failed: {e}"))?
+        != 0
+    {
+        return Err("external artifact contains trailing uncompressed data".to_string());
+    }
+    let (uncompressed_bytes, checksum) = reader.finish();
+    if uncompressed_bytes != expected.external_uncompressed_bytes {
+        return Err(format!(
+            "external artifact uncompressed byte count {uncompressed_bytes} does not match manifest {}",
+            expected.external_uncompressed_bytes
+        ));
+    }
+    if checksum != expected.external_checksum_sha256 {
+        return Err("external artifact checksum does not match manifest".to_string());
+    }
+    Ok(())
+}
+
+/// Read-only health probe. It never mutates snapshot or coverage state; the
+/// maintenance reconciler is the sole authority allowed to turn an unhealthy
+/// result into a durable `missing` state and coverage gap.
+#[pg_extern]
+fn flashback_internal_external_snapshot_health(
+    snapshot_id: i64,
+    tracking_id: i64,
+    deep: default!(bool, false),
+) -> JsonB {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_external_snapshot_health is owner-only");
+    }
+    match external_snapshot_health_check(snapshot_id, tracking_id, deep) {
+        Ok(()) => JsonB(serde_json::json!({"status": "healthy", "reason": null})),
+        Err(reason) => JsonB(serde_json::json!({"status": "unhealthy", "reason": reason})),
+    }
+}
+
 /// Stream one verified external_zstd artifact into an already-created shadow
 /// relation. Every immutable database/manifest/locator field is rebound before
 /// the first INSERT; decode, row count, trailer, byte count, and checksum must

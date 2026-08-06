@@ -1158,6 +1158,76 @@ BEGIN
 END;
 $$;
 
+-- Record that one generation's immutable boundary artifact is no longer
+-- usable. Building generations are aborted; active/sealed generations retain
+-- their audit identity but receive a permanent, boundary-inclusive gap.
+CREATE OR REPLACE FUNCTION flashback_internal_freeze_generation_missing_snapshot(
+    p_generation_id bigint,
+    p_tracking_id bigint,
+    p_reason text,
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_generation flashback.coverage_generations%ROWTYPE;
+BEGIN
+    IF p_generation_id IS NULL OR p_tracking_id IS NULL OR p_reason IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: missing-snapshot freeze requires generation_id, tracking_id, reason'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+    SELECT * INTO v_generation
+    FROM flashback.coverage_generations
+    WHERE generation_id = p_generation_id AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: generation % does not belong to lifecycle %',
+            p_generation_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF v_generation.state = 'building' THEN
+        RETURN public.flashback_internal_transition_coverage_generation(
+            p_generation_id, p_tracking_id, 'building', 'aborted', p_reason,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            jsonb_build_object('missing_snapshot', true) || COALESCE(p_details, '{}'::jsonb)
+        );
+    END IF;
+    IF v_generation.state NOT IN ('active', 'sealed') THEN
+        RETURN false;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_gaps g
+        WHERE g.tracking_id = p_tracking_id
+          AND g.source_generation_id = p_generation_id
+          AND g.reason = p_reason
+          AND COALESCE((g.details->>'permanent_gap')::boolean, false)
+    ) THEN
+        RETURN false;
+    END IF;
+
+    UPDATE flashback.coverage_generations
+       SET state_reason = p_reason
+     WHERE generation_id = p_generation_id AND tracking_id = p_tracking_id;
+    INSERT INTO flashback.coverage_gaps (
+        tracking_id, source_generation_id, reason,
+        gap_start_time, gap_start_lsn, lower_bound_inclusive, details
+    ) VALUES (
+        p_tracking_id, p_generation_id, p_reason,
+        COALESCE(v_generation.boundary_time, v_generation.valid_through_time, clock_timestamp()),
+        COALESCE(v_generation.boundary_lsn, v_generation.valid_through_lsn),
+        true,
+        jsonb_build_object('permanent_gap', true, 'missing_snapshot', true)
+          || COALESCE(p_details, '{}'::jsonb)
+    );
+    RETURN true;
+END;
+$$;
+
 REVOKE ALL ON FUNCTION public.flashback_internal_lock_ns_stream() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_lock_ns_lifecycle() FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_lock_database_stream(oid) FROM PUBLIC;
@@ -1173,6 +1243,7 @@ REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text
 REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_freeze_generation_missing_snapshot(bigint, bigint, text, jsonb) FROM PUBLIC;
 
 DO $$
 BEGIN
@@ -1190,6 +1261,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_freeze_generation_missing_snapshot(bigint, bigint, text, jsonb) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_lock_database_stream(oid) FROM pg_monitor';
@@ -1205,6 +1277,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_freeze_generation_missing_snapshot(bigint, bigint, text, jsonb) FROM pg_monitor';
     END IF;
 END
 $$;

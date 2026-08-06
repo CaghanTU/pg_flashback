@@ -743,6 +743,7 @@ pub extern "C-unwind" fn pg_flashback_maintenance_worker_main(arg: pg_sys::Datum
         }
         if is_capture_enabled() && !is_any_restore_active() {
             run_ensure_partitions();
+            run_external_snapshot_health();
             run_retention_purge();
         }
         let capture_interval = WORKER_INTERVAL_MS.get().clamp(50, 10_000) as u64;
@@ -951,6 +952,19 @@ fn run_retention_purge() {
                              END IF;
                          END
                          $$",
+    );
+}
+
+fn run_external_snapshot_health() {
+    run_bounded_maintenance(
+        "EXTERNAL_SNAPSHOT_HEALTH",
+        "DO $$
+             BEGIN
+                 IF to_regprocedure('flashback_internal_reconcile_external_snapshot_scan(integer)') IS NOT NULL THEN
+                     PERFORM flashback_internal_reconcile_external_snapshot_scan(1);
+                 END IF;
+             END
+             $$",
     );
 }
 

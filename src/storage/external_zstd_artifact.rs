@@ -418,6 +418,13 @@ pub fn open_published_artifact(
     let manifest = read_json(&final_fd, "manifest.json")?;
     let artifact = open_readonly(&final_fd, ARTIFACT_FILE)
         .map_err(|e| format!("open published artifact: {e}"))?;
+    let lock_rc = unsafe { libc::flock(artifact.as_raw_fd(), libc::LOCK_SH) };
+    if lock_rc != 0 {
+        return Err(format!(
+            "lock published artifact for reading: {}",
+            io::Error::last_os_error()
+        ));
+    }
     Ok((artifact, manifest))
 }
 
