@@ -783,12 +783,13 @@ BEGIN
     ) INTO v_result;
     RETURN jsonb_build_object(
         'schema_version', 1,
-        'status', 'copy_committed',
+        'status', 'copy_in_progress',
         'operation_id', p_operation_id,
         'tracking_id', v_op.tracking_id,
         'generation_id', v_op.generation_id,
         'snapshot_id', v_snapshot_id,
-        'copy', v_result
+        'copy', v_result,
+        'note', 'the WAL boundary marker committed; the background copier may still be writing its staged artifact'
     );
 END;
 $$;
@@ -962,6 +963,253 @@ BEGIN
 END;
 $$;
 
+-- Reconcile external maintenance across the transaction/filesystem boundary.
+-- Cleanup intentionally precedes reservation processing: a reservation
+-- aborted below may be physically removed only by a later committed call.
+CREATE OR REPLACE FUNCTION flashback_internal_reconcile_external_maintenance(
+    p_stale_after interval DEFAULT interval '5 minutes',
+    p_limit integer DEFAULT 1
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_op record;
+    v_current record;
+    v_cleanup record;
+    v_artifact jsonb;
+    v_finalize jsonb;
+    v_purged boolean;
+    v_cleaned integer := 0;
+    v_resumed integer := 0;
+    v_aborted integer := 0;
+    v_deferred integer := 0;
+    v_errors integer := 0;
+    v_reason text;
+    v_last_error text;
+BEGIN
+    IF p_stale_after IS NULL OR p_stale_after < interval '0 seconds' THEN
+        RAISE EXCEPTION 'pg_flashback: external reconcile stale interval must be non-negative'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_limit IS NULL OR p_limit < 1 OR p_limit > 100 THEN
+        RAISE EXCEPTION 'pg_flashback: external reconcile limit must be between 1 and 100'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Canonical order begins with the database-stream lock. Do not wait:
+    -- capture correctness always wins over maintenance progress.
+    IF NOT pg_try_advisory_xact_lock(
+        public.flashback_internal_lock_ns_stream(),
+        (SELECT oid::integer FROM pg_database WHERE datname = current_database())
+    ) THEN
+        RETURN jsonb_build_object(
+            'status', 'busy', 'cleaned', 0, 'resumed', 0,
+            'aborted', 0, 'deferred', 1, 'errors', 0
+        );
+    END IF;
+
+    -- Phase 1: physical cleanup only for an abort that was already durable
+    -- before this transaction. A receipt makes absent-after-crash retries
+    -- finite and prevents an old tombstone starving later work.
+    FOR v_cleanup IN
+        SELECT s.operation_id, s.tracking_id, s.generation_id,
+               (o.details->>'snapshot_id')::bigint AS snapshot_id,
+               (o.details->>'operation_nonce')::bigint AS operation_nonce
+        FROM flashback.operation_current_state s
+        JOIN flashback.operations o ON o.operation_id = s.operation_id
+        JOIN flashback.coverage_generations cg
+          ON cg.generation_id = s.generation_id
+         AND cg.tracking_id = s.tracking_id
+        JOIN flashback.snapshots sn
+          ON sn.snapshot_id = (o.details->>'snapshot_id')::bigint
+         AND sn.tracking_id = s.tracking_id
+        LEFT JOIN flashback.external_artifact_cleanup_receipts r
+          ON r.snapshot_id = sn.snapshot_id
+        WHERE s.command = 'maintain'
+          AND s.state IN ('failed', 'abandoned')
+          AND o.details->>'storage_backend' = 'external_zstd'
+          AND cg.state = 'aborted'
+          AND sn.payload_state = 'aborted'
+          AND r.snapshot_id IS NULL
+        ORDER BY s.created_at, s.operation_id
+        LIMIT p_limit
+    LOOP
+        BEGIN
+            v_purged := public.flashback_internal_purge_aborted_external_artifact(
+                v_cleanup.tracking_id, v_cleanup.generation_id,
+                v_cleanup.snapshot_id
+            );
+            INSERT INTO flashback.external_artifact_cleanup_receipts (
+                snapshot_id, tracking_id, generation_id, operation_nonce,
+                artifact_was_present
+            ) VALUES (
+                v_cleanup.snapshot_id, v_cleanup.tracking_id,
+                v_cleanup.generation_id, v_cleanup.operation_nonce, v_purged
+            ) ON CONFLICT (snapshot_id) DO NOTHING;
+            v_cleaned := v_cleaned + 1;
+        EXCEPTION WHEN OTHERS THEN
+            -- A live copier lease, lock timeout, unsafe root, or transient IO
+            -- error is retryable. Never broaden deletion or falsify a receipt.
+            v_deferred := v_deferred + 1;
+            v_errors := v_errors + 1;
+            v_last_error := SQLSTATE || ': ' || SQLERRM;
+        END;
+    END LOOP;
+
+    -- Phase 2: reconcile started operations. The operation header is
+    -- immutable, so all exact identities come from its durable details.
+    FOR v_op IN
+        SELECT s.operation_id, s.tracking_id, s.generation_id,
+               s.created_at, o.details
+        FROM flashback.operation_current_state s
+        JOIN flashback.operations o ON o.operation_id = s.operation_id
+        WHERE s.command = 'maintain'
+          AND s.state = 'started'
+          AND o.details->>'storage_backend' = 'external_zstd'
+        ORDER BY s.created_at, s.operation_id
+        LIMIT p_limit
+    LOOP
+        v_artifact := NULL;
+        v_reason := NULL;
+        IF NOT public.flashback_internal_try_lock_lifecycle(v_op.tracking_id) THEN
+            v_deferred := v_deferred + 1;
+            CONTINUE;
+        END IF;
+
+        SELECT s.state AS operation_state, cg.state AS generation_state,
+               sn.payload_state, sn.snapshot_lsn, cs.state AS stream_state,
+               (o.details->>'snapshot_id')::bigint AS snapshot_id
+          INTO v_current
+        FROM flashback.operation_current_state s
+        JOIN flashback.operations o ON o.operation_id = s.operation_id
+        JOIN flashback.coverage_generations cg
+          ON cg.generation_id = s.generation_id
+         AND cg.tracking_id = s.tracking_id
+        JOIN flashback.snapshots sn
+          ON sn.snapshot_id = (o.details->>'snapshot_id')::bigint
+         AND sn.tracking_id = s.tracking_id
+        LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
+        WHERE s.operation_id = v_op.operation_id
+        FOR UPDATE OF cg, sn;
+
+        IF v_current.operation_state IS DISTINCT FROM 'started' THEN
+            CONTINUE;
+        END IF;
+
+        BEGIN
+            IF v_current.payload_state = 'available'
+               AND v_current.generation_state = 'building'
+            THEN
+                PERFORM public.flashback_internal_activate_external_generation(
+                    v_op.generation_id, v_op.tracking_id, v_current.snapshot_id
+                );
+                v_finalize := public.flashback_maintain_finalize(v_op.operation_id);
+                v_resumed := v_resumed + 1;
+                CONTINUE;
+            ELSIF v_current.payload_state = 'available'
+                  AND v_current.generation_state = 'active'
+            THEN
+                v_finalize := public.flashback_maintain_finalize(v_op.operation_id);
+                v_resumed := v_resumed + 1;
+                CONTINUE;
+            ELSIF v_current.generation_state = 'aborted'
+                  OR v_current.payload_state = 'aborted'
+            THEN
+                v_reason := 'external_reservation_already_aborted';
+            ELSIF v_current.generation_state <> 'building'
+                  OR v_current.payload_state <> 'creating'
+            THEN
+                v_reason := format(
+                    'external_reservation_state_mismatch:generation=%s,snapshot=%s',
+                    v_current.generation_state, v_current.payload_state
+                );
+            ELSE
+                v_artifact := public.flashback_internal_external_artifact_state(
+                    v_op.tracking_id, v_op.generation_id,
+                    v_current.snapshot_id
+                );
+                IF v_artifact->>'status' = 'staging_active' THEN
+                    v_deferred := v_deferred + 1;
+                    CONTINUE;
+                ELSIF v_artifact->>'status' IN ('staging_committed', 'published')
+                      AND v_current.snapshot_lsn IS NOT NULL
+                THEN
+                    PERFORM public.flashback_internal_finalize_external_snapshot(
+                        v_op.tracking_id, v_op.generation_id,
+                        v_current.snapshot_id
+                    );
+                    v_finalize := public.flashback_maintain_finalize(v_op.operation_id);
+                    v_resumed := v_resumed + 1;
+                    CONTINUE;
+                ELSIF v_artifact->>'status' IN ('staging_committed', 'published')
+                      AND v_current.stream_state = 'active'
+                THEN
+                    -- Complete immutable bytes await only the marker COMMIT
+                    -- coordinate. Let capture consume it.
+                    v_deferred := v_deferred + 1;
+                    CONTINUE;
+                ELSIF v_artifact->>'status' IN ('staging_committed', 'published') THEN
+                    v_reason := 'external_boundary_unresolvable_stream_unavailable';
+                ELSIF v_op.created_at > clock_timestamp() - p_stale_after THEN
+                    v_deferred := v_deferred + 1;
+                    CONTINUE;
+                ELSE
+                    v_reason := CASE v_artifact->>'status'
+                        WHEN 'absent' THEN 'external_copier_never_started'
+                        WHEN 'staging_incomplete' THEN 'external_copier_crashed_before_receipt'
+                        ELSE 'external_artifact_unknown_state'
+                    END;
+                END IF;
+            END IF;
+
+            IF v_current.payload_state = 'creating' THEN
+                PERFORM public.flashback_internal_snapshot_abort(
+                    v_current.snapshot_id, v_op.tracking_id
+                );
+            END IF;
+            IF v_current.generation_state = 'building' THEN
+                PERFORM public.flashback_internal_transition_coverage_generation(
+                    v_op.generation_id, v_op.tracking_id,
+                    'building', 'aborted', v_reason,
+                    NULL, NULL, NULL, NULL, NULL, NULL,
+                    jsonb_build_object('external_reconciler', true)
+                );
+            END IF;
+            PERFORM public.flashback_operation_append_event(
+                v_op.operation_id, 'failed', NULL, v_reason,
+                'external snapshot maintenance could not be resumed safely',
+                jsonb_build_object(
+                    'tracking_id', v_op.tracking_id,
+                    'generation_id', v_op.generation_id,
+                    'snapshot_id', v_current.snapshot_id,
+                    'artifact_state', COALESCE(v_artifact->>'status', 'unknown')
+                )
+            );
+            v_aborted := v_aborted + 1;
+        EXCEPTION WHEN OTHERS THEN
+            -- Preserve the started reservation for retry. The subtransaction
+            -- rolls back any partial DB finalization/activation.
+            v_deferred := v_deferred + 1;
+            v_errors := v_errors + 1;
+            v_last_error := SQLSTATE || ': ' || SQLERRM;
+        END;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'status', CASE WHEN v_errors > 0 THEN 'partial' ELSE 'ok' END,
+        'cleaned', v_cleaned,
+        'resumed', v_resumed,
+        'aborted', v_aborted,
+        'deferred', v_deferred,
+        'errors', v_errors,
+        'last_error', v_last_error
+    );
+END;
+$$;
+
 -- Back-compat convenience: begin only. Callers (CLI: begin -> poll finalize)
 -- must call flashback_maintain_finalize(operation_id) once the successor is
 -- healthy; this function intentionally does not wait or poll.
@@ -1079,19 +1327,24 @@ COMMENT ON FUNCTION flashback_maintain_external_publish(bigint) IS
     'External maintenance phase three: publish the verified artifact, activate the successor, and finalize the operation.';
 COMMENT ON FUNCTION flashback_maintain_finalize(bigint) IS
     'Second phase: once successor coverage is healthy, seal the predecessor generation (retained, not deleted) and mark the maintain operation sealed. Safe to call repeatedly before that.';
+COMMENT ON FUNCTION flashback_internal_reconcile_external_maintenance(interval, integer) IS
+    '[Internal] Resume or durably abort stale external maintenance; physical orphan purge occurs only in a later transaction.';
 COMMENT ON FUNCTION flashback_maintain_execute(text) IS
     'Back-compat alias for flashback_maintain_begin(); callers must still call flashback_maintain_finalize(operation_id).';
 COMMENT ON FUNCTION flashback_prepare_uninstall(boolean) IS
     'Fail-closed uninstall preparation: refuse active lifecycles/pending restores; drop orphan slots when idle.';
 
 REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_maintenance(interval, integer) FROM PUBLIC;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
         REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM flashback_admin;
+        REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_maintenance(interval, integer) FROM flashback_admin;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM pg_monitor;
+        REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_maintenance(interval, integer) FROM pg_monitor;
     END IF;
 END
 $$;

@@ -113,7 +113,7 @@ BEGIN
         '0/1000',clock_timestamp(),'0/1000',clock_timestamp(),NULL,NULL,'{}'
     );
 END \$setup\$;
-$(if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 || "${PGFB_EXTZSTD_CLI:-0}" == 1 ]]; then cat <<'SQL'
+$(if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 || "${PGFB_EXTZSTD_CLI:-0}" == 1 || "${PGFB_EXTZSTD_RECONCILE:-0}" == 1 ]]; then cat <<'SQL'
 SELECT '0|0|0';
 SQL
 else cat <<SQL
@@ -195,6 +195,111 @@ if [[ "${PGFB_EXTZSTD_CLI:-0}" == 1 ]]; then
     exit 0
 fi
 
+if [[ "${PGFB_EXTZSTD_RECONCILE:-0}" == 1 ]]; then
+    command -v python3 >/dev/null || { echo "FAIL: python3 is required"; exit 1; }
+    SYSTEM_ID=$(q "SELECT system_identifier FROM pg_control_system()")
+    DB_OID=$(q "SELECT oid FROM pg_database WHERE datname=current_database()")
+
+    # A reservation whose copier never started becomes durable failed/aborted
+    # first; physical cleanup and its receipt happen only on a later call.
+    BEGIN1=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    OP1=$(jq -r .operation_id <<<"$BEGIN1")
+    GEN1=$(jq -r .new_generation_id <<<"$BEGIN1")
+    SNAP1=$(jq -r .snapshot_id <<<"$BEGIN1")
+    R1=$(q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)")
+    [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP1")" == failed ]] || {
+        echo "FAIL: absent copier operation was not failed: $R1"; exit 1;
+    }
+    [[ "$(q "SELECT state FROM flashback.coverage_generations WHERE generation_id=$GEN1")" == aborted ]] || {
+        echo "FAIL: absent copier generation was not aborted"; exit 1;
+    }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAP1")" == aborted ]] || {
+        echo "FAIL: absent copier snapshot was not aborted"; exit 1;
+    }
+    [[ "$(q "SELECT count(*) FROM flashback.external_artifact_cleanup_receipts WHERE snapshot_id=$SNAP1")" == 0 ]] || {
+        echo "FAIL: cleanup receipt committed in the abort transaction"; exit 1;
+    }
+    q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)" >/dev/null
+    [[ "$(q "SELECT count(*) FROM flashback.external_artifact_cleanup_receipts WHERE snapshot_id=$SNAP1")" == 1 ]] || {
+        echo "FAIL: later cleanup did not record exact receipt"; exit 1;
+    }
+
+    # A held exact lease must defer rather than deleting or aborting a live
+    # copier. Once the lease disappears, the incomplete orphan is aborted and
+    # is cleaned on the following transaction.
+    BEGIN2=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    OP2=$(jq -r .operation_id <<<"$BEGIN2")
+    NONCE2=$(jq -r .operation_nonce <<<"$BEGIN2")
+    STAGE2="$ARTIFACT_ROOT/$SYSTEM_ID/$DB_OID/.staging/$NONCE2"
+    mkdir -p "$STAGE2"
+    chmod 700 "$STAGE2"
+    : >"$STAGE2/lease"
+    chmod 600 "$STAGE2/lease"
+    python3 - "$STAGE2/lease" <<'PY' &
+import fcntl
+import sys
+import time
+
+with open(sys.argv[1], "r+") as lease:
+    fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
+    time.sleep(60)
+PY
+    LOCK_PID=$!
+    sleep 0.2
+    R2=$(q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)")
+    [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP2")" == started ]] || {
+        echo "FAIL: active copier lease was not deferred: $R2"; exit 1;
+    }
+    kill "$LOCK_PID" >/dev/null 2>&1 || true
+    wait "$LOCK_PID" >/dev/null 2>&1 || true
+    LOCK_PID=""
+    R2B=$(q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)")
+    [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP2")" == failed ]] || {
+        echo "FAIL: incomplete orphan was not failed after lease release: $R2B"; exit 1;
+    }
+    q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)" >/dev/null
+    [[ ! -e "$STAGE2" ]] || { echo "FAIL: incomplete orphan directory survived cleanup"; exit 1; }
+
+    # A fully copied artifact with a consumed boundary is resumed by the
+    # reconciler through publication, activation, and journal finalization.
+    BEGIN3=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    OP3=$(jq -r .operation_id <<<"$BEGIN3")
+    TRACK3=$(jq -r .tracking_id <<<"$BEGIN3")
+    GEN3=$(jq -r .new_generation_id <<<"$BEGIN3")
+    SNAP3=$(jq -r .snapshot_id <<<"$BEGIN3")
+    q "SELECT public.flashback_maintain_external_copy($OP3)" >/dev/null
+    for _ in $(seq 1 600); do
+        ARTIFACT3=$(q "SELECT public.flashback_internal_external_artifact_state(
+          $TRACK3,$GEN3,$SNAP3)")
+        [[ "$(jq -r .status <<<"$ARTIFACT3")" =~ ^(staging_committed|published)$ ]] && break
+        sleep 0.05
+    done
+    ARTIFACT3=${ARTIFACT3:-'{}'}
+    [[ "$(jq -r .status <<<"$ARTIFACT3")" =~ ^(staging_committed|published)$ ]] || {
+        echo "FAIL: resume fixture copier did not commit its artifact: ${ARTIFACT3:-missing}"; exit 1;
+    }
+    for _ in $(seq 1 300); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        [[ "$(q "SELECT snapshot_lsn IS NOT NULL FROM flashback.snapshots WHERE snapshot_id=$SNAP3")" == t ]] && break
+        sleep 0.05
+    done
+    [[ "$(q "SELECT snapshot_lsn IS NOT NULL FROM flashback.snapshots WHERE snapshot_id=$SNAP3")" == t ]] || {
+        echo "FAIL: resume fixture boundary did not resolve"; exit 1;
+    }
+    R3=$(q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)")
+    [[ "$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP3")" == sealed ]] || {
+        echo "FAIL: committed staged artifact did not resume to sealed: $R3"; exit 1;
+    }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAP3")" == available ]] || {
+        echo "FAIL: resumed artifact did not become available"; exit 1;
+    }
+    [[ "$(q "SELECT state FROM flashback.coverage_generations WHERE generation_id=$GEN3")" == active ]] || {
+        echo "FAIL: resumed generation did not activate"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS mode=reconcile"
+    exit 0
+fi
+
 if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 ]]; then
     PLAN=$(q "SELECT public.flashback_maintain_plan('public.ext_artifact_e2e')")
     [[ "$(jq -r .snapshot_storage_backend <<<"$PLAN")" == external_zstd ]] || {
@@ -209,8 +314,8 @@ if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 ]]; then
     SNAPSHOT=$(jq -r .snapshot_id <<<"$BEGIN_RESULT")
     TRACKING=$(jq -r .tracking_id <<<"$BEGIN_RESULT")
     COPY_RESULT=$(q "SELECT public.flashback_maintain_external_copy($OPERATION)")
-    [[ "$(jq -r .status <<<"$COPY_RESULT")" == copy_committed ]] || {
-        echo "FAIL: external maintain copy did not commit: $COPY_RESULT"; exit 1;
+    [[ "$(jq -r .status <<<"$COPY_RESULT")" == copy_in_progress ]] || {
+        echo "FAIL: external maintain copy did not start: $COPY_RESULT"; exit 1;
     }
     for _ in $(seq 1 200); do
         q "SELECT public.flashback_consume_wal(50000)" >/dev/null

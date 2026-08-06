@@ -40,8 +40,9 @@
 #![allow(dead_code)]
 
 use crate::storage::external_zstd_artifact::{
-    finalize_staged_artifact, open_published_artifact, purge_published_artifact, ArtifactStream,
-    FinalManifest, FinalizationInput, PendingArtifact, ProvisionalManifest,
+    finalize_staged_artifact, open_published_artifact, probe_external_artifact_state,
+    purge_published_artifact, purge_staged_artifact, ArtifactStream, FinalManifest,
+    FinalizationInput, PendingArtifact, ProvisionalManifest,
 };
 use crate::storage::external_zstd_format::{
     decode_datum, encode_datum, read_header, read_row, read_trailer, resolve_receive_info,
@@ -1143,6 +1144,113 @@ fn flashback_internal_finalize_external_snapshot(
         "compressed_bytes": finalized.provisional.compressed_bytes,
         "checksum_sha256": finalized.provisional.checksum_sha256,
     }))
+}
+
+fn external_reservation_nonce(
+    tracking_id: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+    require_aborted: bool,
+) -> Result<u64, String> {
+    let state_clause = if require_aborted {
+        "AND cg.state='aborted' AND s.payload_state='aborted'"
+    } else {
+        "AND cg.state IN ('building','active','aborted') \
+         AND s.payload_state IN ('creating','available','aborted')"
+    };
+    let nonce = Spi::get_one::<i64>(&format!(
+        "SELECT cg.operation_nonce \
+         FROM flashback.coverage_generations cg \
+         JOIN flashback.snapshots s \
+           ON s.snapshot_id=cg.boundary_snapshot_id \
+          AND s.tracking_id=cg.tracking_id \
+         WHERE cg.generation_id={generation_id}::bigint \
+           AND cg.tracking_id={tracking_id}::bigint \
+           AND cg.boundary_snapshot_id={snapshot_id}::bigint \
+           AND cg.storage_backend='external_zstd' \
+           AND s.storage_backend='external_zstd' {state_clause}"
+    ))
+    .map_err(|error| format!("external reservation evidence query failed: {error}"))?
+    .ok_or_else(|| {
+        "external reservation identity does not exist in the required state".to_string()
+    })?;
+    if nonce <= 0 {
+        return Err("external reservation operation_nonce is invalid".to_string());
+    }
+    Ok(nonce as u64)
+}
+
+/// Read-only, exact-identity filesystem state used by the maintenance
+/// reconciler. It never scans another database or trusts mtimes.
+#[pg_extern]
+fn flashback_internal_external_artifact_state(
+    tracking_id: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+) -> JsonB {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_external_artifact_state is owner-only");
+    }
+    let nonce = external_reservation_nonce(tracking_id, generation_id, snapshot_id, false)
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
+    let state = probe_external_artifact_state(
+        std::path::Path::new(&root),
+        unsafe { pg_sys::GetSystemIdentifier() },
+        unsafe { pg_sys::MyDatabaseId }.to_u32(),
+        tracking_id,
+        snapshot_id,
+        nonce,
+    )
+    .unwrap_or_else(|error| pgrx::error!("external artifact state probe failed: {error}"));
+    JsonB(serde_json::json!({
+        "status": state.as_str(),
+        "tracking_id": tracking_id,
+        "generation_id": generation_id,
+        "snapshot_id": snapshot_id,
+        "operation_nonce": nonce,
+    }))
+}
+
+/// Physical cleanup for a reservation whose DB generation and snapshot have
+/// already committed their aborted states. A live copier lock refuses purge;
+/// a crash between physical cleanup and this transaction's commit is safe
+/// because the durable state was established by an earlier transaction.
+#[pg_extern]
+fn flashback_internal_purge_aborted_external_artifact(
+    tracking_id: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+) -> bool {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_purge_aborted_external_artifact is owner-only");
+    }
+    let nonce = external_reservation_nonce(tracking_id, generation_id, snapshot_id, true)
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
+    let root = std::path::Path::new(&root);
+    let system_identifier = unsafe { pg_sys::GetSystemIdentifier() };
+    let database_oid = unsafe { pg_sys::MyDatabaseId }.to_u32();
+    let staged = purge_staged_artifact(root, system_identifier, database_oid, nonce)
+        .unwrap_or_else(|error| pgrx::error!("external staging purge failed: {error}"));
+    let published = purge_published_artifact(
+        root,
+        system_identifier,
+        database_oid,
+        tracking_id,
+        snapshot_id,
+        nonce,
+    )
+    .unwrap_or_else(|error| pgrx::error!("external published-orphan purge failed: {error}"));
+    staged || published
 }
 
 fn external_snapshot_health_check(

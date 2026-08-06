@@ -966,6 +966,9 @@ fn run_external_snapshot_health() {
                  IF to_regprocedure('flashback_internal_reconcile_external_snapshot_retirements(integer)') IS NOT NULL THEN
                      PERFORM flashback_internal_reconcile_external_snapshot_retirements(1);
                  END IF;
+                 IF to_regprocedure('flashback_internal_reconcile_external_maintenance(interval,integer)') IS NOT NULL THEN
+                     PERFORM flashback_internal_reconcile_external_maintenance(interval '5 minutes', 1);
+                 END IF;
              END
              $$",
     );

@@ -184,4 +184,24 @@ require 'flashback_internal_activate_external_generation'
 require 'flashback_internal_snapshot_retire_legacy'
 require 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_create'
 
+require_any() {
+  local pat=$1
+  shift
+  if ! rg -n "$pat" "$@" >/dev/null; then
+    echo "ERROR: SnapshotStore coordination surface missing $pat" >&2
+    exit 1
+  else
+    echo "OK: $pat"
+  fi
+}
+
+require_any 'flashback_internal_external_artifact_state' \
+  src/storage/external_zstd_coordinator.rs sql/functions/maintain_uninstall.sql
+require_any 'flashback_internal_purge_aborted_external_artifact' \
+  src/storage/external_zstd_coordinator.rs sql/functions/maintain_uninstall.sql
+require_any 'flashback_internal_reconcile_external_maintenance' \
+  sql/functions/maintain_uninstall.sql src/storage/worker.rs
+require_any 'external_artifact_cleanup_receipts' \
+  sql/functions/schema_bootstrap.sql sql/functions/maintain_uninstall.sql
+
 echo "OK: SnapshotStore ownership surface verification complete"

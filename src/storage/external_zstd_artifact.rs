@@ -24,6 +24,27 @@ pub const PROVISIONAL_PENDING: &str = "provisional.pending";
 pub const PROVISIONAL_FILE: &str = "provisional.json";
 pub const LEASE_FILE: &str = "lease";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalArtifactState {
+    Absent,
+    StagingActive,
+    StagingIncomplete,
+    StagingCommitted,
+    Published,
+}
+
+impl ExternalArtifactState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::StagingActive => "staging_active",
+            Self::StagingIncomplete => "staging_incomplete",
+            Self::StagingCommitted => "staging_committed",
+            Self::Published => "published",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvisionalManifest {
     pub operation_nonce: u64,
@@ -133,6 +154,155 @@ fn open_readonly(parent: &OwnedFd, name: &str) -> io::Result<File> {
         libc::O_RDONLY | libc::O_CLOEXEC,
         0,
     )
+}
+
+fn open_optional_dir(parent: &OwnedFd, name: &str) -> Result<Option<OwnedFd>, String> {
+    match open_dir_beneath(parent.as_raw_fd(), name) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("open directory {name}: {error}")),
+    }
+}
+
+/// Inspect one exact DB-reserved artifact identity without following links or
+/// trusting directory mtimes. The staging lease distinguishes a live copier
+/// from a crashed/incomplete writer; the immutable final directory wins over
+/// any stale staging observation because finalization publishes by rename.
+pub fn probe_external_artifact_state(
+    root: &Path,
+    system_identifier: u64,
+    database_oid: u32,
+    tracking_id: i64,
+    snapshot_id: i64,
+    operation_nonce: u64,
+) -> Result<ExternalArtifactState, String> {
+    let components = [
+        system_identifier.to_string(),
+        database_oid.to_string(),
+        tracking_id.to_string(),
+        format!("{snapshot_id}-{operation_nonce}"),
+        operation_nonce.to_string(),
+    ];
+    for component in &components {
+        validate_component(component)?;
+    }
+
+    let root_fd = open_root_dir(root).map_err(|e| e.to_string())?;
+    let Some(system_fd) = open_optional_dir(&root_fd, &components[0])? else {
+        return Ok(ExternalArtifactState::Absent);
+    };
+    let Some(database_fd) = open_optional_dir(&system_fd, &components[1])? else {
+        return Ok(ExternalArtifactState::Absent);
+    };
+
+    if let Some(tracking_fd) = open_optional_dir(&database_fd, &components[2])? {
+        if open_optional_dir(&tracking_fd, &components[3])?.is_some() {
+            return Ok(ExternalArtifactState::Published);
+        }
+    }
+
+    let Some(staging_parent_fd) = open_optional_dir(&database_fd, ".staging")? else {
+        return Ok(ExternalArtifactState::Absent);
+    };
+    let Some(staging_fd) = open_optional_dir(&staging_parent_fd, &components[4])? else {
+        return Ok(ExternalArtifactState::Absent);
+    };
+
+    if let Ok(lease) = open_beneath(
+        staging_fd.as_raw_fd(),
+        LEASE_FILE,
+        libc::O_RDWR | libc::O_CLOEXEC,
+        0,
+    ) {
+        let rc = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(ExternalArtifactState::StagingActive);
+            }
+            return Err(format!("lock staging lease for probe: {error}"));
+        }
+        let _ = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_UN) };
+    }
+
+    if open_readonly(&staging_fd, PROVISIONAL_FILE).is_ok() {
+        return Ok(ExternalArtifactState::StagingCommitted);
+    }
+    Ok(ExternalArtifactState::StagingIncomplete)
+}
+
+/// Remove only the exact staging directory associated with a durably-aborted
+/// DB reservation. A live copier's lease makes this fail closed. Unexpected
+/// files make the final rmdir fail instead of broadening the deletion set.
+pub fn purge_staged_artifact(
+    root: &Path,
+    system_identifier: u64,
+    database_oid: u32,
+    operation_nonce: u64,
+) -> Result<bool, String> {
+    let components = [
+        system_identifier.to_string(),
+        database_oid.to_string(),
+        operation_nonce.to_string(),
+    ];
+    for component in &components {
+        validate_component(component)?;
+    }
+    let root_fd = open_root_dir(root).map_err(|e| e.to_string())?;
+    let Some(system_fd) = open_optional_dir(&root_fd, &components[0])? else {
+        return Ok(false);
+    };
+    let Some(database_fd) = open_optional_dir(&system_fd, &components[1])? else {
+        return Ok(false);
+    };
+    let Some(staging_parent_fd) = open_optional_dir(&database_fd, ".staging")? else {
+        return Ok(false);
+    };
+    let Some(staging_fd) = open_optional_dir(&staging_parent_fd, &components[2])? else {
+        return Ok(false);
+    };
+
+    let lease = match open_beneath(
+        staging_fd.as_raw_fd(),
+        LEASE_FILE,
+        libc::O_RDWR | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("open staging lease for purge: {error}")),
+    };
+    if let Some(lease) = lease.as_ref() {
+        let rc = unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(format!(
+                "staging artifact is still owned by a copier: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    for name in [
+        ARTIFACT_TMP,
+        ARTIFACT_FILE,
+        "manifest.json",
+        PROVISIONAL_PENDING,
+        PROVISIONAL_FILE,
+        LEASE_FILE,
+    ] {
+        match unlink_beneath(staging_fd.as_raw_fd(), name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove staged {name}: {error}")),
+        }
+    }
+    fsync_fd(staging_fd.as_raw_fd()).map_err(|e| format!("fsync purged staging directory: {e}"))?;
+    drop(lease);
+    drop(staging_fd);
+    crate::storage::external_zstd::rmdir_beneath(staging_parent_fd.as_raw_fd(), &components[2])
+        .map_err(|e| format!("remove staging artifact directory: {e}"))?;
+    fsync_fd(staging_parent_fd.as_raw_fd())
+        .map_err(|e| format!("fsync staging parent after purge: {e}"))?;
+    Ok(true)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(parent: &OwnedFd, name: &str) -> Result<T, String> {
@@ -767,6 +937,67 @@ mod tests {
             .read_to_end(&mut decoded)
             .unwrap();
         assert_eq!(decoded, b"payload");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_probe_and_exact_staging_purge_are_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "pgfb-artifact-state-{}-{}",
+            std::process::id(),
+            991_002_u64
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
+
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::Absent
+        );
+        let mut stream = ArtifactStream::create(&root, 10, 20, 30, 1).unwrap();
+        stream.writer().unwrap().write_all(b"payload").unwrap();
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::StagingActive
+        );
+        assert!(purge_staged_artifact(&root, 10, 20, 30).is_err());
+
+        let pending = stream
+            .finish_copy(ProvisionalManifest {
+                operation_nonce: 30,
+                database_oid: 20,
+                tracking_id: 40,
+                generation_id: 50,
+                snapshot_id: 60,
+                format_version: 1,
+                codec: "zstd".to_string(),
+                row_count: 1,
+                uncompressed_bytes: 0,
+                compressed_bytes: 0,
+                checksum_sha256: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::StagingActive
+        );
+        pending.mark_copy_committed().unwrap();
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::StagingCommitted
+        );
+
+        std::fs::remove_file(root.join("10/20/.staging/30/provisional.json")).unwrap();
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::StagingIncomplete
+        );
+        assert!(purge_staged_artifact(&root, 10, 20, 30).unwrap());
+        assert_eq!(
+            probe_external_artifact_state(&root, 10, 20, 40, 60, 30).unwrap(),
+            ExternalArtifactState::Absent
+        );
+        assert!(!purge_staged_artifact(&root, 10, 20, 30).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

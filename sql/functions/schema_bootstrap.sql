@@ -10,6 +10,23 @@ BEGIN
 END
 $$;
 
+-- Durable receipt for non-transactional external artifact cleanup.  A crash
+-- after unlink but before this INSERT is harmless: the next pass observes an
+-- absent exact identity and inserts the receipt.  The receipt prevents old
+-- aborted reservations from starving newer reconciliation work forever.
+CREATE TABLE IF NOT EXISTS flashback.external_artifact_cleanup_receipts (
+    snapshot_id      BIGINT PRIMARY KEY,
+    tracking_id      BIGINT NOT NULL,
+    generation_id    BIGINT NOT NULL,
+    operation_nonce  BIGINT NOT NULL,
+    artifact_was_present BOOLEAN NOT NULL,
+    cleaned_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT external_artifact_cleanup_receipts_generation_key
+        UNIQUE (generation_id, tracking_id, snapshot_id),
+    CONSTRAINT external_artifact_cleanup_receipts_nonce_check
+        CHECK (operation_nonce > 0)
+);
+
 DO $$
 BEGIN
     IF to_regclass('flashback.delta_log') IS NULL THEN
@@ -708,13 +725,13 @@ BEGIN
                     OR (locator IS NOT NULL AND available_at IS NOT NULL)
                 ),
             -- NULL is legal only for a still-creating external_zstd artifact,
-            -- whose exact boundary LSN is unknowable until the transactional
-            -- marker''s COMMIT is decoded (flashback_internal_snapshot_refine_boundary).
-            -- Every available row, any backend, must have an exact LSN.
+            -- or its aborted tombstone when no marker COMMIT was ever decoded.
+            -- Every usable/available row, any backend, must have an exact LSN.
             CONSTRAINT snapshots_lsn_shape_check
                 CHECK (
                     snapshot_lsn IS NOT NULL
-                    OR (payload_state = ''creating'' AND storage_backend = ''external_zstd'')
+                    OR (payload_state IN (''creating'', ''aborted'')
+                        AND storage_backend = ''external_zstd'')
                 ),
             CONSTRAINT snapshots_external_available_shape_check
                 CHECK (
@@ -864,6 +881,15 @@ BEGIN
         -- Validated only after the backfill below has populated locator for
         -- every currently-available row (or downgraded it to missing).
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'flashback.snapshots'::regclass
+          AND conname = 'snapshots_lsn_shape_check'
+          AND pg_get_constraintdef(oid) NOT LIKE '%aborted%'
+    ) THEN
+        ALTER TABLE flashback.snapshots
+            DROP CONSTRAINT snapshots_lsn_shape_check;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'flashback.snapshots'::regclass
@@ -873,7 +899,8 @@ BEGIN
             ADD CONSTRAINT snapshots_lsn_shape_check
             CHECK (
                 snapshot_lsn IS NOT NULL
-                OR (payload_state = 'creating' AND storage_backend = 'external_zstd')
+                OR (payload_state IN ('creating', 'aborted')
+                    AND storage_backend = 'external_zstd')
             ) NOT VALID;
         -- Every pre-existing row is heap_v1 with an already-populated
         -- snapshot_lsn (it was NOT NULL until this upgrade), so this
