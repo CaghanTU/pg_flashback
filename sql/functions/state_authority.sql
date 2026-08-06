@@ -995,6 +995,118 @@ BEGIN
 END;
 $$;
 
+-- Dedicated constructor for the one intentionally incomplete generation
+-- shape used by online external SnapshotStore creation.  Keeping it separate
+-- preserves the established heap_v1 constructor signature and prevents an
+-- upgrade from leaving an obsolete overload behind.
+CREATE OR REPLACE FUNCTION flashback_internal_create_online_generation_reservation(
+    p_tracking_id bigint,
+    p_generation_no bigint,
+    p_stream_id bigint,
+    p_rel_oid oid,
+    p_snapshot_id bigint,
+    p_boundary_marker text,
+    p_parent_generation_id bigint,
+    p_recovery_profile text,
+    p_storage_backend text,
+    p_operation_nonce bigint,
+    p_details jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_stream flashback.capture_streams%ROWTYPE;
+    v_snapshot flashback.snapshots%ROWTYPE;
+    v_retired_at timestamptz;
+    v_parent_tracking_id bigint;
+    v_generation_id bigint;
+BEGIN
+    IF p_tracking_id IS NULL OR p_generation_no IS NULL OR p_stream_id IS NULL
+       OR p_rel_oid IS NULL OR p_snapshot_id IS NULL OR p_operation_nonce IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: online generation constructor requires complete identity'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_storage_backend IS DISTINCT FROM 'external_zstd'
+       OR p_boundary_marker IS DISTINCT FROM 'online_pending:' || p_operation_nonce::text
+    THEN
+        RAISE EXCEPTION 'pg_flashback: invalid external_zstd online generation reservation'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    SELECT * INTO v_stream
+    FROM flashback.capture_streams
+    WHERE stream_id = p_stream_id
+    FOR SHARE;
+    IF NOT FOUND
+       OR v_stream.state IS DISTINCT FROM 'active'
+       OR v_stream.database_oid IS DISTINCT FROM (
+           SELECT oid FROM pg_database WHERE datname=current_database()
+       )
+       OR v_stream.database_name IS DISTINCT FROM current_database()::name
+    THEN
+        RAISE EXCEPTION 'pg_flashback: online generation requires the active stream for this database'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    PERFORM public.flashback_internal_lock_database_stream(v_stream.database_oid);
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+
+    SELECT retired_at INTO v_retired_at
+    FROM flashback.tracking_lifecycles
+    WHERE tracking_id = p_tracking_id;
+    IF NOT FOUND OR v_retired_at IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: online generation requires an active lifecycle %', p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT * INTO v_snapshot
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id
+    FOR SHARE;
+    IF NOT FOUND
+       OR v_snapshot.tracking_id IS DISTINCT FROM p_tracking_id
+       OR v_snapshot.rel_oid IS DISTINCT FROM p_rel_oid
+       OR v_snapshot.payload_state IS DISTINCT FROM 'creating'
+       OR v_snapshot.storage_backend IS DISTINCT FROM 'external_zstd'
+    THEN
+        RAISE EXCEPTION 'pg_flashback: invalid creating external snapshot % for lifecycle %',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF p_parent_generation_id IS NOT NULL THEN
+        SELECT tracking_id INTO v_parent_tracking_id
+        FROM flashback.coverage_generations
+        WHERE generation_id = p_parent_generation_id;
+        IF NOT FOUND OR v_parent_tracking_id IS DISTINCT FROM p_tracking_id THEN
+            RAISE EXCEPTION 'pg_flashback: parent generation % does not belong to lifecycle %',
+                p_parent_generation_id, p_tracking_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+    END IF;
+
+    INSERT INTO flashback.coverage_generations (
+        tracking_id, generation_no, stream_id, recovery_profile, state,
+        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
+        boundary_marker, parent_generation_id, storage_backend,
+        operation_nonce, details
+    ) VALUES (
+        p_tracking_id, p_generation_no, p_stream_id,
+        COALESCE(p_recovery_profile, 'local_delta'), 'building',
+        'online_external', p_rel_oid, p_snapshot_id,
+        p_boundary_marker, p_parent_generation_id, p_storage_backend,
+        p_operation_nonce, COALESCE(p_details, '{}'::jsonb)
+    )
+    RETURNING generation_id INTO v_generation_id;
+
+    RETURN v_generation_id;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_internal_create_retirement_intent(
     p_generation_id bigint,
     p_tracking_id bigint,
@@ -1059,6 +1171,7 @@ REVOKE ALL ON FUNCTION public.flashback_internal_advance_generation_watermark(bi
 REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM PUBLIC;
 
 DO $$
@@ -1075,6 +1188,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
@@ -1089,6 +1203,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_retirement(bigint, text, text, bigint, bigint) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_capture_stream(oid, text, bigint, bigint, text, text, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_coverage_generation(bigint, bigint, bigint, text, oid, bigint, pg_lsn, timestamptz, bigint, text, bigint, text, jsonb) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_online_generation_reservation(bigint, bigint, bigint, oid, bigint, text, bigint, text, text, bigint, jsonb) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_create_retirement_intent(bigint, bigint, text, bigint, text, oid, bigint, text, text, jsonb, bigint, bigint, pg_lsn, pg_lsn, jsonb) FROM pg_monitor';
     END IF;
 END

@@ -51,6 +51,7 @@ use pgrx::bgworkers::DynamicBackgroundWorker;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
+use pgrx::JsonB;
 use std::time::Duration;
 
 /// Successful M1-M7 outcome, returned to the caller for M8 (its own
@@ -549,6 +550,61 @@ pub fn launch_copier_worker(
         .load_dynamic()
 }
 
+/// Internal owner-only entry point for the marker transaction. The SQL
+/// caller owns the transaction boundary: COMMIT makes both the binding and
+/// transactional logical message durable; ROLLBACK removes both.
+#[pg_extern]
+fn flashback_internal_run_external_marker_transaction(
+    tracking_id: i64,
+    rel_oid: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+) -> JsonB {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!(
+            "flashback_internal_run_external_marker_transaction is an internal owner-only function"
+        );
+    }
+    if tracking_id <= 0 || rel_oid <= 0 || generation_id <= 0 || snapshot_id <= 0 {
+        pgrx::error!("external marker transaction identifiers must all be positive");
+    }
+
+    let db_oid = unsafe { pg_sys::MyDatabaseId };
+    let segment = unsafe { HandoffSegment::coordinator_create(generation_id as u64) };
+    let worker = launch_copier_worker(segment.handle(), db_oid)
+        .expect("failed to launch external_zstd copier worker");
+    worker
+        .wait_for_startup()
+        .expect("external_zstd copier worker did not start");
+
+    match run_marker_transaction(
+        tracking_id,
+        pg_sys::Oid::from(rel_oid as u32),
+        generation_id,
+        snapshot_id,
+        &segment,
+        &worker,
+    ) {
+        Ok(outcome) => {
+            let result = JsonB(serde_json::json!({
+                "boundary_xid": outcome.boundary_xid,
+                "boundary_marker": outcome.boundary_marker,
+                "boundary_message_lsn": outcome.boundary_message_lsn,
+                "pinned_wal_lsn": segment.read_pinned_wal_lsn(),
+                "fetched_row_count": segment.read_fetched_row_count(),
+            }));
+            segment.detach();
+            result
+        }
+        Err(error) => {
+            segment.write_error_message(&error.to_string());
+            segment.signal(HandoffPhase::Failed);
+            segment.detach();
+            pgrx::error!("pg_flashback external marker transaction failed: {error}")
+        }
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
@@ -813,6 +869,179 @@ mod tests {
             .wait_for_startup()
             .expect("real copier worker did not start");
         (segment, worker)
+    }
+
+    fn marker_sql(fx: &Fixture, generation_id: i64, snapshot_id: i64) -> String {
+        format!(
+            "SELECT public.flashback_internal_run_external_marker_transaction(\
+             {}::bigint, {}::bigint, {generation_id}::bigint, {snapshot_id}::bigint)",
+            fx.tracking_id,
+            fx.rel_oid.to_u32()
+        )
+    }
+
+    fn assert_reservation_unbound(fx: &Fixture, generation_id: i64, snapshot_id: i64, nonce: i64) {
+        let (state, boundary_xid, boundary_marker, payload_state) =
+            generation_snapshot(fx.tracking_id, generation_id, snapshot_id);
+        assert_eq!(state, "building");
+        assert_eq!(
+            boundary_xid, None,
+            "failed marker transaction leaked a boundary xid"
+        );
+        assert_eq!(boundary_marker, format!("online_pending:{nonce}"));
+        assert_eq!(payload_state, "creating");
+        let bound_fields = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM flashback.snapshots WHERE snapshot_id = {snapshot_id}::bigint \
+             AND tracking_id = {}::bigint AND (snapshot_lsn IS NOT NULL \
+             OR schema_def <> '{{}}'::jsonb OR external_column_contract <> '[]'::jsonb)",
+            fx.tracking_id
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            bound_fields, 0,
+            "failed marker transaction leaked snapshot binding fields"
+        );
+    }
+
+    fn wait_for_relation_lock(rel_oid: pg_sys::Oid, mode: &str) {
+        for _ in 0..100 {
+            let held = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' \
+                 AND relation = {}::oid AND mode = {} AND granted)",
+                rel_oid.to_u32(),
+                quote_literal(mode)
+            ))
+            .unwrap()
+            .unwrap_or(false);
+            if held {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("timed out waiting for {mode} on relation {rel_oid:?}");
+    }
+
+    #[pg_test]
+    fn test_marker_m2_conflict_atomic_retry() {
+        let fx = setup(
+            "it_coord_m2_conflict",
+            "id int primary key, note text",
+            "it_coord_m2_conflict_slot",
+        );
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(
+            "INSERT INTO public.it_coord_m2_conflict VALUES (1, 'before')",
+        );
+        let nonce = 700007;
+        let (generation_id, snapshot_id) = reserve(&fx, nonce);
+
+        let (lock_segment, lock_worker) =
+            crate::storage::external_zstd_handoff::test_support::launch_commit_sql_worker(
+                "LOCK TABLE public.it_coord_m2_conflict IN ACCESS EXCLUSIVE MODE; \
+                 SELECT pg_sleep(3)",
+            );
+        wait_for_relation_lock(fx.rel_oid, "AccessExclusiveLock");
+
+        let marker_call = format!(
+            "SET pg_flashback.local_boundary_write_stall_ms = 200; {}",
+            marker_sql(&fx, generation_id, snapshot_id)
+        );
+        let (marker_segment, marker_worker) =
+            crate::storage::external_zstd_handoff::test_support::launch_commit_sql_worker(
+                &marker_call,
+            );
+        let marker_result = marker_segment.wait_for_state(
+            HandoffPhase::SnapshotPinned,
+            Duration::from_secs(10),
+            Some(&marker_worker),
+        );
+        assert_eq!(marker_result, Err(HandoffWaitError::PeerFailed));
+        let failure = marker_segment.read_error_message();
+        assert!(
+            failure.contains("lock not available") || failure.contains("lock timeout"),
+            "M2 failure must identify the real lock conflict, got: {failure}"
+        );
+        marker_segment.detach();
+
+        assert_reservation_unbound(&fx, generation_id, snapshot_id, nonce);
+
+        let lock_result = lock_segment.wait_for_state(
+            HandoffPhase::SnapshotPinned,
+            Duration::from_secs(10),
+            Some(&lock_worker),
+        );
+        assert_eq!(lock_result, Ok(()));
+        lock_segment.detach();
+
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&marker_sql(
+            &fx,
+            generation_id,
+            snapshot_id,
+        ));
+        let boundary_xid = Spi::get_one::<i64>(&format!(
+            "SELECT boundary_xid FROM flashback.coverage_generations \
+             WHERE generation_id = {generation_id}::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            boundary_xid > 0,
+            "retry did not commit the boundary binding"
+        );
+    }
+
+    #[pg_test]
+    fn test_marker_db_commit_visible_rollback_hidden() {
+        let fx = setup(
+            "it_coord_tx_visibility",
+            "id int primary key, note text",
+            "it_coord_tx_visibility_slot",
+        );
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(
+            "INSERT INTO public.it_coord_tx_visibility VALUES (1, 'before')",
+        );
+        let nonce = 700008;
+        let (generation_id, snapshot_id) = reserve(&fx, nonce);
+
+        let rollback_sql = format!(
+            "{}; SELECT 1 / 0",
+            marker_sql(&fx, generation_id, snapshot_id)
+        );
+        let (rollback_segment, rollback_worker) =
+            crate::storage::external_zstd_handoff::test_support::launch_commit_sql_worker(
+                &rollback_sql,
+            );
+        let rollback_result = rollback_segment.wait_for_state(
+            HandoffPhase::SnapshotPinned,
+            Duration::from_secs(15),
+            Some(&rollback_worker),
+        );
+        assert_eq!(rollback_result, Err(HandoffWaitError::PeerFailed));
+        assert!(
+            rollback_segment
+                .read_error_message()
+                .contains("division by zero"),
+            "rollback worker must fail at the deliberate post-message abort point"
+        );
+        rollback_segment.detach();
+
+        assert_reservation_unbound(&fx, generation_id, snapshot_id, nonce);
+
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&marker_sql(
+            &fx,
+            generation_id,
+            snapshot_id,
+        ));
+        let boundary_xid = Spi::get_one::<i64>(&format!(
+            "SELECT boundary_xid FROM flashback.coverage_generations \
+             WHERE generation_id = {generation_id}::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            boundary_xid > 0,
+            "committed retry did not persist the boundary binding"
+        );
     }
 
     /// Happy path + externally observable ordering: the copier's real

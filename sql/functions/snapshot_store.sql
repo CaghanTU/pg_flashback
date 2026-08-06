@@ -972,26 +972,24 @@ BEGIN
     -- NULL snapshot_lsn is not enforced -- not a dangling reference).
     v_marker := 'online_pending:' || p_operation_nonce::text;
 
-    -- operation_nonce is bound here via the dedicated, UNIQUE-constrained
-    -- column (coverage_generations_operation_nonce_key) -- this INSERT is
-    -- the actual enforcement point for the uniqueness guardrail; a
-    -- colliding p_operation_nonce raises a clear unique_violation instead
-    -- of silently aliasing two different online-create attempts. Also
-    -- mirrored into details for uniform observability alongside every
-    -- other generation row's details, but the column is authoritative.
-    INSERT INTO flashback.coverage_generations (
-        tracking_id, generation_no, stream_id, recovery_profile, state,
-        boundary_kind, rel_oid_at_boundary, boundary_snapshot_id,
-        boundary_marker, parent_generation_id, storage_backend,
-        operation_nonce, details
-    ) VALUES (
-        p_tracking_id, p_generation_no, p_stream_id, COALESCE(p_recovery_profile, 'local_delta'), 'building',
-        'online_external', p_rel_oid, v_snapshot_id,
-        v_marker, p_parent_generation_id, p_storage_backend,
+    -- Generation-row construction stays in state_authority.sql.  The
+    -- operation_nonce column's UNIQUE constraint remains the database-level
+    -- aliasing guard; this SnapshotStore routine only coordinates the atomic
+    -- snapshot reservation + centralized generation construction.
+    v_gen_id := public.flashback_internal_create_online_generation_reservation(
+        p_tracking_id,
+        p_generation_no,
+        p_stream_id,
+        p_rel_oid,
+        v_snapshot_id,
+        v_marker,
+        p_parent_generation_id,
+        COALESCE(p_recovery_profile, 'local_delta'),
+        p_storage_backend,
         p_operation_nonce,
-        COALESCE(p_details, '{}'::jsonb) || jsonb_build_object('operation_nonce', p_operation_nonce)
-    )
-    RETURNING coverage_generations.generation_id INTO v_gen_id;
+        COALESCE(p_details, '{}'::jsonb)
+            || jsonb_build_object('operation_nonce', p_operation_nonce)
+    );
 
     RETURN QUERY SELECT v_gen_id, v_snapshot_id;
 END;

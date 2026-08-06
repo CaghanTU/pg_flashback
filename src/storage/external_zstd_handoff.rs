@@ -591,8 +591,10 @@ pub extern "C-unwind" fn pg_flashback_external_zstd_handoff_selftest_worker_main
 enum SelftestMode {
     Normal = 0,
     Fail = 1,
-    /// Exit immediately without attaching or signaling anything, simulating
-    /// a hard crash before the copier ever reaches the handoff protocol.
+    /// Exit without attaching or signaling anything, simulating a hard crash
+    /// before the copier reaches the handoff protocol.  A short startup grace
+    /// makes the test deterministic: the coordinator first observes a started
+    /// worker, then observes that same peer die.
     Crash = 2,
 }
 
@@ -618,7 +620,10 @@ fn worker_body(arg: pg_sys::Datum) {
         // Deliberately exit without attaching to the segment at all -- the
         // coordinator must detect this as a dead peer via its own
         // DynamicBackgroundWorker handle, never by any signal through the
-        // DSM segment (there is none).
+        // DSM segment (there is none).  Do not race wait_for_startup(): that
+        // would test the bgworker registry's startup-status timing instead of
+        // HandoffSegment::wait_for_state's PeerDead path.
+        std::thread::sleep(Duration::from_secs(1));
         return;
     }
 

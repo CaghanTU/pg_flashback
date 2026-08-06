@@ -180,7 +180,7 @@ pub unsafe fn encode_datum(datum: pg_sys::Datum, send: &TypeSendInfo) -> Vec<u8>
     // correctly, unlike assuming a fixed 4-byte header).
     let varlena_ptr = bytea_ptr.cast::<pg_sys::varlena>();
     let len = varsize_any_exhdr(varlena_ptr);
-    let data_ptr = vardata_any(varlena_ptr) as *const u8;
+    let data_ptr = vardata_any(varlena_ptr).cast::<u8>();
     std::slice::from_raw_parts(data_ptr, len).to_vec()
 }
 

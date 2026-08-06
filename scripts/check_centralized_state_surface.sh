@@ -23,8 +23,15 @@ def scan_text(raw_text, filename):
     if basename in ('state_authority.sql', 'schema_bootstrap.sql'):
         return errors
 
-    if re.search(r'\bUPDATE\s+flashback\.(capture_streams|coverage_generations|generation_payload_retirements)\b[^;]*?\bSET\b[^;]*?\bstate\s*=', text, re.IGNORECASE | re.DOTALL):
-        errors.append("Direct UPDATE state= outside state_authority")
+    for match in re.finditer(
+        r'\bUPDATE\s+flashback\.(capture_streams|coverage_generations|generation_payload_retirements)\b(?P<body>[^;]*)',
+        text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        set_clause = re.split(r'\bWHERE\b', match.group('body'), maxsplit=1, flags=re.IGNORECASE)[0]
+        if re.search(r'\bSET\b[\s\S]*?(?<![A-Za-z0-9_])state\s*=', set_clause, re.IGNORECASE):
+            errors.append("Direct UPDATE state= outside state_authority")
+            break
 
     if re.search(r'\bINSERT\s+INTO\s+flashback\.(capture_streams|coverage_generations|generation_payload_retirements)\b', text, re.IGNORECASE):
         errors.append("Scattered INSERT into state tables outside state_authority")
@@ -44,6 +51,7 @@ def run_selftests():
     print("==> Running linter selftest suite")
     test_cases = [
         ("UPDATE flashback.capture_streams\nSET\n  state = 'broken'", True),
+        ("UPDATE flashback.coverage_generations SET boundary_xid=7 WHERE state='building'", False),
         ("INSERT INTO flashback.coverage_generations (tracking_id) VALUES (1)", True),
         ("UPDATE flashback.operations SET details = '{}'", True),
         ("DELETE FROM flashback.operation_events WHERE operation_id = 1", True),
@@ -107,6 +115,7 @@ require 'flashback_internal_lock_database_stream'
 require 'flashback_internal_lock_lifecycles'
 require 'flashback_internal_create_capture_stream'
 require 'flashback_internal_create_coverage_generation'
+require 'flashback_internal_create_online_generation_reservation'
 require 'flashback_internal_create_retirement_intent'
 require 'REVOKE ALL ON FUNCTION public.flashback_internal_transition_capture_stream'
 
