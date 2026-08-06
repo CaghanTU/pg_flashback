@@ -1159,8 +1159,31 @@ BEGIN
             constraints     JSONB NOT NULL DEFAULT ''{}''::jsonb,
             schema_def      JSONB,
             helper_schema_sha256 TEXT,
-            UNIQUE(rel_oid, schema_version)
+            CONSTRAINT schema_versions_generation_schema_version_key
+                UNIQUE(tracking_id, generation_id, schema_version)
         )';
+    END IF;
+END
+$$;
+
+-- Schema epochs are coverage-generation evidence, not a property of a
+-- physical rel_oid alone.  An online SnapshotStore successor deliberately
+-- captures the same logical epoch as its active predecessor before it owns
+-- later DDL.  The legacy rel_oid/version key made that honest overlap
+-- impossible and tempted callers to advance tracked_tables prematurely.
+DO $$
+BEGIN
+    ALTER TABLE flashback.schema_versions
+        DROP CONSTRAINT IF EXISTS schema_versions_rel_oid_schema_version_key;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint c
+        WHERE c.conrelid = 'flashback.schema_versions'::regclass
+          AND c.conname = 'schema_versions_generation_schema_version_key'
+    ) THEN
+        ALTER TABLE flashback.schema_versions
+            ADD CONSTRAINT schema_versions_generation_schema_version_key
+            UNIQUE (tracking_id, generation_id, schema_version);
     END IF;
 END
 $$;

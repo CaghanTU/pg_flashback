@@ -1517,7 +1517,6 @@ DECLARE
     v_marker text;
     v_schema_def jsonb;
     v_column_contract jsonb;
-    v_previous_schema_version bigint;
     v_schema_version bigint;
     v_applied_lsn pg_lsn;
     v_n integer;
@@ -1587,17 +1586,16 @@ BEGIN
     v_schema_def := public.flashback_collect_schema_def(p_rel_oid);
     v_column_contract := public.flashback_internal_materializable_columns(p_rel_oid);
     SELECT COALESCE(tt.schema_version, 1)
-      INTO v_previous_schema_version
+      INTO v_schema_version
     FROM flashback.tracked_tables tt
     WHERE tt.tracking_id = p_tracking_id
       AND tt.is_active
       AND tt.rel_oid = p_rel_oid;
-    IF v_previous_schema_version IS NULL THEN
+    IF v_schema_version IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: tracked lifecycle % changed before online boundary bind',
             p_tracking_id
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
-    v_schema_version := v_previous_schema_version + 1;
     v_applied_lsn := pg_current_wal_insert_lsn();
 
     IF v_column_contract = '[]'::jsonb THEN
@@ -1635,19 +1633,6 @@ BEGIN
     IF v_n <> 1 THEN
         RAISE EXCEPTION 'pg_flashback: snapshot % boundary bind raced (expected exactly 1 row)',
             p_snapshot_id
-            USING ERRCODE = 'serialization_failure';
-    END IF;
-
-    UPDATE flashback.tracked_tables
-       SET schema_version = v_schema_version
-     WHERE tracking_id = p_tracking_id
-       AND rel_oid = p_rel_oid
-       AND is_active
-       AND COALESCE(schema_version, 1) = v_previous_schema_version;
-    GET DIAGNOSTICS v_n = ROW_COUNT;
-    IF v_n <> 1 THEN
-        RAISE EXCEPTION 'pg_flashback: lifecycle % schema epoch changed during online boundary bind',
-            p_tracking_id
             USING ERRCODE = 'serialization_failure';
     END IF;
 
@@ -1855,12 +1840,28 @@ DECLARE
     v_generation flashback.coverage_generations%ROWTYPE;
     v_parent flashback.coverage_generations%ROWTYPE;
     v_snapshot flashback.snapshots%ROWTYPE;
+    v_database_oid oid;
 BEGIN
     IF p_generation_id IS NULL OR p_tracking_id IS NULL OR p_snapshot_id IS NULL THEN
         RAISE EXCEPTION 'pg_flashback: external activation requires exact generation, tracking, and snapshot identities'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
+    -- Canonical global order is stream -> lifecycle.  Holding the stream lock
+    -- also serializes this handoff with WAL promotion, so every already-
+    -- consumed post-boundary fact can be reassigned atomically before the
+    -- successor becomes active.
+    SELECT cs.database_oid INTO v_database_oid
+    FROM flashback.coverage_generations cg
+    JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
+    WHERE cg.generation_id = p_generation_id
+      AND cg.tracking_id = p_tracking_id;
+    IF v_database_oid IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: external generation % has no local capture stream',
+            p_generation_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    PERFORM public.flashback_internal_lock_database_stream(v_database_oid);
     PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
 
     SELECT * INTO v_generation
@@ -1899,6 +1900,42 @@ BEGIN
 
     IF v_generation.state = 'active' THEN
         RETURN false;
+    END IF;
+
+    -- The external copy is online: while its artifact was being written, the
+    -- WAL worker correctly kept the predecessor active and may already have
+    -- promoted changes after the snapshot boundary into that predecessor.
+    -- Transfer those exact facts before sealing it.  Pending DDL is included
+    -- so a transaction staged before activation but decoded afterwards keeps
+    -- one generation identity.  All rows remain on the same tracking/stream;
+    -- only ownership at the proven boundary changes.
+    IF v_generation.parent_generation_id IS NOT NULL THEN
+        UPDATE flashback.delta_log
+           SET generation_id = p_generation_id
+         WHERE tracking_id = p_tracking_id
+           AND generation_id = v_generation.parent_generation_id
+           AND stream_id = v_generation.stream_id
+           AND commit_lsn > v_snapshot.snapshot_lsn;
+
+        UPDATE flashback.schema_versions
+           SET generation_id = p_generation_id
+         WHERE tracking_id = p_tracking_id
+           AND generation_id = v_generation.parent_generation_id
+           AND stream_id = v_generation.stream_id
+           AND (
+                commit_lsn > v_snapshot.snapshot_lsn
+                -- A visible unstamped row is a committed DDL transaction
+                -- whose COMMIT has not yet been consumed. Boundary refinement
+                -- already consumed the marker COMMIT, so it belongs after the
+                -- external snapshot even if its statement LSN is older.
+                OR commit_lsn IS NULL
+           );
+
+        UPDATE flashback.pending_wal_events
+           SET generation_id = p_generation_id
+         WHERE tracking_id = p_tracking_id
+           AND generation_id = v_generation.parent_generation_id
+           AND stream_id = v_generation.stream_id;
     END IF;
 
     IF v_generation.parent_generation_id IS NOT NULL THEN

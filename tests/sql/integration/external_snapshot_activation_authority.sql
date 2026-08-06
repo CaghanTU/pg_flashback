@@ -122,3 +122,139 @@ BEGIN
     PERFORM public.flashback_set_restore_in_progress(false);
 END;
 $test$;
+
+-- An online successor must inherit every post-boundary fact that the WAL
+-- worker promoted while the predecessor was still the only active
+-- generation.  This is the exact concurrency window between boundary bind
+-- and immutable artifact publication.
+DO $test$
+DECLARE
+    v_boot record;
+    v_db oid := (SELECT oid FROM pg_database WHERE datname = current_database());
+    v_tracking bigint;
+    v_parent bigint;
+    v_stream bigint;
+    v_rel oid;
+    v_reserved record;
+    v_bound record;
+    v_snap flashback.snapshots%ROWTYPE;
+    v_locator jsonb;
+    v_parent_schema_version bigint;
+BEGIN
+    CREATE TABLE public.it_external_handoff (id integer PRIMARY KEY, note text);
+    INSERT INTO public.it_external_handoff VALUES (1, 'boundary');
+    v_rel := 'public.it_external_handoff'::regclass;
+    SELECT stream_id INTO STRICT v_stream
+    FROM flashback.capture_streams
+    WHERE database_oid = v_db AND state = 'active';
+    SELECT * INTO STRICT v_boot
+    FROM public.flashback_bootstrap_local_delta_lifecycle_core(
+        v_rel, v_stream, 'd'::"char", NULL
+    );
+    v_tracking := v_boot.out_tracking_id;
+    v_parent := v_boot.out_generation_id;
+    PERFORM public.flashback_test_inject_commit(
+        v_tracking, '0/A82000'::pg_lsn, clock_timestamp(),
+        v_boot.out_boundary_xid, '[]'::jsonb
+    );
+
+    SELECT * INTO v_reserved
+    FROM public.flashback_internal_reserve_online_generation(
+        p_tracking_id => v_tracking, p_rel_oid => v_rel,
+        p_stream_id => v_stream, p_generation_no => 2,
+        p_parent_generation_id => v_parent,
+        p_storage_backend => 'external_zstd', p_operation_nonce => 881002
+    );
+    SELECT * INTO v_bound
+    FROM public.flashback_internal_bind_online_boundary(
+        v_reserved.generation_id, v_tracking, v_reserved.snapshot_id, v_rel
+    );
+    PERFORM public.flashback_test_inject_commit(
+        v_tracking, '0/A83000'::pg_lsn, clock_timestamp(),
+        v_bound.boundary_xid, '[]'::jsonb
+    );
+
+    -- Both facts are deliberately consumed before external activation and
+    -- therefore initially land on the still-active predecessor.
+    PERFORM public.flashback_test_inject_commit(
+        v_tracking, '0/A84000'::pg_lsn, clock_timestamp(), 881003,
+        jsonb_build_array(jsonb_build_object(
+            'op', 'UPDATE',
+            'old', '{"id":1,"note":"boundary"}'::jsonb,
+            'new', '{"id":1,"note":"after-boundary"}'::jsonb
+        ))
+    );
+    PERFORM public.flashback_test_inject_ddl_commit(
+        v_tracking, '0/A85000'::pg_lsn, clock_timestamp(), 881004,
+        'ALTER', public.flashback_collect_schema_def(v_rel)
+    );
+    IF NOT EXISTS (
+        SELECT 1 FROM flashback.delta_log
+        WHERE tracking_id = v_tracking AND generation_id = v_parent
+          AND commit_lsn = '0/A84000'::pg_lsn
+    ) THEN
+        RAISE EXCEPTION 'fixture did not place post-boundary DML on predecessor';
+    END IF;
+    SELECT schema_version INTO v_parent_schema_version
+    FROM flashback.schema_versions
+    WHERE tracking_id = v_tracking AND generation_id = v_parent
+      AND commit_lsn = '0/A85000'::pg_lsn;
+    IF v_parent_schema_version IS NULL THEN
+        RAISE EXCEPTION 'fixture did not place post-boundary DDL on predecessor';
+    END IF;
+
+    SELECT * INTO v_snap FROM flashback.snapshots
+    WHERE snapshot_id = v_reserved.snapshot_id;
+    v_locator := jsonb_build_object(
+        'system_identifier', (pg_control_system()).system_identifier::text,
+        'database_oid', v_db::text,
+        'tracking_id', v_tracking::text,
+        'snapshot_id', v_reserved.snapshot_id::text,
+        'nonce', '881002'
+    );
+    PERFORM public.flashback_internal_publish_external_snapshot(
+        v_reserved.snapshot_id, v_tracking, v_reserved.generation_id, 881002,
+        v_locator, 1, 'zstd', 1, 1, 1, repeat('b', 64),
+        v_snap.external_column_contract,
+        public.flashback_sha256(v_snap.schema_def::text)
+    );
+    PERFORM public.flashback_internal_activate_external_generation(
+        v_reserved.generation_id, v_tracking, v_reserved.snapshot_id
+    );
+
+    IF EXISTS (
+        SELECT 1 FROM flashback.delta_log
+        WHERE tracking_id = v_tracking AND generation_id = v_parent
+          AND commit_lsn > '0/A83000'::pg_lsn
+    ) OR NOT EXISTS (
+        SELECT 1 FROM flashback.delta_log
+        WHERE tracking_id = v_tracking
+          AND generation_id = v_reserved.generation_id
+          AND commit_lsn = '0/A84000'::pg_lsn
+    ) THEN
+        RAISE EXCEPTION 'post-boundary DML was not handed to external successor';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM flashback.schema_versions
+        WHERE tracking_id = v_tracking AND generation_id = v_parent
+          AND schema_version = v_parent_schema_version
+    ) OR NOT EXISTS (
+        SELECT 1 FROM flashback.schema_versions
+        WHERE tracking_id = v_tracking
+          AND generation_id = v_reserved.generation_id
+          AND schema_version = v_parent_schema_version
+          AND commit_lsn = '0/A85000'::pg_lsn
+    ) THEN
+        RAISE EXCEPTION 'post-boundary schema epoch was not handed to external successor';
+    END IF;
+    IF (SELECT schema_version FROM flashback.tracked_tables
+        WHERE tracking_id = v_tracking) IS DISTINCT FROM v_parent_schema_version
+    THEN
+        RAISE EXCEPTION 'tracked lifecycle schema epoch diverged during handoff';
+    END IF;
+
+    PERFORM public.flashback_set_restore_in_progress(true);
+    DROP TABLE public.it_external_handoff;
+    PERFORM public.flashback_set_restore_in_progress(false);
+END;
+$test$;
