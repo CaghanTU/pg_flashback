@@ -474,6 +474,7 @@ DECLARE
     v_old_rel_oid oid;
     v_live_oid oid;
     v_capacity_rel oid;
+    v_snapshot_capacity_checked boolean := false;
     v_current_generation_id bigint;
     v_new_stream_id bigint;
     v_new_snapshot_id bigint;
@@ -633,7 +634,14 @@ BEGIN
         SELECT * INTO v_boundary_snap
         FROM flashback_internal_snapshot_resolve(admission.boundary_snapshot_id, admission.tracking_id);
         v_capacity_rel := v_boundary_snap.payload_relid;
-        IF v_capacity_rel IS NULL THEN
+        IF v_capacity_rel IS NULL
+           AND v_boundary_snap.storage_backend = 'external_zstd'
+        THEN
+            PERFORM flashback_local_restore_preflight_snapshot(
+                admission.boundary_snapshot_id, admission.tracking_id
+            );
+            v_snapshot_capacity_checked := true;
+        ELSIF v_capacity_rel IS NULL THEN
             RAISE EXCEPTION 'pg_flashback: cannot admit restore capacity for dropped table % without boundary snapshot %',
                 p_target_table, admission.snapshot_table;
         END IF;
@@ -641,7 +649,9 @@ BEGIN
 
     -- Capacity preflight before the final-strength relation lock (or before
     -- reconstruct when the live relation is already absent).
-    PERFORM flashback_local_restore_preflight(v_capacity_rel);
+    IF NOT v_snapshot_capacity_checked THEN
+        PERFORM flashback_local_restore_preflight(v_capacity_rel);
+    END IF;
     PERFORM flashback_apply_local_boundary_lock_timeout();
 
     IF v_live_oid IS NOT NULL THEN
@@ -714,6 +724,7 @@ DECLARE
     v_old_rel_oid oid;
     v_live_oid oid;
     v_capacity_rel oid;
+    v_snapshot_capacity_checked boolean := false;
     v_current_generation_id bigint;
     v_new_stream_id bigint;
     v_new_snapshot_id bigint;
@@ -761,13 +772,22 @@ BEGIN
         SELECT * INTO v_boundary_snap
         FROM flashback_internal_snapshot_resolve(admission.boundary_snapshot_id, admission.tracking_id);
         v_capacity_rel := v_boundary_snap.payload_relid;
-        IF v_capacity_rel IS NULL THEN
+        IF v_capacity_rel IS NULL
+           AND v_boundary_snap.storage_backend = 'external_zstd'
+        THEN
+            PERFORM flashback_local_restore_preflight_snapshot(
+                admission.boundary_snapshot_id, admission.tracking_id
+            );
+            v_snapshot_capacity_checked := true;
+        ELSIF v_capacity_rel IS NULL THEN
             RAISE EXCEPTION 'pg_flashback: cannot revalidate restore capacity for dropped table % without boundary snapshot %',
                 p_target_table, admission.snapshot_table;
         END IF;
     END IF;
     -- Revalidate capacity before materialization.
-    PERFORM flashback_local_restore_preflight(v_capacity_rel);
+    IF NOT v_snapshot_capacity_checked THEN
+        PERFORM flashback_local_restore_preflight(v_capacity_rel);
+    END IF;
 
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg

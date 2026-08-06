@@ -39,6 +39,22 @@ fn flashback_tablespace_filesystem_available_bytes(tablespace_oid: pgrx::pg_sys:
         .unwrap_or_else(|message| pgrx::error!("pg_flashback: {message}"))
 }
 
+/// Return available bytes on the configured external SnapshotStore root.
+/// Root ownership/mode/symlink validation is repeated here so capacity advice
+/// can never make an unsafe path look admissible.
+#[pg_extern(stable, name = "flashback_external_filesystem_available_bytes")]
+fn flashback_external_filesystem_available_bytes() -> i64 {
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|message| pgrx::error!("pg_flashback: {message}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|message| {
+            pgrx::error!("pg_flashback: unsafe external snapshot root: {message}")
+        });
+    available_bytes_for_path(Path::new(&root))
+        .unwrap_or_else(|message| pgrx::error!("pg_flashback: {message}"))
+}
+
 fn available_bytes_for_path(path: &Path) -> Result<i64, String> {
     let probe = if path.is_dir() {
         path.to_path_buf()

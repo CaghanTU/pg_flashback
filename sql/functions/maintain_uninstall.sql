@@ -389,7 +389,17 @@ DECLARE
     v_maintenance_status text;
     v_recommended boolean;
     v_required boolean;
+    v_backend text;
+    v_capacity jsonb;
 BEGIN
+    v_backend := lower(COALESCE(
+        NULLIF(current_setting('pg_flashback.snapshot_storage_backend', true), ''),
+        'heap_v1'
+    ));
+    IF v_backend NOT IN ('heap_v1', 'external_zstd') THEN
+        RAISE EXCEPTION 'pg_flashback: invalid snapshot_storage_backend %', v_backend
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
     IF NOT flashback_is_actively_protected(v_name) THEN
         RETURN jsonb_build_object(
             'schema_version', 1,
@@ -425,11 +435,28 @@ BEGIN
           AND cg.state = 'building'
     ) INTO v_building;
 
-    BEGIN
-        SELECT * INTO v_advise FROM flashback_advise(v_name::regclass);
-    EXCEPTION WHEN OTHERS THEN
-        v_advise := NULL;
-    END;
+    IF v_backend = 'external_zstd' THEN
+        BEGIN
+            SELECT to_jsonb(m) INTO v_capacity
+            FROM flashback_measure_external_snapshot_capacity(v_name::regclass) m;
+        EXCEPTION WHEN OTHERS THEN
+            v_capacity := jsonb_build_object(
+                'admissible', false,
+                'error', SQLERRM
+            );
+        END;
+    ELSE
+        BEGIN
+            SELECT * INTO v_advise FROM flashback_advise(v_name::regclass);
+            v_capacity := CASE WHEN v_advise IS NULL THEN NULL ELSE to_jsonb(v_advise) END;
+        EXCEPTION WHEN OTHERS THEN
+            v_advise := NULL;
+            v_capacity := jsonb_build_object(
+                'admissible', false,
+                'error', SQLERRM
+            );
+        END;
+    END IF;
 
     v_storage := flashback_lifecycle_storage_metrics(v_name);
     v_storage_status := COALESCE(v_storage->>'status', 'unknown');
@@ -443,6 +470,9 @@ BEGIN
     -- not_needed: none of the above.
     v_maintenance_status := CASE
         WHEN v_pending_restore OR v_building OR v_storage_status = 'blocked' THEN 'blocked'
+        WHEN v_backend = 'external_zstd'
+             AND NOT COALESCE((v_capacity->>'admissible')::boolean, false)
+        THEN 'blocked'
         WHEN v_health IN ('timeline_mismatch', 'repository_anchor_missing', 'slot_lost', 'reanchor_recommended')
         THEN 'required'
         WHEN v_storage_status IN ('hard', 'fs_reserve_breached') THEN 'required'
@@ -464,23 +494,136 @@ BEGIN
         'code', CASE
             WHEN v_pending_restore THEN 'pending_restore'
             WHEN v_building THEN 'generation_building'
+            WHEN v_backend = 'external_zstd'
+                 AND NOT COALESCE((v_capacity->>'admissible')::boolean, false)
+            THEN 'external_capacity_insufficient'
             ELSE 'ok'
         END,
         'coverage_health', v_health,
         'maintenance_status', v_maintenance_status,
         'recommended', v_recommended,
         'required', v_required,
+        'snapshot_storage_backend', v_backend,
         'pending_restore', v_pending_restore,
         'generation_building', v_building,
         'storage', v_storage,
-        'capacity', CASE WHEN v_advise IS NULL THEN NULL ELSE to_jsonb(v_advise) END,
+        'capacity', v_capacity,
         'action', CASE
+            WHEN v_backend = 'external_zstd'
+                 AND NOT COALESCE((v_capacity->>'admissible')::boolean, false)
+            THEN 'configure a safe external_snapshot_root and free-space budgets before maintain'
             WHEN v_storage_status = 'blocked' THEN 'lifecycle is frozen by a permanent storage gap; raise budgets/free disk, then track a fresh lifecycle'
             WHEN v_storage_status IN ('hard', 'fs_reserve_breached') THEN 'flashback_maintain_begin urgently: retained payload/filesystem reserve is over budget'
             ELSE 'flashback_maintain_begin creates a new WAL-aligned base/generation; predecessor stays retained until successor is healthy'
         END,
         'note', 'dry-run only; execute via flashback_maintain_begin + flashback_maintain_finalize (or CLI maintain --yes)'
     );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_internal_reserve_external_maintenance(p_table text)
+RETURNS TABLE (
+    tracking_id bigint,
+    rel_oid oid,
+    parent_generation_id bigint,
+    generation_id bigint,
+    snapshot_id bigint,
+    operation_nonce bigint
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_tracking_id bigint;
+    v_rel_oid oid;
+    v_schema text;
+    v_table text;
+    v_stream_id bigint;
+    v_parent bigint;
+    v_generation_no bigint;
+    v_generation bigint;
+    v_snapshot bigint;
+    v_nonce bigint;
+BEGIN
+    PERFORM public.flashback_require_primary('flashback_maintain_begin');
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'pg_flashback: external maintenance requires READ COMMITTED isolation';
+    END IF;
+
+    SELECT r.tracking_id, r.rel_oid, r.schema_name, r.table_name
+      INTO v_tracking_id, v_rel_oid, v_schema, v_table
+    FROM public.flashback_internal_resolve_tracked_table(p_table) r;
+    IF v_tracking_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: % is not an active local_delta lifecycle', p_table;
+    END IF;
+
+    v_stream_id := public.flashback_ensure_active_wal_stream();
+    IF v_stream_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: no usable logical slot exists for external maintenance';
+    END IF;
+    PERFORM public.flashback_internal_lock_lifecycle(v_tracking_id);
+
+    SELECT tt.rel_oid, tt.schema_name, tt.table_name
+      INTO v_rel_oid, v_schema, v_table
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = v_tracking_id
+      AND tt.is_active
+      AND tt.recovery_profile = 'local_delta'
+    FOR UPDATE;
+    IF NOT FOUND
+       OR to_regclass(format('%I.%I', v_schema, v_table))::oid IS DISTINCT FROM v_rel_oid
+    THEN
+        RAISE EXCEPTION 'pg_flashback: tracked table identity changed before external reservation';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM flashback.coverage_generations
+        WHERE flashback.coverage_generations.tracking_id = v_tracking_id
+          AND state = 'building'
+    ) THEN
+        RAISE EXCEPTION 'pg_flashback: lifecycle % already has a pending generation',
+            v_tracking_id USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT cg.generation_id INTO v_parent
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracking_id AND cg.state = 'active'
+    FOR UPDATE;
+    IF v_parent IS NULL THEN
+        SELECT cg.generation_id INTO v_parent
+        FROM flashback.coverage_generations cg
+        WHERE cg.tracking_id = v_tracking_id AND cg.state = 'aborted'
+        ORDER BY cg.generation_no DESC
+        LIMIT 1
+        FOR UPDATE;
+    END IF;
+    IF v_parent IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: lifecycle % has no active or aborted predecessor',
+            v_tracking_id;
+    END IF;
+
+    PERFORM public.flashback_admit_external_snapshot_capacity(v_rel_oid::regclass);
+    SELECT COALESCE(max(cg.generation_no), 0) + 1
+      INTO v_generation_no
+    FROM flashback.coverage_generations cg
+    WHERE cg.tracking_id = v_tracking_id;
+    v_nonce := txid_current();
+
+    SELECT r.generation_id, r.snapshot_id
+      INTO v_generation, v_snapshot
+    FROM public.flashback_internal_reserve_online_generation(
+        v_tracking_id, v_rel_oid, v_stream_id, v_generation_no, v_parent,
+        'external_zstd', v_nonce, 'local_delta',
+        jsonb_build_object('source', 'maintain')
+    ) r;
+
+    tracking_id := v_tracking_id;
+    rel_oid := v_rel_oid;
+    parent_generation_id := v_parent;
+    generation_id := v_generation;
+    snapshot_id := v_snapshot;
+    operation_nonce := v_nonce;
+    RETURN NEXT;
 END;
 $$;
 
@@ -497,7 +640,15 @@ DECLARE
     v_predecessor_generation_id bigint;
     v_new_generation_id bigint;
     v_operation_id bigint;
+    v_backend text;
+    v_snapshot_id bigint;
+    v_rel_oid oid;
+    v_operation_nonce bigint;
 BEGIN
+    IF txid_current_if_assigned() IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_maintain_begin() must be the first write in a dedicated transaction'
+            USING HINT = 'COMMIT or ROLLBACK, then retry pg_flashback maintain.';
+    END IF;
     v_plan := flashback_maintain_plan(p_table);
     IF COALESCE(v_plan->>'status', '') <> 'ok' THEN
         RAISE EXCEPTION 'pg_flashback: maintain refused (%)', COALESCE(v_plan->>'code', 'unknown')
@@ -513,6 +664,46 @@ BEGIN
     END IF;
 
     v_name := v_plan->>'table_name';
+    v_backend := COALESCE(v_plan->>'snapshot_storage_backend', 'heap_v1');
+
+    IF v_backend = 'external_zstd' THEN
+        SELECT r.tracking_id, r.rel_oid, r.parent_generation_id,
+               r.generation_id, r.snapshot_id, r.operation_nonce
+          INTO v_tracking_id, v_rel_oid, v_predecessor_generation_id,
+               v_new_generation_id, v_snapshot_id, v_operation_nonce
+        FROM public.flashback_internal_reserve_external_maintenance(v_name) r;
+
+        v_operation_id := flashback_operation_begin(
+            p_command => 'maintain',
+            p_table => v_name,
+            p_tracking_id => v_tracking_id,
+            p_generation_id => v_new_generation_id,
+            p_details => jsonb_build_object(
+                'predecessor_generation_id', v_predecessor_generation_id,
+                'successor_generation_id', v_new_generation_id,
+                'snapshot_id', v_snapshot_id,
+                'rel_oid', v_rel_oid,
+                'operation_nonce', v_operation_nonce,
+                'storage_backend', 'external_zstd'
+            )
+        );
+
+        RETURN jsonb_build_object(
+            'schema_version', 1,
+            'status', 'reserved',
+            'code', 'external_copy_required',
+            'operation_id', v_operation_id,
+            'table_name', v_name,
+            'tracking_id', v_tracking_id,
+            'predecessor_generation_id', v_predecessor_generation_id,
+            'new_generation_id', v_new_generation_id,
+            'snapshot_id', v_snapshot_id,
+            'rel_oid', v_rel_oid,
+            'operation_nonce', v_operation_nonce,
+            'storage_backend', 'external_zstd',
+            'note', 'reservation committed; run the external copy/marker phase in a new transaction'
+        );
+    END IF;
 
     SELECT tt.tracking_id INTO v_tracking_id
     FROM flashback.tracked_tables tt
@@ -554,6 +745,105 @@ BEGIN
         'predecessor_generation_id', v_predecessor_generation_id,
         'new_generation_id', v_new_generation_id,
         'note', 'reanchor and this operation row committed together; call flashback_maintain_finalize(operation_id) once successor coverage is healthy — predecessor stays retained (not deleted) until then'
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_maintain_external_copy(p_operation_id bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_op record;
+    v_details jsonb;
+    v_result jsonb;
+    v_snapshot_id bigint;
+    v_rel_oid bigint;
+BEGIN
+    SELECT s.*, o.details
+      INTO v_op
+    FROM flashback.operation_current_state s
+    JOIN flashback.operations o ON o.operation_id = s.operation_id
+    WHERE s.operation_id = p_operation_id
+      AND s.command = 'maintain'
+      AND s.state = 'started';
+    IF v_op.operation_id IS NULL
+       OR v_op.details->>'storage_backend' IS DISTINCT FROM 'external_zstd'
+    THEN
+        RAISE EXCEPTION 'pg_flashback: operation % is not a pending external maintenance copy',
+            p_operation_id USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    v_details := v_op.details;
+    v_snapshot_id := (v_details->>'snapshot_id')::bigint;
+    v_rel_oid := (v_details->>'rel_oid')::bigint;
+    SELECT public.flashback_internal_run_external_marker_transaction(
+        v_op.tracking_id, v_rel_oid, v_op.generation_id, v_snapshot_id
+    ) INTO v_result;
+    RETURN jsonb_build_object(
+        'schema_version', 1,
+        'status', 'copy_committed',
+        'operation_id', p_operation_id,
+        'tracking_id', v_op.tracking_id,
+        'generation_id', v_op.generation_id,
+        'snapshot_id', v_snapshot_id,
+        'copy', v_result
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_maintain_external_publish(p_operation_id bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_op record;
+    v_snapshot_id bigint;
+    v_publish jsonb;
+    v_finalize jsonb;
+BEGIN
+    SELECT s.*, o.details
+      INTO v_op
+    FROM flashback.operation_current_state s
+    JOIN flashback.operations o ON o.operation_id = s.operation_id
+    WHERE s.operation_id = p_operation_id
+      AND s.command = 'maintain'
+      AND s.state = 'started';
+    IF v_op.operation_id IS NULL
+       OR v_op.details->>'storage_backend' IS DISTINCT FROM 'external_zstd'
+    THEN
+        RAISE EXCEPTION 'pg_flashback: operation % is not a pending external maintenance publish',
+            p_operation_id USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    v_snapshot_id := (v_op.details->>'snapshot_id')::bigint;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM flashback.snapshots s
+        WHERE s.snapshot_id = v_snapshot_id
+          AND s.tracking_id = v_op.tracking_id
+          AND s.payload_state IN ('creating', 'available')
+          AND s.snapshot_lsn IS NOT NULL
+    ) THEN
+        RETURN jsonb_build_object(
+            'schema_version', 1,
+            'status', 'pending',
+            'operation_id', p_operation_id,
+            'reason', 'external boundary COMMIT LSN is not resolved yet'
+        );
+    END IF;
+    SELECT public.flashback_internal_finalize_external_snapshot(
+        v_op.tracking_id, v_op.generation_id, v_snapshot_id
+    ) INTO v_publish;
+    v_finalize := public.flashback_maintain_finalize(p_operation_id);
+    RETURN jsonb_build_object(
+        'schema_version', 1,
+        'status', COALESCE(v_finalize->>'status', 'pending'),
+        'operation_id', p_operation_id,
+        'publish', v_publish,
+        'finalize', v_finalize
     );
 END;
 $$;
@@ -782,10 +1072,26 @@ $$;
 COMMENT ON FUNCTION flashback_maintain_plan(text) IS
     'Read-only maintain/reanchor plan with capacity, storage-budget and pending-restore guards. maintenance_status is one of not_needed|recommended|required|blocked.';
 COMMENT ON FUNCTION flashback_maintain_begin(text) IS
-    'Reanchor + durable operations-journal row in one transaction (reanchor is the required first write). Returns operation_id for flashback_maintain_finalize.';
+    'Backend-aware maintenance begin: heap_v1 reanchors immediately; external_zstd durably reserves an online generation and returns an operation for copy/publish.';
+COMMENT ON FUNCTION flashback_maintain_external_copy(bigint) IS
+    'External maintenance phase two: run the online copy and transactional WAL boundary marker for the exact reserved operation.';
+COMMENT ON FUNCTION flashback_maintain_external_publish(bigint) IS
+    'External maintenance phase three: publish the verified artifact, activate the successor, and finalize the operation.';
 COMMENT ON FUNCTION flashback_maintain_finalize(bigint) IS
     'Second phase: once successor coverage is healthy, seal the predecessor generation (retained, not deleted) and mark the maintain operation sealed. Safe to call repeatedly before that.';
 COMMENT ON FUNCTION flashback_maintain_execute(text) IS
     'Back-compat alias for flashback_maintain_begin(); callers must still call flashback_maintain_finalize(operation_id).';
 COMMENT ON FUNCTION flashback_prepare_uninstall(boolean) IS
     'Fail-closed uninstall preparation: refuse active lifecycles/pending restores; drop orphan slots when idle.';
+
+REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM PUBLIC;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'flashback_admin') THEN
+        REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM flashback_admin;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
+        REVOKE ALL ON FUNCTION public.flashback_internal_reserve_external_maintenance(text) FROM pg_monitor;
+    END IF;
+END
+$$;

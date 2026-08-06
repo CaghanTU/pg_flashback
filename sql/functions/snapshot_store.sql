@@ -1517,6 +1517,9 @@ DECLARE
     v_marker text;
     v_schema_def jsonb;
     v_column_contract jsonb;
+    v_previous_schema_version bigint;
+    v_schema_version bigint;
+    v_applied_lsn pg_lsn;
     v_n integer;
 BEGIN
     IF p_generation_id IS NULL OR p_tracking_id IS NULL
@@ -1583,6 +1586,19 @@ BEGIN
     v_marker := format('online_external:%s:%s:%s', p_tracking_id, v_gen.generation_no, v_xid);
     v_schema_def := public.flashback_collect_schema_def(p_rel_oid);
     v_column_contract := public.flashback_internal_materializable_columns(p_rel_oid);
+    SELECT COALESCE(tt.schema_version, 1)
+      INTO v_previous_schema_version
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = p_tracking_id
+      AND tt.is_active
+      AND tt.rel_oid = p_rel_oid;
+    IF v_previous_schema_version IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: tracked lifecycle % changed before online boundary bind',
+            p_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    v_schema_version := v_previous_schema_version + 1;
+    v_applied_lsn := pg_current_wal_insert_lsn();
 
     IF v_column_contract = '[]'::jsonb THEN
         RAISE EXCEPTION 'pg_flashback: relation % has no materializable columns', p_rel_oid
@@ -1621,6 +1637,48 @@ BEGIN
             p_snapshot_id
             USING ERRCODE = 'serialization_failure';
     END IF;
+
+    UPDATE flashback.tracked_tables
+       SET schema_version = v_schema_version
+     WHERE tracking_id = p_tracking_id
+       AND rel_oid = p_rel_oid
+       AND is_active
+       AND COALESCE(schema_version, 1) = v_previous_schema_version;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> 1 THEN
+        RAISE EXCEPTION 'pg_flashback: lifecycle % schema epoch changed during online boundary bind',
+            p_tracking_id
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+
+    -- A generation is not a usable schema epoch merely because its artifact
+    -- carries schema_def. Destructive-DDL and restore admission resolve the
+    -- canonical contract through schema_versions bound to the active
+    -- generation. Create that binding in the same marker transaction and
+    -- from the same locked catalog image as the external artifact contract;
+    -- otherwise promotion would leave an active generation that can never
+    -- honestly admit DROP/recovery.
+    INSERT INTO flashback.schema_versions (
+        rel_oid, tracking_id, generation_id, stream_id, source_xid,
+        schema_version, applied_at, applied_lsn, committed_at, commit_lsn,
+        columns, primary_key, constraints, schema_def, helper_schema_sha256
+    ) VALUES (
+        p_rel_oid, p_tracking_id, p_generation_id, v_gen.stream_id, v_xid,
+        v_schema_version, clock_timestamp(), v_applied_lsn, NULL, NULL,
+        COALESCE(v_schema_def -> 'columns', '[]'::jsonb),
+        COALESCE(v_schema_def -> 'primary_key', '[]'::jsonb),
+        jsonb_build_object(
+            'check_unique_fk', COALESCE(v_schema_def -> 'constraints', '[]'::jsonb),
+            'indexes', COALESCE(v_schema_def -> 'indexes', '[]'::jsonb),
+            'partition_by', v_schema_def -> 'partition_by',
+            'partitions', v_schema_def -> 'partitions',
+            'triggers', COALESCE(v_schema_def -> 'triggers', '[]'::jsonb),
+            'rls_policies', COALESCE(v_schema_def -> 'rls_policies', '[]'::jsonb),
+            'rls_enabled', COALESCE((v_schema_def -> 'rls_enabled')::boolean, false)
+        ),
+        v_schema_def,
+        public.flashback_helper_schema_sha256(p_rel_oid)
+    );
 
     RETURN QUERY SELECT v_xid, v_marker;
 END;

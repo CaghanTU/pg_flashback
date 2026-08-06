@@ -83,12 +83,16 @@ GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text, pg_lsn)         TO flashba
 GRANT EXECUTE ON FUNCTION flashback_restore_lsn(text[], pg_lsn)       TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_estimate_local_restore_peak_bytes(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_local_restore_preflight(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_local_restore_preflight_snapshot(bigint, bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_measure_local_capacity(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_admit_local_capacity(regclass, text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_measure_external_snapshot_capacity(regclass) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_admit_external_snapshot_capacity(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_advise(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_config_recommend(regclass, text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_relation_filesystem_available_bytes(regclass) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_tablespace_filesystem_available_bytes(oid) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_external_filesystem_available_bytes() TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_restore_parallel(text, timestamptz, int) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted(text, timestamptz) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_recover_deleted_lsn(text, pg_lsn) TO flashback_admin;
@@ -111,6 +115,8 @@ GRANT EXECUTE ON FUNCTION flashback_maintain_plan(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_execute(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_begin(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_finalize(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_external_copy(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_maintain_external_publish(bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_storage_budget_policy() TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_lifecycle_storage_metrics(text) TO flashback_admin;
 -- flashback_storage_freeze_lifecycle/flashback_storage_freeze_scan remain

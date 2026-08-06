@@ -1009,8 +1009,13 @@ BEGIN
       AND p_target_lsn <= cs.valid_through_lsn
       AND (cg.superseded_before_lsn IS NULL OR p_target_lsn < cg.superseded_before_lsn)
       AND sr.payload_state = 'available'
-      AND sr.payload_relid IS NOT NULL
-      AND public.flashback_payload_is_owned(sr.payload_relid)
+      AND EXISTS (
+          SELECT 1
+          FROM public.flashback_internal_snapshot_payload_healthy(
+              snap.snapshot_id, snap.tracking_id, false
+          ) h
+          WHERE h.status = 'healthy'
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM flashback.generation_payload_retirements retirement
@@ -1063,8 +1068,13 @@ BEGIN
       AND p_target_lsn <= cs.valid_through_lsn
       AND (cg.superseded_before_lsn IS NULL OR p_target_lsn < cg.superseded_before_lsn)
       AND sr.payload_state = 'available'
-      AND sr.payload_relid IS NOT NULL
-      AND public.flashback_payload_is_owned(sr.payload_relid)
+      AND EXISTS (
+          SELECT 1
+          FROM public.flashback_internal_snapshot_payload_healthy(
+              snap.snapshot_id, snap.tracking_id, false
+          ) h
+          WHERE h.status = 'healthy'
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM flashback.generation_payload_retirements retirement

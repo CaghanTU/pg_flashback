@@ -1146,8 +1146,9 @@ SQL
 SELECT flashback_maintain_execute(:'table');
 SQL
 )" || fail "maintain execute failed"
-    local op_id
+    local op_id backend copy_json=""
     op_id=$(printf '%s' "$out" | jq -r '.operation_id // empty')
+    backend=$(printf '%s' "$out" | jq -r '.storage_backend // "heap_v1"')
 
     # CLI polls flashback_maintain_finalize with separate psql invocations and a
     # bounded timeout; the server never sleeps on our behalf. Finalize seals the
@@ -1156,21 +1157,45 @@ SQL
     if [[ -n "$op_id" && "$op_id" != "null" ]]; then
         local deadline
         deadline=$(( $(date +%s) + MAINTAIN_FINALIZE_TIMEOUT_S ))
-        while true; do
-            final_json="$(psql_tuples -v "opid=$op_id" <<'SQL'
+        if [[ "$backend" == external_zstd ]]; then
+            # Reservation, online copy/marker, and publication are separate
+            # transactions by design. The copy keeps writes online and the
+            # artifact remains ineligible until its marker COMMIT is decoded.
+            copy_json="$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_maintain_external_copy(:'opid'::bigint);
+SQL
+)" || fail "external maintain copy failed for operation_id=$op_id"
+            while true; do
+                psql_tuples <<'SQL' >/dev/null
+SELECT flashback_consume_wal(50000);
+SQL
+                final_json="$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_maintain_external_publish(:'opid'::bigint);
+SQL
+)" || fail "external maintain publish failed for operation_id=$op_id"
+                fstate=$(printf '%s' "$final_json" | jq -r '.status // empty')
+                [[ "$fstate" == sealed ]] && break
+                (( $(date +%s) >= deadline )) && break
+                sleep 0.1
+            done
+        else
+            while true; do
+                final_json="$(psql_tuples -v "opid=$op_id" <<'SQL'
 SELECT flashback_maintain_finalize(:'opid'::bigint);
 SQL
 )" || fail "maintain finalize failed for operation_id=$op_id"
-            fstate=$(printf '%s' "$final_json" | jq -r '.status // empty')
-            [[ "$fstate" == "sealed" ]] && break
-            (( $(date +%s) >= deadline )) && break
-            sleep 1
-        done
+                fstate=$(printf '%s' "$final_json" | jq -r '.status // empty')
+                [[ "$fstate" == "sealed" ]] && break
+                (( $(date +%s) >= deadline )) && break
+                sleep 1
+            done
+        fi
     fi
 
     if [[ "$JSON_OUT" == 1 ]]; then
-        emit_envelope maintain ok ok "$(jq -n --argjson begin "$out" --argjson finalize "${final_json:-null}" \
-            '{begin:$begin, finalize:$finalize}')" null
+        emit_envelope maintain ok ok "$(jq -n --argjson begin "$out" \
+            --argjson copy "${copy_json:-null}" --argjson finalize "${final_json:-null}" \
+            '{begin:$begin, copy:$copy, finalize:$finalize}')" null
     else
         echo "Maintain started for $(printf '%s' "$out" | jq -r '.table_name') generation=$(printf '%s' "$out" | jq -r '.new_generation_id')"
         if [[ "$fstate" == "sealed" ]]; then

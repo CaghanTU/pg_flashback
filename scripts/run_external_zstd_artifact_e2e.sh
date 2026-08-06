@@ -15,12 +15,17 @@ ARTIFACT_ROOT="$BASE/artifacts"
 LOG="$BASE/postgres.log"
 PORT="${PGFB_PORT:-$((32000 + RUN_ID % 1000))}"
 LOCK_PID=""
+CONSUMER_PID=""
 
 cleanup() {
     local rc=$?
     if [[ -n "$LOCK_PID" ]]; then
         kill "$LOCK_PID" >/dev/null 2>&1 || true
         wait "$LOCK_PID" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$CONSUMER_PID" ]]; then
+        kill "$CONSUMER_PID" >/dev/null 2>&1 || true
+        wait "$CONSUMER_PID" >/dev/null 2>&1 || true
     fi
     "$BINDIR/pg_ctl" -D "$DATA" -m immediate stop >/dev/null 2>&1 || true
     if [[ "${PGFB_E2E_KEEP:-0}" != 1 ]]; then rm -rf "$BASE"; fi
@@ -46,6 +51,13 @@ unix_socket_directories = '$SOCKET'
 pg_flashback.target_database = 'pgfb_unused'
 pg_flashback.capture_mode = 'wal'
 pg_flashback.external_snapshot_root = '$ARTIFACT_ROOT'
+pg_flashback.snapshot_storage_backend = 'external_zstd'
+pg_flashback.external_snapshot_min_free_bytes = '1MB'
+pg_flashback.external_snapshot_safety_reserve_bytes = '1MB'
+pg_flashback.local_max_snapshot_bytes = '10GB'
+pg_flashback.local_max_restore_peak_bytes = '10GB'
+pg_flashback.local_min_filesystem_bytes = '1MB'
+pg_flashback.local_safety_reserve_bytes = '1MB'
 pg_flashback.external_snapshot_batch_rows = 128
 pg_flashback.external_snapshot_zstd_level = 3
 EOF
@@ -101,6 +113,10 @@ BEGIN
         '0/1000',clock_timestamp(),'0/1000',clock_timestamp(),NULL,NULL,'{}'
     );
 END \$setup\$;
+$(if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 || "${PGFB_EXTZSTD_CLI:-0}" == 1 ]]; then cat <<'SQL'
+SELECT '0|0|0';
+SQL
+else cat <<SQL
 WITH tt AS (
   SELECT tracking_id,rel_oid FROM flashback.tracked_tables
   WHERE table_name='ext_artifact_e2e' AND is_active
@@ -115,8 +131,103 @@ SELECT generation_id||'|'||snapshot_id||'|'||tracking_id
 FROM ids, LATERAL public.flashback_internal_reserve_online_generation(
   ids.tracking_id,ids.rel_oid,ids.stream_id,2,ids.parent_id,
   'external_zstd',990001
-)")
+)
+SQL
+fi)")
 IFS='|' read -r GENERATION SNAPSHOT TRACKING <<<"$IDS"
+
+if [[ "${PGFB_EXTZSTD_CLI:-0}" == 1 ]]; then
+    CLI_RESULT=$("$(dirname "$0")/pg_flashback" --json maintain public.ext_artifact_e2e --yes)
+    [[ "$(jq -r '.data.finalize.status' <<<"$CLI_RESULT")" == sealed ]] || {
+        echo "FAIL: operator CLI did not finish external maintain: $CLI_RESULT"; exit 1;
+    }
+    [[ "$(q "SELECT count(*) FROM flashback.snapshots WHERE storage_backend='external_zstd' AND payload_state='available'")" == 1 ]] || {
+        echo "FAIL: operator CLI did not leave one available external artifact"; exit 1;
+    }
+    q "UPDATE public.ext_artifact_e2e SET note='post-external-boundary' WHERE id=1" >/dev/null
+    EXPECTED_FP=$(q "SELECT md5(string_agg(id::text||':'||note,',' ORDER BY id)) FROM public.ext_artifact_e2e")
+    # The isolated harness has no continuously scheduled capture worker. Prove
+    # that the committed post-boundary UPDATE is durable before asking the DDL
+    # hook to admit DROP; otherwise the expected fail-closed write-stall guard
+    # would reject the DROP for an undrained commit.
+    for _ in $(seq 1 300); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE tracking_id=1 AND event_type='UPDATE'")" -ge 1 ]] && break
+        sleep 0.05
+    done
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE tracking_id=1 AND event_type='UPDATE'")" -ge 1 ]] || {
+        echo "FAIL: post-boundary UPDATE did not become durable before DROP"; exit 1;
+    }
+    q "DROP TABLE public.ext_artifact_e2e" >/dev/null
+    for _ in $(seq 1 300); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE tracking_id=1 AND event_type='DROP'")" == 1 ]] && break
+        sleep 0.05
+    done
+    # Recovery commits a post-restore boundary and then waits for the capture
+    # worker to resolve/verify it. This deterministic harness disables the
+    # periodic worker, so run the same public consume primitive concurrently
+    # while the real operator CLI performs and observes recovery.
+    (
+        while true; do
+            "$BINDIR/psql" -X -v ON_ERROR_STOP=1 -Atqc \
+                "SELECT public.flashback_consume_wal(50000); SELECT public.flashback_finalize_recover_operations()" \
+                >/dev/null 2>&1 || true
+            sleep 0.05
+        done
+    ) &
+    CONSUMER_PID=$!
+    RECOVER_RESULT=$("$(dirname "$0")/pg_flashback" --json recover public.ext_artifact_e2e --latest-drop --yes)
+    kill "$CONSUMER_PID" >/dev/null 2>&1 || true
+    wait "$CONSUMER_PID" >/dev/null 2>&1 || true
+    CONSUMER_PID=""
+    [[ "$(jq -r '.status' <<<"$RECOVER_RESULT")" == ok ]] || {
+        echo "FAIL: operator CLI external DROP recovery failed: $RECOVER_RESULT"; exit 1;
+    }
+    RESTORED_FP=$(q "SELECT md5(string_agg(id::text||':'||note,',' ORDER BY id)) FROM public.ext_artifact_e2e")
+    [[ "$RESTORED_FP" == "$EXPECTED_FP" ]] || {
+        echo "FAIL: external DROP recovery fingerprint $RESTORED_FP != $EXPECTED_FP"; exit 1;
+    }
+    [[ "$(q "SELECT count(*) FROM pg_constraint WHERE conrelid='public.ext_artifact_e2e'::regclass AND contype='p'")" == 1 ]] || {
+        echo "FAIL: external DROP recovery did not restore primary key"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS mode=cli-maintain-drop-recover"
+    exit 0
+fi
+
+if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 ]]; then
+    PLAN=$(q "SELECT public.flashback_maintain_plan('public.ext_artifact_e2e')")
+    [[ "$(jq -r .snapshot_storage_backend <<<"$PLAN")" == external_zstd ]] || {
+        echo "FAIL: maintain plan did not select external_zstd: $PLAN"; exit 1;
+    }
+    BEGIN_RESULT=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    [[ "$(jq -r .status <<<"$BEGIN_RESULT")" == reserved ]] || {
+        echo "FAIL: external maintain begin did not reserve: $BEGIN_RESULT"; exit 1;
+    }
+    OPERATION=$(jq -r .operation_id <<<"$BEGIN_RESULT")
+    GENERATION=$(jq -r .new_generation_id <<<"$BEGIN_RESULT")
+    SNAPSHOT=$(jq -r .snapshot_id <<<"$BEGIN_RESULT")
+    TRACKING=$(jq -r .tracking_id <<<"$BEGIN_RESULT")
+    COPY_RESULT=$(q "SELECT public.flashback_maintain_external_copy($OPERATION)")
+    [[ "$(jq -r .status <<<"$COPY_RESULT")" == copy_committed ]] || {
+        echo "FAIL: external maintain copy did not commit: $COPY_RESULT"; exit 1;
+    }
+    for _ in $(seq 1 200); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        PUBLISH_RESULT=$(q "SELECT public.flashback_maintain_external_publish($OPERATION)")
+        [[ "$(jq -r .status <<<"$PUBLISH_RESULT")" == sealed ]] && break
+        sleep 0.05
+    done
+    [[ "$(jq -r .status <<<"$PUBLISH_RESULT")" == sealed ]] || {
+        echo "FAIL: external maintain publish did not seal: ${PUBLISH_RESULT:-missing}"; exit 1;
+    }
+    [[ "$(q "SELECT payload_state||'|'||storage_backend FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == "available|external_zstd" ]] || {
+        echo "FAIL: public maintain did not publish external snapshot"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS mode=operator-maintain"
+    exit 0
+fi
+
 [[ -n "$GENERATION" && -n "$SNAPSHOT" && -n "$TRACKING" ]] || {
     echo "FAIL: reservation identities missing"; exit 1;
 }

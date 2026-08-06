@@ -266,6 +266,174 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION flashback_measure_external_snapshot_capacity(p_rel regclass)
+RETURNS TABLE (
+    rel oid,
+    source_heap_bytes bigint,
+    source_toast_bytes bigint,
+    source_index_bytes bigint,
+    projected_artifact_bytes bigint,
+    configured_min_free_bytes bigint,
+    configured_safety_reserve_bytes bigint,
+    filesystem_available_bytes bigint,
+    admissible boolean
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel oid := p_rel;
+    v_heap bigint;
+    v_toast bigint;
+    v_index bigint;
+    v_min_free bigint;
+    v_reserve bigint;
+    v_available bigint;
+    v_projected bigint;
+BEGIN
+    IF v_rel IS NULL THEN
+        RAISE EXCEPTION 'flashback_measure_external_snapshot_capacity: relation is NULL';
+    END IF;
+    v_heap := pg_relation_size(v_rel);
+    SELECT COALESCE(pg_relation_size(c.reltoastrelid), 0)
+      INTO v_toast
+    FROM pg_class c
+    WHERE c.oid = v_rel;
+    v_toast := COALESCE(v_toast, 0);
+    v_index := COALESCE(pg_indexes_size(v_rel), 0);
+    v_min_free := flashback_local_guc_bytes(
+        'pg_flashback.external_snapshot_min_free_bytes'
+    );
+    v_reserve := flashback_local_guc_bytes(
+        'pg_flashback.external_snapshot_safety_reserve_bytes'
+    );
+    IF v_min_free IS NULL OR v_min_free <= 0
+       OR v_reserve IS NULL OR v_reserve <= 0
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot capacity GUCs must both be configured above zero'
+            USING ERRCODE = 'invalid_parameter_value',
+                  HINT = 'Set pg_flashback.external_snapshot_min_free_bytes and pg_flashback.external_snapshot_safety_reserve_bytes, then reload.';
+    END IF;
+    v_available := public.flashback_external_filesystem_available_bytes();
+    -- Artifact compression is never assumed for admission. Heap+TOAST is the
+    -- conservative source-footprint proxy; the writer still fails closed on
+    -- ENOSPC and never publishes a partial artifact.
+    v_projected := v_heap + v_toast;
+
+    rel := v_rel;
+    source_heap_bytes := v_heap;
+    source_toast_bytes := v_toast;
+    source_index_bytes := v_index;
+    projected_artifact_bytes := v_projected;
+    configured_min_free_bytes := v_min_free;
+    configured_safety_reserve_bytes := v_reserve;
+    filesystem_available_bytes := v_available;
+    admissible := v_available >= v_projected + v_min_free + v_reserve;
+    RETURN NEXT;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_admit_external_snapshot_capacity(p_rel regclass)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    m record;
+BEGIN
+    SELECT * INTO STRICT m
+    FROM public.flashback_measure_external_snapshot_capacity(p_rel);
+    IF NOT m.admissible THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot capacity admission failed'
+            USING ERRCODE = 'disk_full',
+                  DETAIL = format(
+                      'available=%s projected=%s min_free=%s reserve=%s',
+                      m.filesystem_available_bytes,
+                      m.projected_artifact_bytes,
+                      m.configured_min_free_bytes,
+                      m.configured_safety_reserve_bytes
+                  ),
+                  HINT = 'Free space on external_snapshot_root or adjust the explicit external capacity budgets.';
+    END IF;
+    RETURN m.projected_artifact_bytes;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_local_restore_preflight_snapshot(
+    p_snapshot_id bigint,
+    p_tracking_id bigint
+)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    s flashback.snapshots%ROWTYPE;
+    v_peak bigint;
+    v_max_peak bigint;
+    v_min_fs bigint;
+    v_reserve bigint;
+    v_available bigint;
+    v_payload regclass;
+BEGIN
+    SELECT * INTO s
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id AND tracking_id = p_tracking_id;
+    IF NOT FOUND OR s.payload_state <> 'available' THEN
+        RAISE EXCEPTION 'pg_flashback: restore boundary snapshot % is not available',
+            p_snapshot_id USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF s.storage_backend = 'heap_v1' THEN
+        SELECT r.payload_relid INTO v_payload
+        FROM public.flashback_internal_snapshot_resolve(
+            p_snapshot_id, p_tracking_id
+        ) r;
+        RETURN public.flashback_local_restore_preflight(v_payload);
+    END IF;
+    IF s.storage_backend <> 'external_zstd'
+       OR s.external_uncompressed_bytes IS NULL
+       OR s.external_uncompressed_bytes <= 0
+    THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot % has no trustworthy restore-size evidence',
+            p_snapshot_id USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    v_max_peak := COALESCE(
+        flashback_local_guc_bytes('pg_flashback.local_max_restore_peak_bytes'),
+        flashback_local_guc_bytes('pg_flashback.local_restore_max_peak_bytes')
+    );
+    v_min_fs := flashback_local_guc_bytes('pg_flashback.local_min_filesystem_bytes');
+    v_reserve := COALESCE(
+        flashback_local_guc_bytes('pg_flashback.local_safety_reserve_bytes'),
+        flashback_local_guc_bytes('pg_flashback.local_restore_safety_reserve_bytes'),
+        pg_size_bytes('64MB')
+    );
+    IF v_max_peak IS NULL OR v_max_peak <= 0 OR v_min_fs IS NULL OR v_min_fs <= 0 THEN
+        RAISE EXCEPTION 'pg_flashback: local restore capacity GUCs must be configured above zero';
+    END IF;
+    -- Shadow + live replacement/successor allowance. Index sizes cannot be
+    -- observed after DROP, so use a deliberately conservative 3x logical
+    -- artifact size envelope plus the configured reserve.
+    v_peak := (s.external_uncompressed_bytes * 3) + v_reserve;
+    v_available := public.flashback_tablespace_filesystem_available_bytes(0::oid);
+    IF v_peak > v_max_peak OR v_available < v_peak + v_min_fs THEN
+        RAISE EXCEPTION 'pg_flashback: external-boundary restore capacity admission failed'
+            USING ERRCODE = 'disk_full',
+                  DETAIL = format(
+                      'projected_peak=%s max_peak=%s available=%s min_free=%s',
+                      v_peak, v_max_peak, v_available, v_min_fs
+                  );
+    END IF;
+    RETURN v_peak;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_admit_local_capacity(
     p_rel regclass,
     p_operation text
@@ -486,6 +654,12 @@ COMMENT ON FUNCTION flashback_advise(regclass) IS
 
 COMMENT ON FUNCTION flashback_admit_local_capacity(regclass, text) IS
     'Fail-closed local capacity and write-stall admission shared by track, re-anchor and restore.';
+COMMENT ON FUNCTION flashback_measure_external_snapshot_capacity(regclass) IS
+    'Read-only external_zstd persist estimate using the configured artifact filesystem and explicit free-space reserves.';
+COMMENT ON FUNCTION flashback_admit_external_snapshot_capacity(regclass) IS
+    'Fail-closed external_zstd snapshot persist admission; compression savings are never assumed.';
+COMMENT ON FUNCTION flashback_local_restore_preflight_snapshot(bigint, bigint) IS
+    'Backend-neutral restore capacity admission for a retained SnapshotStore boundary, including DROP recovery from external_zstd.';
 
 -- =================================================================
 -- Read-only cluster/database config recommendation for local_delta.
