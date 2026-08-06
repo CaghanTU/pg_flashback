@@ -61,10 +61,34 @@ pg_flashback.local_safety_reserve_bytes = '1MB'
 pg_flashback.external_snapshot_batch_rows = 128
 pg_flashback.external_snapshot_zstd_level = 3
 EOF
+if [[ -n "${PGFB_EXTZSTD_FAILPOINT_CASE:-}" ]]; then
+    printf "pg_flashback.test_external_zstd_failpoint = '%s'\n" \
+        "$PGFB_EXTZSTD_FAILPOINT_CASE" >>"$DATA/postgresql.conf"
+fi
+if [[ -n "${PGFB_EXTZSTD_PAUSE_CASE:-}" ]]; then
+    printf "pg_flashback.test_external_zstd_failpoint = 'pause:%s'\n" \
+        "$PGFB_EXTZSTD_PAUSE_CASE" >>"$DATA/postgresql.conf"
+fi
 "$BINDIR/pg_ctl" -D "$DATA" -l "$LOG" start >/dev/null
 
 export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE=postgres
 q() { "$BINDIR/psql" -X -v ON_ERROR_STOP=1 -Atqc "$1"; }
+
+wait_postgres_ready() {
+    local consecutive=0
+    for _ in $(seq 1 600); do
+        if "$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d postgres -qAtc "SELECT 1" \
+            >/dev/null 2>&1; then
+            consecutive=$((consecutive + 1))
+            [[ "$consecutive" -ge 10 ]] && return 0
+        else
+            consecutive=0
+        fi
+        sleep 0.1
+    done
+    echo "FAIL: PostgreSQL did not become ready after injected process death" >&2
+    return 1
+}
 
 q "CREATE EXTENSION pg_flashback"
 SLOT=pg_flashback_postgres
@@ -113,7 +137,7 @@ BEGIN
         '0/1000',clock_timestamp(),'0/1000',clock_timestamp(),NULL,NULL,'{}'
     );
 END \$setup\$;
-$(if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 || "${PGFB_EXTZSTD_CLI:-0}" == 1 || "${PGFB_EXTZSTD_RECONCILE:-0}" == 1 ]]; then cat <<'SQL'
+$(if [[ "${PGFB_EXTZSTD_MAINTAIN:-0}" == 1 || "${PGFB_EXTZSTD_CLI:-0}" == 1 || "${PGFB_EXTZSTD_RECONCILE:-0}" == 1 || "${PGFB_EXTZSTD_ISOLATION:-0}" == 1 || "${PGFB_EXTZSTD_MULTIDB:-0}" == 1 || -n "${PGFB_EXTZSTD_FAILPOINT_CASE:-}" ]]; then cat <<'SQL'
 SELECT '0|0|0';
 SQL
 else cat <<SQL
@@ -135,6 +159,327 @@ FROM ids, LATERAL public.flashback_internal_reserve_online_generation(
 SQL
 fi)")
 IFS='|' read -r GENERATION SNAPSHOT TRACKING <<<"$IDS"
+
+disable_external_failpoint() {
+    wait_postgres_ready
+    "$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d postgres -qAtc \
+        "ALTER SYSTEM SET pg_flashback.test_external_zstd_failpoint = ''" >/dev/null
+    q "SELECT pg_reload_conf()" >/dev/null
+    for _ in $(seq 1 100); do
+        [[ "$(q "SELECT current_setting('pg_flashback.test_external_zstd_failpoint')")" == "" ]] && return 0
+        sleep 0.05
+    done
+    echo "FAIL: external_zstd failpoint did not clear after reload" >&2
+    return 1
+}
+
+complete_external_maintenance() {
+    local begin_result copy_result publish_result
+    begin_result=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    FP_OPERATION=$(jq -r .operation_id <<<"$begin_result")
+    FP_SNAPSHOT=$(jq -r .snapshot_id <<<"$begin_result")
+    FP_TRACKING=$(jq -r .tracking_id <<<"$begin_result")
+    copy_result=$(q "SELECT public.flashback_maintain_external_copy($FP_OPERATION)")
+    [[ "$(jq -r .status <<<"$copy_result")" == copy_in_progress ]] || {
+        echo "FAIL: clean external maintenance copy did not start: $copy_result" >&2; return 1;
+    }
+    publish_result='{}'
+    for _ in $(seq 1 600); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        publish_result=$(q "SELECT public.flashback_maintain_external_publish($FP_OPERATION)")
+        [[ "$(jq -r .status <<<"$publish_result")" == sealed ]] && break
+        sleep 0.05
+    done
+    [[ "$(jq -r .status <<<"$publish_result")" == sealed ]] || {
+        echo "FAIL: clean external maintenance did not seal: $publish_result" >&2; return 1;
+    }
+}
+
+if [[ -n "${PGFB_EXTZSTD_FAILPOINT_CASE:-}" ]]; then
+    FAILPOINT="$PGFB_EXTZSTD_FAILPOINT_CASE"
+    BEGIN_FP=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    OP_FP=$(jq -r .operation_id <<<"$BEGIN_FP")
+    GEN_FP=$(jq -r .new_generation_id <<<"$BEGIN_FP")
+    SNAP_FP=$(jq -r .snapshot_id <<<"$BEGIN_FP")
+    TRACK_FP=$(jq -r .tracking_id <<<"$BEGIN_FP")
+
+    COPY_RC=0
+    COPY_OUTPUT=$(q "SELECT public.flashback_maintain_external_copy($OP_FP)" 2>&1) || COPY_RC=$?
+
+    case "$FAILPOINT" in
+        copier_*)
+            disable_external_failpoint
+            # Some failpoints fire after the coordinator has already returned;
+            # allow that late copier death and the resulting postmaster crash
+            # recovery to settle before inspecting durable state.
+            sleep 0.5
+            wait_postgres_ready
+            # Boundary emission may have committed before the copier died.
+            # Consume whatever is durable, then let the reconciler make the
+            # only legal decision: resume a receipt-complete copy or abort an
+            # incomplete one. Neither outcome may leave a building generation.
+            for _ in $(seq 1 600); do
+                q "SELECT public.flashback_consume_wal(50000)" >/dev/null 2>&1 || true
+                q "SELECT public.flashback_internal_reconcile_external_maintenance(interval '0 seconds',10)" >/dev/null 2>&1 || true
+                OP_STATE=$(q "SELECT state FROM flashback.operation_current_state WHERE operation_id=$OP_FP" 2>/dev/null || true)
+                [[ "$OP_STATE" =~ ^(sealed|failed)$ ]] && break
+                sleep 0.05
+            done
+            [[ "${OP_STATE:-}" =~ ^(sealed|failed)$ ]] || {
+                echo "FAIL: copier failpoint did not reach a terminal operation state: ${OP_STATE:-missing}"; exit 1;
+            }
+            [[ "$(q "SELECT count(*) FROM flashback.coverage_generations WHERE generation_id=$GEN_FP AND state='building'")" == 0 ]] || {
+                echo "FAIL: copier failpoint left a building generation"; exit 1;
+            }
+            if [[ "$FAILPOINT" == copier_after_commit_receipt ]]; then
+                [[ "$OP_STATE" == sealed ]] || { echo "FAIL: receipt-complete copy was not resumed"; exit 1; }
+            else
+                [[ "$OP_STATE" == failed ]] || { echo "FAIL: incomplete copy was not failed closed"; exit 1; }
+                complete_external_maintenance
+            fi
+            ;;
+        finalizer_*)
+            [[ "$COPY_RC" == 0 ]] || { echo "FAIL: finalizer failpoint fired during copy: $COPY_OUTPUT"; exit 1; }
+            for _ in $(seq 1 600); do
+                q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+                [[ "$(q "SELECT snapshot_lsn IS NOT NULL FROM flashback.snapshots WHERE snapshot_id=$SNAP_FP")" == t ]] && break
+                sleep 0.05
+            done
+            PUBLISH_RC=0
+            PUBLISH_OUTPUT=$(q "SELECT public.flashback_maintain_external_publish($OP_FP)" 2>&1) || PUBLISH_RC=$?
+            [[ "$PUBLISH_RC" -ne 0 ]] || { echo "FAIL: finalizer failpoint did not terminate its backend: $PUBLISH_OUTPUT"; exit 1; }
+            disable_external_failpoint
+            for _ in $(seq 1 100); do
+                RETRY=$(q "SELECT public.flashback_maintain_external_publish($OP_FP)")
+                [[ "$(jq -r .status <<<"$RETRY")" == sealed ]] && break
+                sleep 0.05
+            done
+            RETRY=${RETRY:-'{}'}
+            [[ "$(jq -r .status <<<"$RETRY")" == sealed ]] || {
+                echo "FAIL: finalizer retry did not seal: ${RETRY:-missing}"; exit 1;
+            }
+            ;;
+        restore_during_decode)
+            [[ "$COPY_RC" == 0 ]] || { echo "FAIL: restore failpoint fired during copy: $COPY_OUTPUT"; exit 1; }
+            disable_external_failpoint
+            for _ in $(seq 1 600); do
+                q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+                RETRY=$(q "SELECT public.flashback_maintain_external_publish($OP_FP)")
+                [[ "$(jq -r .status <<<"$RETRY")" == sealed ]] && break
+                sleep 0.05
+            done
+            q "CREATE TABLE public.ext_failpoint_restore (LIKE public.ext_artifact_e2e INCLUDING ALL)" >/dev/null
+            RESTORE_RC=0
+            RESTORE_OUTPUT=$("$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d postgres -qAtc \
+                "SET pg_flashback.test_external_zstd_failpoint='restore_during_decode'; SELECT public.flashback_internal_snapshot_materialize($SNAP_FP,$TRACK_FP,'public','ext_failpoint_restore','\"id\",\"note\"','')" 2>&1) || RESTORE_RC=$?
+            [[ "$RESTORE_RC" -ne 0 ]] || { echo "FAIL: restore failpoint did not terminate its backend: $RESTORE_OUTPUT"; exit 1; }
+            wait_postgres_ready
+            [[ "$(q "SELECT count(*) FROM public.ext_failpoint_restore")" == 0 ]] || {
+                echo "FAIL: interrupted restore left partial rows"; exit 1;
+            }
+            q "SELECT public.flashback_internal_snapshot_materialize($SNAP_FP,$TRACK_FP,'public','ext_failpoint_restore','\"id\",\"note\"','')" >/dev/null
+            [[ "$(q "SELECT count(*) FROM public.ext_failpoint_restore")" == 5000 ]] || {
+                echo "FAIL: restore retry did not materialize all rows"; exit 1;
+            }
+            ;;
+        retire_after_delete)
+            [[ "$COPY_RC" == 0 ]] || { echo "FAIL: retire failpoint fired during copy: $COPY_OUTPUT"; exit 1; }
+            disable_external_failpoint
+            for _ in $(seq 1 600); do
+                q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+                RETRY=$(q "SELECT public.flashback_maintain_external_publish($OP_FP)")
+                [[ "$(jq -r .status <<<"$RETRY")" == sealed ]] && break
+                sleep 0.05
+            done
+            q "SELECT public.flashback_internal_snapshot_retire_begin($SNAP_FP,$TRACK_FP)" >/dev/null
+            RETIRE_RC=0
+            RETIRE_OUTPUT=$("$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d postgres -qAtc \
+                "SET pg_flashback.test_external_zstd_failpoint='retire_after_delete'; SELECT public.flashback_internal_snapshot_retire_purge($SNAP_FP,$TRACK_FP)" 2>&1) || RETIRE_RC=$?
+            [[ "$RETIRE_RC" -ne 0 ]] || { echo "FAIL: retirement failpoint did not terminate its backend: $RETIRE_OUTPUT"; exit 1; }
+            wait_postgres_ready
+            [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAP_FP")" == retiring ]] || {
+                echo "FAIL: interrupted retirement lost durable retiring state"; exit 1;
+            }
+            q "SELECT public.flashback_internal_snapshot_retire_finish($SNAP_FP,$TRACK_FP,'retired')" >/dev/null
+            [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAP_FP")" == retired ]] || {
+                echo "FAIL: retirement retry did not finish"; exit 1;
+            }
+            ;;
+        *) echo "FAIL: unknown external_zstd failpoint case: $FAILPOINT"; exit 1 ;;
+    esac
+    echo "EXTERNAL_ZSTD_FAILPOINT=PASS case=$FAILPOINT copy_rc=$COPY_RC"
+    exit 0
+fi
+
+if [[ "${PGFB_EXTZSTD_ISOLATION:-0}" == 1 ]]; then
+    OTHER_IDS=$(q "DO \$iso\$
+    DECLARE
+        v_rel oid; v_tracking bigint; v_snapshot bigint; v_generation bigint;
+        v_stream bigint := (SELECT stream_id FROM flashback.capture_streams WHERE state='active');
+    BEGIN
+        CREATE TABLE public.ext_artifact_other(id bigint PRIMARY KEY, note text NOT NULL);
+        INSERT INTO public.ext_artifact_other VALUES (1,'before');
+        v_rel := 'public.ext_artifact_other'::regclass;
+        INSERT INTO flashback.tracked_tables
+            (rel_oid,schema_name,table_name,base_snapshot_table,recovery_profile)
+        VALUES (v_rel,'public','ext_artifact_other',NULL,'local_delta')
+        RETURNING tracking_id INTO v_tracking;
+        v_snapshot := public.flashback_internal_snapshot_create(
+            v_tracking,v_rel,'public','ext_artifact_other','0/1000','initial_track');
+        v_generation := public.flashback_internal_create_coverage_generation(
+            p_tracking_id=>v_tracking,p_generation_no=>1,p_stream_id=>v_stream,
+            p_boundary_kind=>'initial_track',p_rel_oid_at_boundary=>v_rel,
+            p_boundary_snapshot_id=>v_snapshot,p_boundary_xid=>txid_current(),
+            p_boundary_marker=>'ext-artifact-other');
+        PERFORM public.flashback_internal_transition_coverage_generation(
+            v_generation,v_tracking,'building','active','fixture','0/1000',
+            clock_timestamp(),'0/1000',clock_timestamp(),NULL,NULL,'{}');
+    END \$iso\$;
+    SELECT tracking_id||'|'||rel_oid::text FROM flashback.tracked_tables
+    WHERE table_name='ext_artifact_other' AND is_active")
+    IFS='|' read -r OTHER_TRACKING OTHER_OID <<<"$OTHER_IDS"
+
+    BEGIN_ISO=$(q "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    OP_ISO=$(jq -r .operation_id <<<"$BEGIN_ISO")
+    SNAP_ISO=$(jq -r .snapshot_id <<<"$BEGIN_ISO")
+    TRACK_ISO=$(jq -r .tracking_id <<<"$BEGIN_ISO")
+    COPY_ISO=$(q "SELECT public.flashback_maintain_external_copy($OP_ISO)")
+    [[ "$(jq -r .status <<<"$COPY_ISO")" == copy_in_progress ]] || {
+        echo "FAIL: isolation external copy did not start: $COPY_ISO"; exit 1;
+    }
+    [[ "$(q "SELECT count(*) FROM pg_stat_activity WHERE backend_type='pg_flashback external_zstd copier'")" -ge 1 ]] || {
+        echo "FAIL: slow external copier was not observable"; exit 1;
+    }
+
+    q "UPDATE public.ext_artifact_e2e SET note='after-boundary' WHERE id=1;
+       INSERT INTO public.ext_artifact_other VALUES (2,'during-copy')" >/dev/null
+    ISOLATION_START=$(date +%s%3N)
+    for _ in $(seq 1 80); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        MAIN_DELTA=$(q "SELECT count(*) FROM flashback.delta_log
+          WHERE tracking_id=$TRACK_ISO AND event_type='UPDATE'
+            AND new_data->>'note'='after-boundary'")
+        OTHER_DELTA=$(q "SELECT count(*) FROM flashback.delta_log
+          WHERE tracking_id=$OTHER_TRACKING AND event_type='INSERT'
+            AND new_data->>'id'='2' AND new_data->>'note'='during-copy'")
+        [[ "$MAIN_DELTA" -ge 1 && "$OTHER_DELTA" -ge 1 ]] && break
+        sleep 0.05
+    done
+    ISOLATION_MS=$(( $(date +%s%3N) - ISOLATION_START ))
+    [[ "${MAIN_DELTA:-0}" -ge 1 && "${OTHER_DELTA:-0}" -ge 1 ]] || {
+        echo "FAIL: WAL for main/other table did not drain during slow external copy"; exit 1;
+    }
+    [[ "$ISOLATION_MS" -lt 4500 ]] || {
+        echo "FAIL: unrelated-table WAL visibility waited for the 5s copier pause (${ISOLATION_MS}ms)"; exit 1;
+    }
+
+    disable_external_failpoint
+    PUBLISH_ISO='{}'
+    for _ in $(seq 1 600); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        PUBLISH_ISO=$(q "SELECT public.flashback_maintain_external_publish($OP_ISO)" 2>/dev/null \
+            || printf '%s' '{"status":"copy_still_active"}')
+        [[ "$(jq -r .status <<<"$PUBLISH_ISO")" == sealed ]] && break
+        sleep 0.05
+    done
+    [[ "$(jq -r .status <<<"$PUBLISH_ISO")" == sealed ]] || {
+        echo "FAIL: isolation external artifact did not seal: $PUBLISH_ISO"; exit 1;
+    }
+    q "CREATE TABLE public.ext_isolation_snapshot (LIKE public.ext_artifact_e2e INCLUDING ALL);
+       SELECT public.flashback_internal_snapshot_materialize(
+         $SNAP_ISO,$TRACK_ISO,'public','ext_isolation_snapshot','\"id\",\"note\"','')" >/dev/null
+    [[ "$(q "SELECT note FROM public.ext_isolation_snapshot WHERE id=1")" != after-boundary ]] || {
+        echo "FAIL: repeatable-read snapshot incorrectly included post-boundary update"; exit 1;
+    }
+    [[ "$(q "SELECT note FROM public.ext_artifact_e2e WHERE id=1")" == after-boundary ]] || {
+        echo "FAIL: source post-boundary update was lost"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ISOLATION=PASS wal_visibility_ms=$ISOLATION_MS main_delta=$MAIN_DELTA other_delta=$OTHER_DELTA other_oid=$OTHER_OID"
+    exit 0
+fi
+
+if [[ "${PGFB_EXTZSTD_MULTIDB:-0}" == 1 ]]; then
+    complete_external_maintenance
+    DB1_TRACKING=$FP_TRACKING
+    DB1_SNAPSHOT=$FP_SNAPSHOT
+    DB1_LOCATOR=$(q "SELECT locator::text FROM flashback.snapshots WHERE snapshot_id=$DB1_SNAPSHOT")
+
+    q "CREATE DATABASE ext_other_db" >/dev/null
+    qdb() { "$BINDIR/psql" -X -v ON_ERROR_STOP=1 -d ext_other_db -Atqc "$1"; }
+    qdb "CREATE EXTENSION pg_flashback" >/dev/null
+    qdb "SELECT slot_name FROM pg_create_logical_replication_slot(
+      'pg_flashback_ext_other_db','pg_flashback')" >/dev/null
+    qdb "DO \$db2\$
+    DECLARE
+        v_db oid := (SELECT oid FROM pg_database WHERE datname=current_database());
+        v_stream bigint; v_tracking bigint; v_snapshot bigint; v_generation bigint;
+        v_rel oid; v_confirmed pg_lsn; v_restart pg_lsn;
+    BEGIN
+        CREATE TABLE public.ext_artifact_e2e(id bigint PRIMARY KEY, note text NOT NULL);
+        INSERT INTO public.ext_artifact_e2e
+        SELECT g, repeat(md5(g::text),8) FROM generate_series(1,5000) g;
+        v_rel := 'public.ext_artifact_e2e'::regclass;
+        SELECT confirmed_flush_lsn,restart_lsn INTO v_confirmed,v_restart
+          FROM pg_replication_slots WHERE slot_name='pg_flashback_ext_other_db';
+        v_stream := public.flashback_internal_create_capture_stream(
+          p_database_oid=>v_db,p_initial_state=>'active',
+          p_slot_name=>'pg_flashback_ext_other_db',p_plugin_name=>'pg_flashback',
+          p_confirmed_flush_lsn=>v_confirmed,p_restart_lsn=>v_restart);
+        INSERT INTO flashback.tracked_tables
+          (rel_oid,schema_name,table_name,base_snapshot_table,recovery_profile)
+        VALUES (v_rel,'public','ext_artifact_e2e',NULL,'local_delta')
+        RETURNING tracking_id INTO v_tracking;
+        v_snapshot := public.flashback_internal_snapshot_create(
+          v_tracking,v_rel,'public','ext_artifact_e2e','0/1000','initial_track');
+        v_generation := public.flashback_internal_create_coverage_generation(
+          p_tracking_id=>v_tracking,p_generation_no=>1,p_stream_id=>v_stream,
+          p_boundary_kind=>'initial_track',p_rel_oid_at_boundary=>v_rel,
+          p_boundary_snapshot_id=>v_snapshot,p_boundary_xid=>txid_current(),
+          p_boundary_marker=>'ext-artifact-db2-parent');
+        PERFORM public.flashback_internal_transition_coverage_generation(
+          v_generation,v_tracking,'building','active','fixture','0/1000',
+          clock_timestamp(),'0/1000',clock_timestamp(),NULL,NULL,'{}');
+    END \$db2\$" >/dev/null
+
+    DB2_BEGIN=$(qdb "SELECT public.flashback_maintain_begin('public.ext_artifact_e2e')")
+    DB2_OPERATION=$(jq -r .operation_id <<<"$DB2_BEGIN")
+    DB2_TRACKING=$(jq -r .tracking_id <<<"$DB2_BEGIN")
+    DB2_SNAPSHOT=$(jq -r .snapshot_id <<<"$DB2_BEGIN")
+    qdb "SELECT public.flashback_maintain_external_copy($DB2_OPERATION)" >/dev/null
+    DB2_PUBLISH='{}'
+    for _ in $(seq 1 600); do
+        qdb "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        DB2_PUBLISH=$(qdb "SELECT public.flashback_maintain_external_publish($DB2_OPERATION)" 2>/dev/null \
+            || printf '%s' '{"status":"copy_still_active"}')
+        [[ "$(jq -r .status <<<"$DB2_PUBLISH")" == sealed ]] && break
+        sleep 0.05
+    done
+    [[ "$(jq -r .status <<<"$DB2_PUBLISH")" == sealed ]] || {
+        echo "FAIL: second database external snapshot did not seal: $DB2_PUBLISH"; exit 1;
+    }
+    DB2_LOCATOR=$(qdb "SELECT locator::text FROM flashback.snapshots WHERE snapshot_id=$DB2_SNAPSHOT")
+    DB1_OID=$(jq -r .database_oid <<<"$DB1_LOCATOR")
+    DB2_OID=$(jq -r .database_oid <<<"$DB2_LOCATOR")
+    DB1_NONCE=$(jq -r .nonce <<<"$DB1_LOCATOR")
+    DB2_NONCE=$(jq -r .nonce <<<"$DB2_LOCATOR")
+    [[ "$DB1_OID" != "$DB2_OID" ]] || { echo "FAIL: database artifact namespaces collided"; exit 1; }
+    DB1_DIR="$ARTIFACT_ROOT/$(jq -r .system_identifier <<<"$DB1_LOCATOR")/$DB1_OID/$DB1_TRACKING/$DB1_SNAPSHOT-$DB1_NONCE"
+    DB2_DIR="$ARTIFACT_ROOT/$(jq -r .system_identifier <<<"$DB2_LOCATOR")/$DB2_OID/$DB2_TRACKING/$DB2_SNAPSHOT-$DB2_NONCE"
+    [[ -s "$DB1_DIR/artifact.zst" && -s "$DB2_DIR/artifact.zst" ]] || {
+        echo "FAIL: one multi-database artifact is missing"; exit 1;
+    }
+
+    qdb "SELECT public.flashback_internal_snapshot_retire_begin($DB2_SNAPSHOT,$DB2_TRACKING)" >/dev/null
+    qdb "SELECT public.flashback_internal_snapshot_retire_purge($DB2_SNAPSHOT,$DB2_TRACKING)" >/dev/null
+    qdb "SELECT public.flashback_internal_snapshot_retire_finish($DB2_SNAPSHOT,$DB2_TRACKING,'retired')" >/dev/null
+    [[ ! -e "$DB2_DIR" ]] || { echo "FAIL: second database retirement left bytes"; exit 1; }
+    [[ -s "$DB1_DIR/artifact.zst" ]] || { echo "FAIL: second database cleanup removed first database bytes"; exit 1; }
+    [[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($DB1_SNAPSHOT,$DB1_TRACKING,true)")" == healthy ]] || {
+        echo "FAIL: first database artifact became unhealthy after second database cleanup"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_MULTIDB=PASS db1_oid=$DB1_OID db2_oid=$DB2_OID db1_snapshot=$DB1_SNAPSHOT db2_snapshot=$DB2_SNAPSHOT"
+    exit 0
+fi
 
 if [[ "${PGFB_EXTZSTD_CLI:-0}" == 1 ]]; then
     CLI_RESULT=$("$(dirname "$0")/pg_flashback" --json maintain public.ext_artifact_e2e --yes)

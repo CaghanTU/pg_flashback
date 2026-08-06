@@ -757,6 +757,9 @@ pub fn finalize_staged_artifact(
                     }
                     Err(error) => return Err(format!("seal staged artifact name: {error}")),
                 }
+                crate::storage::worker::trigger_external_snapshot_failpoint(
+                    "finalizer_after_artifact_seal",
+                );
 
                 let manifest = build_final_manifest(&provisional, &input);
                 match write_json_exclusive(&staging_fd, "manifest.json", &manifest) {
@@ -774,6 +777,9 @@ pub fn finalize_staged_artifact(
                 }
                 fsync_fd(staging_fd.as_raw_fd())
                     .map_err(|e| format!("fsync staging before publish: {e}"))?;
+                crate::storage::worker::trigger_external_snapshot_failpoint(
+                    "finalizer_after_manifest_fsync",
+                );
                 rename_beneath(
                     staging_parent_fd.as_raw_fd(),
                     &staging_name,
@@ -785,6 +791,9 @@ pub fn finalize_staged_artifact(
                     .map_err(|e| format!("fsync staging parent after publish: {e}"))?;
                 fsync_fd(tracking_fd.as_raw_fd())
                     .map_err(|e| format!("fsync tracking parent after publish: {e}"))?;
+                crate::storage::worker::trigger_external_snapshot_failpoint(
+                    "finalizer_after_publish_rename",
+                );
                 let final_dir_fd = open_dir_beneath(tracking_fd.as_raw_fd(), &final_name)
                     .map_err(|e| format!("open published artifact directory: {e}"))?;
                 (final_dir_fd, provisional, manifest)

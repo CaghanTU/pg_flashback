@@ -438,14 +438,20 @@ fn copier_worker_body(arg: pg_sys::Datum) {
                             identity,
                         )
                     })?;
-                    pending.mark_copy_committed().map(|manifest| {
-                        log!(
-                            "pg_flashback external_zstd copier committed staged artifact: operation_nonce={}, rows={}, compressed_bytes={}",
-                            manifest.operation_nonce,
-                            manifest.row_count,
-                            manifest.compressed_bytes
-                        );
-                    })
+                    crate::storage::worker::trigger_external_snapshot_failpoint(
+                        "copier_after_copy_commit",
+                    );
+                    let manifest = pending.mark_copy_committed()?;
+                    crate::storage::worker::trigger_external_snapshot_failpoint(
+                        "copier_after_commit_receipt",
+                    );
+                    log!(
+                        "pg_flashback external_zstd copier committed staged artifact: operation_nonce={}, rows={}, compressed_bytes={}",
+                        manifest.operation_nonce,
+                        manifest.row_count,
+                        manifest.compressed_bytes
+                    );
+                    Ok(())
                 } else {
                     BackgroundWorker::transaction(|| {
                         open_cursor_and_fetch(&column_list, &target_relation)
@@ -718,6 +724,7 @@ fn stream_cursor_to_staging(
         segment.operation_nonce(),
         crate::storage::worker::external_snapshot_zstd_level(),
     )?;
+    crate::storage::worker::trigger_external_snapshot_failpoint("copier_after_staging_create");
     write_header(artifact.writer()?, &columns)
         .map_err(|e| format!("write artifact header: {e}"))?;
 
@@ -801,6 +808,11 @@ fn stream_cursor_to_staging(
                 row_count = row_count.saturating_add(1);
             }
             unsafe { pg_sys::SPI_freetuptable(tuptable) };
+            if row_count == processed as u64 {
+                crate::storage::worker::trigger_external_snapshot_failpoint(
+                    "copier_during_compression",
+                );
+            }
             pg_sys::check_for_interrupts!();
             if pgrx::bgworkers::BackgroundWorker::sigterm_received() {
                 unsafe { pg_sys::SPI_cursor_close(portal) };
@@ -814,7 +826,7 @@ fn stream_cursor_to_staging(
     write_trailer(artifact.writer()?, row_count)
         .map_err(|e| format!("write artifact trailer: {e}"))?;
     segment.write_fetched_row_count(row_count);
-    artifact.finish_copy(ProvisionalManifest {
+    let pending = artifact.finish_copy(ProvisionalManifest {
         operation_nonce: segment.operation_nonce(),
         database_oid,
         tracking_id: identity.tracking_id,
@@ -826,7 +838,11 @@ fn stream_cursor_to_staging(
         uncompressed_bytes: 0,
         compressed_bytes: 0,
         checksum_sha256: String::new(),
-    })
+    })?;
+    crate::storage::worker::trigger_external_snapshot_failpoint(
+        "copier_after_staged_fsync_before_commit",
+    );
+    Ok(pending)
 }
 
 /// A real `SPI_cursor_open_with_args` + `SPI_cursor_fetch` against a
@@ -1125,11 +1141,13 @@ fn flashback_internal_finalize_external_snapshot(
         quote_literal(&finalized.manifest.schema_def_sha256),
     ))
     .unwrap_or_else(|error| pgrx::error!("external snapshot publication rejected: {error}"));
+    crate::storage::worker::trigger_external_snapshot_failpoint("finalizer_after_db_available");
     Spi::run(&format!(
         "SELECT public.flashback_internal_activate_external_generation(\
          {generation_id}::bigint, {tracking_id}::bigint, {snapshot_id}::bigint)"
     ))
     .unwrap_or_else(|error| pgrx::error!("external generation activation rejected: {error}"));
+    crate::storage::worker::trigger_external_snapshot_failpoint("finalizer_after_activation");
     finalized
         .cleanup_coordination_files()
         .unwrap_or_else(|error| pgrx::error!("external finalizer cleanup failed: {error}"));
@@ -1490,7 +1508,7 @@ fn flashback_internal_purge_external_snapshot(snapshot_id: i64, tracking_id: i64
     crate::storage::external_zstd::validate_root_os_level(&root)
         .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
         .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
-    purge_published_artifact(
+    let purged = purge_published_artifact(
         std::path::Path::new(&root),
         system_identifier,
         database_oid,
@@ -1498,7 +1516,9 @@ fn flashback_internal_purge_external_snapshot(snapshot_id: i64, tracking_id: i64
         snapshot_id,
         operation_nonce,
     )
-    .unwrap_or_else(|error| pgrx::error!("external artifact purge failed: {error}"))
+    .unwrap_or_else(|error| pgrx::error!("external artifact purge failed: {error}"));
+    crate::storage::worker::trigger_external_snapshot_failpoint("retire_after_delete");
+    purged
 }
 
 /// Stream one verified external_zstd artifact into an already-created shadow
@@ -1700,6 +1720,11 @@ fn flashback_internal_materialize_external_snapshot(
                 inserted += insert_decoded_batch(&destination, &columns, &receivers, batch)
                     .unwrap_or_else(|error| pgrx::error!("external batch insert failed: {error}"));
                 batch = Vec::with_capacity(batch_limit);
+                if inserted > 0 {
+                    crate::storage::worker::trigger_external_snapshot_failpoint(
+                        "restore_during_decode",
+                    );
+                }
                 pg_sys::check_for_interrupts!();
             }
         }

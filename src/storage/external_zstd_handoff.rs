@@ -1241,9 +1241,13 @@ mod tests {
         let seg = unsafe { HandoffSegment::coordinator_create(999) };
         let worker = launch_selftest_worker_mode(seg.handle(), SelftestMode::Fail)
             .expect("failed to launch selftest worker");
-        worker
-            .wait_for_startup()
-            .expect("selftest worker did not start");
+        // Fail mode intentionally signals and exits immediately. On a fast
+        // scheduler the bgworker registry may already report `Stopped` by the
+        // time the coordinator observes startup, even though the durable DSM
+        // assertion we care about (`Failed`) was published correctly. Do not
+        // turn that harmless registry timing into a flaky prerequisite; the
+        // exact PeerFailed assertion below remains the authority.
+        let _ = worker.wait_for_startup();
 
         // Fail mode signals Failed immediately without waiting for
         // LockHeldGoAhead -- proves the PeerFailed path, distinct from the

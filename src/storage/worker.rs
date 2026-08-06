@@ -158,6 +158,25 @@ pub fn external_snapshot_zstd_level() -> i32 {
     EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC.get().clamp(1, 19)
 }
 
+/// Terminate the current PostgreSQL process at one named external SnapshotStore
+/// durability boundary. This is deliberately narrower than a general-purpose
+/// fault injector: the SUSET GUC is empty by default, accepts only exact names
+/// checked at call sites, and is used solely by isolated crash/retry E2E tests.
+/// `proc_exit` skips Rust destructors, which is essential for proving recovery
+/// from the same filesystem state a real backend/copier death can leave.
+pub fn trigger_external_snapshot_failpoint(name: &str) {
+    let configured = TEST_EXTERNAL_ZSTD_FAILPOINT_GUC.get();
+    let enabled = configured.as_deref().and_then(|value| value.to_str().ok());
+    let pause_name = format!("pause:{name}");
+    if enabled == Some(pause_name.as_str()) {
+        warning!("pg_flashback TEST ONLY external_zstd pause fired: {name}");
+        std::thread::sleep(Duration::from_secs(5));
+    } else if enabled == Some(name) {
+        warning!("pg_flashback TEST ONLY external_zstd failpoint fired: {name}");
+        unsafe { pg_sys::proc_exit(86) };
+    }
+}
+
 pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.worker_interval_ms",
