@@ -666,6 +666,73 @@ BEGIN
 END;
 $$;
 
+-- Finish at most p_limit external retirements that belong to an already
+-- unprotected lifecycle. Generation-retention intents are deliberately
+-- excluded: flashback_resume_generation_retirement owns their successor
+-- proof, delta/schema deletion, and audit finalization.
+CREATE OR REPLACE FUNCTION flashback_internal_reconcile_external_snapshot_retirements(
+    p_limit integer DEFAULT 1
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    r record;
+    v_finished integer := 0;
+    v_deferred integer := 0;
+    v_last_error text;
+BEGIN
+    IF p_limit < 0 OR p_limit > 16 THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot retirement limit must be between 0 and 16'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    FOR r IN
+        SELECT s.snapshot_id, s.tracking_id
+        FROM flashback.snapshots s
+        JOIN flashback.tracked_tables tt
+          ON tt.tracking_id = s.tracking_id
+        WHERE s.storage_backend = 'external_zstd'
+          AND s.payload_state = 'retiring'
+          AND NOT tt.is_active
+          AND COALESCE(tt.protection_state, 'active') IN ('unprotected', 'cleaned')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM flashback.generation_payload_retirements gr
+              WHERE gr.snapshot_id = s.snapshot_id
+                AND gr.tracking_id = s.tracking_id
+                AND gr.state = 'retiring'
+          )
+        ORDER BY s.snapshot_id
+        LIMIT p_limit
+    LOOP
+        BEGIN
+            PERFORM public.flashback_internal_snapshot_retire_purge(
+                r.snapshot_id, r.tracking_id
+            );
+            PERFORM public.flashback_internal_snapshot_retire_finish(
+                r.snapshot_id, r.tracking_id, 'retired'
+            );
+            v_finished := v_finished + 1;
+        EXCEPTION WHEN OTHERS THEN
+            -- A restore holding the shared artifact lock is expected to defer
+            -- cleanup. The state stays `retiring`; a later bounded cycle
+            -- retries. Preserve the last error in the returned evidence.
+            v_deferred := v_deferred + 1;
+            v_last_error := SQLERRM;
+        END;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'finished', v_finished,
+        'deferred', v_deferred,
+        'last_error', v_last_error
+    );
+END;
+$$;
+
 -- ------------------------------------------------------------------
 -- phased retirement. Begin must commit before purge: external filesystem
 -- deletion can outlive a database transaction, so it is never performed
@@ -1852,6 +1919,8 @@ COMMENT ON FUNCTION flashback_internal_reconcile_snapshot_health(bigint, bigint,
     IS '[Internal] SnapshotStore: recheck an unhealthy artifact under lifecycle lock, then mark it missing and freeze coverage atomically.';
 COMMENT ON FUNCTION flashback_internal_reconcile_external_snapshot_scan(integer)
     IS '[Internal] SnapshotStore: bounded shallow/deep maintenance scan with durable audit rotation.';
+COMMENT ON FUNCTION flashback_internal_reconcile_external_snapshot_retirements(integer)
+    IS '[Internal] SnapshotStore: bounded retry of crash-safe external retirements for unprotected lifecycles.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire(bigint, bigint, text)
     IS '[Internal] SnapshotStore: drop the exact artifact''s payload and transition to retired or missing.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire_begin(bigint, bigint)
@@ -1883,6 +1952,7 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_sizes(bigint, text[]) 
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_retirements(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM PUBLIC;
@@ -1907,6 +1977,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_retirements(integer) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM flashback_admin';
@@ -1929,6 +2000,7 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint, bigint, boolean) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_retirements(integer) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM pg_monitor';

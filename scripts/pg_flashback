@@ -1010,7 +1010,7 @@ SQL
 
 cmd_cleanup() {
     local tid=$1
-    local out status
+    local out status deadline
     require_version_match
     reject_controls tracking_id "$tid"
     [[ "$tid" =~ ^[0-9]+$ ]] || die "cleanup --tracking-id requires a numeric id"
@@ -1025,6 +1025,21 @@ SELECT flashback_cleanup(:'tid'::bigint, (:'dry'::text IN ('1','true','t','yes')
 SQL
 )"
     status=$(printf '%s' "$out" | jq -r '.status // empty')
+    if [[ "$DRY_RUN" != 1 && "$status" == cleanup_pending ]]; then
+        deadline=$(( $(date +%s) + MAINTAIN_FINALIZE_TIMEOUT_S ))
+        while [[ "$status" == cleanup_pending && $(date +%s) -le $deadline ]]; do
+            sleep 0.1
+            # A new psql invocation is a new transaction. This separation is
+            # required before irreversible external artifact deletion.
+            out="$(psql_tuples -v "tid=$tid" <<'SQL'
+SELECT flashback_cleanup(:'tid'::bigint, false);
+SQL
+)"
+            status=$(printf '%s' "$out" | jq -r '.status // empty')
+        done
+        [[ "$status" != cleanup_pending ]] || \
+            fail "cleanup timed out waiting for external snapshot retirement"
+    fi
     if [[ "$JSON_OUT" == 1 ]]; then
         jq -n --argjson data "$out" \
             '{schema_version:1, command:"cleanup", status:"ok", code:($data.code // "ok"), data:$data, error:null}'

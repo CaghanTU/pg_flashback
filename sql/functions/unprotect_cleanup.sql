@@ -368,6 +368,8 @@ DECLARE
     v_delta_count bigint;
     v_manifest_count bigint;
     gen_rec record;
+    snap_rec record;
+    v_pending_external integer := 0;
 BEGIN
     PERFORM flashback_require_primary('flashback_cleanup');
 
@@ -410,30 +412,62 @@ BEGIN
         );
     END IF;
 
+    -- heap_v1 retirement is transactional. external_zstd retirement is
+    -- deliberately two-call: this transaction commits available->retiring;
+    -- only a later cleanup invocation or maintenance cycle may unlink bytes.
+    FOR snap_rec IN
+        SELECT snapshot_id, payload_state, storage_backend
+        FROM flashback.snapshots
+        WHERE tracking_id = p_tracking_id
+          AND payload_state IN ('available', 'retiring')
+        ORDER BY snapshot_id
+    LOOP
+        IF snap_rec.storage_backend = 'external_zstd'
+           AND snap_rec.payload_state = 'available'
+        THEN
+            PERFORM flashback_internal_snapshot_retire_begin(
+                snap_rec.snapshot_id, p_tracking_id
+            );
+            v_pending_external := v_pending_external + 1;
+        ELSIF snap_rec.storage_backend = 'external_zstd'
+              AND snap_rec.payload_state = 'retiring'
+        THEN
+            BEGIN
+                PERFORM flashback_internal_snapshot_retire_purge(
+                    snap_rec.snapshot_id, p_tracking_id
+                );
+                PERFORM flashback_internal_snapshot_retire_finish(
+                    snap_rec.snapshot_id, p_tracking_id, 'retired'
+                );
+            EXCEPTION WHEN OTHERS THEN
+                -- Most commonly a concurrent restore holds the shared file
+                -- lock. Preserve retiring and let a later transaction retry.
+                v_pending_external := v_pending_external + 1;
+            END;
+        ELSIF snap_rec.payload_state = 'available' THEN
+            PERFORM flashback_internal_snapshot_retire(
+                snap_rec.snapshot_id, p_tracking_id, 'retired'
+            );
+        END IF;
+    END LOOP;
+
+    IF v_pending_external > 0 THEN
+        RETURN jsonb_build_object(
+            'schema_version', 1,
+            'status', 'cleanup_pending',
+            'code', 'external_retirement_pending',
+            'tracking_id', p_tracking_id,
+            'table_name', format('%I.%I', r.schema_name, r.table_name),
+            'pending_snapshots', v_pending_external,
+            'action', 'retry flashback_cleanup in a new transaction'
+        );
+    END IF;
+
     v_op := flashback_operation_begin(
         'cleanup', format('%I.%I', r.schema_name, r.table_name), p_tracking_id,
         NULL, NULL, NULL, NULL, NULL,
         jsonb_build_object('dry_run', false)
     );
-
-    -- Retire snapshot payload tables via SnapshotStore; never touch unrelated
-    -- lifecycles. Only `available` artifacts need retiring here -- rows
-    -- already retired/missing/aborted are terminal and immutable, so this
-    -- must skip them rather than re-issue their transition.
-    DECLARE
-        snap_rec record;
-    BEGIN
-        FOR snap_rec IN
-            SELECT snapshot_id
-            FROM flashback.snapshots
-            WHERE tracking_id = p_tracking_id
-              AND payload_state = 'available'
-        LOOP
-            PERFORM flashback_internal_snapshot_retire(
-                snap_rec.snapshot_id, p_tracking_id, 'retired'
-            );
-        END LOOP;
-    END;
 
     DELETE FROM flashback.delta_log WHERE tracking_id = p_tracking_id;
     DELETE FROM flashback.schema_versions WHERE tracking_id = p_tracking_id;

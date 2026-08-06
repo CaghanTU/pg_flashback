@@ -197,6 +197,46 @@ SCAN=$(q "SELECT public.flashback_internal_reconcile_external_snapshot_scan(1)")
     echo "FAIL: maintenance health audit was not persisted"; exit 1;
 }
 
+if [[ "${PGFB_EXTZSTD_CLEANUP:-0}" == 1 ]]; then
+    UNPROTECT=$(q "SELECT public.flashback_unprotect('public.ext_artifact_e2e')")
+    [[ "$(jq -r .status <<<"$UNPROTECT")" == stopping ]] || {
+        echo "FAIL: external cleanup unprotect did not enter stopping: $UNPROTECT"; exit 1;
+    }
+    for _ in $(seq 1 200); do
+        q "SELECT public.flashback_consume_wal(50000)" >/dev/null
+        q "SELECT public.flashback_finalize_unprotect_operations()" >/dev/null
+        [[ "$(q "SELECT protection_state FROM flashback.tracked_tables WHERE tracking_id=$TRACKING")" == unprotected ]] && break
+        sleep 0.05
+    done
+    [[ "$(q "SELECT protection_state||'|'||is_active::text FROM flashback.tracked_tables WHERE tracking_id=$TRACKING")" == "unprotected|false" ]] || {
+        echo "FAIL: external lifecycle did not finish unprotected"; exit 1;
+    }
+
+    CLEANUP1=$(q "SELECT public.flashback_cleanup($TRACKING,false)")
+    [[ "$(jq -r .status <<<"$CLEANUP1")" == cleanup_pending ]] || {
+        echo "FAIL: first external cleanup transaction did not stop after durable retire begin: $CLEANUP1"; exit 1;
+    }
+    [[ -d "$FINAL_DIR" ]] || { echo "FAIL: first cleanup transaction removed bytes"; exit 1; }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retiring ]] || {
+        echo "FAIL: first cleanup transaction did not commit retiring"; exit 1;
+    }
+
+    RECONCILE_RETIRE=$(q "SELECT public.flashback_internal_reconcile_external_snapshot_retirements(1)")
+    [[ "$(jq -r .finished <<<"$RECONCILE_RETIRE")" == 1 ]] || {
+        echo "FAIL: maintenance did not finish pending external retirement: $RECONCILE_RETIRE"; exit 1;
+    }
+    CLEANUP2=$(q "SELECT public.flashback_cleanup($TRACKING,false)")
+    [[ "$(jq -r .status <<<"$CLEANUP2")" == cleaned ]] || {
+        echo "FAIL: second external cleanup transaction did not finish: $CLEANUP2"; exit 1;
+    }
+    [[ ! -e "$FINAL_DIR" ]] || { echo "FAIL: cleanup left external artifact bytes"; exit 1; }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retired ]] || {
+        echo "FAIL: cleanup did not finish snapshot retired"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS mode=operator-cleanup"
+    exit 0
+fi
+
 if [[ "${PGFB_EXTZSTD_RETIRE:-0}" == 1 ]]; then
     [[ "$(q "SELECT public.flashback_internal_snapshot_retire_begin($SNAPSHOT,$TRACKING)")" == t ]] || {
         echo "FAIL: retirement begin did not transition artifact"; exit 1;
