@@ -23,6 +23,7 @@ PORT=$((36000 + ($$ % 20000)))
 SOCKET="/tmp/pgfb-ch-$RUN_ID"
 DATA="$WORK/data"
 INSTALL_ROOT="$WORK/install"
+EXTERNAL_ROOT="$WORK/external-snapshots"
 PRIMARY_STARTED=0
 PREFIX_INSTALLED=0
 RUN_COMPLETE=0
@@ -144,8 +145,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-mkdir -p "$INSTALL_ROOT" "$SOCKET" "$WORK/log"
+mkdir -p "$INSTALL_ROOT" "$SOCKET" "$WORK/log" "$EXTERNAL_ROOT"
 chmod 700 "$SOCKET"
+chmod 700 "$EXTERNAL_ROOT"
 tar -C "$INSTALL_ROOT" -xzf "$CANDIDATE_DIR/$EXT_ARCHIVE"
 EXT_ROOT="$(find "$INSTALL_ROOT" -maxdepth 1 -type d -name 'pg_flashback-candidate-*' -print -quit)"
 [[ -n "$EXT_ROOT" ]] || die "unexpected archive layout"
@@ -185,6 +187,12 @@ pg_flashback.local_max_snapshot_bytes = 8GB
 pg_flashback.local_max_restore_peak_bytes = 16GB
 pg_flashback.local_min_filesystem_bytes = 64MB
 pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.snapshot_storage_backend = 'external_zstd'
+pg_flashback.external_snapshot_root = '$EXTERNAL_ROOT'
+pg_flashback.external_snapshot_min_free_bytes = '64MB'
+pg_flashback.external_snapshot_safety_reserve_bytes = '16MB'
+pg_flashback.external_snapshot_batch_rows = 128
+pg_flashback.external_snapshot_zstd_level = 3
 EOF
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$WORK/log/postgresql.log" start -w >/dev/null
 PRIMARY_STARTED=1
@@ -758,5 +766,74 @@ fi
     || die "unsupported relation left a tracking lifecycle"
 pass "unsupported FK/topology/storage/sequence metadata fail closed without residue"
 
+# Candidate-only external SnapshotStore smoke.  Protect intentionally creates
+# the ordinary initial heap boundary; maintain must then create and activate a
+# new external_zstd generation through the packaged CLI, after which the same
+# audited DROP recovery path must restore from that external boundary.
+q "CREATE TABLE public.smoke_external(
+     id bigint PRIMARY KEY,
+     payload text NOT NULL,
+     attrs jsonb NOT NULL
+   );
+   INSERT INTO public.smoke_external
+   SELECT g,
+          repeat(md5(g::text), 16),
+          jsonb_build_object('id',g,'shape',g % 7)
+   FROM generate_series(1,2000) AS g;"
+"$CLI" protect public.smoke_external >/dev/null
+"$CLI" maintain public.smoke_external --yes >/dev/null
+EXTERNAL_TRACKING_ID="$(q "SELECT tracking_id FROM flashback.tracked_tables
+  WHERE is_active AND schema_name='public' AND table_name='smoke_external';")"
+for _ in $(seq 1 400); do
+    EXTERNAL_STATE="$(q "SELECT COALESCE(snapshot_storage_backend,'')||'|'||
+                                COALESCE(snapshot_payload_state,'')||'|'||health
+                           FROM flashback_health()
+                          WHERE tracking_id=$EXTERNAL_TRACKING_ID;")"
+    [[ "$EXTERNAL_STATE" == "external_zstd|available|healthy" ]] && break
+    sleep 0.05
+done
+[[ "${EXTERNAL_STATE:-}" == "external_zstd|available|healthy" ]] \
+    || die "external maintain did not activate a healthy artifact: ${EXTERNAL_STATE:-missing}"
+[[ "$(q "SELECT count(*) FROM flashback_doctor()
+             WHERE check_name IN ('snapshot_storage_backend','external_snapshot_root')
+               AND status='ok';")" == 2 ]] \
+    || die "doctor did not report external SnapshotStore readiness"
+EXTERNAL_FP="$(fingerprint_of public.smoke_external)"
+EXTERNAL_SHA="$(data_sha256_of public.smoke_external)"
+q "UPDATE public.smoke_external
+      SET payload = payload || '-after-maintain',
+          attrs = attrs || '{\"changed\":true}'::jsonb
+    WHERE id BETWEEN 1 AND 125;"
+for _ in $(seq 1 400); do
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log
+               WHERE tracking_id=$EXTERNAL_TRACKING_ID
+                 AND event_type='UPDATE';")" -ge 125 ]] && break
+    sleep 0.05
+done
+[[ "$(q "SELECT count(*) FROM flashback.delta_log
+             WHERE tracking_id=$EXTERNAL_TRACKING_ID
+               AND event_type='UPDATE';")" -ge 125 ]] \
+    || die "post-external-boundary WAL did not become visible"
+EXTERNAL_FP="$(fingerprint_of public.smoke_external)"
+EXTERNAL_SHA="$(data_sha256_of public.smoke_external)"
+q "DROP TABLE public.smoke_external;"
+for _ in $(seq 1 400); do
+    [[ "$(q "SELECT count(*) FROM flashback_disaster_points(
+                   'public.smoke_external', interval '1 hour')
+               WHERE event_type='DROP' AND status='restorable';")" -ge 1 ]] && break
+    sleep 0.05
+done
+"$CLI" recover public.smoke_external --latest-drop --yes >/dev/null
+for _ in $(seq 1 400); do
+    [[ "$(q "SELECT health FROM flashback_health()
+               WHERE tracking_id=$EXTERNAL_TRACKING_ID;")" == healthy ]] && break
+    sleep 0.05
+done
+[[ "$(fingerprint_of public.smoke_external)" == "$EXTERNAL_FP" ]] \
+    || die "external DROP recovery fingerprint mismatch"
+[[ "$(data_sha256_of public.smoke_external)" == "$EXTERNAL_SHA" ]] \
+    || die "external DROP recovery COPY-binary SHA-256 mismatch"
+pass "candidate external_zstd protect-maintain-DML-DROP-recover path"
+
 RUN_COMPLETE=1
-log "PASS: local-only clean-host smoke ($PASSED assertions)"
+log "PASS: clean-host local_delta + external_zstd smoke ($PASSED assertions)"
