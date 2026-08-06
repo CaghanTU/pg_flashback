@@ -26,8 +26,10 @@ pg_test = []
 fs2 = "0.4"
 libc = "0.2"
 pgrx = "=0.16.1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+zstd = "0.13"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

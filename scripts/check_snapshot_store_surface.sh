@@ -172,6 +172,8 @@ require 'flashback_internal_snapshot_sizes'
 require 'flashback_internal_snapshot_retire'
 require 'flashback_internal_snapshot_transition'
 require 'flashback_internal_snapshot_refine_boundary'
+require 'flashback_internal_publish_external_snapshot'
+require 'flashback_internal_activate_external_generation'
 require 'flashback_internal_snapshot_retire_legacy'
 require 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_create'
 

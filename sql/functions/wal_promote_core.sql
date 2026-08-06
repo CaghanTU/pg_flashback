@@ -194,7 +194,7 @@ BEGIN
     FOR pending IN
         SELECT
             cg.generation_id, cg.tracking_id, cg.parent_generation_id,
-            cg.boundary_snapshot_id, cg.boundary_kind,
+            cg.boundary_snapshot_id, cg.boundary_kind, cg.storage_backend,
             c.commit_lsn, c.committed_at
         FROM flashback.coverage_generations cg
         JOIN _fb_wal_commits c ON c.source_xid = cg.boundary_xid
@@ -222,6 +222,15 @@ BEGIN
                SELECT boundary_xid FROM flashback.coverage_generations
                WHERE generation_id = pending.generation_id
            );
+
+        -- External artifacts are not eligible coverage merely because their
+        -- marker COMMIT was observed.  WAL consumption owns only exact
+        -- boundary refinement for this backend.  The filesystem finalizer
+        -- must first publish and verify an immutable artifact; a separate
+        -- authority then seals the predecessor and activates this generation.
+        IF pending.storage_backend = 'external_zstd' THEN
+            CONTINUE;
+        END IF;
 
         IF pending.parent_generation_id IS NOT NULL THEN
             SELECT stream_id, state INTO v_parent_stream_id, v_parent_state

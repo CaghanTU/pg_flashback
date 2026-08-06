@@ -30,9 +30,11 @@ transitive dependencies and exact versions are recorded in `Cargo.lock`.
 | Crate | Component | License |
 |---|---|---|
 | `pgrx`, `pgrx-tests` | PostgreSQL extension framework and tests | MIT |
+| `serde` | Artifact metadata serialization | MIT OR Apache-2.0 |
 | `serde_json` | JSON serialization | MIT OR Apache-2.0 |
 | `sha2` | SHA-256 implementation | MIT OR Apache-2.0 |
 | `fs2` | File locking | MIT OR Apache-2.0 |
+| `zstd` | Streaming snapshot compression | MIT |
 
 At the 0.1.0 release candidate, RustSec also reports two maintenance-only
 warnings in pgrx's locked transitive tree: `paste` (RUSTSEC-2024-0436, used by

@@ -114,10 +114,10 @@
 //! syntax is used to emit the same hardware instructions, not the
 //! underlying guarantee.
 //!
-//! Stage 4 of a staged implementation (see the Step 9 plan, §15): exercised
-//! directly by the `#[pg_test]`s below (including a real cross-process
-//! round trip); the real online-snapshot coordinator/copier land in Stage
-//! 5-7. `#![allow(dead_code)]` is temporary scaffolding for that gap.
+//! The production online-snapshot coordinator/copier uses this protocol;
+//! the tests below additionally exercise it in isolation, including a real
+//! cross-process round trip. A few fault-injection helpers remain test-only,
+//! hence the temporary module-level dead-code allowance.
 #![allow(dead_code)]
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, DynamicBackgroundWorker};
@@ -168,12 +168,26 @@ const COLUMN_LIST_CAP: usize = 8192;
 /// `HandoffShared.target_relation` (e.g. `"public"."my_table"`) -- same
 /// write-before-publish contract as `column_list`.
 const TARGET_RELATION_CAP: usize = 256;
+const COLUMN_CONTRACT_CAP: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyIdentity {
+    pub tracking_id: i64,
+    pub generation_id: i64,
+    pub snapshot_id: i64,
+    pub rel_oid: u32,
+}
 
 #[repr(C)]
 struct HandoffShared {
     state: u32,
     cv: pg_sys::ConditionVariable,
     operation_nonce: u64,
+    persist_requested: u32,
+    tracking_id: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+    rel_oid: u32,
     /// Written once, in full, by the coordinator strictly before the
     /// `LockHeldGoAhead` atomic store (see `signal`) -- its visibility to
     /// the copier is a consequence of that store's Release ordering and
@@ -184,6 +198,8 @@ struct HandoffShared {
     column_list: [u8; COLUMN_LIST_CAP],
     target_relation_len: u32,
     target_relation: [u8; TARGET_RELATION_CAP],
+    column_contract_len: u32,
+    column_contract: [u8; COLUMN_CONTRACT_CAP],
     /// The reverse direction: written once by the copier, strictly before
     /// its `SnapshotPinned` atomic store, read by the coordinator only
     /// after observing `SnapshotPinned` -- the row count its real cursor
@@ -277,8 +293,14 @@ impl HandoffSegment {
         (*shared).state = HandoffPhase::WaitingForLock as u32;
         pg_sys::ConditionVariableInit(&mut (*shared).cv);
         (*shared).operation_nonce = operation_nonce;
+        (*shared).persist_requested = 0;
+        (*shared).tracking_id = 0;
+        (*shared).generation_id = 0;
+        (*shared).snapshot_id = 0;
+        (*shared).rel_oid = 0;
         (*shared).column_list_len = 0;
         (*shared).target_relation_len = 0;
+        (*shared).column_contract_len = 0;
         (*shared).fetched_row_count = 0;
         (*shared).pinned_wal_lsn = 0;
         (*shared).error_message_len = 0;
@@ -322,6 +344,47 @@ impl HandoffSegment {
     pub fn operation_nonce(&self) -> u64 {
         let _ = self.atomic_state().load(Ordering::Acquire);
         unsafe { (*self.shared).operation_nonce }
+    }
+
+    /// Coordinator side: bind the durable reservation identity to this
+    /// one copier before it is launched. A zero field is never accepted;
+    /// the worker fails closed instead of consulting mutable names.
+    pub fn write_copy_identity(&self, identity: CopyIdentity) -> Result<(), String> {
+        if identity.tracking_id <= 0
+            || identity.generation_id <= 0
+            || identity.snapshot_id <= 0
+            || identity.rel_oid == 0
+        {
+            return Err("external_zstd copy identity must be complete and positive".to_string());
+        }
+        unsafe {
+            (*self.shared).tracking_id = identity.tracking_id;
+            (*self.shared).generation_id = identity.generation_id;
+            (*self.shared).snapshot_id = identity.snapshot_id;
+            (*self.shared).rel_oid = identity.rel_oid;
+            (*self.shared).persist_requested = 1;
+        }
+        Ok(())
+    }
+
+    pub fn read_copy_identity(&self) -> Option<CopyIdentity> {
+        let _ = self.atomic_state().load(Ordering::Acquire);
+        unsafe {
+            if (*self.shared).persist_requested == 0 {
+                return None;
+            }
+            let identity = CopyIdentity {
+                tracking_id: (*self.shared).tracking_id,
+                generation_id: (*self.shared).generation_id,
+                snapshot_id: (*self.shared).snapshot_id,
+                rel_oid: (*self.shared).rel_oid,
+            };
+            (identity.tracking_id > 0
+                && identity.generation_id > 0
+                && identity.snapshot_id > 0
+                && identity.rel_oid != 0)
+                .then_some(identity)
+        }
     }
 
     /// Coordinator side only: write the quoted, comma-separated column
@@ -391,6 +454,33 @@ impl HandoffSegment {
             let len = (*self.shared).target_relation_len as usize;
             let len = len.min(TARGET_RELATION_CAP);
             let src = std::ptr::addr_of!((*self.shared).target_relation);
+            let slice = std::slice::from_raw_parts((*src).as_ptr(), len);
+            String::from_utf8_lossy(slice).into_owned()
+        }
+    }
+
+    /// Coordinator side: publish the exact lock-captured JSON column
+    /// contract before `LockHeldGoAhead`.
+    pub fn write_column_contract(&self, contract: &str) -> Result<(), String> {
+        let bytes = contract.as_bytes();
+        if bytes.len() > COLUMN_CONTRACT_CAP {
+            return Err(format!(
+                "column contract ({} bytes) exceeds the {COLUMN_CONTRACT_CAP}-byte handoff bound",
+                bytes.len()
+            ));
+        }
+        unsafe {
+            let dst = std::ptr::addr_of_mut!((*self.shared).column_contract);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*dst).as_mut_ptr(), bytes.len());
+            (*self.shared).column_contract_len = bytes.len() as u32;
+        }
+        Ok(())
+    }
+
+    pub fn read_column_contract(&self) -> String {
+        unsafe {
+            let len = ((*self.shared).column_contract_len as usize).min(COLUMN_CONTRACT_CAP);
+            let src = std::ptr::addr_of!((*self.shared).column_contract);
             let slice = std::slice::from_raw_parts((*src).as_ptr(), len);
             String::from_utf8_lossy(slice).into_owned()
         }

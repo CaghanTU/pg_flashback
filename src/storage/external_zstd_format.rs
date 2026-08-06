@@ -1,14 +1,10 @@
 //! external_zstd artifact binary format, `format_version = 1`
 //! (Step 9, Stage 3 of the implementation plan).
 //!
-//! This module owns the frame layout (§5 of the plan) and the PostgreSQL
-//! binary-send/receive plumbing for one column value. It does **not** wrap
-//! a zstd stream and does **not** touch SPI/cursors -- those land in later
-//! stages (the copier's streaming persist/restore). What's tested here is
-//! round-tripped directly: write a header + rows + trailer into an
-//! in-memory buffer, read it back, and confirm the decoded values are
-//! byte-identical to what was encoded, using real PostgreSQL binary
-//! send/receive functions against a real table's real columns.
+//! This module owns the frame layout and PostgreSQL binary-send/receive
+//! plumbing used by both the production streaming copier and restore reader.
+//! Its direct tests additionally round-trip headers, rows, and trailers in
+//! memory against real PostgreSQL column types.
 //!
 //! Format (all multi-byte integers big-endian):
 //! ```text
@@ -34,11 +30,9 @@
 //! verified exactly. This is pg_flashback's own artifact format, not a
 //! claim of `COPY BINARY` wire compatibility -- no external tool reads it.
 //!
-//! Stage 3 of a staged implementation (see the Step 9 plan, §15): exercised
-//! directly by the `#[pg_test]`s below; real production callers (the
-//! zstd-streaming copier/finalizer) land in later stages.
-//! `#![allow(dead_code)]` is temporary scaffolding for that gap, removed
-//! once Stage 6+ wires real callers in.
+//! A small number of format helpers are intentionally test-only until the
+//! remaining failpoint matrix is wired, hence the temporary module-level
+//! dead-code allowance.
 #![allow(dead_code)]
 
 use pgrx::pg_sys;

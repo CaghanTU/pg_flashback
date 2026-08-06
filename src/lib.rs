@@ -255,6 +255,10 @@ mod tests {
         "../tests/sql/integration/online_boundary_bind.sql"
     );
     sql_test!(
+        it_external_snapshot_activation_authority,
+        "../tests/sql/integration/external_snapshot_activation_authority.sql"
+    );
+    sql_test!(
         it_tracked_table_resolver_search_path,
         "../tests/sql/integration/tracked_table_resolver_search_path.sql"
     );

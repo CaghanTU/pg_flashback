@@ -1,19 +1,13 @@
-//! external_zstd online-snapshot marker-transaction coordinator (Step 9,
-//! Stage 6 completion). Wires Stage 4's DSM handoff, Stage 5's reservation
-//! authority, and Stage 6's boundary-bind authority into the real M1-M7
-//! sequence the plan's §1e timeline describes -- not the SQL authority
-//! functions tested in isolation, the actual orchestration that will
-//! eventually sit behind a public `flashback_reanchor`-style online
-//! wrapper.
+//! Production external_zstd online-snapshot coordinator. It wires the DSM
+//! handoff, durable reservation, lock-protected boundary bind, streaming
+//! copier, immutable artifact finalization, generation activation, and
+//! restore materialization into the SnapshotStore authority surface.
 //!
-//! This module does **not** implement the copy/finalizer transactions
-//! (C1-C5/F1-F11) -- the real streaming persist to a zstd artifact is
-//! Stage 7's job, explicitly deferred. What this module proves is that
-//! the *handoff itself* -- lock, revalidate, bind, signal, wait, publish
-//! the boundary WAL message -- works for real, in the right order, against
-//! a real second OS process, with real DDL adversarially interleaved, and
-//! with every pre-commit failure point leaving the durable Stage 5
-//! reservation exactly as the reconciler (plan §1h) expects to find it.
+//! The marker transaction and copy transaction deliberately remain separate:
+//! the copy pins its repeatable-read snapshot only after the marker-side table
+//! lock is held, while the WAL message is emitted only after that pin is
+//! acknowledged. Publication and generation activation are later, independently
+//! durable milestones so either can be resumed after a crash.
 //!
 //! # M8 (COMMIT) is deliberately not this module's job
 //!
@@ -39,19 +33,32 @@
 //! `UPDATE flashback.coverage_generations`/`UPDATE flashback.snapshots`
 //! anywhere in this module, and there must never be one added here.
 //!
-//! `#![allow(dead_code)]` is temporary: nothing outside this module's own
-//! tests calls `run_marker_transaction` yet, since the public wrapper that
-//! will drive it end-to-end (`flashback_track_online`/an online variant of
-//! `flashback_reanchor`) is out of scope until the copy/finalizer
-//! transactions (Stage 7) exist to give it something to hand off to.
+//! Some orchestration helpers remain callable only through the background
+//! worker and test seams until the public operator workflow is wired. Keep
+//! the module-level allowance until that final call-site closure, rather than
+//! weakening the production lifecycle protocol to manufacture Rust callers.
 #![allow(dead_code)]
 
-use crate::storage::external_zstd_handoff::{HandoffPhase, HandoffSegment, HandoffWaitError};
+use crate::storage::external_zstd_artifact::{
+    finalize_staged_artifact, open_published_artifact, ArtifactStream, FinalManifest,
+    FinalizationInput, PendingArtifact, ProvisionalManifest,
+};
+use crate::storage::external_zstd_format::{
+    decode_datum, encode_datum, read_header, read_row, read_trailer, resolve_receive_info,
+    resolve_send_info, write_header, write_row, write_trailer, ColumnDescriptor, TypeReceiveInfo,
+    TypeSendInfo, FORMAT_VERSION,
+};
+use crate::storage::external_zstd_handoff::{
+    CopyIdentity, HandoffPhase, HandoffSegment, HandoffWaitError,
+};
 use pgrx::bgworkers::DynamicBackgroundWorker;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
 use pgrx::JsonB;
+use sha2::{Digest, Sha256};
+use std::ffi::{CStr, CString};
+use std::io::Read;
 use std::time::Duration;
 
 /// Successful M1-M7 outcome, returned to the caller for M8 (its own
@@ -264,18 +271,26 @@ pub fn run_marker_transaction(
     // signal) and read by the copier only after it observes
     // LockHeldGoAhead -- exactly the write-before-publish contract
     // write_column_list/read_column_list document.
-    let column_list = run_catching(|| {
-        Spi::get_one::<String>(&format!(
-            "SELECT string_agg(quote_ident(col->>'name'), ',' ORDER BY (col->>'attnum')::int) \
+    let (column_list, column_contract) = run_catching(|| {
+        Spi::get_two::<String, String>(&format!(
+            "SELECT string_agg(quote_ident(col->>'name'), ',' ORDER BY (col->>'attnum')::int), \
+                    s.external_column_contract::text \
              FROM flashback.snapshots s, jsonb_array_elements(s.external_column_contract) AS col \
-             WHERE s.snapshot_id = {snapshot_id}::bigint AND s.tracking_id = {tracking_id}::bigint"
+             WHERE s.snapshot_id = {snapshot_id}::bigint AND s.tracking_id = {tracking_id}::bigint \
+             GROUP BY s.external_column_contract"
         ))
-    })?
-    .ok_or_else(|| {
+    })?;
+    let column_list = column_list.ok_or_else(|| {
         MarkerError::Other("no materializable columns bound for this snapshot".to_string())
+    })?;
+    let column_contract = column_contract.ok_or_else(|| {
+        MarkerError::Other("no materializable column contract bound for this snapshot".to_string())
     })?;
     segment
         .write_column_list(&column_list)
+        .map_err(MarkerError::Other)?;
+    segment
+        .write_column_contract(&column_contract)
         .map_err(MarkerError::Other)?;
     let qualified_target = format!("{}.{}", quote_ident(&schema), quote_ident(&table));
     segment
@@ -363,6 +378,13 @@ fn copier_worker_body(arg: pg_sys::Datum) {
             return;
         }
     };
+    struct UnpinOnExit(pg_sys::dsm_handle);
+    impl Drop for UnpinOnExit {
+        fn drop(&mut self) {
+            unsafe { pg_sys::dsm_unpin_segment(self.0) };
+        }
+    }
+    let _unpin = UnpinOnExit(segment.handle());
 
     BackgroundWorker::connect_worker_to_spi_by_oid(Some(db_oid), None);
     // Sets the isolation level for the *next* transaction this session
@@ -403,17 +425,39 @@ fn copier_worker_body(arg: pg_sys::Datum) {
         Ok(()) => {
             let column_list = segment.read_column_list();
             let target_relation = segment.read_target_relation();
+            let copy_identity = segment.read_copy_identity();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                BackgroundWorker::transaction(|| {
-                    open_cursor_and_fetch(&column_list, &target_relation)
-                })
+                if let Some(identity) = copy_identity {
+                    let pending = BackgroundWorker::transaction(|| {
+                        stream_cursor_to_staging(
+                            &segment,
+                            &column_list,
+                            &target_relation,
+                            &segment.read_column_contract(),
+                            identity,
+                        )
+                    })?;
+                    pending.mark_copy_committed().map(|manifest| {
+                        log!(
+                            "pg_flashback external_zstd copier committed staged artifact: operation_nonce={}, rows={}, compressed_bytes={}",
+                            manifest.operation_nonce,
+                            manifest.row_count,
+                            manifest.compressed_bytes
+                        );
+                    })
+                } else {
+                    BackgroundWorker::transaction(|| {
+                        open_cursor_and_fetch(&column_list, &target_relation)
+                    })
+                    .map(|(n, pinned_lsn)| {
+                        segment.write_fetched_row_count(n);
+                        segment.write_pinned_wal_lsn(pinned_lsn);
+                        segment.signal(HandoffPhase::SnapshotPinned);
+                    })
+                }
             }));
             match outcome {
-                Ok(Ok((n, pinned_lsn))) => {
-                    segment.write_fetched_row_count(n);
-                    segment.write_pinned_wal_lsn(pinned_lsn);
-                    segment.signal(HandoffPhase::SnapshotPinned);
-                }
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     log!("pg_flashback external_zstd copier: cursor open/fetch failed: {e}");
                     segment.write_error_message(&e);
@@ -442,6 +486,346 @@ fn copier_worker_body(arg: pg_sys::Datum) {
             segment.signal(HandoffPhase::Failed);
         }
     }
+}
+
+fn parse_column_contract(contract: &str) -> Result<Vec<ColumnDescriptor>, String> {
+    fn json_u32(value: &serde_json::Value, name: &str) -> Result<u32, String> {
+        value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .or_else(|| value.as_str().and_then(|v| v.parse::<u32>().ok()))
+            .ok_or_else(|| format!("{name} is outside u32"))
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(contract).map_err(|e| format!("invalid column contract JSON: {e}"))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "column contract must be a JSON array".to_string())?;
+    if entries.is_empty() {
+        return Err("column contract is empty".to_string());
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let field = |name: &str| {
+                entry
+                    .get(name)
+                    .ok_or_else(|| format!("column contract entry is missing {name}"))
+            };
+            let attidentity = field("attidentity")?
+                .as_str()
+                .ok_or_else(|| "attidentity must be a string".to_string())?
+                .as_bytes()
+                .first()
+                .copied()
+                .unwrap_or(0);
+            Ok(ColumnDescriptor {
+                attnum: field("attnum")?
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| "attnum is outside i32".to_string())?,
+                // PostgreSQL's jsonb conversion renders OID-typed values as
+                // decimal strings, while hand-built test contracts may use
+                // JSON numbers. Accept both representations, with the same
+                // exact u32 bound.
+                atttypid: json_u32(field("atttypid")?, "atttypid")?,
+                atttypmod: field("atttypmod")?
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or_else(|| "atttypmod is outside i32".to_string())?,
+                attcollation: json_u32(field("attcollation")?, "attcollation")?,
+                attnotnull: field("attnotnull")?
+                    .as_bool()
+                    .ok_or_else(|| "attnotnull must be boolean".to_string())?,
+                attidentity,
+                name: field("name")?
+                    .as_str()
+                    .ok_or_else(|| "column name must be a string".to_string())?
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+struct CountingHashReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl<R> CountingHashReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes, format!("{:x}", self.hasher.finalize()))
+    }
+}
+
+impl<R: Read> Read for CountingHashReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.bytes = self.bytes.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+fn quote_identifier(identifier: &str) -> Result<String, String> {
+    let input = CString::new(identifier).map_err(|_| "identifier contains NUL".to_string())?;
+    let quoted = unsafe { pg_sys::quote_identifier(input.as_ptr()) };
+    if quoted.is_null() {
+        return Err("quote_identifier returned NULL".to_string());
+    }
+    Ok(unsafe { CStr::from_ptr(quoted) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn insert_decoded_batch(
+    destination: &str,
+    columns: &[ColumnDescriptor],
+    receivers: &[TypeReceiveInfo],
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+) -> Result<u64, String> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut parameter = 1_usize;
+    let values_sql = rows
+        .iter()
+        .map(|_| {
+            let tuple = (0..columns.len())
+                .map(|_| {
+                    let item = format!("${parameter}");
+                    parameter += 1;
+                    item
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("({tuple})")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let column_list = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",");
+    let identity_override = if columns.iter().any(|column| column.attidentity != 0) {
+        " OVERRIDING SYSTEM VALUE"
+    } else {
+        ""
+    };
+    let query = CString::new(format!(
+        "INSERT INTO {destination} ({column_list}){identity_override} VALUES {values_sql}"
+    ))
+    .map_err(|_| "external materialize query contains NUL".to_string())?;
+    let mut argument_types = Vec::with_capacity(rows.len() * columns.len());
+    for _ in &rows {
+        argument_types.extend(
+            columns
+                .iter()
+                .map(|column| pg_sys::Oid::from(column.atttypid)),
+        );
+    }
+
+    let inserted = unsafe {
+        let parent = pg_sys::CurrentMemoryContext;
+        let mut batch_context = pgrx::PgMemoryContexts::Transient {
+            parent,
+            name: "pg_flashback external restore batch",
+            min_context_size: 8 * 1024,
+            initial_block_size: 64 * 1024,
+            max_block_size: 8 * 1024 * 1024,
+        };
+        batch_context.switch_to(|_| {
+            let mut datums = Vec::with_capacity(rows.len() * columns.len());
+            let mut nulls = Vec::with_capacity(rows.len() * columns.len());
+            for row in &rows {
+                for ((value, column), receiver) in row.iter().zip(columns).zip(receivers) {
+                    match value {
+                        Some(bytes) => {
+                            datums.push(decode_datum(bytes, receiver, column.atttypmod));
+                            nulls.push(b' ' as std::os::raw::c_char);
+                        }
+                        None => {
+                            datums.push(pg_sys::Datum::from(0));
+                            nulls.push(b'n' as std::os::raw::c_char);
+                        }
+                    }
+                }
+            }
+            let status = pg_sys::SPI_execute_with_args(
+                query.as_ptr(),
+                i32::try_from(argument_types.len())
+                    .map_err(|_| "too many external restore parameters".to_string())?,
+                argument_types.as_mut_ptr(),
+                datums.as_mut_ptr(),
+                nulls.as_ptr(),
+                false,
+                0,
+            );
+            if status != pg_sys::SPI_OK_INSERT as i32 {
+                return Err(format!(
+                    "external restore INSERT returned SPI status {status}"
+                ));
+            }
+            let processed = pg_sys::SPI_processed;
+            if !pg_sys::SPI_tuptable.is_null() {
+                pg_sys::SPI_freetuptable(pg_sys::SPI_tuptable);
+            }
+            Ok(processed)
+        })
+    }?;
+    if inserted != rows.len() as u64 {
+        return Err(format!(
+            "external restore inserted {inserted} rows from a {}-row batch",
+            rows.len()
+        ));
+    }
+    Ok(inserted)
+}
+
+fn stream_cursor_to_staging(
+    segment: &HandoffSegment,
+    column_list: &str,
+    target_relation: &str,
+    column_contract: &str,
+    identity: CopyIdentity,
+) -> Result<PendingArtifact, String> {
+    let root = crate::storage::worker::external_snapshot_root()?;
+    crate::storage::external_zstd::validate_root_os_level(&root)?;
+    crate::storage::external_zstd::validate_root_spi_level(&root)?;
+    let columns = parse_column_contract(column_contract)?;
+    let sends: Vec<TypeSendInfo> = columns
+        .iter()
+        .map(|column| resolve_send_info(pg_sys::Oid::from(column.atttypid)))
+        .collect::<Result<_, _>>()?;
+    let system_identifier = unsafe { pg_sys::GetSystemIdentifier() };
+    let database_oid = unsafe { pg_sys::MyDatabaseId }.to_u32();
+    let mut artifact = ArtifactStream::create(
+        std::path::Path::new(&root),
+        system_identifier,
+        database_oid,
+        segment.operation_nonce(),
+        crate::storage::worker::external_snapshot_zstd_level(),
+    )?;
+    write_header(artifact.writer()?, &columns)
+        .map_err(|e| format!("write artifact header: {e}"))?;
+
+    let query = format!("SELECT {column_list} FROM {target_relation}");
+    let query_c = std::ffi::CString::new(query).map_err(|e| e.to_string())?;
+    let name_c = std::ffi::CString::new("pg_flashback_external_copy").unwrap();
+    let batch_rows = crate::storage::worker::external_snapshot_batch_rows();
+    let max_row_bytes = crate::storage::worker::external_snapshot_max_row_bytes();
+    let mut row_count = 0_u64;
+
+    Spi::connect(|_client| -> Result<(), String> {
+        let portal = unsafe {
+            pg_sys::SPI_cursor_open_with_args(
+                name_c.as_ptr(),
+                query_c.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                true,
+                0,
+            )
+        };
+        if portal.is_null() {
+            return Err("SPI_cursor_open_with_args returned a null portal".to_string());
+        }
+
+        let mut first_fetch = true;
+        loop {
+            unsafe { pg_sys::SPI_cursor_fetch(portal, true, batch_rows as i64) };
+            let processed = unsafe { pg_sys::SPI_processed as usize };
+            if first_fetch {
+                let pinned_lsn = unsafe { pg_sys::GetXLogInsertRecPtr() };
+                segment.write_pinned_wal_lsn(pinned_lsn);
+                segment.signal(HandoffPhase::SnapshotPinned);
+                first_fetch = false;
+            }
+            if processed == 0 {
+                break;
+            }
+
+            let tuptable = unsafe { pg_sys::SPI_tuptable };
+            if tuptable.is_null() {
+                unsafe { pg_sys::SPI_cursor_close(portal) };
+                return Err("SPI_tuptable was null after cursor fetch".to_string());
+            }
+            let tupdesc = unsafe { (*tuptable).tupdesc };
+            let tuples = unsafe { (*tuptable).vals };
+            for row_index in 0..processed {
+                let tuple = unsafe { *tuples.add(row_index) };
+                let mut values = Vec::with_capacity(columns.len());
+                let mut encoded_size = columns.len().div_ceil(8);
+                for (column_index, send) in sends.iter().enumerate() {
+                    let mut is_null = false;
+                    let datum = unsafe {
+                        pg_sys::SPI_getbinval(
+                            tuple,
+                            tupdesc,
+                            (column_index + 1) as i32,
+                            &mut is_null,
+                        )
+                    };
+                    if is_null {
+                        values.push(None);
+                    } else {
+                        let bytes = unsafe { encode_datum(datum, send) };
+                        encoded_size = encoded_size
+                            .checked_add(4 + bytes.len())
+                            .ok_or_else(|| "encoded row size overflow".to_string())?;
+                        if encoded_size > max_row_bytes {
+                            unsafe { pg_sys::SPI_cursor_close(portal) };
+                            return Err(format!(
+                                "encoded row exceeds pg_flashback.external_snapshot_max_row_bytes ({max_row_bytes})"
+                            ));
+                        }
+                        values.push(Some(bytes));
+                    }
+                }
+                write_row(artifact.writer()?, &values)
+                    .map_err(|e| format!("write artifact row: {e}"))?;
+                row_count = row_count.saturating_add(1);
+            }
+            unsafe { pg_sys::SPI_freetuptable(tuptable) };
+            pg_sys::check_for_interrupts!();
+            if pgrx::bgworkers::BackgroundWorker::sigterm_received() {
+                unsafe { pg_sys::SPI_cursor_close(portal) };
+                return Err("external_zstd copy cancelled by SIGTERM".to_string());
+            }
+        }
+        unsafe { pg_sys::SPI_cursor_close(portal) };
+        Ok(())
+    })?;
+
+    write_trailer(artifact.writer()?, row_count)
+        .map_err(|e| format!("write artifact trailer: {e}"))?;
+    segment.write_fetched_row_count(row_count);
+    artifact.finish_copy(ProvisionalManifest {
+        operation_nonce: segment.operation_nonce(),
+        database_oid,
+        tracking_id: identity.tracking_id,
+        generation_id: identity.generation_id,
+        snapshot_id: identity.snapshot_id,
+        format_version: FORMAT_VERSION,
+        codec: "zstd".to_string(),
+        row_count,
+        uncompressed_bytes: 0,
+        compressed_bytes: 0,
+        checksum_sha256: String::new(),
+    })
 }
 
 /// A real `SPI_cursor_open_with_args` + `SPI_cursor_fetch` against a
@@ -569,8 +953,35 @@ fn flashback_internal_run_external_marker_transaction(
         pgrx::error!("external marker transaction identifiers must all be positive");
     }
 
+    let operation_nonce = Spi::get_one::<i64>(&format!(
+        "SELECT operation_nonce FROM flashback.coverage_generations \
+         WHERE generation_id = {generation_id}::bigint \
+           AND tracking_id = {tracking_id}::bigint \
+           AND boundary_snapshot_id = {snapshot_id}::bigint \
+           AND rel_oid_at_boundary = {rel_oid}::oid \
+           AND state = 'building' AND storage_backend = 'external_zstd'"
+    ))
+    .unwrap_or_else(|error| pgrx::error!("cannot resolve external copy reservation: {error}"))
+    .unwrap_or_else(|| pgrx::error!("external copy reservation does not exist"));
+    if operation_nonce <= 0 {
+        pgrx::error!("external copy reservation has an invalid operation_nonce");
+    }
+
     let db_oid = unsafe { pg_sys::MyDatabaseId };
-    let segment = unsafe { HandoffSegment::coordinator_create(generation_id as u64) };
+    let segment = unsafe { HandoffSegment::coordinator_create(operation_nonce as u64) };
+    // pg_test cannot set a POSTMASTER-context artifact root per test. Its
+    // coordinator regressions therefore keep exercising the exact real
+    // lock/DSM/marker protocol in probe mode; production builds always bind
+    // the copy identity and execute the real staged persist path.
+    #[cfg(not(feature = "pg_test"))]
+    segment
+        .write_copy_identity(CopyIdentity {
+            tracking_id,
+            generation_id,
+            snapshot_id,
+            rel_oid: rel_oid as u32,
+        })
+        .unwrap_or_else(|error| pgrx::error!("cannot bind external copier identity: {error}"));
     let worker = launch_copier_worker(segment.handle(), db_oid)
         .expect("failed to launch external_zstd copier worker");
     worker
@@ -603,6 +1014,365 @@ fn flashback_internal_run_external_marker_transaction(
             pgrx::error!("pg_flashback external marker transaction failed: {error}")
         }
     }
+}
+
+/// Finalize a copy-committed staged artifact after ordinary WAL consumption
+/// has resolved its exact boundary LSN. The caller's SQL transaction owns
+/// the database commit. Filesystem publication happens first; an abort after
+/// the atomic rename leaves a manifest-bound orphan that this same function
+/// resumes idempotently on its next call.
+#[pg_extern]
+fn flashback_internal_finalize_external_snapshot(
+    tracking_id: i64,
+    generation_id: i64,
+    snapshot_id: i64,
+) -> JsonB {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_finalize_external_snapshot is owner-only");
+    }
+    if tracking_id <= 0 || generation_id <= 0 || snapshot_id <= 0 {
+        pgrx::error!("external finalizer identifiers must all be positive");
+    }
+
+    let evidence = Spi::connect(|client| -> Result<(i64, String, String, String), String> {
+        let table = client
+            .select(
+                &format!(
+                    "SELECT cg.operation_nonce, s.snapshot_lsn::text AS boundary_lsn, \
+                            public.flashback_sha256(s.schema_def::text) AS schema_hash, \
+                            s.external_column_contract::text AS column_contract \
+                     FROM flashback.coverage_generations cg \
+                     JOIN flashback.snapshots s \
+                       ON s.snapshot_id = cg.boundary_snapshot_id \
+                      AND s.tracking_id = cg.tracking_id \
+                     WHERE cg.generation_id = {generation_id}::bigint \
+                       AND cg.tracking_id = {tracking_id}::bigint \
+                       AND cg.boundary_snapshot_id = {snapshot_id}::bigint \
+                       AND cg.state IN ('building','active') \
+                       AND cg.storage_backend = 'external_zstd' \
+                       AND s.payload_state IN ('creating','available') \
+                       AND s.storage_backend = 'external_zstd'"
+                ),
+                None,
+                &[],
+            )
+            .map_err(|e| e.to_string())?;
+        let row = table.first();
+        let nonce = row
+            .get_by_name::<i64, _>("operation_nonce")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "external generation is not ready or does not exist".to_string())?;
+        let boundary_lsn = row
+            .get_by_name::<String, _>("boundary_lsn")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "external generation boundary LSN is not resolved yet".to_string())?;
+        let schema_hash = row
+            .get_by_name::<String, _>("schema_hash")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "external snapshot schema hash is missing".to_string())?;
+        let column_contract = row
+            .get_by_name::<String, _>("column_contract")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "external snapshot column contract is missing".to_string())?;
+        Ok((nonce, boundary_lsn, schema_hash, column_contract))
+    })
+    .unwrap_or_else(|error| pgrx::error!("external finalizer evidence query failed: {error}"));
+
+    if evidence.0 <= 0 {
+        pgrx::error!("external generation operation_nonce is invalid");
+    }
+    let column_contract: serde_json::Value = serde_json::from_str(&evidence.3)
+        .unwrap_or_else(|error| pgrx::error!("external column contract is invalid: {error}"));
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
+
+    let finalized = finalize_staged_artifact(
+        std::path::Path::new(&root),
+        FinalizationInput {
+            system_identifier: unsafe { pg_sys::GetSystemIdentifier() },
+            database_oid: unsafe { pg_sys::MyDatabaseId }.to_u32(),
+            tracking_id,
+            generation_id,
+            snapshot_id,
+            operation_nonce: evidence.0 as u64,
+            boundary_lsn: evidence.1.clone(),
+            schema_def_sha256: evidence.2.clone(),
+            column_contract: column_contract.clone(),
+            pg_major: pg_sys::PG_VERSION_NUM / 10_000,
+        },
+    )
+    .unwrap_or_else(|error| pgrx::error!("external artifact finalization failed: {error}"));
+
+    let locator_text = finalized.locator.to_string();
+    let contract_text = finalized.manifest.column_contract.to_string();
+    Spi::run(&format!(
+        "SELECT public.flashback_internal_publish_external_snapshot(\
+         {snapshot_id}::bigint, {tracking_id}::bigint, {generation_id}::bigint, {}::bigint, \
+         {}::jsonb, {}::bigint, {}, {}::integer, {}::bigint, {}::bigint, {}, {}::jsonb, {})",
+        finalized.provisional.operation_nonce,
+        quote_literal(&locator_text),
+        finalized.provisional.row_count,
+        quote_literal(&finalized.manifest.codec),
+        finalized.manifest.format_version,
+        finalized.provisional.uncompressed_bytes,
+        finalized.provisional.compressed_bytes,
+        quote_literal(&finalized.provisional.checksum_sha256),
+        quote_literal(&contract_text),
+        quote_literal(&finalized.manifest.schema_def_sha256),
+    ))
+    .unwrap_or_else(|error| pgrx::error!("external snapshot publication rejected: {error}"));
+    Spi::run(&format!(
+        "SELECT public.flashback_internal_activate_external_generation(\
+         {generation_id}::bigint, {tracking_id}::bigint, {snapshot_id}::bigint)"
+    ))
+    .unwrap_or_else(|error| pgrx::error!("external generation activation rejected: {error}"));
+    finalized
+        .cleanup_coordination_files()
+        .unwrap_or_else(|error| pgrx::error!("external finalizer cleanup failed: {error}"));
+
+    JsonB(serde_json::json!({
+        "status": "available",
+        "tracking_id": tracking_id,
+        "generation_id": generation_id,
+        "snapshot_id": snapshot_id,
+        "locator": finalized.locator,
+        "row_count": finalized.provisional.row_count,
+        "compressed_bytes": finalized.provisional.compressed_bytes,
+        "checksum_sha256": finalized.provisional.checksum_sha256,
+    }))
+}
+
+/// Stream one verified external_zstd artifact into an already-created shadow
+/// relation. Every immutable database/manifest/locator field is rebound before
+/// the first INSERT; decode, row count, trailer, byte count, and checksum must
+/// all agree before this function can return successfully.
+#[pg_extern]
+fn flashback_internal_materialize_external_snapshot(
+    snapshot_id: i64,
+    tracking_id: i64,
+    destination_schema: &str,
+    destination_table: &str,
+) -> i64 {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_materialize_external_snapshot is owner-only");
+    }
+    if snapshot_id <= 0 || tracking_id <= 0 {
+        pgrx::error!("external materialize identifiers must be positive");
+    }
+
+    let evidence = Spi::connect(
+        |client| -> Result<(serde_json::Value, FinalManifest, serde_json::Value), String> {
+            let table = client
+                .select(
+                    &format!(
+                        "SELECT s.locator::text AS locator, s.row_count, s.snapshot_lsn::text, \
+                                s.external_codec, s.external_format_version, \
+                                s.external_uncompressed_bytes, s.external_compressed_bytes, \
+                                s.external_checksum_sha256, s.external_column_contract::text, \
+                                s.schema_def_sha256, \
+                                public.flashback_internal_materializable_columns(\
+                                  format('%I.%I', {}, {})::regclass)::text AS destination_contract \
+                         FROM flashback.snapshots s \
+                         WHERE s.snapshot_id={snapshot_id}::bigint \
+                           AND s.tracking_id={tracking_id}::bigint \
+                           AND s.payload_state='available' \
+                           AND s.storage_backend='external_zstd'",
+                        quote_literal(destination_schema),
+                        quote_literal(destination_table),
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|e| e.to_string())?;
+            let row = table.first();
+            let required_string = |name: &str| -> Result<String, String> {
+                row.get_by_name::<String, _>(name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("external snapshot evidence {name} is missing"))
+            };
+            let locator: serde_json::Value = serde_json::from_str(&required_string("locator")?)
+                .map_err(|e| format!("invalid external locator: {e}"))?;
+            let column_contract: serde_json::Value =
+                serde_json::from_str(&required_string("external_column_contract")?)
+                    .map_err(|e| format!("invalid external column contract: {e}"))?;
+            let destination_contract: serde_json::Value =
+                serde_json::from_str(&required_string("destination_contract")?)
+                    .map_err(|e| format!("invalid destination column contract: {e}"))?;
+            if destination_contract != column_contract {
+                return Err(
+                    "destination relation column contract does not match external artifact"
+                        .to_string(),
+                );
+            }
+            let manifest = FinalManifest {
+                format_version: row
+                    .get_by_name::<i32, _>("external_format_version")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external format version is missing".to_string())?
+                    as u32,
+                codec: required_string("external_codec")?,
+                system_identifier: locator
+                    .get("system_identifier")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "locator system_identifier is missing".to_string())?
+                    .to_string(),
+                database_oid: locator
+                    .get("database_oid")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| "locator database_oid is invalid".to_string())?,
+                tracking_id,
+                snapshot_id,
+                boundary_lsn: required_string("snapshot_lsn")?,
+                schema_def_sha256: required_string("schema_def_sha256")?,
+                column_contract,
+                row_count: row
+                    .get_by_name::<i64, _>("row_count")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external row_count is missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external row_count is negative".to_string())?,
+                external_uncompressed_bytes: row
+                    .get_by_name::<i64, _>("external_uncompressed_bytes")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external uncompressed byte count is missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external uncompressed byte count is negative".to_string())?,
+                external_compressed_bytes: row
+                    .get_by_name::<i64, _>("external_compressed_bytes")
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "external compressed byte count is missing".to_string())?
+                    .try_into()
+                    .map_err(|_| "external compressed byte count is negative".to_string())?,
+                external_checksum_sha256: required_string("external_checksum_sha256")?,
+                pg_major: pg_sys::PG_VERSION_NUM / 10_000,
+            };
+            Ok((locator, manifest, destination_contract))
+        },
+    )
+    .unwrap_or_else(|error| pgrx::error!("external materialize admission failed: {error}"));
+
+    let system_identifier = unsafe { pg_sys::GetSystemIdentifier() };
+    let database_oid = unsafe { pg_sys::MyDatabaseId }.to_u32();
+    let locator_string = |name: &str| {
+        evidence
+            .0
+            .get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| pgrx::error!("external locator is missing {name}"))
+    };
+    if locator_string("system_identifier") != system_identifier.to_string()
+        || locator_string("database_oid") != database_oid.to_string()
+        || locator_string("tracking_id") != tracking_id.to_string()
+        || locator_string("snapshot_id") != snapshot_id.to_string()
+    {
+        pgrx::error!("external locator does not belong to this database/lifecycle");
+    }
+    let operation_nonce: u64 = locator_string("nonce")
+        .parse()
+        .unwrap_or_else(|_| pgrx::error!("external locator nonce is invalid"));
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
+    let (artifact, disk_manifest) = open_published_artifact(
+        std::path::Path::new(&root),
+        system_identifier,
+        database_oid,
+        tracking_id,
+        snapshot_id,
+        operation_nonce,
+    )
+    .unwrap_or_else(|error| pgrx::error!("external artifact open failed: {error}"));
+    if disk_manifest != evidence.1 {
+        pgrx::error!("external artifact manifest conflicts with database evidence");
+    }
+    let compressed_len = artifact
+        .metadata()
+        .unwrap_or_else(|error| pgrx::error!("external artifact stat failed: {error}"))
+        .len();
+    if compressed_len != disk_manifest.external_compressed_bytes {
+        pgrx::error!(
+            "external artifact compressed length {compressed_len} does not match manifest {}",
+            disk_manifest.external_compressed_bytes
+        );
+    }
+
+    let columns = parse_column_contract(&disk_manifest.column_contract.to_string())
+        .unwrap_or_else(|error| pgrx::error!("external artifact contract is invalid: {error}"));
+    let receivers = columns
+        .iter()
+        .map(|column| resolve_receive_info(pg_sys::Oid::from(column.atttypid)))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|error| pgrx::error!("external receive type is unsupported: {error}"));
+    let destination = format!(
+        "{}.{}",
+        quote_identifier(destination_schema)
+            .unwrap_or_else(|error| pgrx::error!("invalid destination schema: {error}")),
+        quote_identifier(destination_table)
+            .unwrap_or_else(|error| pgrx::error!("invalid destination table: {error}")),
+    );
+    let decoder = zstd::stream::read::Decoder::new(artifact)
+        .unwrap_or_else(|error| pgrx::error!("external zstd decoder failed: {error}"));
+    let mut reader = CountingHashReader::new(decoder);
+    let header = read_header(&mut reader)
+        .unwrap_or_else(|error| pgrx::error!("external artifact header is invalid: {error}"));
+    if header != columns {
+        pgrx::error!("external artifact header does not match immutable column contract");
+    }
+    let max_parameters = 65_535_usize;
+    let batch_limit = crate::storage::worker::external_snapshot_batch_rows()
+        .min(max_parameters / columns.len().max(1))
+        .max(1);
+    let max_row_bytes = crate::storage::worker::external_snapshot_max_row_bytes();
+    let mut inserted = 0_u64;
+    Spi::connect_mut(|_client| {
+        let mut batch = Vec::with_capacity(batch_limit);
+        while inserted + (batch.len() as u64) < disk_manifest.row_count {
+            batch.push(
+                read_row(&mut reader, columns.len(), max_row_bytes as i64).unwrap_or_else(
+                    |error| pgrx::error!("external artifact row decode failed: {error}"),
+                ),
+            );
+            if batch.len() == batch_limit
+                || inserted + batch.len() as u64 == disk_manifest.row_count
+            {
+                inserted += insert_decoded_batch(&destination, &columns, &receivers, batch)
+                    .unwrap_or_else(|error| pgrx::error!("external batch insert failed: {error}"));
+                batch = Vec::with_capacity(batch_limit);
+                pg_sys::check_for_interrupts!();
+            }
+        }
+    });
+    let trailer = read_trailer(&mut reader)
+        .unwrap_or_else(|error| pgrx::error!("external artifact trailer is invalid: {error}"));
+    if trailer != disk_manifest.row_count || inserted != disk_manifest.row_count {
+        pgrx::error!(
+            "external artifact row count mismatch: manifest={}, trailer={trailer}, inserted={inserted}",
+            disk_manifest.row_count
+        );
+    }
+    let mut extra = [0_u8; 1];
+    if reader
+        .read(&mut extra)
+        .unwrap_or_else(|error| pgrx::error!("external artifact EOF check failed: {error}"))
+        != 0
+    {
+        pgrx::error!("external artifact contains trailing uncompressed data");
+    }
+    let (uncompressed_bytes, checksum) = reader.finish();
+    if uncompressed_bytes != disk_manifest.external_uncompressed_bytes
+        || checksum != disk_manifest.external_checksum_sha256
+    {
+        pgrx::error!(
+            "external artifact integrity mismatch: bytes={uncompressed_bytes}, checksum={checksum}"
+        );
+    }
+    inserted as i64
 }
 
 #[cfg(any(test, feature = "pg_test"))]

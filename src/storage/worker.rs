@@ -134,12 +134,29 @@ fn effective_worker_batch_size() -> usize {
     WORKER_BATCH_SIZE_GUC.get().clamp(128, 50_000) as usize
 }
 
-// Step 9 external_zstd GUC accessors (EXTERNAL_SNAPSHOT_ROOT_GUC,
-// SNAPSHOT_STORAGE_BACKEND_GUC, EXTERNAL_SNAPSHOT_BATCH_ROWS_GUC,
-// EXTERNAL_SNAPSHOT_MAX_ROW_BYTES_GUC, EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC,
-// TEST_EXTERNAL_ZSTD_FAILPOINT_GUC) are added alongside src/storage/
-// external_zstd.rs (Stage 2), their first real caller, rather than as
-// unused stubs here.
+pub fn external_snapshot_root() -> Result<String, String> {
+    EXTERNAL_SNAPSHOT_ROOT_GUC
+        .get()
+        .as_deref()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "pg_flashback.external_snapshot_root is not set".to_string())
+}
+
+pub fn external_snapshot_batch_rows() -> usize {
+    EXTERNAL_SNAPSHOT_BATCH_ROWS_GUC.get().clamp(100, 1_000_000) as usize
+}
+
+pub fn external_snapshot_max_row_bytes() -> usize {
+    EXTERNAL_SNAPSHOT_MAX_ROW_BYTES_GUC
+        .get()
+        .clamp(1_024, 1_073_741_824) as usize
+}
+
+pub fn external_snapshot_zstd_level() -> i32 {
+    EXTERNAL_SNAPSHOT_ZSTD_LEVEL_GUC.get().clamp(1, 19)
+}
 
 pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(

@@ -139,6 +139,10 @@
       "class": "supported-core",
       "reason": "toast restore via seam"
     },
+    "external_snapshot_activation_authority.sql": {
+      "class": "infra",
+      "reason": "external artifact publication and generation activation eligibility boundary"
+    },
     "exact_drop_identity_propagation.sql": {
       "class": "supported-core",
       "reason": "exact DROP disaster_event_id propagation lock_phase\u2192core\u2192expected_proof"

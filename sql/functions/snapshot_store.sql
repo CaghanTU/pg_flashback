@@ -386,6 +386,20 @@ BEGIN
     END IF;
 
     SELECT * INTO v_source
+    FROM public.flashback_internal_snapshot_resolve(p_snapshot_id, p_tracking_id);
+    IF NOT FOUND OR v_source.payload_state IS DISTINCT FROM 'available' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % is not available', p_snapshot_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF v_source.storage_backend = 'external_zstd' THEN
+        PERFORM public.flashback_internal_materialize_external_snapshot(
+            p_snapshot_id, p_tracking_id, p_dest_schema, p_dest_table
+        );
+        RETURN;
+    END IF;
+
+    SELECT * INTO v_source
     FROM public.flashback_internal_snapshot_require_available(p_snapshot_id, p_tracking_id);
 
     EXECUTE format(
@@ -420,7 +434,10 @@ SECURITY DEFINER
 SET search_path = pg_catalog, flashback, pg_temp
 AS $$
     SELECT r.snapshot_id, r.tracking_id,
-           COALESCE(pg_total_relation_size(r.payload_relid), 0)
+           CASE WHEN s.storage_backend = 'external_zstd'
+                THEN COALESCE(s.external_compressed_bytes, 0)
+                ELSE COALESCE(pg_total_relation_size(r.payload_relid), 0)
+           END
     FROM flashback.snapshots s
     CROSS JOIN LATERAL public.flashback_internal_snapshot_resolve(s.snapshot_id, s.tracking_id) r
     WHERE (p_tracking_id IS NULL OR s.tracking_id = p_tracking_id)
@@ -533,12 +550,6 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    IF v_snap.payload_state <> 'available' THEN
-        RAISE EXCEPTION 'pg_flashback: snapshot artifact % state is % (must be available for boundary refinement)',
-            p_snapshot_id, v_snap.payload_state
-            USING ERRCODE = 'object_not_in_prerequisite_state';
-    END IF;
-
     SELECT * INTO v_gen
     FROM flashback.coverage_generations
     WHERE generation_id = p_generation_id AND tracking_id = p_tracking_id
@@ -552,6 +563,24 @@ BEGIN
     IF v_gen.state NOT IN ('building', 'active') THEN
         RAISE EXCEPTION 'pg_flashback: coverage generation % state is % (must be building or active for boundary refinement)',
             p_generation_id, v_gen.state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    -- heap_v1 is materialized before marker resolution and therefore must
+    -- already be available. external_zstd deliberately resolves the marker
+    -- while its independently copied artifact is still `creating`; this
+    -- writes only the exact coordinate and does not make the artifact or
+    -- generation eligible for recovery.
+    IF v_snap.payload_state <> 'available'
+       AND NOT (
+           v_snap.payload_state = 'creating'
+           AND v_snap.storage_backend = 'external_zstd'
+           AND v_gen.storage_backend = 'external_zstd'
+           AND v_gen.state = 'building'
+       )
+    THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % state/backend %/% is not eligible for boundary refinement',
+            p_snapshot_id, v_snap.payload_state, v_snap.storage_backend
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
@@ -1191,6 +1220,279 @@ BEGIN
 END;
 $$;
 
+-- Publish one fully staged external_zstd artifact. This is the only SQL
+-- authority allowed to fill external artifact evidence and perform the
+-- creating -> available transition. The filesystem finalizer must already
+-- have fsynced and atomically published the directory; a transaction abort
+-- after that point leaves a resumable published orphan, never an available
+-- row pointing at partial bytes.
+CREATE OR REPLACE FUNCTION flashback_internal_publish_external_snapshot(
+    p_snapshot_id bigint,
+    p_tracking_id bigint,
+    p_generation_id bigint,
+    p_operation_nonce bigint,
+    p_locator jsonb,
+    p_row_count bigint,
+    p_codec text,
+    p_format_version integer,
+    p_uncompressed_bytes bigint,
+    p_compressed_bytes bigint,
+    p_checksum_sha256 text,
+    p_column_contract jsonb,
+    p_schema_def_sha256 text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_generation flashback.coverage_generations%ROWTYPE;
+    v_snapshot flashback.snapshots%ROWTYPE;
+    v_stream_state text;
+    v_n integer;
+BEGIN
+    IF p_snapshot_id IS NULL OR p_tracking_id IS NULL OR p_generation_id IS NULL
+       OR p_operation_nonce IS NULL OR p_operation_nonce <= 0
+       OR p_locator IS NULL OR p_row_count IS NULL OR p_row_count < 0
+       OR p_codec IS DISTINCT FROM 'zstd' OR p_format_version IS DISTINCT FROM 1
+       OR p_uncompressed_bytes IS NULL OR p_uncompressed_bytes < 0
+       OR p_compressed_bytes IS NULL OR p_compressed_bytes <= 0
+       OR p_checksum_sha256 IS NULL
+       OR p_checksum_sha256 !~ '^[0-9a-f]{64}$'
+       OR p_column_contract IS NULL
+       OR p_schema_def_sha256 IS NULL
+       OR p_schema_def_sha256 !~ '^[0-9a-f]{64}$'
+    THEN
+        RAISE EXCEPTION 'pg_flashback: incomplete or invalid external snapshot publication evidence'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_locator->>'system_identifier' IS DISTINCT FROM (pg_control_system()).system_identifier::text
+       OR p_locator->>'database_oid' IS DISTINCT FROM (
+           SELECT oid::text FROM pg_database WHERE datname = current_database()
+       )
+       OR p_locator->>'tracking_id' IS DISTINCT FROM p_tracking_id::text
+       OR p_locator->>'snapshot_id' IS DISTINCT FROM p_snapshot_id::text
+       OR p_locator->>'nonce' IS DISTINCT FROM p_operation_nonce::text
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot locator does not match immutable identity'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+
+    SELECT * INTO v_generation
+    FROM flashback.coverage_generations
+    WHERE generation_id = p_generation_id
+      AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_generation.state NOT IN ('building', 'active')
+       OR v_generation.storage_backend IS DISTINCT FROM 'external_zstd'
+       OR v_generation.operation_nonce IS DISTINCT FROM p_operation_nonce
+       OR v_generation.boundary_snapshot_id IS DISTINCT FROM p_snapshot_id
+       OR v_generation.boundary_xid IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external generation % is not ready for artifact publication',
+            p_generation_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT state INTO v_stream_state
+    FROM flashback.capture_streams
+    WHERE stream_id = v_generation.stream_id
+    FOR SHARE;
+    IF NOT FOUND OR v_stream_state IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'pg_flashback: external generation % capture stream is not healthy',
+            p_generation_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT * INTO v_snapshot
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id
+      AND tracking_id = p_tracking_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot % does not exist', p_snapshot_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    IF v_snapshot.payload_state = 'available' THEN
+        IF v_snapshot.storage_backend IS DISTINCT FROM 'external_zstd'
+           OR v_snapshot.locator IS DISTINCT FROM p_locator
+           OR v_snapshot.row_count IS DISTINCT FROM p_row_count
+           OR v_snapshot.external_codec IS DISTINCT FROM p_codec
+           OR v_snapshot.external_format_version IS DISTINCT FROM p_format_version
+           OR v_snapshot.external_uncompressed_bytes IS DISTINCT FROM p_uncompressed_bytes
+           OR v_snapshot.external_compressed_bytes IS DISTINCT FROM p_compressed_bytes
+           OR v_snapshot.external_checksum_sha256 IS DISTINCT FROM p_checksum_sha256
+           OR v_snapshot.external_column_contract IS DISTINCT FROM p_column_contract
+           OR v_snapshot.schema_def_sha256 IS DISTINCT FROM p_schema_def_sha256
+        THEN
+            RAISE EXCEPTION 'pg_flashback: conflicting idempotent external snapshot publication for %',
+                p_snapshot_id
+                USING ERRCODE = 'serialization_failure';
+        END IF;
+        RETURN false;
+    END IF;
+
+    IF v_snapshot.payload_state IS DISTINCT FROM 'creating'
+       OR v_snapshot.storage_backend IS DISTINCT FROM 'external_zstd'
+       OR v_snapshot.snapshot_lsn IS NULL
+       OR v_snapshot.external_column_contract IS DISTINCT FROM p_column_contract
+       OR public.flashback_sha256(v_snapshot.schema_def::text) IS DISTINCT FROM p_schema_def_sha256
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot % database evidence does not match staged artifact',
+            p_snapshot_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    UPDATE flashback.snapshots
+       SET payload_state = 'available',
+           locator = p_locator,
+           snapshot_table = '',
+           row_count = p_row_count,
+           available_at = COALESCE(available_at, clock_timestamp()),
+           external_codec = p_codec,
+           external_format_version = p_format_version,
+           external_uncompressed_bytes = p_uncompressed_bytes,
+           external_compressed_bytes = p_compressed_bytes,
+           external_checksum_sha256 = p_checksum_sha256,
+           external_column_contract = p_column_contract,
+           schema_def_sha256 = p_schema_def_sha256
+     WHERE snapshot_id = p_snapshot_id
+       AND tracking_id = p_tracking_id
+       AND payload_state = 'creating';
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> 1 THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot % publication raced', p_snapshot_id
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+-- Activate an external generation only after its exact marker boundary and
+-- immutable artifact are both proven.  This is deliberately separate from
+-- WAL consumption: observing a COMMIT can refine coordinates, but can never
+-- make partial or missing filesystem bytes recoverable.
+CREATE OR REPLACE FUNCTION flashback_internal_activate_external_generation(
+    p_generation_id bigint,
+    p_tracking_id bigint,
+    p_snapshot_id bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_generation flashback.coverage_generations%ROWTYPE;
+    v_parent flashback.coverage_generations%ROWTYPE;
+    v_snapshot flashback.snapshots%ROWTYPE;
+BEGIN
+    IF p_generation_id IS NULL OR p_tracking_id IS NULL OR p_snapshot_id IS NULL THEN
+        RAISE EXCEPTION 'pg_flashback: external activation requires exact generation, tracking, and snapshot identities'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+
+    SELECT * INTO v_generation
+    FROM flashback.coverage_generations
+    WHERE generation_id = p_generation_id
+      AND tracking_id = p_tracking_id
+      AND boundary_snapshot_id = p_snapshot_id
+    FOR UPDATE;
+
+    IF NOT FOUND
+       OR v_generation.storage_backend IS DISTINCT FROM 'external_zstd'
+       OR v_generation.state NOT IN ('building', 'active')
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external generation % is not eligible for activation',
+            p_generation_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    SELECT * INTO v_snapshot
+    FROM flashback.snapshots
+    WHERE snapshot_id = p_snapshot_id
+      AND tracking_id = p_tracking_id
+    FOR SHARE;
+    IF NOT FOUND
+       OR v_snapshot.storage_backend IS DISTINCT FROM 'external_zstd'
+       OR v_snapshot.payload_state IS DISTINCT FROM 'available'
+       OR v_snapshot.snapshot_lsn IS NULL
+       OR v_snapshot.captured_at IS NULL
+       OR v_snapshot.locator IS NULL
+       OR v_snapshot.external_checksum_sha256 IS NULL
+    THEN
+        RAISE EXCEPTION 'pg_flashback: external snapshot % is not verified and available',
+            p_snapshot_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    IF v_generation.state = 'active' THEN
+        RETURN false;
+    END IF;
+
+    IF v_generation.parent_generation_id IS NOT NULL THEN
+        SELECT * INTO v_parent
+        FROM flashback.coverage_generations
+        WHERE generation_id = v_generation.parent_generation_id
+          AND tracking_id = p_tracking_id
+        FOR UPDATE;
+
+        IF FOUND AND v_parent.state = 'active' THEN
+            PERFORM public.flashback_internal_transition_coverage_generation(
+                v_parent.generation_id,
+                p_tracking_id,
+                'active',
+                'sealed',
+                'external_successor_artifact_available',
+                NULL,
+                NULL,
+                CASE WHEN v_parent.stream_id = v_generation.stream_id
+                     THEN v_snapshot.snapshot_lsn ELSE NULL END,
+                CASE WHEN v_parent.stream_id = v_generation.stream_id
+                     THEN v_snapshot.captured_at ELSE NULL END,
+                v_snapshot.snapshot_lsn,
+                v_snapshot.captured_at,
+                '{}'::jsonb
+            );
+        END IF;
+    END IF;
+
+    PERFORM public.flashback_internal_transition_coverage_generation(
+        p_generation_id,
+        p_tracking_id,
+        'building',
+        'active',
+        'external_artifact_available',
+        v_snapshot.snapshot_lsn,
+        v_snapshot.captured_at,
+        v_snapshot.snapshot_lsn,
+        v_snapshot.captured_at,
+        NULL,
+        NULL,
+        jsonb_build_object('snapshot_id', p_snapshot_id)
+    );
+
+    UPDATE flashback.coverage_gaps
+       SET gap_end_lsn = v_snapshot.snapshot_lsn,
+           gap_end_time = v_snapshot.captured_at,
+           reanchored_by_generation_id = p_generation_id,
+           reanchored_at = clock_timestamp()
+     WHERE tracking_id = p_tracking_id
+       AND source_generation_id = v_generation.parent_generation_id
+       AND reanchored_by_generation_id IS NULL
+       AND gap_start_lsn < v_snapshot.snapshot_lsn;
+
+    RETURN true;
+END;
+$$;
+
 COMMENT ON FUNCTION flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb)
     IS '[Internal] SnapshotStore: sole mutation authority for flashback.snapshots.payload_state (CAS).';
 COMMENT ON FUNCTION flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb)
@@ -1215,6 +1517,10 @@ COMMENT ON FUNCTION flashback_internal_snapshot_reserve(bigint, oid, text)
     IS '[Internal] SnapshotStore: reserve a creating snapshot artifact row without copying data (external_zstd only).';
 COMMENT ON FUNCTION flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb)
     IS '[Internal] SnapshotStore: atomically reserve a building generation + creating snapshot for an online (non-blocking) external_zstd create.';
+COMMENT ON FUNCTION flashback_internal_publish_external_snapshot(bigint, bigint, bigint, bigint, jsonb, bigint, text, integer, bigint, bigint, text, jsonb, text)
+    IS '[Internal] SnapshotStore: publish a fully fsynced external_zstd artifact and atomically bind its immutable evidence.';
+COMMENT ON FUNCTION flashback_internal_activate_external_generation(bigint, bigint, bigint)
+    IS '[Internal] SnapshotStore: activate external coverage only after exact boundary and immutable artifact availability are proven.';
 
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_create(bigint, oid, text, text, pg_lsn, text, jsonb) FROM PUBLIC;
@@ -1228,6 +1534,8 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_publish_external_snapshot(bigint, bigint, bigint, bigint, jsonb, bigint, text, integer, bigint, bigint, text, jsonb, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_activate_external_generation(bigint, bigint, bigint) FROM PUBLIC;
 
 DO $$
 BEGIN
@@ -1244,6 +1552,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_publish_external_snapshot(bigint, bigint, bigint, bigint, jsonb, bigint, text, integer, bigint, bigint, text, jsonb, text) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_activate_external_generation(bigint, bigint, bigint) FROM flashback_admin';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pg_monitor') THEN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_transition(bigint, bigint, text[], text, text, jsonb, text, bigint, jsonb) FROM pg_monitor';
@@ -1258,6 +1568,8 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reserve_online_generation(bigint, oid, bigint, bigint, bigint, text, bigint, text, jsonb) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_publish_external_snapshot(bigint, bigint, bigint, bigint, jsonb, bigint, text, integer, bigint, bigint, text, jsonb, text) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_activate_external_generation(bigint, bigint, bigint) FROM pg_monitor';
     END IF;
 END
 $$;
