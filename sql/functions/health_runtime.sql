@@ -114,7 +114,14 @@ RETURNS TABLE (
     retained_delta_bytes bigint,
     configured_capacity_budget bigint,
     capacity_override boolean,
-    reason text
+    reason text,
+    snapshot_id bigint,
+    snapshot_storage_backend text,
+    snapshot_payload_state text,
+    snapshot_health_status text,
+    snapshot_health_reason text,
+    snapshot_compressed_bytes bigint,
+    snapshot_uncompressed_bytes bigint
 )
 LANGUAGE plpgsql
 VOLATILE
@@ -159,6 +166,13 @@ BEGIN
             cg.valid_through_time,
             cg.state_reason AS generation_state_reason,
             cg.details AS generation_details,
+            cg.boundary_snapshot_id,
+            active_snapshot.storage_backend AS active_snapshot_backend,
+            active_snapshot.payload_state AS active_snapshot_state,
+            active_snapshot.external_compressed_bytes,
+            active_snapshot.external_uncompressed_bytes,
+            active_snapshot_audit.status AS active_snapshot_audit_status,
+            active_snapshot_audit.reason AS active_snapshot_audit_reason,
             pending.generation_id AS pending_generation_id,
             pending.state_reason AS pending_state_reason,
             pending.boundary_kind AS pending_boundary_kind,
@@ -175,6 +189,12 @@ BEGIN
             WHERE g.tracking_id = tt.tracking_id AND g.state = 'active'
             LIMIT 1
         ) cg ON true
+        LEFT JOIN flashback.snapshots active_snapshot
+          ON active_snapshot.snapshot_id = cg.boundary_snapshot_id
+         AND active_snapshot.tracking_id = cg.tracking_id
+        LEFT JOIN flashback.snapshot_health_audits active_snapshot_audit
+          ON active_snapshot_audit.snapshot_id = active_snapshot.snapshot_id
+         AND active_snapshot_audit.tracking_id = active_snapshot.tracking_id
         LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         LEFT JOIN LATERAL (
             SELECT g.generation_id, g.state_reason, g.boundary_kind
@@ -247,8 +267,14 @@ BEGIN
                                 OR successor.boundary_lsn >= sealed.superseded_before_lsn
                             )
                             AND successor_snapshot.payload_state = 'available'
-                            AND successor_snapshot.payload_relid IS NOT NULL
-                            AND public.flashback_payload_is_owned(successor_snapshot.payload_relid)
+                            AND (
+                                (
+                                    successor_snapshot.storage_backend = 'heap_v1'
+                                    AND successor_snapshot.payload_relid IS NOT NULL
+                                    AND public.flashback_payload_is_owned(successor_snapshot.payload_relid)
+                                )
+                                OR successor_snapshot.storage_backend = 'external_zstd'
+                            )
                       )
                   )
             ) AS blocked
@@ -314,6 +340,25 @@ BEGIN
             v_health := 'slot_lost';
             v_action := 'recreate_logical_slot_and_reanchor';
             v_reason := COALESCE(rec.invalidation_reason, slot.wal_status, 'logical slot lost');
+        ELSIF rec.boundary_snapshot_id IS NOT NULL
+           AND (
+               rec.active_snapshot_state IS DISTINCT FROM 'available'
+               OR rec.active_snapshot_audit_status = 'unhealthy'
+           )
+        THEN
+            -- Payload identity/integrity is a durable coverage prerequisite.
+            -- Slot loss remains the higher-priority root cause, but a healthy
+            -- stream/slot may never hide a missing or corrupt active boundary.
+            v_health := 'reanchor_recommended';
+            v_action := 'repair_external_snapshot_storage_then_reanchor';
+            v_reason := COALESCE(
+                rec.active_snapshot_audit_reason,
+                format(
+                    'active snapshot %s is %s',
+                    rec.boundary_snapshot_id,
+                    COALESCE(rec.active_snapshot_state, 'missing')
+                )
+            );
         ELSIF workers.admission_state IN ('beyond_max_workers', 'capacity_insufficient')
            OR (
                workers.admission_state IS DISTINCT FROM 'not_configured'
@@ -439,6 +484,32 @@ BEGIN
         );
         capacity_override := COALESCE(v_cap.capacity_override, false);
         reason := v_reason;
+        snapshot_id := rec.boundary_snapshot_id;
+        snapshot_storage_backend := rec.active_snapshot_backend;
+        snapshot_payload_state := rec.active_snapshot_state;
+        snapshot_health_status := CASE
+            WHEN rec.active_snapshot_state IS DISTINCT FROM 'available' THEN 'unhealthy'
+            WHEN rec.active_snapshot_backend = 'external_zstd'
+                THEN COALESCE(rec.active_snapshot_audit_status, 'not_yet_audited')
+            ELSE 'healthy'
+        END;
+        snapshot_health_reason := CASE
+            WHEN rec.active_snapshot_state IS DISTINCT FROM 'available'
+                THEN format('snapshot_state_%s', COALESCE(rec.active_snapshot_state, 'missing'))
+            WHEN rec.active_snapshot_backend = 'external_zstd'
+                THEN rec.active_snapshot_audit_reason
+            ELSE NULL
+        END;
+        snapshot_compressed_bytes := CASE
+            WHEN rec.active_snapshot_backend = 'external_zstd'
+                THEN rec.external_compressed_bytes
+            ELSE NULL
+        END;
+        snapshot_uncompressed_bytes := CASE
+            WHEN rec.active_snapshot_backend = 'external_zstd'
+                THEN rec.external_uncompressed_bytes
+            ELSE NULL
+        END;
         RETURN NEXT;
     END LOOP;
 END;

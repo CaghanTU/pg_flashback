@@ -106,7 +106,7 @@ $$;
 CREATE OR REPLACE FUNCTION flashback_status_snapshot(p_table text DEFAULT NULL)
 RETURNS jsonb
 LANGUAGE plpgsql
-STABLE
+VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
@@ -114,6 +114,8 @@ DECLARE
     v_workers record;
     v_slot record;
     v_disk bigint;
+    v_external_disk bigint;
+    v_external_free bigint;
     v_tables jsonb;
     v_latest_drop jsonb;
     v_requested text := NULLIF(p_table, '');
@@ -127,6 +129,17 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'flashback';
 
+    SELECT COALESCE(sum(s.external_compressed_bytes), 0)
+      INTO v_external_disk
+    FROM flashback.snapshots s
+    WHERE s.storage_backend = 'external_zstd'
+      AND s.payload_state IN ('available', 'retiring');
+    BEGIN
+        v_external_free := public.flashback_external_filesystem_available_bytes();
+    EXCEPTION WHEN OTHERS THEN
+        v_external_free := NULL;
+    END;
+
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'table_name', h.table_name,
         'tracking_id', h.tracking_id,
@@ -138,7 +151,14 @@ BEGIN
         'valid_through_lsn', h.valid_through_lsn,
         'recovery_profile', h.recovery_profile,
         'generation_id', h.generation_id,
-        'generation_state', h.generation_state
+        'generation_state', h.generation_state,
+        'snapshot_id', h.snapshot_id,
+        'snapshot_storage_backend', h.snapshot_storage_backend,
+        'snapshot_payload_state', h.snapshot_payload_state,
+        'snapshot_health_status', h.snapshot_health_status,
+        'snapshot_health_reason', h.snapshot_health_reason,
+        'snapshot_compressed_bytes', h.snapshot_compressed_bytes,
+        'snapshot_uncompressed_bytes', h.snapshot_uncompressed_bytes
     ) ORDER BY h.table_name), '[]'::jsonb)
       INTO v_tables
     FROM flashback_health() h
@@ -208,6 +228,9 @@ BEGIN
             'safe_wal_size', v_slot.safe_wal_size
         ) END,
         'flashback_disk_bytes', v_disk,
+        'external_snapshot_bytes', v_external_disk,
+        'total_managed_bytes', v_disk + v_external_disk,
+        'external_filesystem_available_bytes', v_external_free,
         'disk_retention', flashback_disk_retention_status(),
         'tables', v_tables,
         'latest_drop_recoverability', v_latest_drop,

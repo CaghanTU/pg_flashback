@@ -117,6 +117,38 @@ BEGIN
             v_gen.state, v_gen.boundary_lsn, v_gen.valid_through_lsn;
     END IF;
 
+    -- Operator projections must describe the immutable backend actually bound
+    -- to this generation.  They must not infer it from the current cluster GUC
+    -- (which may select a different backend for the next generation).
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.flashback_health() h
+        WHERE h.tracking_id = v_tracking
+          AND h.snapshot_id = v_reserved.snapshot_id
+          AND h.snapshot_storage_backend = 'external_zstd'
+          AND h.snapshot_payload_state = 'available'
+          AND h.snapshot_health_status = 'not_yet_audited'
+          AND h.snapshot_compressed_bytes = 1
+          AND h.snapshot_uncompressed_bytes = 1
+    ) THEN
+        RAISE EXCEPTION 'health projection did not expose the active external snapshot identity/status';
+    END IF;
+    IF public.flashback_status_snapshot('public.it_external_activation')
+           #>> '{tables,0,snapshot_storage_backend}'
+       IS DISTINCT FROM 'external_zstd'
+    THEN
+        RAISE EXCEPTION 'status projection did not expose the active external backend';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.flashback_doctor()
+        WHERE check_name = 'snapshot_storage_backend'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM public.flashback_doctor()
+        WHERE check_name = 'external_snapshot_root'
+    ) THEN
+        RAISE EXCEPTION 'doctor omitted SnapshotStore configuration checks';
+    END IF;
+
     PERFORM public.flashback_set_restore_in_progress(true);
     DROP TABLE public.it_external_activation;
     PERFORM public.flashback_set_restore_in_progress(false);

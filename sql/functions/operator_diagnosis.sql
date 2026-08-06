@@ -34,6 +34,12 @@ DECLARE
     v_pending bigint;
     v_pending_verify bigint;
     v_slot_keep text;
+    v_snapshot_backend text;
+    v_external_root text;
+    v_external_min_free bigint;
+    v_external_reserve bigint;
+    v_external_available bigint;
+    v_external_error text;
 BEGIN
     -- Read the configured GUC directly so doctor can report an actionable error
     -- row when capture_mode is illegal (effective_capture_mode() raises).
@@ -54,6 +60,19 @@ BEGIN
         0
     );
     v_slot_keep := current_setting('max_slot_wal_keep_size', true);
+    v_snapshot_backend := lower(COALESCE(
+        NULLIF(current_setting('pg_flashback.snapshot_storage_backend', true), ''),
+        'heap_v1'
+    ));
+    v_external_root := NULLIF(
+        current_setting('pg_flashback.external_snapshot_root', true), ''
+    );
+    v_external_min_free := flashback_local_guc_bytes(
+        'pg_flashback.external_snapshot_min_free_bytes', NULL
+    );
+    v_external_reserve := flashback_local_guc_bytes(
+        'pg_flashback.external_snapshot_safety_reserve_bytes', NULL
+    );
 
     -- preload / capture mode
     scope := 'cluster'; check_name := 'shared_preload_libraries';
@@ -83,6 +102,54 @@ BEGIN
     ELSE
         status := 'error';
         action := 'set wal_level=logical in postgresql.conf and restart PostgreSQL';
+    END IF;
+    RETURN NEXT;
+
+    scope := 'cluster'; check_name := 'snapshot_storage_backend';
+    observed := v_snapshot_backend; expected := 'heap_v1 or external_zstd';
+    IF v_snapshot_backend IN ('heap_v1', 'external_zstd') THEN
+        status := 'ok'; action := 'none';
+    ELSE
+        status := 'error';
+        action := 'set pg_flashback.snapshot_storage_backend to heap_v1 or external_zstd and reload PostgreSQL';
+    END IF;
+    RETURN NEXT;
+
+    scope := 'cluster'; check_name := 'external_snapshot_root';
+    observed := format('backend=%s root=%s min_free=%s reserve=%s',
+        v_snapshot_backend, COALESCE(v_external_root, 'unset'),
+        COALESCE(v_external_min_free::text, 'unset'),
+        COALESCE(v_external_reserve::text, 'unset'));
+    expected := 'when external_zstd is selected: safe 0700 root outside PGDATA/tablespaces with explicit positive budgets';
+    IF v_snapshot_backend <> 'external_zstd' THEN
+        status := 'ok'; action := 'none';
+        observed := observed || '; external backend not selected';
+    ELSIF v_external_root IS NULL
+          OR COALESCE(v_external_min_free, 0) <= 0
+          OR COALESCE(v_external_reserve, 0) <= 0
+    THEN
+        status := 'error';
+        action := 'configure external_snapshot_root plus positive external_snapshot_min_free_bytes and external_snapshot_safety_reserve_bytes, then restart/reload as required';
+    ELSE
+        BEGIN
+            v_external_available := public.flashback_external_filesystem_available_bytes();
+            v_external_error := NULL;
+        EXCEPTION WHEN OTHERS THEN
+            v_external_available := NULL;
+            v_external_error := SQLERRM;
+        END;
+        observed := observed || format(' available=%s validation=%s',
+            COALESCE(v_external_available::text, 'unknown'),
+            COALESCE(v_external_error, 'ok'));
+        IF v_external_error IS NOT NULL THEN
+            status := 'error';
+            action := 'fix external snapshot root ownership/mode/location; it must be safe and reachable by PostgreSQL';
+        ELSIF v_external_available < v_external_min_free + v_external_reserve THEN
+            status := 'error';
+            action := 'free space on external_snapshot_root or raise its filesystem capacity before maintain';
+        ELSE
+            status := 'ok'; action := 'none';
+        END IF;
     END IF;
     RETURN NEXT;
 

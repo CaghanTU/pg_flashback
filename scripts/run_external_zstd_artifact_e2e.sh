@@ -412,6 +412,15 @@ SCAN=$(q "SELECT public.flashback_internal_reconcile_external_snapshot_scan(1)")
 [[ "$(q "SELECT status||'|'||(deep_checked_at IS NOT NULL)::text FROM flashback.snapshot_health_audits WHERE snapshot_id=$SNAPSHOT AND tracking_id=$TRACKING")" == "healthy|true" ]] || {
     echo "FAIL: maintenance health audit was not persisted"; exit 1;
 }
+[[ "$(q "SELECT snapshot_storage_backend||'|'||snapshot_payload_state||'|'||snapshot_health_status FROM public.flashback_health() WHERE tracking_id=$TRACKING")" == "external_zstd|available|healthy" ]] || {
+    echo "FAIL: operator health did not expose the healthy active external artifact"; exit 1;
+}
+[[ "$(q "SELECT flashback_status_snapshot('public.ext_artifact_e2e') #>> '{tables,0,snapshot_storage_backend}'")" == external_zstd ]] || {
+    echo "FAIL: operator status did not expose the active external backend"; exit 1;
+}
+[[ "$(q "SELECT count(*) FROM public.flashback_doctor() WHERE check_name IN ('snapshot_storage_backend','external_snapshot_root') AND status='ok'")" == 2 ]] || {
+    echo "FAIL: doctor did not report the configured external SnapshotStore as ready"; exit 1;
+}
 
 if [[ "${PGFB_EXTZSTD_CLEANUP:-0}" == 1 ]]; then
     UNPROTECT=$(q "SELECT public.flashback_unprotect('public.ext_artifact_e2e')")
@@ -574,6 +583,9 @@ RECONCILE=$(q "SELECT public.flashback_internal_reconcile_snapshot_health(
 }
 [[ "$(q "SELECT state_reason FROM flashback.coverage_generations WHERE generation_id=$GENERATION")" == snapshot_payload_missing_or_corrupt ]] || {
     echo "FAIL: reconciliation did not freeze generation health"; exit 1;
+}
+[[ "$(q "SELECT health FROM public.flashback_health() WHERE tracking_id=$TRACKING")" == reanchor_recommended ]] || {
+    echo "FAIL: operator health hid the missing/corrupt active external artifact"; exit 1;
 }
 mv -f "$FINAL_DIR/artifact.zst.good" "$FINAL_DIR/artifact.zst"
 [[ "$(q "SELECT status FROM public.flashback_internal_snapshot_payload_healthy($SNAPSHOT,$TRACKING,true)")" == unhealthy ]] || {
