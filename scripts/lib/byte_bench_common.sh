@@ -325,8 +325,8 @@ export -f insert_batch_toast
 
 # Scale shape: roughly 8 KiB of deterministic, poorly-compressible payload per
 # row. It keeps 50 GiB qualification at a tractable row count while still
-# exercising TOAST, a primary key, a unique constraint, a CHECK, an expression
-# index, comments and a non-empty ACL. The whole row remains below the default
+# exercising TOAST, a primary key, a unique constraint, a CHECK, comments and
+# a non-empty ACL. The whole row remains below the default
 # 64 KiB WAL capture ceiling during the 1% post-protect churn.
 insert_batch_wide() {
     local rel=$1 start=$2 n=$3
