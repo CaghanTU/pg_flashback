@@ -667,15 +667,127 @@ END;
 $$;
 
 -- ------------------------------------------------------------------
--- retire: drop the exact artifact's physical payload and transition it
--- to a terminal state (retired for planned retention/cleanup, missing
--- for an incidental loss such as a broken capture stream discarding a
--- building generation's snapshot). Idempotent when the artifact is
--- already at the requested terminal state; fail-closed when it is
--- already terminal at a *different* state, or when it is not yet
--- available (creating/retiring is a caller ordering bug, not something
--- to paper over).
+-- phased retirement. Begin must commit before purge: external filesystem
+-- deletion can outlive a database transaction, so it is never performed
+-- while the database still claims the payload is available.
 -- ------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_retire_begin(
+    p_snapshot_id bigint,
+    p_tracking_id bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_row record;
+BEGIN
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+    SELECT * INTO v_row
+    FROM public.flashback_internal_snapshot_resolve(p_snapshot_id, p_tracking_id);
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown snapshot artifact % (tracking %)',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_row.payload_state = 'retiring' THEN
+        RETURN false;
+    END IF;
+    IF v_row.payload_state <> 'available' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % is % (must be available to begin retirement)',
+            p_snapshot_id, v_row.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN public.flashback_internal_snapshot_transition(
+        p_snapshot_id, p_tracking_id, ARRAY['available'], 'retiring'
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_retire_purge(
+    p_snapshot_id bigint,
+    p_tracking_id bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_row record;
+BEGIN
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+    SELECT * INTO v_row
+    FROM public.flashback_internal_snapshot_resolve(p_snapshot_id, p_tracking_id);
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown snapshot artifact % (tracking %)',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_row.payload_state IN ('retired', 'missing') THEN
+        RETURN false;
+    END IF;
+    IF v_row.payload_state <> 'retiring' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % is % (begin retirement must commit before purge)',
+            p_snapshot_id, v_row.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF v_row.storage_backend = 'external_zstd' THEN
+        RETURN public.flashback_internal_purge_external_snapshot(
+            p_snapshot_id, p_tracking_id
+        );
+    END IF;
+    IF v_row.storage_backend = 'heap_v1' AND v_row.payload_relid IS NOT NULL THEN
+        PERFORM public.flashback_drop_payload_table(v_row.payload_relid);
+        RETURN true;
+    END IF;
+    RETURN false;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flashback_internal_snapshot_retire_finish(
+    p_snapshot_id bigint,
+    p_tracking_id bigint,
+    p_target_state text DEFAULT 'retired'
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+DECLARE
+    v_row record;
+BEGIN
+    IF p_target_state NOT IN ('retired', 'missing') THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot retire target state must be retired or missing, got %',
+            p_target_state USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    PERFORM public.flashback_internal_lock_lifecycle(p_tracking_id);
+    SELECT * INTO v_row
+    FROM public.flashback_internal_snapshot_resolve(p_snapshot_id, p_tracking_id);
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_flashback: unknown snapshot artifact % (tracking %)',
+            p_snapshot_id, p_tracking_id
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_row.payload_state = p_target_state THEN
+        RETURN false;
+    END IF;
+    IF v_row.payload_state <> 'retiring' THEN
+        RAISE EXCEPTION 'pg_flashback: snapshot artifact % is % (must be retiring to finish)',
+            p_snapshot_id, v_row.payload_state
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN public.flashback_internal_snapshot_transition(
+        p_snapshot_id, p_tracking_id, ARRAY['retiring'], p_target_state
+    );
+END;
+$$;
+
+-- Compatibility wrapper remains atomic only for heap_v1. External artifacts
+-- must use begin/commit then purge+finish so a crash cannot leave DB=available
+-- after irreversible filesystem deletion.
 CREATE OR REPLACE FUNCTION flashback_internal_snapshot_retire(
     p_snapshot_id bigint,
     p_tracking_id bigint,
@@ -717,16 +829,21 @@ BEGIN
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
-    PERFORM public.flashback_internal_snapshot_transition(
-        p_snapshot_id, p_tracking_id, ARRAY['available'], 'retiring'
+    IF v_row.storage_backend = 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: external_zstd retirement requires phased begin/commit then purge+finish'
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+
+    PERFORM public.flashback_internal_snapshot_retire_begin(
+        p_snapshot_id, p_tracking_id
     );
 
     IF v_row.storage_backend = 'heap_v1' AND v_row.payload_relid IS NOT NULL THEN
         PERFORM public.flashback_drop_payload_table(v_row.payload_relid);
     END IF;
 
-    PERFORM public.flashback_internal_snapshot_transition(
-        p_snapshot_id, p_tracking_id, ARRAY['retiring'], p_target_state
+    PERFORM public.flashback_internal_snapshot_retire_finish(
+        p_snapshot_id, p_tracking_id, p_target_state
     );
     RETURN true;
 END;
@@ -1737,6 +1854,12 @@ COMMENT ON FUNCTION flashback_internal_reconcile_external_snapshot_scan(integer)
     IS '[Internal] SnapshotStore: bounded shallow/deep maintenance scan with durable audit rotation.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire(bigint, bigint, text)
     IS '[Internal] SnapshotStore: drop the exact artifact''s payload and transition to retired or missing.';
+COMMENT ON FUNCTION flashback_internal_snapshot_retire_begin(bigint, bigint)
+    IS '[Internal] SnapshotStore: durable retirement intent; must commit before physical purge.';
+COMMENT ON FUNCTION flashback_internal_snapshot_retire_purge(bigint, bigint)
+    IS '[Internal] SnapshotStore: idempotently purge one exact retiring physical payload.';
+COMMENT ON FUNCTION flashback_internal_snapshot_retire_finish(bigint, bigint, text)
+    IS '[Internal] SnapshotStore: finish a purged retiring artifact as retired or missing.';
 COMMENT ON FUNCTION flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz)
     IS '[Internal] SnapshotStore: refine snapshot_lsn and captured_at when resolving a building generation boundary.';
 COMMENT ON FUNCTION flashback_internal_snapshot_retire_legacy(bigint, text)
@@ -1761,6 +1884,9 @@ REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_payload_healthy(bigint
 REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_finish(bigint, bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM PUBLIC;
@@ -1782,6 +1908,9 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM flashback_admin';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_finish(bigint, bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM flashback_admin';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM flashback_admin';
@@ -1801,6 +1930,9 @@ BEGIN
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_snapshot_health(bigint, bigint, boolean) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_reconcile_external_snapshot_scan(integer) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire(bigint, bigint, text) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_begin(bigint, bigint) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_purge(bigint, bigint) FROM pg_monitor';
+        EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_finish(bigint, bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_refine_boundary(bigint, bigint, bigint, bigint, pg_lsn, timestamptz) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_retire_legacy(bigint, text) FROM pg_monitor';
         EXECUTE 'REVOKE ALL ON FUNCTION public.flashback_internal_snapshot_reserve(bigint, oid, text) FROM pg_monitor';

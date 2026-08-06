@@ -16,6 +16,7 @@ DECLARE
     v_tracking_id bigint;
     v_retirement_id bigint;
     v_snap record;
+    v_snapshot_health record;
 BEGIN
     IF p_reason IS NULL OR btrim(p_reason) = '' THEN
         RAISE EXCEPTION 'flashback_begin_generation_retirement: reason is required';
@@ -107,10 +108,11 @@ BEGIN
     END IF;
     SELECT * INTO v_snap
     FROM flashback_internal_snapshot_resolve(gen.snapshot_id, gen.tracking_id);
-    IF gen.payload_state <> 'available'
-       OR v_snap.payload_relid IS NULL
-       OR NOT flashback_payload_is_owned(v_snap.payload_relid)
-    THEN
+    SELECT * INTO v_snapshot_health
+    FROM flashback_internal_snapshot_payload_healthy(
+        gen.snapshot_id, gen.tracking_id, false
+    );
+    IF gen.payload_state <> 'available' OR v_snapshot_health.status <> 'healthy' THEN
         RAISE EXCEPTION 'pg_flashback: generation % snapshot payload is not available',
             p_generation_id;
     END IF;
@@ -127,18 +129,22 @@ BEGIN
         JOIN flashback.snapshots successor_snapshot
           ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
          AND successor_snapshot.tracking_id = successor.tracking_id
-        CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
-            successor_snapshot.snapshot_id, successor_snapshot.tracking_id
-        ) sr
         WHERE successor.tracking_id = gen.tracking_id
           AND successor.state = 'active'
           AND (
               successor.stream_id IS DISTINCT FROM gen.stream_id
               OR successor.boundary_lsn >= gen.superseded_before_lsn
           )
-          AND sr.payload_state = 'available'
-          AND sr.payload_relid IS NOT NULL
-          AND flashback_payload_is_owned(sr.payload_relid)
+          AND successor_snapshot.payload_state = 'available'
+          AND EXISTS (
+              SELECT 1
+              FROM flashback_internal_snapshot_payload_healthy(
+                  successor_snapshot.snapshot_id,
+                  successor_snapshot.tracking_id,
+                  false
+              ) h
+              WHERE h.status = 'healthy'
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM flashback.generation_payload_retirements successor_retirement
@@ -157,9 +163,11 @@ BEGIN
         p_snapshot_table => gen.snapshot_table,
         p_snapshot_rel_oid => v_snap.payload_relid::oid,
         p_snapshot_row_count => gen.row_count,
-        p_snapshot_schema_fingerprint => flashback_payload_schema_fingerprint(
-            v_snap.payload_relid
-        ),
+        p_snapshot_schema_fingerprint => CASE
+            WHEN v_snap.storage_backend = 'external_zstd'
+                THEN md5(gen.schema_def::text)
+            ELSE flashback_payload_schema_fingerprint(v_snap.payload_relid)
+        END,
         p_snapshot_storage_backend => v_snap.storage_backend,
         p_snapshot_locator => v_snap.locator,
         -- Deliberately no COUNT/MIN/MAX content scan here.  The immutable
@@ -175,6 +183,13 @@ BEGIN
             'superseded_before_lsn', gen.superseded_before_lsn,
             'retention_interval', gen.retention_interval
         )
+    );
+
+    -- Commit this `retiring` snapshot state together with the intent. The
+    -- resume phase refuses to purge in the same transaction (intent_txid
+    -- guard below), making irreversible external deletion crash-safe.
+    PERFORM flashback_internal_snapshot_retire_begin(
+        gen.snapshot_id, gen.tracking_id
     );
 
     RETURN v_retirement_id;
@@ -243,12 +258,25 @@ BEGIN
     END IF;
     SELECT * INTO v_snap
     FROM flashback_internal_snapshot_resolve(retirement.snapshot_id, retirement.tracking_id);
-    IF retirement.payload_state <> 'available'
-       OR v_snap.payload_relid IS NULL
-       OR v_snap.payload_relid::oid IS DISTINCT FROM retirement.snapshot_rel_oid
-       OR NOT flashback_payload_is_owned(v_snap.payload_relid)
-       OR flashback_payload_schema_fingerprint(v_snap.payload_relid)
-              <> retirement.snapshot_schema_fingerprint
+    IF retirement.payload_state <> 'retiring'
+       OR (
+           v_snap.storage_backend = 'heap_v1'
+           AND (
+               v_snap.payload_relid IS NULL
+               OR v_snap.payload_relid::oid IS DISTINCT FROM retirement.snapshot_rel_oid
+               OR NOT flashback_payload_is_owned(v_snap.payload_relid)
+               OR flashback_payload_schema_fingerprint(v_snap.payload_relid)
+                    <> retirement.snapshot_schema_fingerprint
+           )
+       )
+       OR (
+           v_snap.storage_backend = 'external_zstd'
+           AND (
+               v_snap.payload_relid IS NOT NULL
+               OR md5(retirement.schema_def::text)
+                    <> retirement.snapshot_schema_fingerprint
+           )
+       )
        OR (retirement.snapshot_storage_backend IS NOT NULL
            AND v_snap.storage_backend IS DISTINCT FROM retirement.snapshot_storage_backend)
        OR (retirement.snapshot_locator IS NOT NULL
@@ -276,18 +304,22 @@ BEGIN
         JOIN flashback.snapshots successor_snapshot
           ON successor_snapshot.snapshot_id = successor.boundary_snapshot_id
          AND successor_snapshot.tracking_id = successor.tracking_id
-        CROSS JOIN LATERAL flashback_internal_snapshot_resolve(
-            successor_snapshot.snapshot_id, successor_snapshot.tracking_id
-        ) sr
         WHERE successor.tracking_id = retirement.tracking_id
           AND successor.state = 'active'
           AND (
               successor.stream_id IS DISTINCT FROM retirement.generation_stream_id
               OR successor.boundary_lsn >= retirement.generation_superseded_before_lsn
           )
-          AND sr.payload_state = 'available'
-          AND sr.payload_relid IS NOT NULL
-          AND flashback_payload_is_owned(sr.payload_relid)
+          AND successor_snapshot.payload_state = 'available'
+          AND EXISTS (
+              SELECT 1
+              FROM flashback_internal_snapshot_payload_healthy(
+                  successor_snapshot.snapshot_id,
+                  successor_snapshot.tracking_id,
+                  false
+              ) h
+              WHERE h.status = 'healthy'
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM flashback.generation_payload_retirements successor_retirement
@@ -299,7 +331,10 @@ BEGIN
             USING HINT = 'Re-anchor coverage (flashback_reanchor) before retiring the last sealed generation.';
     END IF;
 
-    PERFORM flashback_internal_snapshot_retire(
+    PERFORM flashback_internal_snapshot_retire_purge(
+        retirement.snapshot_id, retirement.tracking_id
+    );
+    PERFORM flashback_internal_snapshot_retire_finish(
         retirement.snapshot_id, retirement.tracking_id, 'retired'
     );
 

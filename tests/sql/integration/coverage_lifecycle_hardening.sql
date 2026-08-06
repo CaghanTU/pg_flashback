@@ -742,6 +742,14 @@ BEGIN
         'heap_v1', jsonb_build_object('schema', 'flashback', 'relation', 'base_snapshot_990001'),
         0, 0
     );
+    -- The production begin phase commits the durable intent and the
+    -- available -> retiring transition atomically before any physical
+    -- deletion is attempted. This fixture uses a foreign intent_txid to
+    -- emulate that already-committed first transaction, so mirror the same
+    -- snapshot state explicitly.
+    PERFORM flashback_internal_snapshot_retire_begin(
+        v_pred_snapshot, v_tracking_id
+    );
 
     -- No active successor exists: resume must fail closed.
     v_failed := false;

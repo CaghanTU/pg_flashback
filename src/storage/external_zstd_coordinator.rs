@@ -40,8 +40,8 @@
 #![allow(dead_code)]
 
 use crate::storage::external_zstd_artifact::{
-    finalize_staged_artifact, open_published_artifact, ArtifactStream, FinalManifest,
-    FinalizationInput, PendingArtifact, ProvisionalManifest,
+    finalize_staged_artifact, open_published_artifact, purge_published_artifact, ArtifactStream,
+    FinalManifest, FinalizationInput, PendingArtifact, ProvisionalManifest,
 };
 use crate::storage::external_zstd_format::{
     decode_datum, encode_datum, read_header, read_row, read_trailer, resolve_receive_info,
@@ -1338,6 +1338,59 @@ fn flashback_internal_external_snapshot_health(
         Ok(()) => JsonB(serde_json::json!({"status": "healthy", "reason": null})),
         Err(reason) => JsonB(serde_json::json!({"status": "unhealthy", "reason": reason})),
     }
+}
+
+/// Physical phase of external artifact retirement. Database state must have
+/// committed `available -> retiring` in an earlier transaction. This function
+/// owns no state transition; it only purges the exact locator-bound directory.
+#[pg_extern]
+fn flashback_internal_purge_external_snapshot(snapshot_id: i64, tracking_id: i64) -> bool {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!("flashback_internal_purge_external_snapshot is owner-only");
+    }
+    let locator_text = Spi::get_one::<String>(&format!(
+        "SELECT locator::text FROM flashback.snapshots \
+         WHERE snapshot_id={snapshot_id}::bigint \
+           AND tracking_id={tracking_id}::bigint \
+           AND payload_state='retiring' \
+           AND storage_backend='external_zstd'"
+    ))
+    .unwrap_or_else(|error| pgrx::error!("external purge evidence query failed: {error}"))
+    .unwrap_or_else(|| pgrx::error!("external purge requires an exact retiring snapshot artifact"));
+    let locator: serde_json::Value = serde_json::from_str(&locator_text)
+        .unwrap_or_else(|error| pgrx::error!("external purge locator is invalid: {error}"));
+    let locator_string = |name: &str| {
+        locator
+            .get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| pgrx::error!("external purge locator is missing {name}"))
+    };
+    let system_identifier = unsafe { pg_sys::GetSystemIdentifier() };
+    let database_oid = unsafe { pg_sys::MyDatabaseId }.to_u32();
+    if locator_string("system_identifier") != system_identifier.to_string()
+        || locator_string("database_oid") != database_oid.to_string()
+        || locator_string("tracking_id") != tracking_id.to_string()
+        || locator_string("snapshot_id") != snapshot_id.to_string()
+    {
+        pgrx::error!("external purge locator does not belong to this database/lifecycle");
+    }
+    let operation_nonce: u64 = locator_string("nonce")
+        .parse()
+        .unwrap_or_else(|_| pgrx::error!("external purge locator nonce is invalid"));
+    let root = crate::storage::worker::external_snapshot_root()
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    crate::storage::external_zstd::validate_root_os_level(&root)
+        .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+        .unwrap_or_else(|error| pgrx::error!("external snapshot root is unsafe: {error}"));
+    purge_published_artifact(
+        std::path::Path::new(&root),
+        system_identifier,
+        database_oid,
+        tracking_id,
+        snapshot_id,
+        operation_nonce,
+    )
+    .unwrap_or_else(|error| pgrx::error!("external artifact purge failed: {error}"))
 }
 
 /// Stream one verified external_zstd artifact into an already-created shadow

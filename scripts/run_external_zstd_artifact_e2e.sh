@@ -14,9 +14,14 @@ SOCKET="$BASE/socket"
 ARTIFACT_ROOT="$BASE/artifacts"
 LOG="$BASE/postgres.log"
 PORT="${PGFB_PORT:-$((32000 + RUN_ID % 1000))}"
+LOCK_PID=""
 
 cleanup() {
     local rc=$?
+    if [[ -n "$LOCK_PID" ]]; then
+        kill "$LOCK_PID" >/dev/null 2>&1 || true
+        wait "$LOCK_PID" >/dev/null 2>&1 || true
+    fi
     "$BINDIR/pg_ctl" -D "$DATA" -m immediate stop >/dev/null 2>&1 || true
     if [[ "${PGFB_E2E_KEEP:-0}" != 1 ]]; then rm -rf "$BASE"; fi
     exit "$rc"
@@ -191,6 +196,73 @@ SCAN=$(q "SELECT public.flashback_internal_reconcile_external_snapshot_scan(1)")
 [[ "$(q "SELECT status||'|'||(deep_checked_at IS NOT NULL)::text FROM flashback.snapshot_health_audits WHERE snapshot_id=$SNAPSHOT AND tracking_id=$TRACKING")" == "healthy|true" ]] || {
     echo "FAIL: maintenance health audit was not persisted"; exit 1;
 }
+
+if [[ "${PGFB_EXTZSTD_RETIRE:-0}" == 1 ]]; then
+    [[ "$(q "SELECT public.flashback_internal_snapshot_retire_begin($SNAPSHOT,$TRACKING)")" == t ]] || {
+        echo "FAIL: retirement begin did not transition artifact"; exit 1;
+    }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retiring ]] || {
+        echo "FAIL: retiring state did not commit before purge"; exit 1;
+    }
+    [[ -d "$FINAL_DIR" ]] || { echo "FAIL: begin physically removed artifact"; exit 1; }
+
+    # A restore reader holds a shared flock on the immutable artifact. Purge
+    # must acquire the corresponding exclusive non-blocking lock and refuse
+    # deletion while that reader is live.
+    LOCK_READY="$BASE/restore-lock.ready"
+    python3 - "$FINAL_DIR/artifact.zst" "$LOCK_READY" <<'PY' &
+import fcntl
+import pathlib
+import sys
+import time
+
+with open(sys.argv[1], "rb") as artifact:
+    fcntl.flock(artifact, fcntl.LOCK_SH)
+    pathlib.Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+    time.sleep(60)
+PY
+    LOCK_PID=$!
+    for _ in $(seq 1 100); do [[ -s "$LOCK_READY" ]] && break; sleep 0.05; done
+    [[ -s "$LOCK_READY" ]] || { echo "FAIL: restore lock holder did not become ready"; exit 1; }
+    if q "SELECT public.flashback_internal_snapshot_retire_purge($SNAPSHOT,$TRACKING)" \
+        >"$BASE/purge-while-read.out" 2>&1; then
+        echo "FAIL: purge succeeded while a restore held the artifact lock"; exit 1
+    fi
+    grep -q 'in use by a restore' "$BASE/purge-while-read.out" || {
+        echo "FAIL: concurrent purge failed for the wrong reason"; exit 1;
+    }
+    [[ -s "$FINAL_DIR/artifact.zst" ]] || { echo "FAIL: refused purge removed artifact"; exit 1; }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retiring ]] || {
+        echo "FAIL: refused purge changed durable retirement state"; exit 1;
+    }
+    kill "$LOCK_PID"
+    wait "$LOCK_PID" >/dev/null 2>&1 || true
+    LOCK_PID=""
+
+    [[ "$(q "SELECT public.flashback_internal_snapshot_retire_purge($SNAPSHOT,$TRACKING)")" == t ]] || {
+        echo "FAIL: physical purge did not remove artifact"; exit 1;
+    }
+    [[ ! -e "$FINAL_DIR" ]] || { echo "FAIL: published artifact directory survived purge"; exit 1; }
+
+    # Simulate a crash after irreversible filesystem deletion but before the
+    # database terminal transition. The committed `retiring` row must survive
+    # restart and finish idempotently without requiring the files to reappear.
+    "$BINDIR/pg_ctl" -D "$DATA" -m immediate restart -l "$LOG" >/dev/null
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retiring ]] || {
+        echo "FAIL: restart lost the durable retiring state"; exit 1;
+    }
+    [[ "$(q "SELECT public.flashback_internal_snapshot_retire_finish($SNAPSHOT,$TRACKING,'retired')")" == t ]] || {
+        echo "FAIL: retirement finish did not transition artifact"; exit 1;
+    }
+    [[ "$(q "SELECT payload_state FROM flashback.snapshots WHERE snapshot_id=$SNAPSHOT")" == retired ]] || {
+        echo "FAIL: artifact did not finish retired"; exit 1;
+    }
+    [[ "$(q "SELECT public.flashback_internal_snapshot_retire_finish($SNAPSHOT,$TRACKING,'retired')")" == f ]] || {
+        echo "FAIL: retirement finish retry was not idempotent"; exit 1;
+    }
+    echo "EXTERNAL_ZSTD_ARTIFACT_E2E=PASS mode=retirement"
+    exit 0
+fi
 
 # A missing payload and one-byte corruption must be visible to the read-only
 # health probe, and the restore reader must fail closed without leaving rows.

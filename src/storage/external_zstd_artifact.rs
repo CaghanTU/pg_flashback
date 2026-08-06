@@ -428,6 +428,85 @@ pub fn open_published_artifact(
     Ok((artifact, manifest))
 }
 
+/// Delete one exact published payload after acquiring an exclusive advisory
+/// lock on `artifact.zst`. A concurrent restore holds a shared lock on the
+/// same inode, so retirement fails closed and is retried later instead of
+/// unlinking a stream that is currently being read.
+pub fn purge_published_artifact(
+    root: &Path,
+    system_identifier: u64,
+    database_oid: u32,
+    tracking_id: i64,
+    snapshot_id: i64,
+    operation_nonce: u64,
+) -> Result<bool, String> {
+    let components = [
+        system_identifier.to_string(),
+        database_oid.to_string(),
+        tracking_id.to_string(),
+        format!("{snapshot_id}-{operation_nonce}"),
+    ];
+    for component in &components {
+        validate_component(component)?;
+    }
+    let root_fd = open_root_dir(root).map_err(|e| e.to_string())?;
+    let system_fd = match open_dir_beneath(root_fd.as_raw_fd(), &components[0]) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open system artifact directory: {error}")),
+    };
+    let database_fd = match open_dir_beneath(system_fd.as_raw_fd(), &components[1]) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open database artifact directory: {error}")),
+    };
+    let tracking_fd = match open_dir_beneath(database_fd.as_raw_fd(), &components[2]) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open tracking artifact directory: {error}")),
+    };
+    let final_fd = match open_dir_beneath(tracking_fd.as_raw_fd(), &components[3]) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("open published artifact directory: {error}")),
+    };
+    let artifact = match open_readonly(&final_fd, ARTIFACT_FILE) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("open published artifact for purge: {error}")),
+    };
+    if let Some(artifact) = artifact.as_ref() {
+        let lock_rc = unsafe { libc::flock(artifact.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_rc != 0 {
+            return Err(format!(
+                "published artifact is in use by a restore: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    for name in [
+        ARTIFACT_FILE,
+        "manifest.json",
+        PROVISIONAL_FILE,
+        PROVISIONAL_PENDING,
+        LEASE_FILE,
+    ] {
+        match unlink_beneath(final_fd.as_raw_fd(), name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove published {name}: {error}")),
+        }
+    }
+    fsync_fd(final_fd.as_raw_fd()).map_err(|e| format!("fsync purged artifact directory: {e}"))?;
+    drop(artifact);
+    drop(final_fd);
+    crate::storage::external_zstd::rmdir_beneath(tracking_fd.as_raw_fd(), &components[3])
+        .map_err(|e| format!("remove published artifact directory: {e}"))?;
+    fsync_fd(tracking_fd.as_raw_fd())
+        .map_err(|e| format!("fsync tracking directory after purge: {e}"))?;
+    Ok(true)
+}
+
 impl FinalizedArtifact {
     /// Remove copy-only coordination files after the database publication
     /// authority accepted the manifest. `artifact.zst` and `manifest.json`
