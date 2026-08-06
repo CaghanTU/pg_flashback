@@ -49,8 +49,23 @@ LOG="$LOG_DIR/postgresql.log"
 SOCKET="/tmp/pgfb-qual-$RUN_ID"
 SUMMARY_JSON="$WORK_ROOT/summary.json"
 DB_NAME=pgfb_qual
+QUAL_SNAPSHOT_BACKEND="${PG_FLASHBACK_QUAL_SNAPSHOT_BACKEND:-heap_v1}"
+QUAL_LOCAL_MAX_SNAPSHOT_BYTES="${PG_FLASHBACK_QUAL_LOCAL_MAX_SNAPSHOT_BYTES:-8GB}"
+QUAL_LOCAL_MAX_RESTORE_PEAK_BYTES="${PG_FLASHBACK_QUAL_LOCAL_MAX_RESTORE_PEAK_BYTES:-16GB}"
+QUAL_LOCAL_MIN_FILESYSTEM_BYTES="${PG_FLASHBACK_QUAL_LOCAL_MIN_FILESYSTEM_BYTES:-64MB}"
+QUAL_LOCAL_SAFETY_RESERVE_BYTES="${PG_FLASHBACK_QUAL_LOCAL_SAFETY_RESERVE_BYTES:-16MB}"
+QUAL_MAX_SLOT_WAL_KEEP_SIZE="${PG_FLASHBACK_QUAL_MAX_SLOT_WAL_KEEP_SIZE:-4GB}"
+QUAL_MAX_WAL_SIZE="${PG_FLASHBACK_QUAL_MAX_WAL_SIZE:-4GB}"
+QUAL_EXTERNAL_MIN_FREE_BYTES="${PG_FLASHBACK_QUAL_EXTERNAL_MIN_FREE_BYTES:-64MB}"
+QUAL_EXTERNAL_SAFETY_RESERVE_BYTES="${PG_FLASHBACK_QUAL_EXTERNAL_SAFETY_RESERVE_BYTES:-16MB}"
+QUAL_EXTERNAL_ROOT="${PG_FLASHBACK_QUAL_EXTERNAL_ROOT:-$WORK_ROOT/external-snapshots}"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
+
+case "$QUAL_SNAPSHOT_BACKEND" in
+    heap_v1|external_zstd) ;;
+    *) die "invalid PG_FLASHBACK_QUAL_SNAPSHOT_BACKEND=$QUAL_SNAPSHOT_BACKEND" ;;
+esac
 
 case "$MODE" in
     matrices)
@@ -142,7 +157,7 @@ cleanup() {
     if [[ "$overall" == "PASS" && "${PGFB_QUAL_KEEP:-0}" != "1" ]]; then
         "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 || \
             "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
-        rm -rf "$DATA" "$LOG_DIR" "$SOCKET"
+        rm -rf "$DATA" "$LOG_DIR" "$SOCKET" "$QUAL_EXTERNAL_ROOT"
         rmdir "$WORK_ROOT" 2>/dev/null || true
     elif [[ "$overall" == "PASS" ]]; then
         echo "PGFB_QUAL_KEEP=1: leaving $WORK_ROOT and $SOCKET" >&2
@@ -166,7 +181,8 @@ trap cleanup EXIT
 [[ -x "$PSQL" ]] || die "psql not found via $PG_CONFIG"
 [[ -f "$SHARE_DIR/extension/pg_flashback.control" ]] || die "extension not installed in $SHARE_DIR"
 
-mkdir -p "$WORK_ROOT" "$LOG_DIR" "$SOCKET"
+mkdir -p "$WORK_ROOT" "$LOG_DIR" "$SOCKET" "$QUAL_EXTERNAL_ROOT"
+chmod 0700 "$QUAL_EXTERNAL_ROOT"
 "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >/dev/null
 cat >>"$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
@@ -174,17 +190,22 @@ wal_level = logical
 max_replication_slots = 16
 max_wal_senders = 16
 max_worker_processes = 16
-max_slot_wal_keep_size = '4GB'
+max_slot_wal_keep_size = '$QUAL_MAX_SLOT_WAL_KEEP_SIZE'
+max_wal_size = '$QUAL_MAX_WAL_SIZE'
 fsync = on
 pg_flashback.enabled = on
 pg_flashback.capture_mode = wal
 pg_flashback.worker_interval_ms = 50
 pg_flashback.max_workers = 4
 pg_flashback.target_databases = 'postgres'
-pg_flashback.local_max_snapshot_bytes = 8GB
-pg_flashback.local_max_restore_peak_bytes = 16GB
-pg_flashback.local_min_filesystem_bytes = 64MB
-pg_flashback.local_safety_reserve_bytes = 16MB
+pg_flashback.local_max_snapshot_bytes = '$QUAL_LOCAL_MAX_SNAPSHOT_BYTES'
+pg_flashback.local_max_restore_peak_bytes = '$QUAL_LOCAL_MAX_RESTORE_PEAK_BYTES'
+pg_flashback.local_min_filesystem_bytes = '$QUAL_LOCAL_MIN_FILESYSTEM_BYTES'
+pg_flashback.local_safety_reserve_bytes = '$QUAL_LOCAL_SAFETY_RESERVE_BYTES'
+pg_flashback.snapshot_storage_backend = '$QUAL_SNAPSHOT_BACKEND'
+pg_flashback.external_snapshot_root = '$QUAL_EXTERNAL_ROOT'
+pg_flashback.external_snapshot_min_free_bytes = '$QUAL_EXTERNAL_MIN_FREE_BYTES'
+pg_flashback.external_snapshot_safety_reserve_bytes = '$QUAL_EXTERNAL_SAFETY_RESERVE_BYTES'
 pg_flashback.allow_unaudited_restore = on
 EOF
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$LOG" -o "-p $PORT -k $SOCKET" start -w >/dev/null
@@ -390,6 +411,7 @@ if [[ "$MODE" == "bench" || "$MODE" == "all" ]]; then
             PG_FLASHBACK_BENCH_SIZES="$BENCH_SIZES" \
             PG_FLASHBACK_TABLESIZE_SHAPES="$BENCH_SHAPES" \
             PG_FLASHBACK_BENCH_RESULT_DIR="$BENCH_RESULT_DIR" \
+            PG_FLASHBACK_EXPECT_SNAPSHOT_BACKEND="$QUAL_SNAPSHOT_BACKEND" \
             PG_CONFIG="$PG_CONFIG" \
             "$ROOT/scripts/run_byte_table_size_bench.sh"
 

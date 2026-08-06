@@ -44,6 +44,9 @@ size_to_bytes() {
         100MiB) echo $((100 * 1024 * 1024)) ;;
         500MiB) echo $((500 * 1024 * 1024)) ;;
         1GiB) echo $((1024 * 1024 * 1024)) ;;
+        10GiB) echo $((10 * 1024 * 1024 * 1024)) ;;
+        25GiB) echo $((25 * 1024 * 1024 * 1024)) ;;
+        50GiB) echo $((50 * 1024 * 1024 * 1024)) ;;
         *) echo "$1" | awk '/^[0-9]+$/ {print; exit} {exit 1}' || { echo "bad size $1" >&2; exit 2; } ;;
     esac
 }
@@ -262,6 +265,8 @@ SELECT jsonb_build_object(
   'local_max_snapshot_bytes', current_setting('pg_flashback.local_max_snapshot_bytes', true),
   'local_max_restore_peak_bytes', current_setting('pg_flashback.local_max_restore_peak_bytes', true),
   'local_min_filesystem_bytes', current_setting('pg_flashback.local_min_filesystem_bytes', true),
+  'snapshot_storage_backend', current_setting('pg_flashback.snapshot_storage_backend', true),
+  'external_snapshot_root', current_setting('pg_flashback.external_snapshot_root', true),
   'filesystem_available_bytes', flashback_tablespace_filesystem_available_bytes(0)
 );
 SQL
@@ -317,6 +322,25 @@ insert_batch_toast() {
               GROUP BY g;"
 }
 export -f insert_batch_toast
+
+# Scale shape: roughly 8 KiB of deterministic, poorly-compressible payload per
+# row. It keeps 50 GiB qualification at a tractable row count while still
+# exercising TOAST, a primary key, a unique constraint, a CHECK, an expression
+# index, comments and a non-empty ACL. The whole row remains below the default
+# 64 KiB WAL capture ceiling during the 1% post-protect churn.
+insert_batch_wide() {
+    local rel=$1 start=$2 n=$3
+    psqlq -c "INSERT INTO $rel(marker,payload)
+              SELECT g,
+                     string_agg(
+                         encode(sha512((g::text || ':' || i::text)::bytea), 'hex'),
+                         '' ORDER BY i
+                     )
+              FROM generate_series($((start + 1)), $((start + n))) g
+              CROSS JOIN generate_series(1, 64) i
+              GROUP BY g;"
+}
+export -f insert_batch_wide
 
 # Loads $rel (already CREATEd empty) up to within +/-10% of $target_bytes as
 # measured by pg_table_size (heap+TOAST, excludes indexes -- callers record
