@@ -212,4 +212,32 @@ if [[ -n "$LOG_PATH" && -f "$LOG_PATH" ]]; then
 fi
 echo "  ok: maintenance worker survived"
 
+echo "-- expected stream-lock contention defers one cadence without worker exit --"
+DEFER_BEFORE=0
+if [[ -n "$LOG_PATH" && -f "$LOG_PATH" ]]; then
+    DEFER_BEFORE=$(grep -c "retention maintenance deferred: canceling statement due to lock timeout" "$LOG_PATH" || true)
+fi
+"$PSQL" -v ON_ERROR_STOP=1 -d "$DB" -Atqc \
+    "BEGIN;
+     SELECT public.flashback_internal_lock_database_stream(
+       (SELECT oid FROM pg_database WHERE datname=current_database()));
+     SELECT pg_sleep(2);
+     COMMIT;" >/dev/null &
+LOCK_HOLDER_PID=$!
+sleep 1
+CONTENDED_PID=$(q "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_flashback maintenance worker' LIMIT 1")
+[[ "$CONTENDED_PID" == "$INITIAL_PID" ]] \
+    || { echo "FAIL: maintenance worker exited under expected lock timeout $INITIAL_PID -> $CONTENDED_PID"; exit 1; }
+wait "$LOCK_HOLDER_PID"
+sleep 0.5
+AFTER_CONTENTION_PID=$(q "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_flashback maintenance worker' LIMIT 1")
+[[ "$AFTER_CONTENTION_PID" == "$INITIAL_PID" ]] \
+    || { echo "FAIL: maintenance worker restarted after expected lock timeout $INITIAL_PID -> $AFTER_CONTENTION_PID"; exit 1; }
+if [[ -n "$LOG_PATH" && -f "$LOG_PATH" ]]; then
+    DEFER_AFTER=$(grep -c "retention maintenance deferred: canceling statement due to lock timeout" "$LOG_PATH" || true)
+    [[ "$DEFER_AFTER" -gt "$DEFER_BEFORE" ]] \
+        || { echo "FAIL: expected bounded retention deferral was not logged"; exit 1; }
+fi
+echo "  ok: expected lock timeout was deferred and worker PID remained $INITIAL_PID"
+
 echo "PASS: maintain lifecycle E2E"

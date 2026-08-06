@@ -148,6 +148,15 @@ cleanup() {
     overall="$(jq -r '.status' "$sticky" 2>/dev/null || echo FAIL)"
     cp -f "$sticky" "$SUMMARY_JSON" 2>/dev/null || true
 
+    # Stop every process that can still have the candidate shared object
+    # mapped BEFORE restoring the shared prefix. Replacing pg_flashback.so
+    # underneath a live postmaster is unsafe and previously caused shutdown-
+    # time process crashes on a clean qualification host.
+    if [[ -f "$DATA/postmaster.pid" ]]; then
+        "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 || \
+            "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
+    fi
+
     # Restore the shared prefix regardless of outcome; the candidate .so must
     # never be left installed as a side effect of this script's own failure.
     if [[ "${EC_BOUND:-0}" == "1" && ( "$overall" != "PASS" || "${PGFB_QUAL_KEEP:-0}" != "1" ) ]]; then
@@ -155,8 +164,6 @@ cleanup() {
     fi
 
     if [[ "$overall" == "PASS" && "${PGFB_QUAL_KEEP:-0}" != "1" ]]; then
-        "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 || \
-            "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
         rm -rf "$DATA" "$LOG_DIR" "$SOCKET" "$QUAL_EXTERNAL_ROOT"
         rmdir "$WORK_ROOT" 2>/dev/null || true
     elif [[ "$overall" == "PASS" ]]; then
@@ -165,10 +172,6 @@ cleanup() {
         # FAIL or interrupted: stop only this run's own cluster by its own
         # DATA directory; never touch other PostgreSQL processes. Evidence
         # (logs, data dir) is retained, not deleted.
-        if [[ -f "$DATA/postmaster.pid" ]]; then
-            "$PG_BIN/pg_ctl" -D "$DATA" stop -m fast -w >/dev/null 2>&1 || \
-                "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
-        fi
         echo "Evidence retained at $WORK_ROOT (status=$overall)" >&2
     fi
 
@@ -289,6 +292,8 @@ warmup_logical_slot() {
          WHERE slot_name = '${slot}' AND database = current_database());" | grep -qx t
 }
 warmup_logical_slot "$DB_NAME" || die "warmup logical slot lifecycle failed"
+wait_flashback_ready "$DB_NAME" 120 \
+    || die "flashback workers did not return to ready after warmup lifecycle"
 
 export PGHOST="$SOCKET" PGPORT="$PORT" PGDATABASE="$DB_NAME"
 PGUSER="$(id -un)"

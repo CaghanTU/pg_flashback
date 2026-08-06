@@ -960,6 +960,7 @@ fn run_retention_purge() {
         "RETENTION_PURGE",
         "DO $$
                          BEGIN
+                           BEGIN
                              IF to_regprocedure('flashback_finalize_recover_operations()') IS NOT NULL THEN
                                  PERFORM flashback_finalize_recover_operations();
                              END IF;
@@ -969,6 +970,10 @@ fn run_retention_purge() {
                              IF to_regprocedure('flashback_apply_retention()') IS NOT NULL THEN
                                  PERFORM flashback_apply_retention();
                              END IF;
+                           EXCEPTION
+                             WHEN lock_not_available OR query_canceled THEN
+                               RAISE WARNING 'pg_flashback: retention maintenance deferred: %', SQLERRM;
+                           END;
                          END
                          $$",
     );
@@ -979,6 +984,7 @@ fn run_external_snapshot_health() {
         "EXTERNAL_SNAPSHOT_HEALTH",
         "DO $$
              BEGIN
+               BEGIN
                  IF to_regprocedure('flashback_internal_reconcile_external_snapshot_scan(integer)') IS NOT NULL THEN
                      PERFORM flashback_internal_reconcile_external_snapshot_scan(1);
                  END IF;
@@ -988,6 +994,10 @@ fn run_external_snapshot_health() {
                  IF to_regprocedure('flashback_internal_reconcile_external_maintenance(interval,integer)') IS NOT NULL THEN
                      PERFORM flashback_internal_reconcile_external_maintenance(interval '5 minutes', 1);
                  END IF;
+               EXCEPTION
+                 WHEN lock_not_available OR query_canceled THEN
+                   RAISE WARNING 'pg_flashback: external snapshot maintenance deferred: %', SQLERRM;
+               END;
              END
              $$",
     );
@@ -1000,17 +1010,24 @@ fn run_ensure_partitions() {
         "PARTITION_ENSURE",
         "DO $$
              BEGIN
+               BEGIN
                  IF to_regprocedure('flashback_ensure_delta_partition(date)') IS NOT NULL THEN
                      PERFORM flashback_ensure_delta_partition(CURRENT_DATE);
                  END IF;
+               EXCEPTION
+                 WHEN lock_not_available OR query_canceled THEN
+                   RAISE WARNING 'pg_flashback: partition maintenance deferred: %', SQLERRM;
+               END;
              END
              $$",
     );
 }
 
-/// Run a best-effort maintenance transaction that cannot monopolize the
-/// capture worker. Errors include lock_timeout and statement_timeout; both
-/// abort only this transaction and are retried on a later maintenance cycle.
+/// Run a best-effort maintenance transaction that cannot monopolize capture.
+/// Each SQL body catches the expected lock_timeout/statement_timeout inside a
+/// PL/pgSQL subtransaction so those routine conflicts abort only that body and
+/// are retried on a later cadence. Unexpected PostgreSQL ERRORs remain fatal:
+/// the postmaster restarts the worker instead of hiding a persistent bug.
 fn run_bounded_maintenance(operation: &str, query: &str) {
     let lock_timeout_ms = MAINTENANCE_LOCK_TIMEOUT_MS_GUC.get().clamp(10, 60_000);
     let statement_timeout_ms = MAINTENANCE_STATEMENT_TIMEOUT_MS_GUC
