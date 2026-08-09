@@ -562,7 +562,7 @@ BEGIN
            SELECT 1
            FROM flashback.coverage_generations cg
            WHERE cg.tracking_id = OLD.tracking_id
-             AND cg.state IN ('building', 'active')
+             AND cg.state IN ('building', 'capturing', 'active')
        )
     THEN
         RAISE EXCEPTION 'pg_flashback: lifecycle % still has an eligible or pending generation', OLD.tracking_id
@@ -1485,7 +1485,7 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
     recovery_profile       TEXT NOT NULL DEFAULT 'local_delta'
                            CHECK (recovery_profile = 'local_delta'),
     state                  TEXT NOT NULL DEFAULT 'building'
-                           CHECK (state IN ('building', 'active', 'sealed', 'retired', 'aborted')),
+                           CHECK (state IN ('building', 'capturing', 'active', 'sealed', 'retired', 'aborted')),
     -- Step 9: which SnapshotStore backend this generation's boundary
     -- snapshot is being/was captured with. Frozen at reservation time
     -- (flashback_internal_reserve_online_generation / the existing
@@ -1581,6 +1581,21 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
             )
         )
         OR (
+            -- Step 9 initial-protect: boundary resolved and durably absorbing
+            -- WAL (see wal_promote_core.sql), but the external artifact is
+            -- not yet verified/published, so never a restore source. Only
+            -- ever reached by a parentless external_zstd generation -- a
+            -- has-parent (re-anchor) generation is kept safe today by its
+            -- active parent absorbing writes instead, and never enters this
+            -- state (wal_promote_core.sql only transitions building ->
+            -- capturing when parent_generation_id IS NULL).
+            state = 'capturing'
+            AND boundary_time IS NOT NULL
+            AND boundary_lsn IS NOT NULL
+            AND storage_backend = 'external_zstd'
+            AND parent_generation_id IS NULL
+        )
+        OR (
             state = 'active'
             AND activated_at IS NOT NULL
             AND boundary_time IS NOT NULL
@@ -1608,7 +1623,7 @@ CREATE TABLE IF NOT EXISTS flashback.coverage_generations (
     ),
     CONSTRAINT coverage_generations_applicability_shape_check CHECK (
         (
-            state IN ('building', 'active', 'aborted')
+            state IN ('building', 'capturing', 'active', 'aborted')
             AND superseded_before_time IS NULL
             AND superseded_before_lsn IS NULL
         ) OR (
@@ -2081,7 +2096,7 @@ BEGIN
         DROP CONSTRAINT IF EXISTS coverage_generations_state_check;
     ALTER TABLE flashback.coverage_generations
         ADD CONSTRAINT coverage_generations_state_check
-        CHECK (state IN ('building', 'active', 'sealed', 'retired', 'aborted'));
+        CHECK (state IN ('building', 'capturing', 'active', 'sealed', 'retired', 'aborted'));
 
     IF EXISTS (
         SELECT 1 FROM pg_constraint
@@ -2149,6 +2164,12 @@ BEGIN
                     OR boundary_marker IS NOT NULL
                 )
             ) OR (
+                state = 'capturing'
+                AND boundary_time IS NOT NULL
+                AND boundary_lsn IS NOT NULL
+                AND storage_backend = 'external_zstd'
+                AND parent_generation_id IS NULL
+            ) OR (
                 state = 'active'
                 AND activated_at IS NOT NULL
                 AND boundary_time IS NOT NULL
@@ -2173,7 +2194,7 @@ BEGIN
         ),
         ADD CONSTRAINT coverage_generations_applicability_shape_check CHECK (
             (
-                state IN ('building', 'active', 'aborted')
+                state IN ('building', 'capturing', 'active', 'aborted')
                 AND superseded_before_time IS NULL
                 AND superseded_before_lsn IS NULL
             ) OR (
@@ -2238,6 +2259,9 @@ BEGIN
             NEW.state = OLD.state
             OR (OLD.state = 'building' AND NEW.state = 'active')
             OR (OLD.state = 'building' AND NEW.state = 'aborted')
+            OR (OLD.state = 'building' AND NEW.state = 'capturing')
+            OR (OLD.state = 'capturing' AND NEW.state = 'active')
+            OR (OLD.state = 'capturing' AND NEW.state = 'aborted')
             OR (OLD.state = 'active' AND NEW.state = 'sealed')
             OR (OLD.state = 'sealed' AND NEW.state = 'retired')
         ) THEN
@@ -2336,7 +2360,7 @@ BEGIN
         END IF;
 
         IF NEW.activated_at IS DISTINCT FROM OLD.activated_at
-           AND NOT (OLD.state = 'building' AND NEW.state = 'active'
+           AND NOT (OLD.state IN ('building', 'capturing') AND NEW.state = 'active'
                     AND OLD.activated_at IS NULL AND NEW.activated_at IS NOT NULL)
         THEN
             RAISE EXCEPTION 'pg_flashback: invalid generation activation audit change'
@@ -2357,13 +2381,32 @@ BEGIN
                 USING ERRCODE = 'integrity_constraint_violation';
         END IF;
         IF NEW.aborted_at IS DISTINCT FROM OLD.aborted_at
-           AND NOT (OLD.state = 'building' AND NEW.state = 'aborted'
+           AND NOT (OLD.state IN ('building', 'capturing') AND NEW.state = 'aborted'
                     AND OLD.aborted_at IS NULL AND NEW.aborted_at IS NOT NULL)
         THEN
             RAISE EXCEPTION 'pg_flashback: invalid generation abort audit change'
                 USING ERRCODE = 'integrity_constraint_violation';
         END IF;
-        IF NEW.details IS DISTINCT FROM OLD.details AND OLD.state <> 'building' THEN
+        -- 'building' keeps its original, wider allowance (details may be
+        -- amended same-state or across any of its legal exits -- unchanged
+        -- from before Step 9). 'capturing' is deliberately narrower: its
+        -- boundary is already resolved and durable, so its details may only
+        -- be augmented as an incidental side effect of actually leaving it
+        -- through a real, centralized-authority transition (capturing ->
+        -- active or capturing -> aborted), never by a same-state
+        -- 'capturing' -> 'capturing' UPDATE. Without singling this out, a
+        -- raw UPDATE ... SET details = ... WHERE state = 'capturing' (state
+        -- unchanged) would pass both this check and the transition-legality
+        -- check above (NEW.state = OLD.state is always legal there) and
+        -- bypass flashback_internal_transition_coverage_generation entirely
+        -- -- exactly the "raw state mutation around the authority" this
+        -- trigger exists to prevent.
+        IF NEW.details IS DISTINCT FROM OLD.details
+           AND NOT (
+               OLD.state = 'building'
+               OR (OLD.state = 'capturing' AND NEW.state IN ('active', 'aborted'))
+           )
+        THEN
             RAISE EXCEPTION 'pg_flashback: qualified generation details are immutable'
                 USING ERRCODE = 'integrity_constraint_violation';
         END IF;
@@ -2539,9 +2582,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS capture_streams_one_active_idx
 CREATE UNIQUE INDEX IF NOT EXISTS coverage_generations_one_active_idx
     ON flashback.coverage_generations (tracking_id)
     WHERE state = 'active';
+-- Step 9: widened from state = 'building' to also cover 'capturing' so a
+-- concurrent second reservation attempt for the same tracking_id can never
+-- slip past the application-level EXISTS guards under a race -- this index,
+-- not those guards, is the actual enforcement of "at most one pending
+-- generation per tracking_id" at COMMIT time.
+DROP INDEX IF EXISTS flashback.coverage_generations_one_building_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS coverage_generations_one_building_idx
     ON flashback.coverage_generations (tracking_id)
-    WHERE state = 'building';
+    WHERE state IN ('building', 'capturing');
 CREATE INDEX IF NOT EXISTS coverage_generations_tracking_boundary_idx
     ON flashback.coverage_generations (tracking_id, boundary_time DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS coverage_generations_boundary_snapshot_once_idx

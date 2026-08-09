@@ -160,7 +160,7 @@ BEGIN
 
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg
-        WHERE cg.tracking_id = v_tracking_id AND cg.state = 'building'
+        WHERE cg.tracking_id = v_tracking_id AND cg.state IN ('building', 'capturing')
     ) THEN
         RAISE EXCEPTION 'flashback_unprotect: lifecycle % has a pending generation', v_tracking_id
             USING HINT = 'Wait for boundary COMMIT LSN resolution before unprotect.';

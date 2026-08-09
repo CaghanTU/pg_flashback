@@ -792,7 +792,7 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg
         WHERE cg.tracking_id = admission.tracking_id
-          AND cg.state = 'building'
+          AND cg.state IN ('building', 'capturing')
     ) THEN
         RAISE EXCEPTION 'pg_flashback: tracking lifecycle % already has a pending generation',
             admission.tracking_id;

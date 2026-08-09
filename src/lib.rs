@@ -255,6 +255,14 @@ mod tests {
         "../tests/sql/integration/online_boundary_bind.sql"
     );
     sql_test!(
+        it_capturing_state_authority,
+        "../tests/sql/integration/capturing_state_authority.sql"
+    );
+    sql_test!(
+        it_capturing_health_doctor,
+        "../tests/sql/integration/capturing_health_doctor.sql"
+    );
+    sql_test!(
         it_external_snapshot_activation_authority,
         "../tests/sql/integration/external_snapshot_activation_authority.sql"
     );

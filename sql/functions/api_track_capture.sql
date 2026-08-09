@@ -622,7 +622,7 @@ BEGIN
         JOIN flashback.tracked_tables tt USING (tracking_id)
         WHERE tt.is_active
           AND tt.recovery_profile = 'local_delta'
-          AND cg.state IN ('building', 'active', 'sealed')
+          AND cg.state IN ('building', 'capturing', 'active', 'sealed')
     ) recoverable_relations;
 
     -- Preflight the fixed prefix with tuple payload conversion disabled. A
@@ -800,7 +800,7 @@ BEGIN
         FROM _fb_wal_peek p
         JOIN flashback.coverage_generations cg
           ON cg.rel_oid_at_boundary = (p.data->>'oid')::oid
-         AND cg.state IN ('building', 'active', 'sealed')
+         AND cg.state IN ('building', 'capturing', 'active', 'sealed')
         JOIN flashback.tracked_tables tt
           ON tt.tracking_id = cg.tracking_id
          AND tt.is_active
@@ -1082,7 +1082,7 @@ BEGIN
         PERFORM flashback_internal_lock_lifecycle(v_tracking_id);
         IF EXISTS (
             SELECT 1 FROM flashback.coverage_generations cg
-            WHERE cg.tracking_id = v_tracking_id AND cg.state = 'building'
+            WHERE cg.tracking_id = v_tracking_id AND cg.state IN ('building', 'capturing')
         ) THEN
             RAISE EXCEPTION 'flashback_untrack: lifecycle % has a pending generation', v_tracking_id
                 USING HINT = 'Wait for its boundary COMMIT LSN to resolve before untracking.';

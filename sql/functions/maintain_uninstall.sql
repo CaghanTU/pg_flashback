@@ -432,7 +432,7 @@ BEGIN
         JOIN flashback.coverage_generations cg ON cg.tracking_id = tt.tracking_id
         WHERE tt.is_active
           AND format('%I.%I', tt.schema_name, tt.table_name) = v_name
-          AND cg.state = 'building'
+          AND cg.state IN ('building', 'capturing')
     ) INTO v_building;
 
     IF v_backend = 'external_zstd' THEN
@@ -579,7 +579,7 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations
         WHERE flashback.coverage_generations.tracking_id = v_tracking_id
-          AND state = 'building'
+          AND state IN ('building', 'capturing')
     ) THEN
         RAISE EXCEPTION 'pg_flashback: lifecycle % already has a pending generation',
             v_tracking_id USING ERRCODE = 'object_not_in_prerequisite_state';

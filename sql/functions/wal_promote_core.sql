@@ -229,6 +229,31 @@ BEGIN
         -- must first publish and verify an immutable artifact; a separate
         -- authority then seals the predecessor and activates this generation.
         IF pending.storage_backend = 'external_zstd' THEN
+            IF pending.parent_generation_id IS NULL THEN
+                -- Step 9 initial-protect: this generation has no active
+                -- predecessor to absorb writes while its artifact builds (the
+                -- has-parent/re-anchor case below relies entirely on that
+                -- absorption, which is why it is left untouched and still
+                -- just CONTINUEs). Move it building -> capturing so the
+                -- `qualified` CTE below starts treating it as a durable WAL
+                -- write target from this exact commit onward -- closing what
+                -- would otherwise be a silent, permanent data-loss window
+                -- between the marker boundary and eventual activation.
+                PERFORM flashback_internal_transition_coverage_generation(
+                    pending.generation_id,
+                    pending.tracking_id,
+                    'building',
+                    'capturing',
+                    'capturing_boundary_commit_observed',
+                    pending.commit_lsn,
+                    pending.committed_at,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    '{}'::jsonb
+                );
+            END IF;
             CONTINUE;
         END IF;
 
@@ -310,7 +335,16 @@ BEGIN
         JOIN _fb_wal_commits c USING (source_xid)
         JOIN flashback.coverage_generations cg
           ON cg.stream_id = p_stream_id
-         AND cg.state IN ('active', 'sealed')
+         -- 'capturing' (Step 9 initial-protect, parentless external_zstd
+         -- only -- see coverage_generations_state_shape_check) is a durable
+         -- write target from its resolved boundary_lsn onward even though
+         -- the generation itself is not yet active/recoverable. It can never
+         -- overlap a has-parent generation's absorption window: a has-parent
+         -- generation never reaches 'capturing' (wal_promote_core.sql only
+         -- transitions building -> capturing when parent_generation_id IS
+         -- NULL), so this can never double-write the same commit under two
+         -- generation_ids for the same relation.
+         AND cg.state IN ('active', 'sealed', 'capturing')
          -- A restore swaps tracked_tables.rel_oid to the new physical OID,
          -- while already-buffered WAL still carries the predecessor OID.
          -- The immutable generation boundary is the ownership identity.

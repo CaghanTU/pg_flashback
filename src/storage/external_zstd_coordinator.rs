@@ -1065,7 +1065,7 @@ fn flashback_internal_finalize_external_snapshot(
                      WHERE cg.generation_id = {generation_id}::bigint \
                        AND cg.tracking_id = {tracking_id}::bigint \
                        AND cg.boundary_snapshot_id = {snapshot_id}::bigint \
-                       AND cg.state IN ('building','active') \
+                       AND cg.state IN ('building','capturing','active') \
                        AND cg.storage_backend = 'external_zstd' \
                        AND s.payload_state IN ('creating','available') \
                        AND s.storage_backend = 'external_zstd'"
@@ -1173,7 +1173,7 @@ fn external_reservation_nonce(
     let state_clause = if require_aborted {
         "AND cg.state='aborted' AND s.payload_state='aborted'"
     } else {
-        "AND cg.state IN ('building','active','aborted') \
+        "AND cg.state IN ('building','capturing','active','aborted') \
          AND s.payload_state IN ('creating','available','aborted')"
     };
     let nonce = Spi::get_one::<i64>(&format!(
@@ -2071,6 +2071,394 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("timed out waiting for {mode} on relation {rel_oid:?}");
+    }
+
+    /// Step 9 initial-protect fixture: genuinely NO parent/predecessor
+    /// generation exists for this tracking_id -- the real new topology this
+    /// stage adds, unlike `Fixture`/`setup()` above (whose own doc comment
+    /// explains why every *existing* online-create reservation always has an
+    /// active heap_v1 parent absorbing writes; that mechanism is exactly
+    /// what a parentless reservation cannot rely on). Reuses the module's
+    /// one shared 'active' capture stream (`capture_streams_one_active_idx`
+    /// permits only one per database).
+    struct InitialFixture {
+        tracking_id: i64,
+        rel_oid: pg_sys::Oid,
+        stream_id: i64,
+    }
+
+    fn setup_initial(table_name: &str, cols: &str) -> InitialFixture {
+        let db_oid = unsafe { pg_sys::MyDatabaseId };
+        let stream_id = shared_stream_id(db_oid);
+
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "DO $do$
+             DECLARE
+                 v_rel_oid oid;
+                 v_tracking_id bigint;
+             BEGIN
+                 CREATE TABLE IF NOT EXISTS public.{table_name} ({cols});
+                 v_rel_oid := 'public.{table_name}'::regclass::oid;
+
+                 -- Deliberately NOT flashback_bootstrap_local_delta_lifecycle_
+                 -- core: no heap CTAS, no coverage_generations row at all yet
+                 -- -- this tracking_id has zero generations until reserve_
+                 -- initial() below, which is exactly the state a real Step 9
+                 -- reservation transaction (task 3) must produce. is_active
+                 -- must be true from this exact row for flashback_consume_
+                 -- wal()'s tracked_oids computation to ever decode this
+                 -- relation at all (api_track_capture.sql).
+                 INSERT INTO flashback.tracked_tables (
+                     rel_oid, schema_name, table_name, base_snapshot_table,
+                     recovery_profile, is_active
+                 )
+                 VALUES (v_rel_oid, 'public', '{table_name}', NULL, 'local_delta', true)
+                 RETURNING tracking_id INTO v_tracking_id;
+             END;
+             $do$;"
+        ));
+
+        let rel_oid_i64 = Spi::get_one::<i64>(&format!(
+            "SELECT 'public.{table_name}'::regclass::oid::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        let rel_oid = pg_sys::Oid::from(rel_oid_i64 as u32);
+        let tracking_id = Spi::get_one::<i64>(&format!(
+            "SELECT tracking_id FROM flashback.tracked_tables WHERE rel_oid = {}::oid",
+            rel_oid.to_u32()
+        ))
+        .unwrap()
+        .unwrap();
+
+        InitialFixture {
+            tracking_id,
+            rel_oid,
+            stream_id,
+        }
+    }
+
+    /// Mirrors reserve() above but generation_no => 1, p_parent_generation_id
+    /// => NULL -- the exact call shape flashback_internal_reserve_online_
+    /// generation already accepted at the primitive layer before this stage
+    /// (confirmed by reading it directly: it only validates a non-NULL
+    /// parent, never requires one), but which nothing durably routed WAL for
+    /// while 'building' until wal_promote_core.sql's new 'capturing' state.
+    fn reserve_initial(fx: &InitialFixture, nonce: i64) -> (i64, i64) {
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "SELECT public.flashback_internal_reserve_online_generation(\
+             p_tracking_id => {}::bigint, p_rel_oid => {}::oid, p_stream_id => {}::bigint, \
+             p_generation_no => 1::bigint, p_parent_generation_id => NULL, \
+             p_storage_backend => 'external_zstd', p_operation_nonce => {nonce}::bigint)",
+            fx.tracking_id,
+            fx.rel_oid.to_u32(),
+            fx.stream_id,
+        ));
+        let (gen_id, snap_id) = Spi::get_two::<i64, i64>(&format!(
+            "SELECT generation_id, boundary_snapshot_id FROM flashback.coverage_generations \
+             WHERE tracking_id = {}::bigint AND generation_no = 1",
+            fx.tracking_id
+        ))
+        .unwrap();
+        (gen_id.unwrap(), snap_id.unwrap())
+    }
+
+    fn marker_sql_initial(fx: &InitialFixture, generation_id: i64, snapshot_id: i64) -> String {
+        format!(
+            "SELECT public.flashback_internal_run_external_marker_transaction(\
+             {}::bigint, {}::bigint, {generation_id}::bigint, {snapshot_id}::bigint)",
+            fx.tracking_id,
+            fx.rel_oid.to_u32()
+        )
+    }
+
+    /// The central proof this whole stage exists for: reservation and the
+    /// M1-M7 marker transaction run through real, production entry points
+    /// in a genuinely separate, committing session (not synthetic), binding
+    /// a real boundary_xid. Whether the *decoded WAL batch* reaching
+    /// flashback_apply_decoded_wal_batch (wal_promote_core.sql) for that
+    /// real boundary_xid is real or staged by the established
+    /// flashback_test_inject_commit / flashback_test_inject_batch seams is
+    /// the one thing this harness cannot decide either way:
+    /// pg_create_logical_replication_slot refuses to run in every session
+    /// this test framework provides -- confirmed directly, not assumed, by
+    /// trying it as the literal first statement of this function's own
+    /// session (still "cannot create logical replication slot in
+    /// transaction that has performed writes"), and by routing it through
+    /// the shared commit-sql worker with nothing else in its payload (same
+    /// error). No existing test anywhere in this codebase creates a real
+    /// slot either (confirmed by search), which is exactly why the
+    /// production-facing dml_*/ddl_* integration tests all use this same
+    /// seam. Neither seam is a fake: both stage pg_temp._fb_wal_batch and
+    /// call the real, unmodified flashback_apply_decoded_wal_batch, so
+    /// every one of wal_promote_core.sql's new lines (the building ->
+    /// capturing transition, the qualified CTE's widened state list and
+    /// strict `>` boundary comparison) executes for real here. What is
+    /// synthetic is only the batch's own manufacture, not the promotion
+    /// logic under test.
+    ///
+    /// This is NOT the production WAL handoff fully qualified end to end.
+    /// It does not exercise the real output plugin, a real logical slot, or
+    /// a real background worker consuming it continuously under concurrent
+    /// load -- only wal_promote_core.sql's own promotion logic, called
+    /// directly with a hand-staged batch. The fully end-to-end proof -- a
+    /// real slot, a real decoder, a real separately-running cluster, real
+    /// concurrent traffic -- is qualification stage 7 (a throttled
+    /// small-table online initial-protect test against a normally-started
+    /// PostgreSQL instance, not this harness) and the stage 8 1 GiB
+    /// production run; nothing in this test may be cited as evidence that
+    /// either of those has already happened.
+    ///
+    /// Proves, for a tracking_id with NO predecessor generation:
+    ///  1. No heap_v1 payload table is ever created for it (its snapshot
+    ///     row's storage_backend is external_zstd and snapshot_table is
+    ///     empty/absent from the very first generation).
+    ///  2. The generation reaches 'capturing' (not 'active') the moment its
+    ///     real, marker-bound boundary commit is promoted -- proving WAL
+    ///     consumption itself, not a later authority, is what makes it a
+    ///     write target.
+    ///  3. Every ordinary INSERT/UPDATE/DELETE committed strictly after the
+    ///     boundary is captured into flashback.delta_log under this exact
+    ///     generation_id, exactly once (re-promoting is idempotent).
+    ///  4. The boundary interval is exact: commit_lsn < boundary_lsn and
+    ///     commit_lsn == boundary_lsn are both entirely excluded, proven
+    ///     together with #3 in one single mixed batch (pre-boundary,
+    ///     boundary-with-an-attached-event, and three post-boundary
+    ///     commits staged together via flashback_test_inject_batch) -- the
+    ///     only way to prove the procedural building -> capturing
+    ///     transition partway through a batch does not make the qualified
+    ///     CTE, which runs once at the end using whatever boundary_lsn is
+    ///     current by then, absorb the wrong prefix.
+    ///  5. flashback_health() reports the exact 'maintenance_required' /
+    ///     'wait_for_boundary_commit_resolution' code while only
+    ///     'capturing' -- not merely "not healthy" (any unrelated fault
+    ///     would also satisfy that), and doctor() never reports 'ok'.
+    #[pg_test]
+    fn test_initial_protect_no_parent_captures_wal_exactly_once() {
+        let fx = setup_initial("it_coord_initial_protect", "id int primary key, note text");
+
+        let nonce = 700200;
+        let (generation_id, snapshot_id) = reserve_initial(&fx, nonce);
+
+        // Proof #1: reserving the generation must never create a heap_v1
+        // payload table -- the snapshot row is external_zstd from the very
+        // first INSERT (flashback_internal_snapshot_reserve), not a later
+        // conversion.
+        let (backend, snapshot_table) = Spi::get_two::<String, String>(&format!(
+            "SELECT storage_backend, snapshot_table FROM flashback.snapshots \
+             WHERE snapshot_id = {snapshot_id}::bigint AND tracking_id = {}::bigint",
+            fx.tracking_id
+        ))
+        .unwrap();
+        assert_eq!(backend.unwrap(), "external_zstd");
+        assert_eq!(
+            snapshot_table.unwrap_or_default(),
+            "",
+            "external_zstd initial protect must never populate snapshot_table (that column is heap_v1-only)"
+        );
+        assert!(
+            Spi::get_one::<bool>(&format!(
+                "SELECT to_regclass('flashback.base_snapshot_t{}') IS NULL",
+                fx.tracking_id
+            ))
+            .unwrap()
+            .unwrap(),
+            "no base_snapshot_t<tracking_id> heap payload table may exist for external initial protect"
+        );
+
+        // Run the real production marker transaction (M1-M7): binds the
+        // boundary, pins the copier's real snapshot, all in one committing
+        // transaction in a genuinely separate session.
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(
+            &marker_sql_initial(&fx, generation_id, snapshot_id),
+        );
+        let boundary_xid = Spi::get_one::<i64>(&format!(
+            "SELECT boundary_xid FROM flashback.coverage_generations \
+             WHERE generation_id = {generation_id}::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+
+        // Boundary-interval proof: one single batch mixing a pre-boundary
+        // commit, the boundary-resolving commit itself (deliberately given
+        // its own row event, at commit_lsn EXACTLY equal to the boundary --
+        // flashback_test_inject_commit's own generation lookup refuses this
+        // for a real boundary-resolving commit, since a real marker
+        // transaction never carries row DML, but the qualified CTE's
+        // strict `>` (not `>=`) is exactly what must reject it here), and
+        // three post-boundary commits -- staged together via
+        // flashback_test_inject_batch into ONE call to the real, unmodified
+        // flashback_apply_decoded_wal_batch. This is the only way to prove
+        // that the pending-generation loop's procedural building ->
+        // capturing transition, which happens partway through this one
+        // batch, does not cause the qualified CTE (which runs once, after
+        // the whole loop, using whatever boundary_lsn is current by then)
+        // to absorb the wrong prefix -- three separate single-commit calls
+        // could never demonstrate that, since each would see the
+        // generation's state exactly as the previous call left it.
+        let pre_boundary_xid = 910099i64;
+        let batch_json = format!(
+            r#"[
+                {{"commit_lsn":"0/1000","source_xid":{pre_boundary_xid},
+                  "events":[{{"op":"INSERT","new":{{"id":1,"note":"pre-boundary"}}}}]}},
+                {{"commit_lsn":"0/2000","source_xid":{boundary_xid},
+                  "events":[{{"op":"INSERT","new":{{"id":99,"note":"smuggled-at-boundary"}}}}]}},
+                {{"commit_lsn":"0/3000","source_xid":910300,
+                  "events":[{{"op":"INSERT","new":{{"id":2,"note":"after-insert"}}}}]}},
+                {{"commit_lsn":"0/3100","source_xid":910301,
+                  "events":[{{"op":"UPDATE","old":{{"id":2,"note":"after-insert"}},"new":{{"id":2,"note":"after-update"}}}}]}},
+                {{"commit_lsn":"0/3200","source_xid":910302,
+                  "events":[{{"op":"DELETE","old":{{"id":2,"note":"after-update"}}}}]}}
+            ]"#
+        );
+        Spi::run(&format!(
+            "SELECT flashback_test_inject_batch({}::bigint, {}::bigint, '{batch_json}'::jsonb)",
+            fx.tracking_id, fx.stream_id
+        ))
+        .expect("mixed pre-boundary/boundary/post-boundary batch promotion failed");
+
+        // Proof #2: the generation must now be 'capturing', not 'active' --
+        // its boundary commit was observed and durably recorded, but the
+        // external artifact is not published/verified yet, so it must not
+        // be recoverable.
+        let (state, gen_boundary_xid, _marker, payload_state) =
+            generation_snapshot(fx.tracking_id, generation_id, snapshot_id);
+        assert_eq!(
+            state, "capturing",
+            "a parentless external_zstd generation must reach 'capturing' once its boundary commit is decoded"
+        );
+        assert_eq!(gen_boundary_xid, Some(boundary_xid));
+        assert_eq!(
+            payload_state, "creating",
+            "the artifact must still be 'creating' -- this test never publishes/finalizes it"
+        );
+
+        // Proof #3 + boundary interval: exact delta_log content under this
+        // generation_id -- the pre-boundary insert (commit_lsn < boundary,
+        // id=1) and the smuggled boundary-commit insert (commit_lsn ==
+        // boundary, id=99) must both be entirely absent; only the three
+        // strictly-post-boundary events (commit_lsn > boundary, id=2) may
+        // appear, exactly once, in commit order.
+        let rows = Spi::connect(|c| {
+            c.select(
+                &format!(
+                    "SELECT event_type, old_data, new_data \
+                     FROM flashback.delta_log \
+                     WHERE generation_id = {generation_id}::bigint \
+                       AND tracking_id = {}::bigint \
+                     ORDER BY event_id",
+                    fx.tracking_id
+                ),
+                None,
+                &[],
+            )
+            .unwrap()
+            .map(|row| row.get_by_name::<String, _>("event_type").unwrap().unwrap())
+            .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            rows,
+            vec!["INSERT", "UPDATE", "DELETE"],
+            "only the strictly-post-boundary INSERT/UPDATE/DELETE (id=2) may be captured, exactly once, in order; \
+             neither the pre-boundary (id=1) nor the exactly-at-boundary (id=99) event may appear"
+        );
+        let smuggled_or_pre_boundary = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM flashback.delta_log \
+             WHERE generation_id = {generation_id}::bigint \
+               AND (new_data->>'id' IN ('1', '99') OR old_data->>'id' IN ('1', '99'))"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            smuggled_or_pre_boundary, 0,
+            "the pre-boundary (id=1, commit_lsn < boundary) and exactly-at-boundary \
+             (id=99, commit_lsn == boundary) events must never reach delta_log at all"
+        );
+
+        // Re-promoting the exact same commit_lsns must not duplicate
+        // anything -- flashback_test_inject_commit itself checks
+        // capture_commits for an existing row at that commit_lsn and
+        // returns a no-op (test_wal_seam.sql), the identical idempotency
+        // guarantee flashback_consume_wal's real slot-advancement path
+        // relies on, now proven for a parentless 'capturing' generation.
+        Spi::run(&format!(
+            "SELECT flashback_test_inject_commit({}::bigint, '0/3000'::pg_lsn, clock_timestamp(), 910300::bigint, \
+             jsonb_build_array(jsonb_build_object('op','INSERT','new',jsonb_build_object('id',2,'note','after-insert'))))",
+            fx.tracking_id
+        )).unwrap();
+        let rows_after_replay = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM flashback.delta_log WHERE generation_id = {generation_id}::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rows_after_replay, 3,
+            "re-promoting an already-seen commit_lsn must not duplicate delta_log rows"
+        );
+
+        // Proof #5: an exact pending/capturing health code and an
+        // actionable recommended_action -- not merely "not healthy", which
+        // could just as easily mean a random unrelated fault. A 'capturing'
+        // generation already has a resolved boundary_lsn/boundary_time (it
+        // could not have reached 'capturing' otherwise -- state_authority.
+        // sql's own cross-table check proves this), so health_runtime.sql
+        // must NOT describe its boundary as still awaiting COMMIT LSN; what
+        // is actually in progress is the external artifact's own
+        // copy/publish/verify, a distinct, later phase with its own action.
+        let (health, action, reason) = Spi::connect(|c| {
+            let t = c
+                .select(
+                    &format!(
+                        "SELECT health, recommended_action, reason FROM flashback_health() \
+                         WHERE tracking_id = {}::bigint",
+                        fx.tracking_id
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap();
+            let row = t.first();
+            (
+                row.get_by_name::<String, _>("health").unwrap().unwrap(),
+                row.get_by_name::<String, _>("recommended_action")
+                    .unwrap()
+                    .unwrap(),
+                row.get_by_name::<String, _>("reason").unwrap().unwrap(),
+            )
+        });
+        assert_eq!(
+            health, "maintenance_required",
+            "a capturing-only lifecycle must report the exact 'maintenance_required' health code"
+        );
+        assert_eq!(
+            action, "wait_for_external_snapshot_publish",
+            "a capturing (not building) lifecycle must report the external-publish action, \
+             never the boundary-resolution action -- its boundary is already resolved"
+        );
+        assert_eq!(
+            reason, "external snapshot copy/publish verification is in progress",
+            "a capturing lifecycle's reason must never describe its already-resolved boundary as pending"
+        );
+
+        // doctor() must never report 'ok' either. A freshly-created,
+        // normally-progressing capturing lifecycle (well under the 5-minute
+        // stale-after bound) is now classified 'warning', not the generic
+        // 'error' every other fault uses -- operator_diagnosis.sql's own
+        // pending/stale split.
+        let doctor_status = Spi::get_one::<String>(
+            "SELECT status FROM flashback_doctor() WHERE check_name = 'tracked_lifecycle_health'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            doctor_status, "warning",
+            "a young, normally-progressing capturing lifecycle must be doctor 'warning', \
+             not the generic 'error' a genuine fault would report"
+        );
+        assert_ne!(
+            doctor_status, "ok",
+            "must never report 'ok' before activation"
+        );
     }
 
     #[pg_test]

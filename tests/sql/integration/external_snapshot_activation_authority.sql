@@ -48,8 +48,16 @@ BEGIN
     WHERE generation_id = v_reserved.generation_id;
     SELECT * INTO v_snap FROM flashback.snapshots
     WHERE snapshot_id = v_reserved.snapshot_id;
-    IF v_gen.state IS DISTINCT FROM 'building'
-       OR v_gen.boundary_lsn IS NOT NULL
+    -- Step 9: this reservation is parentless (p_parent_generation_id =>
+    -- NULL above), so observing its boundary COMMIT now durably resolves
+    -- boundary_lsn and moves it building -> capturing (wal_promote_core.sql)
+    -- -- there is no active predecessor to keep absorbing writes instead,
+    -- so it must become a write target itself the moment its boundary is
+    -- known. Artifact eligibility is still a separate, later proof: the
+    -- generation is 'capturing', not yet 'active'/recoverable, until
+    -- publish+activate below.
+    IF v_gen.state IS DISTINCT FROM 'capturing'
+       OR v_gen.boundary_lsn IS DISTINCT FROM v_lsn
        OR v_snap.payload_state IS DISTINCT FROM 'creating'
        OR v_snap.snapshot_lsn IS DISTINCT FROM v_lsn
     THEN
@@ -86,7 +94,9 @@ BEGIN
 
     SELECT * INTO v_gen FROM flashback.coverage_generations
     WHERE generation_id = v_reserved.generation_id;
-    IF v_gen.state IS DISTINCT FROM 'building' THEN
+    -- Publication proves the artifact, not the generation; this parentless
+    -- reservation is 'capturing' (see above), not 'building', by this point.
+    IF v_gen.state IS DISTINCT FROM 'capturing' THEN
         RAISE EXCEPTION 'artifact publication implicitly activated generation: %', v_gen.state;
     END IF;
     IF NOT public.flashback_internal_activate_external_generation(

@@ -176,6 +176,13 @@ BEGIN
             pending.generation_id AS pending_generation_id,
             pending.state_reason AS pending_state_reason,
             pending.boundary_kind AS pending_boundary_kind,
+            -- Internal only (not part of this function's public RETURNS
+            -- TABLE, which CREATE OR REPLACE FUNCTION cannot change without
+            -- breaking upgrade compatibility): used below purely to choose
+            -- the correct wording between 'building' and 'capturing', both
+            -- of which already surface identically via the public
+            -- recommended_action/reason columns.
+            pending.state AS pending_generation_state,
             COALESCE(gaps.open_gap_count, 0) AS open_gap_count,
             COALESCE(gaps.timeline_gap_count, 0) AS timeline_gap_count,
             COALESCE(gaps.post_restore_gap_count, 0) AS post_restore_gap_count,
@@ -197,9 +204,9 @@ BEGIN
          AND active_snapshot_audit.tracking_id = active_snapshot.tracking_id
         LEFT JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
         LEFT JOIN LATERAL (
-            SELECT g.generation_id, g.state_reason, g.boundary_kind
+            SELECT g.generation_id, g.state_reason, g.boundary_kind, g.state
             FROM flashback.coverage_generations g
-            WHERE g.tracking_id = tt.tracking_id AND g.state = 'building'
+            WHERE g.tracking_id = tt.tracking_id AND g.state IN ('building', 'capturing')
             ORDER BY g.generation_no DESC
             LIMIT 1
         ) pending ON true
@@ -428,7 +435,19 @@ BEGIN
            OR rec.retention_blocked
         THEN
             v_health := 'maintenance_required';
+            -- A 'capturing' generation already has a resolved boundary_lsn/
+            -- boundary_time (wal_promote_core.sql's building -> capturing
+            -- transition only ever fires once both are durably recorded --
+            -- state_authority.sql's own p_new_state = 'capturing' branch
+            -- refuses the transition otherwise). Reporting
+            -- wait_for_boundary_commit_resolution / "boundary awaiting
+            -- COMMIT LSN" for it would describe an already-resolved fact as
+            -- still pending. What is actually still in progress at that
+            -- point is the external artifact's own copy/publish/verify --
+            -- a different, later phase with its own operator action.
             v_action := CASE
+                WHEN rec.pending_generation_id IS NOT NULL AND rec.pending_generation_state = 'capturing'
+                    THEN 'wait_for_external_snapshot_publish'
                 WHEN rec.pending_generation_id IS NOT NULL
                     THEN 'wait_for_boundary_commit_resolution'
                 WHEN rec.retention_blocked
@@ -436,6 +455,8 @@ BEGIN
                 ELSE 'wait_for_payload_retirement'
             END;
             v_reason := COALESCE(
+                CASE WHEN rec.pending_generation_id IS NOT NULL AND rec.pending_generation_state = 'capturing'
+                     THEN 'external snapshot copy/publish verification is in progress' END,
                 CASE WHEN rec.pending_generation_id IS NOT NULL
                      THEN 'generation boundary awaiting COMMIT LSN' END,
                 CASE WHEN rec.retiring_count > 0

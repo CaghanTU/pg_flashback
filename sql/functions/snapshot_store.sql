@@ -549,7 +549,7 @@ BEGIN
         FROM flashback.coverage_generations
         WHERE tracking_id = p_tracking_id
           AND boundary_snapshot_id = p_snapshot_id
-          AND state IN ('building', 'active', 'sealed')
+          AND state IN ('building', 'capturing', 'active', 'sealed')
         ORDER BY generation_id
     LOOP
         IF public.flashback_internal_freeze_generation_missing_snapshot(
@@ -1384,11 +1384,50 @@ BEGIN
     -- follows (plan §1i).
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations
-        WHERE tracking_id = p_tracking_id AND state = 'building'
+        WHERE tracking_id = p_tracking_id AND state IN ('building', 'capturing')
     ) THEN
         RAISE EXCEPTION 'pg_flashback: lifecycle % already has a pending generation',
             p_tracking_id
             USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    -- Step 9 initial-protect: a parentless generation is legal only for
+    -- external_zstd -- already guaranteed above (this function accepts no
+    -- other p_storage_backend at all), restated here so all three
+    -- parentless invariants are enforced together in one place -- and must
+    -- be the tracking_id's first generation ever: generation_no 1, with
+    -- zero prior coverage_generations rows of ANY state (not merely no
+    -- *active* one). Once 'capturing' it is an *unbounded* write target for
+    -- its rel_oid_at_boundary (superseded_before_lsn stays NULL the whole
+    -- time it is building/capturing -- coverage_generations_
+    -- applicability_shape_check), with no absorption relationship to
+    -- anything that came before it. A parentless generation_no 2 attached
+    -- after sealed/aborted/retired history would therefore silently
+    -- discard or double-count the exact prefix that history was
+    -- responsible for -- structurally impossible, not merely undesirable.
+    -- A has-parent reservation has no such hazard (it never becomes a
+    -- write target itself while building -- wal_promote_core.sql's
+    -- has-parent branch is untouched and still just CONTINUEs), so none of
+    -- this applies to it.
+    IF p_parent_generation_id IS NULL THEN
+        IF p_storage_backend IS DISTINCT FROM 'external_zstd' THEN
+            RAISE EXCEPTION 'pg_flashback: a parentless online reservation is only defined for external_zstd, got %',
+                p_storage_backend
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF p_generation_no <> 1 THEN
+            RAISE EXCEPTION 'pg_flashback: a parentless online reservation must be generation_no 1, got %',
+                p_generation_no
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM flashback.coverage_generations
+            WHERE tracking_id = p_tracking_id
+        ) THEN
+            RAISE EXCEPTION 'pg_flashback: lifecycle % already has a coverage generation; a parentless online reservation must be its first',
+                p_tracking_id
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
     END IF;
 
     v_snapshot_id := public.flashback_internal_snapshot_reserve(
@@ -1736,7 +1775,7 @@ BEGIN
       AND tracking_id = p_tracking_id
     FOR UPDATE;
     IF NOT FOUND
-       OR v_generation.state NOT IN ('building', 'active')
+       OR v_generation.state NOT IN ('building', 'capturing', 'active')
        OR v_generation.storage_backend IS DISTINCT FROM 'external_zstd'
        OR v_generation.operation_nonce IS DISTINCT FROM p_operation_nonce
        OR v_generation.boundary_snapshot_id IS DISTINCT FROM p_snapshot_id
@@ -1873,7 +1912,7 @@ BEGIN
 
     IF NOT FOUND
        OR v_generation.storage_backend IS DISTINCT FROM 'external_zstd'
-       OR v_generation.state NOT IN ('building', 'active')
+       OR v_generation.state NOT IN ('building', 'capturing', 'active')
     THEN
         RAISE EXCEPTION 'pg_flashback: external generation % is not eligible for activation',
             p_generation_id
@@ -1965,10 +2004,19 @@ BEGIN
         END IF;
     END IF;
 
+    -- v_generation.state was fetched FOR UPDATE above and is guaranteed
+    -- 'building' or 'capturing' by this point (the 'active' case already
+    -- returned early). A has-parent generation is always still 'building'
+    -- here (wal_promote_core.sql never moves it to 'capturing'); a
+    -- parentless Step 9 initial-protect generation is always 'capturing'
+    -- here, since flashback_internal_publish_external_snapshot requires
+    -- snapshot_lsn to already be resolved, which only happens after WAL
+    -- consumption has already observed the boundary commit and made this
+    -- exact transition.
     PERFORM public.flashback_internal_transition_coverage_generation(
         p_generation_id,
         p_tracking_id,
-        'building',
+        v_generation.state,
         'active',
         'external_artifact_available',
         v_snapshot.snapshot_lsn,

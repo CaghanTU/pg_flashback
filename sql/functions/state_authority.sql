@@ -363,9 +363,11 @@ $$;
 
 -- ------------------------------------------------------------------
 -- Coverage generation transitions (matches flashback_guard graph)
---   building → active | aborted
---   active   → sealed
---   sealed   → retired
+--   building   → active | aborted | capturing
+--   capturing  → active | aborted   (parentless external_zstd only; see
+--                                    coverage_generations_state_shape_check)
+--   active     → sealed
+--   sealed     → retired
 -- ------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION flashback_internal_transition_coverage_generation(
@@ -391,6 +393,7 @@ DECLARE
     v_row flashback.coverage_generations%ROWTYPE;
     v_prefetched_stream_id bigint;
     v_stream flashback.capture_streams%ROWTYPE;
+    v_snap flashback.snapshots%ROWTYPE;
     v_effective_boundary_lsn pg_lsn;
     v_effective_valid_lsn pg_lsn;
     v_n integer;
@@ -475,6 +478,14 @@ BEGIN
                     p_generation_id
                     USING ERRCODE = 'serialization_failure';
             END IF;
+        ELSIF p_new_state = 'capturing' THEN
+            IF (p_boundary_lsn IS NOT NULL AND v_row.boundary_lsn IS NOT NULL AND p_boundary_lsn IS DISTINCT FROM v_row.boundary_lsn)
+               OR (p_boundary_time IS NOT NULL AND v_row.boundary_time IS NOT NULL AND p_boundary_time IS DISTINCT FROM v_row.boundary_time)
+            THEN
+                RAISE EXCEPTION 'pg_flashback: conflicting idempotent retry for capturing generation % (boundary mismatch)',
+                    p_generation_id
+                    USING ERRCODE = 'serialization_failure';
+            END IF;
         ELSIF p_new_state = 'sealed' THEN
             IF (p_superseded_before_lsn IS NOT NULL AND v_row.superseded_before_lsn IS NOT NULL AND p_superseded_before_lsn IS DISTINCT FROM v_row.superseded_before_lsn)
                OR (p_superseded_before_time IS NOT NULL AND v_row.superseded_before_time IS NOT NULL AND p_superseded_before_time IS DISTINCT FROM v_row.superseded_before_time)
@@ -497,6 +508,9 @@ BEGIN
     v_legal :=
         (p_expected_state = 'building' AND p_new_state = 'active')
         OR (p_expected_state = 'building' AND p_new_state = 'aborted')
+        OR (p_expected_state = 'building' AND p_new_state = 'capturing')
+        OR (p_expected_state = 'capturing' AND p_new_state = 'active')
+        OR (p_expected_state = 'capturing' AND p_new_state = 'aborted')
         OR (p_expected_state = 'active' AND p_new_state = 'sealed')
         OR (p_expected_state = 'sealed' AND p_new_state = 'retired');
 
@@ -506,6 +520,42 @@ BEGIN
             p_expected_state, p_new_state, p_generation_id
             USING ERRCODE = 'invalid_parameter_value',
                   HINT = 'Use active → sealed → retired; direct active → retired is forbidden.';
+    END IF;
+
+    -- The state_shape_check CHECK constraint only sees this one row: it can
+    -- prove storage_backend/parent_generation_id shape, but nothing about
+    -- whether the linked snapshot artifact is actually the right one, the
+    -- right backend, in the right state, or resolved to the right LSN. That
+    -- is a cross-table invariant a same-row CHECK cannot express at all, so
+    -- it has to be verified here, in the one centralized authority that
+    -- performs this transition -- not assumed true because wal_promote_
+    -- core.sql happens to be the only caller today and happens to call
+    -- flashback_internal_snapshot_refine_boundary with the same LSN just
+    -- before this.
+    IF p_new_state = 'capturing' THEN
+        IF p_boundary_lsn IS NULL OR p_boundary_time IS NULL THEN
+            RAISE EXCEPTION 'pg_flashback: moving generation % to capturing requires boundary_lsn and boundary_time',
+                p_generation_id
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+
+        SELECT * INTO v_snap
+        FROM flashback.snapshots
+        WHERE snapshot_id = v_row.boundary_snapshot_id
+        FOR SHARE;
+
+        IF NOT FOUND
+           OR v_snap.tracking_id IS DISTINCT FROM p_tracking_id
+           OR v_snap.storage_backend IS DISTINCT FROM 'external_zstd'
+           OR v_snap.payload_state IS DISTINCT FROM 'creating'
+           OR v_snap.snapshot_lsn IS DISTINCT FROM p_boundary_lsn
+        THEN
+            RAISE EXCEPTION
+                'pg_flashback: generation % boundary snapshot % is not eligible for capturing (tracking=%, backend=%, payload_state=%, snapshot_lsn=%)',
+                p_generation_id, v_row.boundary_snapshot_id,
+                v_snap.tracking_id, v_snap.storage_backend, v_snap.payload_state, v_snap.snapshot_lsn
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
     END IF;
 
     IF p_new_state = 'active' THEN
@@ -550,12 +600,12 @@ BEGIN
     UPDATE flashback.coverage_generations
        SET state = p_new_state,
            boundary_lsn = CASE
-               WHEN p_new_state = 'active' AND p_boundary_lsn IS NOT NULL
+               WHEN p_new_state IN ('active', 'capturing') AND p_boundary_lsn IS NOT NULL
                     THEN p_boundary_lsn
                ELSE boundary_lsn
            END,
            boundary_time = CASE
-               WHEN p_new_state = 'active' AND p_boundary_time IS NOT NULL
+               WHEN p_new_state IN ('active', 'capturing') AND p_boundary_time IS NOT NULL
                     THEN p_boundary_time
                ELSE boundary_time
            END,
@@ -603,7 +653,7 @@ BEGIN
            END,
            state_reason = COALESCE(p_state_reason, state_reason),
            details = CASE
-               WHEN p_new_state = 'aborted' OR v_row.state = 'building'
+               WHEN p_new_state = 'aborted' OR v_row.state IN ('building', 'capturing')
                     THEN details || COALESCE(p_details, '{}'::jsonb)
                ELSE details
            END
@@ -1190,9 +1240,9 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    IF v_generation.state = 'building' THEN
+    IF v_generation.state IN ('building', 'capturing') THEN
         RETURN public.flashback_internal_transition_coverage_generation(
-            p_generation_id, p_tracking_id, 'building', 'aborted', p_reason,
+            p_generation_id, p_tracking_id, v_generation.state, 'aborted', p_reason,
             NULL, NULL, NULL, NULL, NULL, NULL,
             jsonb_build_object('missing_snapshot', true) || COALESCE(p_details, '{}'::jsonb)
         );

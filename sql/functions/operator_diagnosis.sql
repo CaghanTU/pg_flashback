@@ -246,13 +246,40 @@ BEGIN
     RETURN NEXT;
 
     -- lifecycle health
+    --
+    -- A pending (building/capturing) generation is not, by itself, a fault:
+    -- it is the normal shape of an in-progress track/reanchor/initial-
+    -- protect, and its elapsed age proves nothing either way -- a
+    -- legitimate large external copy (tens of GiB) can run for a long time,
+    -- and generation age is not evidence the copier died. Counting every
+    -- pending row into v_unhealthy unconditionally would report a routine,
+    -- still-in-progress copy as the same 'error' this check uses for a
+    -- genuinely broken slot/gap/worker -- indistinguishable to an operator
+    -- glancing at doctor output -- so every pending row is excluded from
+    -- v_unhealthy here, regardless of age, and counted in v_pending
+    -- instead. Only real evidence of a fault (an open coverage gap, a
+    -- broken/lost slot, a worker-admission problem, budget exhaustion, or
+    -- any of the other conditions flashback_health() itself already
+    -- classifies as non-healthy and non-pending) still counts as
+    -- unhealthy. There is no reconciler wired to this parentless lifecycle
+    -- yet to positively distinguish "still copying" from "the copier died"
+    -- or "the artifact is missing/corrupt" via a durable heartbeat, lease,
+    -- or failure record -- that evidence-based staleness classification is
+    -- orchestration/reconciler-phase work, not assumed here from elapsed
+    -- time.
     SELECT count(*) FILTER (
                WHERE h.health IS DISTINCT FROM 'healthy'
+                 AND h.recommended_action NOT IN (
+                     'wait_for_boundary_commit_resolution',
+                     'wait_for_external_snapshot_publish'
+                 )
            ),
            COALESCE(sum(h.open_gap_count), 0),
            count(*) FILTER (
-               WHERE h.generation_state = 'building'
-                  OR h.recommended_action = 'wait_for_boundary_commit_resolution'
+               WHERE h.recommended_action IN (
+                   'wait_for_boundary_commit_resolution',
+                   'wait_for_external_snapshot_publish'
+               )
            )
       INTO v_unhealthy, v_gaps, v_pending
     FROM flashback_health() h;
@@ -261,7 +288,7 @@ BEGIN
     observed := format('active=%s unhealthy=%s open_gaps=%s pending_boundaries=%s',
                        v_tracked, COALESCE(v_unhealthy, 0), COALESCE(v_gaps, 0),
                        COALESCE(v_pending, 0));
-    expected := 'active lifecycles healthy with no open gaps or pending boundaries';
+    expected := 'active lifecycles healthy with no open gaps or unresolved faults; pending boundaries/publishes are a warning, not an error, regardless of age';
     IF v_tracked = 0 THEN
         status := 'ok'; action := 'none';
     ELSIF COALESCE(v_unhealthy, 0) > 0 OR COALESCE(v_gaps, 0) > 0 THEN
@@ -269,7 +296,7 @@ BEGIN
         action := 'inspect flashback_health() and repair gaps/worker/slot issues before restore';
     ELSIF COALESCE(v_pending, 0) > 0 THEN
         status := 'warning';
-        action := 'wait for pending boundary COMMIT LSN resolution';
+        action := 'wait for pending boundary COMMIT LSN resolution or external snapshot publish';
     ELSE
         status := 'ok'; action := 'none';
     END IF;
@@ -375,7 +402,7 @@ BEGIN
         ELSIF EXISTS (
             SELECT 1 FROM flashback.coverage_generations g
             WHERE g.tracking_id = v_tracking_id
-              AND g.state = 'building'
+              AND g.state IN ('building', 'capturing')
         ) THEN
             v_reason := 'unresolved building generation boundary present';
         ELSIF EXISTS (

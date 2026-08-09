@@ -219,11 +219,17 @@ BEGIN
         RAISE EXCEPTION 'flashback_test_inject_commit: tracking_id % not found', p_tracking_id;
     END IF;
 
+    -- Step 9: 'capturing' (a parentless external_zstd generation whose
+    -- boundary is already resolved -- see wal_promote_core.sql) is a
+    -- durable write target exactly like 'active', just not yet recoverable;
+    -- it must be preferred here the same way 'active' is, or this seam could
+    -- never inject the post-boundary events a capturing-only lifecycle
+    -- actually needs to prove.
     SELECT cg.*
       INTO v_gen
     FROM flashback.coverage_generations cg
     WHERE cg.tracking_id = p_tracking_id
-      AND cg.state = 'active'
+      AND cg.state IN ('active', 'capturing')
     ORDER BY cg.generation_id DESC
     LIMIT 1;
 
@@ -237,7 +243,7 @@ BEGIN
         ORDER BY cg.generation_id DESC
         LIMIT 1;
         IF v_gen.generation_id IS NULL THEN
-            RAISE EXCEPTION 'flashback_test_inject_commit: no active/building generation for tracking_id %',
+            RAISE EXCEPTION 'flashback_test_inject_commit: no active/capturing/building generation for tracking_id %',
                 p_tracking_id;
         END IF;
         IF COALESCE(jsonb_array_length(p_events), 0) <> 0 THEN
@@ -311,6 +317,123 @@ BEGIN
     );
 
     v_inserted := flashback_apply_decoded_wal_batch(v_gen.stream_id, NULL, NULL);
+    RETURN v_inserted;
+END;
+$$;
+
+-- Unlike flashback_test_inject_commit (exactly one commit, one call to
+-- flashback_apply_decoded_wal_batch), this stages several commits into the
+-- SAME pg_temp._fb_wal_batch before calling it exactly once -- the only way
+-- to prove that a batch mixing a pre-boundary, the boundary-resolving, and
+-- a post-boundary commit together is handled correctly: that the pending-
+-- generation loop's procedural building -> capturing transition, which
+-- runs partway through that one batch, does not cause the qualified CTE
+-- (which runs once, after the whole loop, using whatever boundary_lsn is
+-- current by then) to absorb the wrong prefix. Does not require any
+-- particular coverage_generations state up front, unlike
+-- flashback_test_inject_commit's own v_gen lookup: staging only needs
+-- tracked_tables' rel_oid/schema/table, because generation ownership is
+-- resolved later, by the real qualified CTE itself, exactly as production
+-- decoding does.
+CREATE OR REPLACE FUNCTION flashback_test_inject_batch(
+    p_tracking_id bigint,
+    p_stream_id bigint,
+    p_commits jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, public
+AS $$
+DECLARE
+    v_rel_oid oid;
+    v_schema_name text;
+    v_table_name text;
+    v_ord bigint := 0;
+    commit_rec jsonb;
+    ev jsonb;
+    v_commit_lsn pg_lsn;
+    v_commit_time_us bigint;
+    v_source_xid bigint;
+    v_inserted bigint;
+BEGIN
+    IF p_tracking_id IS NULL OR p_stream_id IS NULL THEN
+        RAISE EXCEPTION 'flashback_test_inject_batch: tracking_id and stream_id are required';
+    END IF;
+    IF p_commits IS NULL OR jsonb_typeof(p_commits) <> 'array' OR jsonb_array_length(p_commits) = 0 THEN
+        RAISE EXCEPTION 'flashback_test_inject_batch: p_commits must be a non-empty jsonb array';
+    END IF;
+
+    SELECT tt.rel_oid, tt.schema_name, tt.table_name
+      INTO v_rel_oid, v_schema_name, v_table_name
+    FROM flashback.tracked_tables tt
+    WHERE tt.tracking_id = p_tracking_id;
+    IF v_rel_oid IS NULL THEN
+        RAISE EXCEPTION 'flashback_test_inject_batch: tracking_id % not found', p_tracking_id;
+    END IF;
+
+    PERFORM flashback_internal_lock_lifecycle(p_tracking_id);
+
+    DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
+    CREATE TEMP TABLE _fb_wal_batch (
+        change_lsn pg_lsn,
+        source_xid bigint,
+        data jsonb,
+        ord bigint
+    ) ON COMMIT DROP;
+
+    FOR commit_rec IN SELECT value FROM jsonb_array_elements(p_commits)
+    LOOP
+        v_commit_lsn := (commit_rec->>'commit_lsn')::pg_lsn;
+        v_source_xid := (commit_rec->>'source_xid')::bigint;
+        IF v_commit_lsn IS NULL OR v_source_xid IS NULL THEN
+            RAISE EXCEPTION 'flashback_test_inject_batch: each commit requires commit_lsn and source_xid';
+        END IF;
+        v_commit_time_us := (
+            EXTRACT(EPOCH FROM (
+                COALESCE((commit_rec->>'commit_time')::timestamptz, clock_timestamp())
+                - TIMESTAMPTZ '2000-01-01 00:00:00+00'
+            )) * 1000000
+        )::bigint;
+
+        FOR ev IN SELECT value FROM jsonb_array_elements(COALESCE(commit_rec->'events', '[]'::jsonb))
+        LOOP
+            IF COALESCE(ev->>'op', '') NOT IN ('INSERT', 'UPDATE', 'DELETE') THEN
+                RAISE EXCEPTION 'flashback_test_inject_batch: unsupported op %', ev->>'op';
+            END IF;
+            v_ord := v_ord + 1;
+            INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
+            VALUES (
+                v_commit_lsn,
+                v_source_xid,
+                jsonb_strip_nulls(jsonb_build_object(
+                    'op', ev->>'op',
+                    'schema', v_schema_name,
+                    'table', v_table_name,
+                    'oid', v_rel_oid,
+                    'xid', v_source_xid,
+                    'old', ev->'old',
+                    'new', ev->'new'
+                )),
+                v_ord
+            );
+        END LOOP;
+
+        v_ord := v_ord + 1;
+        INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
+        VALUES (
+            v_commit_lsn,
+            v_source_xid,
+            jsonb_build_object(
+                'commit', v_source_xid,
+                'lsn', v_commit_lsn::text,
+                'commit_time', v_commit_time_us
+            ),
+            v_ord
+        );
+    END LOOP;
+
+    v_inserted := flashback_apply_decoded_wal_batch(p_stream_id, NULL, NULL);
     RETURN v_inserted;
 END;
 $$;
@@ -536,6 +659,7 @@ $$;
 REVOKE ALL ON FUNCTION flashback_internal_open_capture_stream(text, text, pg_lsn, pg_lsn) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_test_bootstrap_lifecycle(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_test_inject_commit(bigint, pg_lsn, timestamptz, bigint, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION flashback_test_inject_batch(bigint, bigint, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_test_resolve_post_restore_boundary(bigint, pg_lsn) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_test_inject_ddl_commit(bigint, pg_lsn, timestamptz, bigint, text, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION flashback_test_restore_lsn(text, pg_lsn) FROM PUBLIC;

@@ -51,7 +51,7 @@ BEGIN
             SELECT cg.tracking_id
             FROM flashback.coverage_generations cg
             WHERE cg.stream_id = p_stream_id
-              AND cg.state IN ('building', 'active')
+              AND cg.state IN ('building', 'capturing', 'active')
         )
     );
 
@@ -76,7 +76,7 @@ BEGIN
     SELECT count(*) INTO v_discarded_building
     FROM flashback.coverage_generations
     WHERE stream_id = p_stream_id
-      AND state = 'building';
+      AND state IN ('building', 'capturing');
 
     IF NOT public.flashback_internal_transition_capture_stream(
         p_stream_id,
@@ -109,13 +109,14 @@ BEGIN
     -- swapped it); the next explicit re-anchor establishes a fresh exact base.
     FOR build_rec IN
         SELECT cg.generation_id, cg.tracking_id, cg.boundary_snapshot_id,
+               cg.state AS generation_state,
                snap.snapshot_table, snap.payload_state
         FROM flashback.coverage_generations cg
         LEFT JOIN flashback.snapshots snap
           ON snap.snapshot_id = cg.boundary_snapshot_id
          AND snap.tracking_id = cg.tracking_id
         WHERE cg.stream_id = p_stream_id
-          AND cg.state = 'building'
+          AND cg.state IN ('building', 'capturing')
         ORDER BY cg.tracking_id, cg.generation_id
     LOOP
         IF build_rec.boundary_snapshot_id IS NOT NULL
@@ -144,7 +145,7 @@ BEGIN
         PERFORM public.flashback_internal_transition_coverage_generation(
             build_rec.generation_id,
             build_rec.tracking_id,
-            'building',
+            build_rec.generation_state,
             'aborted',
             p_reason,
             NULL, NULL, NULL, NULL, NULL, NULL,
@@ -287,7 +288,7 @@ BEGIN
         FROM flashback.tracked_tables tt
         JOIN flashback.coverage_generations cg
           ON cg.tracking_id = tt.tracking_id
-         AND cg.state IN ('building', 'active', 'sealed')
+         AND cg.state IN ('building', 'capturing', 'active', 'sealed')
         WHERE tt.is_active
           AND tt.recovery_profile = 'local_delta'
           AND (p_rel_oid IS NULL OR tt.rel_oid = p_rel_oid)
@@ -312,7 +313,7 @@ BEGIN
     FROM flashback.tracked_tables tt
     JOIN flashback.coverage_generations cg
       ON cg.tracking_id = tt.tracking_id
-     AND cg.state IN ('building', 'active', 'sealed')
+     AND cg.state IN ('building', 'capturing', 'active', 'sealed')
     JOIN flashback.capture_streams cs ON cs.stream_id = cg.stream_id
     WHERE tt.is_active
       AND tt.recovery_profile = 'local_delta'
@@ -769,7 +770,7 @@ BEGIN
 
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations
-        WHERE tracking_id = v_tracking_id AND state = 'building'
+        WHERE tracking_id = v_tracking_id AND state IN ('building', 'capturing')
     ) THEN
         RAISE EXCEPTION 'pg_flashback: lifecycle % already has a pending generation',
             v_tracking_id;

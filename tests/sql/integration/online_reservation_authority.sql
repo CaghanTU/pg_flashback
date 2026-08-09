@@ -107,11 +107,14 @@ BEGIN
     -- 2. Durable admission check: a second reservation attempt for the same
     -- tracking_id, while the first is still 'building', must fail -- the
     -- durable row itself is the exclusivity invariant, not any session lock.
+    -- generation_no 1 here (not 2): a parentless reservation must itself be
+    -- generation_no 1 (Step 9's own structural invariant, checked before
+    -- this one), so this stays a clean test of the pending-row check alone.
     v_raised := false;
     BEGIN
         PERFORM public.flashback_internal_reserve_online_generation(
             p_tracking_id => v_tracking1, p_rel_oid => v_rel1,
-            p_stream_id => v_stream, p_generation_no => 2,
+            p_stream_id => v_stream, p_generation_no => 1,
             p_parent_generation_id => NULL, p_storage_backend => 'external_zstd',
             p_operation_nonce => 424243
         );
