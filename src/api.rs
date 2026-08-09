@@ -170,7 +170,8 @@ extension_sql_file!(
         "flashback_operator_diagnosis",
         "flashback_health_runtime",
         "flashback_worker_admission",
-        "flashback_monitoring_cache"
+        "flashback_monitoring_cache",
+        "flashback_coverage_runtime"
     ],
 );
 
@@ -195,6 +196,23 @@ extension_sql_file!(
         "flashback_operation_journal",
         "flashback_local_capacity",
         "flashback_worker_admission"
+    ],
+);
+
+extension_sql_file!(
+    "../sql/functions/protect_online.sql",
+    name = "flashback_protect_online",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
+        "flashback_snapshot_store",
+        "flashback_local_capacity",
+        "flashback_local_compatibility",
+        "flashback_api_track_capture",
+        "flashback_worker_admission",
+        "flashback_coverage_runtime",
+        "flashback_health_runtime",
+        "flashback_operation_journal"
     ],
 );
 

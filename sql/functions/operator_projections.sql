@@ -66,9 +66,18 @@ STABLE
 SECURITY DEFINER
 SET search_path = pg_catalog, flashback, public
 AS $$
-    -- Single canonical, ambiguity-safe resolver. An ambiguous unqualified
-    -- name raises rather than returning a possibly-wrong true/false.
-    SELECT EXISTS (SELECT 1 FROM public.flashback_internal_resolve_tracked_table(p_table));
+    -- Single canonical, ambiguity-safe resolver (an ambiguous unqualified
+    -- name raises rather than returning a possibly-wrong true/false),
+    -- narrowed by the single centralized recoverability authority
+    -- (coverage_runtime.sql). is_active alone (all the resolver checks)
+    -- is not sufficient: a Step 9 external_zstd 'starting' lifecycle
+    -- (protect_online.sql) is is_active=true from reservation onward,
+    -- long before it is genuinely, verifiedly protected -- this function
+    -- must report false for it, not true.
+    SELECT EXISTS (
+        SELECT 1 FROM public.flashback_internal_resolve_tracked_table(p_table) r
+        WHERE public.flashback_internal_lifecycle_actively_protected(r.tracking_id)
+    );
 $$;
 
 CREATE OR REPLACE FUNCTION flashback_lifecycle_health(p_table text)

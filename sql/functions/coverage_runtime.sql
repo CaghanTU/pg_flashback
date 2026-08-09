@@ -677,6 +677,39 @@ BEGIN
 END;
 $$;
 
+-- =================================================================
+-- Step 9 Phase 2 correction: the ONE centralized recoverability
+-- authority. is_active alone (what every resolver above still checks)
+-- is necessary but not sufficient: a Step 9 external_zstd initial-protect
+-- lifecycle is is_active=true from flashback_protect_begin's reservation
+-- onward, long before it is genuinely, verifiedly protected (protect_
+-- online.sql's 'starting' state). Every caller that admits a table for
+-- historical read/destructive recovery -- not status/doctor/capture/
+-- reconciler, which must still see a 'starting' lifecycle -- must route
+-- through this predicate (or flashback_admit_lsn_target below, which now
+-- calls it) rather than re-deriving its own ad-hoc protection_state
+-- check. tracked_tables.protection_state predates Step 9 (unprotect_
+-- cleanup.sql's stopping/unprotected/cleaned tail) and is legacy-NULL for
+-- any row created before that column existed, hence the same COALESCE(...,
+-- 'active') convention already used everywhere else that reads it.
+CREATE OR REPLACE FUNCTION flashback_internal_lifecycle_actively_protected(
+    p_tracking_id bigint
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, flashback, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM flashback.tracked_tables tt
+        WHERE tt.tracking_id = p_tracking_id
+          AND tt.is_active
+          AND tt.recovery_profile = 'local_delta'
+          AND COALESCE(tt.protection_state, 'active') = 'active'
+    );
+$$;
+
 DO $$
 DECLARE
     v_fn text;
@@ -684,7 +717,8 @@ BEGIN
     FOREACH v_fn IN ARRAY ARRAY[
         'public.flashback_internal_resolve_tracked_table_tier(text, boolean)',
         'public.flashback_internal_resolve_tracked_table(text)',
-        'public.flashback_internal_resolve_tracked_table_any(text)'
+        'public.flashback_internal_resolve_tracked_table_any(text)',
+        'public.flashback_internal_lifecycle_actively_protected(bigint)'
     ]
     LOOP
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', v_fn);
@@ -973,15 +1007,22 @@ BEGIN
     -- materialization (query/recover previously lacked this pin).
     PERFORM public.flashback_internal_lock_lifecycle(v_tracking_id);
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM flashback.tracked_tables tt
-        WHERE tt.tracking_id = v_tracking_id
-          AND tt.is_active
-          AND tt.recovery_profile = 'local_delta'
-    ) THEN
-        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % changed while target admission waited',
-            v_tracking_id;
+    -- Step 9 Phase 2 correction: the single centralized recoverability
+    -- authority (flashback_internal_lifecycle_actively_protected,
+    -- immediately above the resolvers in this file). is_active alone is
+    -- not sufficient -- a 'starting' external_zstd initial-protect
+    -- lifecycle (protect_online.sql) is is_active=true from reservation
+    -- onward, long before flashback_protect_finalize ever verifies and
+    -- flips protection_state to 'active'. Every historical read/
+    -- destructive path funnels through this one admission primitive
+    -- (restore_lsn.sql's materialize/recover/restore cores, recover_plan.
+    -- sql, and flashback_resolve_target's timestamp-to-LSN resolution all
+    -- call it), so hardening it here is the single point of enforcement --
+    -- no caller re-implements this check.
+    IF NOT public.flashback_internal_lifecycle_actively_protected(v_tracking_id) THEN
+        RAISE EXCEPTION 'pg_flashback: tracking lifecycle % is not actively protected (protection has not completed activation yet, or changed while target admission waited)',
+            v_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
     IF EXISTS (

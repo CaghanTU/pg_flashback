@@ -267,6 +267,10 @@ mod tests {
         "../tests/sql/integration/external_snapshot_activation_authority.sql"
     );
     sql_test!(
+        it_protect_online_authority,
+        "../tests/sql/integration/protect_online_authority.sql"
+    );
+    sql_test!(
         it_tracked_table_resolver_search_path,
         "../tests/sql/integration/tracked_table_resolver_search_path.sql"
     );

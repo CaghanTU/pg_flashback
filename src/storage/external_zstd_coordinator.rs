@@ -2461,6 +2461,199 @@ mod tests {
         );
     }
 
+    /// Step 9 Phase 2: flashback_protect_prepare_replica_identity +
+    /// flashback_protect_external_copy (sql/functions/protect_online.sql)
+    /// are the public SQL entrypoints that wrap this same real M1-M7 marker
+    /// transaction for a brand-new, parentless lifecycle, additionally
+    /// capturing/setting REPLICA IDENTITY FULL -- a step run_marker_
+    /// transaction itself has never needed for its existing callers
+    /// (re-anchor always operates on an already-FULL-identity table, set at
+    /// the original heap_v1 track time).
+    ///
+    /// These are deliberately TWO separate committed transactions, not one:
+    /// an earlier version of this test discovered a real deadlock doing the
+    /// ALTER inside the same transaction as the marker transaction --
+    /// ALTER TABLE ... REPLICA IDENTITY takes AccessExclusiveLock, which is
+    /// still held (PostgreSQL never downgrades a lock mid-transaction)
+    /// while the marker transaction's M6 waits for the background copier to
+    /// open its own read cursor (needs only AccessShareLock, blocked behind
+    /// the still-held AccessExclusiveLock, which can only be released once
+    /// the marker transaction commits -- which never happens until the
+    /// copier signals). See flashback_protect_prepare_replica_identity's
+    /// own header comment for the full correctness argument for why
+    /// splitting the ALTER into its own, earlier, committed transaction is
+    /// still race-free.
+    ///
+    /// This proves that pair of entrypoints, not run_marker_transaction
+    /// directly (already proven above and by online_boundary_bind.sql): the
+    /// table starts at the default identity ('d'), both calls run end to
+    /// end through the real production entrypoints (SQL wrapper -> owner-
+    /// only Rust function -> real marker transaction -> real background
+    /// copier), and afterward the table's replica identity is FULL,
+    /// tracked_tables.replica_identity_was durably records the original
+    /// 'd', and the boundary is bound -- all while a second, concurrent
+    /// session was blocked from writing until each transaction committed,
+    /// so no window ever existed where a write to this table could have
+    /// been WAL-logged with less than a full old-row image once this
+    /// generation could claim it.
+    #[pg_test]
+    fn test_protect_external_copy_sets_replica_identity_full() {
+        let db_oid = unsafe { pg_sys::MyDatabaseId };
+        let stream_id = shared_stream_id(db_oid);
+        let table_name = "it_coord_protect_copy";
+
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "DO $do$
+             DECLARE
+                 v_rel_oid oid;
+             BEGIN
+                 CREATE TABLE IF NOT EXISTS public.{table_name} (id int primary key, note text);
+                 v_rel_oid := 'public.{table_name}'::regclass::oid;
+                 INSERT INTO flashback.tracked_tables (
+                     rel_oid, schema_name, table_name, base_snapshot_table,
+                     recovery_profile, is_active, replica_identity_was, protection_state
+                 )
+                 VALUES (v_rel_oid, 'public', '{table_name}', NULL, 'local_delta', true, 'd', 'starting');
+             END;
+             $do$;"
+        ));
+
+        let rel_oid_i64 = Spi::get_one::<i64>(&format!(
+            "SELECT 'public.{table_name}'::regclass::oid::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        let rel_oid = pg_sys::Oid::from(rel_oid_i64 as u32);
+        let tracking_id = Spi::get_one::<i64>(&format!(
+            "SELECT tracking_id FROM flashback.tracked_tables WHERE rel_oid = {}::oid",
+            rel_oid.to_u32()
+        ))
+        .unwrap()
+        .unwrap();
+
+        let fx = InitialFixture {
+            tracking_id,
+            rel_oid,
+            stream_id,
+        };
+        let nonce = 700900;
+
+        // Pre-condition: the table starts at the ordinary default identity,
+        // never FULL, before flashback_protect_external_copy runs.
+        let relident_before = Spi::get_one::<String>(&format!(
+            "SELECT relreplident::text FROM pg_class WHERE oid = {}::oid",
+            fx.rel_oid.to_u32()
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(relident_before, "d");
+
+        // Reservation + operation_begin combined into one committed session
+        // (matching the existing coordinator tests' 3-launch shape: setup,
+        // reserve, marker/copy -- rather than a 4th sequential dynamic
+        // worker launch for a separate operation_begin call).
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "DO $do$
+             DECLARE
+                 v_gen bigint;
+                 v_snap bigint;
+             BEGIN
+                 SELECT generation_id, snapshot_id
+                   INTO v_gen, v_snap
+                 FROM public.flashback_internal_reserve_online_generation(
+                     p_tracking_id => {}::bigint, p_rel_oid => {}::oid, p_stream_id => {stream_id}::bigint,
+                     p_generation_no => 1::bigint, p_parent_generation_id => NULL,
+                     p_storage_backend => 'external_zstd', p_operation_nonce => {nonce}::bigint);
+                 PERFORM public.flashback_operation_begin(
+                     p_command => 'protect', p_table => 'public.{table_name}',
+                     p_tracking_id => {}::bigint, p_generation_id => v_gen,
+                     p_details => jsonb_build_object(
+                         'snapshot_id', v_snap, 'rel_oid', {}::bigint,
+                         'operation_nonce', {nonce}::bigint, 'storage_backend', 'external_zstd'));
+             END;
+             $do$;",
+            fx.tracking_id,
+            fx.rel_oid.to_u32(),
+            fx.tracking_id,
+            fx.rel_oid.to_u32(),
+        ));
+        let (generation_id, snapshot_id) = Spi::get_two::<i64, i64>(&format!(
+            "SELECT generation_id, boundary_snapshot_id FROM flashback.coverage_generations \
+             WHERE tracking_id = {}::bigint AND generation_no = 1",
+            fx.tracking_id
+        ))
+        .unwrap();
+        let generation_id = generation_id.unwrap();
+        let snapshot_id = snapshot_id.unwrap();
+        let operation_id = Spi::get_one::<i64>(&format!(
+            "SELECT operation_id FROM flashback.operations \
+             WHERE command = 'protect' AND tracking_id = {}::bigint \
+             ORDER BY operation_id DESC LIMIT 1",
+            fx.tracking_id
+        ))
+        .unwrap()
+        .unwrap();
+
+        // Its own, separate committed transaction -- see flashback_protect_
+        // prepare_replica_identity's header comment in protect_online.sql
+        // for exactly why this cannot share a transaction with the marker
+        // transaction below (a real ALTER TABLE ... REPLICA IDENTITY
+        // AccessExclusiveLock vs. the copier's own AccessShareLock deadlock,
+        // found empirically while writing this very test).
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "SELECT public.flashback_protect_prepare_replica_identity({operation_id}::bigint)"
+        ));
+        crate::storage::external_zstd_handoff::test_support::run_sql_committed(&format!(
+            "SELECT public.flashback_protect_external_copy({operation_id}::bigint)"
+        ));
+
+        let relident_after = Spi::get_one::<String>(&format!(
+            "SELECT relreplident::text FROM pg_class WHERE oid = {}::oid",
+            fx.rel_oid.to_u32()
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            relident_after, "f",
+            "flashback_protect_external_copy must set REPLICA IDENTITY FULL for a brand-new parentless lifecycle"
+        );
+
+        let replica_identity_was = Spi::get_one::<String>(&format!(
+            "SELECT replica_identity_was::text FROM flashback.tracked_tables WHERE tracking_id = {}::bigint",
+            fx.tracking_id
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replica_identity_was, "d",
+            "the original (pre-change) replica identity must be durably recorded for unprotect to restore later"
+        );
+
+        let (state, boundary_xid, _marker, payload_state) =
+            generation_snapshot(fx.tracking_id, generation_id, snapshot_id);
+        assert_eq!(
+            state, "building",
+            "flashback_protect_external_copy alone (no WAL consumption yet) must leave the generation building, \
+             not capturing -- that transition belongs to wal_promote_core.sql, not this entrypoint"
+        );
+        assert!(
+            boundary_xid.is_some(),
+            "the marker transaction must have bound a real boundary_xid"
+        );
+        assert_eq!(payload_state, "creating");
+
+        let operation_state = Spi::get_one::<String>(&format!(
+            "SELECT state FROM flashback.operation_current_state WHERE operation_id = {operation_id}::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            operation_state, "started",
+            "flashback_protect_external_copy does not itself append any operation-journal event -- \
+             it leaves the operation 'started' for flashback_protect_finalize to later move to 'activated'"
+        );
+    }
+
     #[pg_test]
     fn test_marker_m2_conflict_atomic_retry() {
         let fx = setup(

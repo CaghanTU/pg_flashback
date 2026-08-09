@@ -117,6 +117,11 @@ GRANT EXECUTE ON FUNCTION flashback_maintain_begin(text) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_finalize(bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_external_copy(bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_maintain_external_publish(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_protect_begin(text) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_protect_prepare_replica_identity(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_protect_external_copy(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_protect_external_publish(bigint) TO flashback_admin;
+GRANT EXECUTE ON FUNCTION flashback_protect_finalize(bigint) TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_storage_budget_policy() TO flashback_admin;
 GRANT EXECUTE ON FUNCTION flashback_lifecycle_storage_metrics(text) TO flashback_admin;
 -- flashback_storage_freeze_lifecycle/flashback_storage_freeze_scan remain

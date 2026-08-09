@@ -340,7 +340,7 @@ BEGIN
     ORDER BY event_id DESC
     LIMIT 1;
 
-    v_is_terminal := (v_cur_event_type IN ('verified', 'failed', 'abandoned', 'unprotected', 'cleaned', 'sealed'));
+    v_is_terminal := (v_cur_event_type IN ('verified', 'failed', 'abandoned', 'unprotected', 'cleaned', 'sealed', 'activated'));
 
     IF v_is_terminal THEN
         IF p_event_type IS NOT DISTINCT FROM v_cur_event_type THEN
@@ -379,6 +379,21 @@ BEGIN
             OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
         WHEN v_command = 'maintain' THEN
             (v_cur_event_type = 'started' AND p_event_type = 'sealed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'failed')
+            OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
+        -- Step 9 Phase 2: online external_zstd initial-protection reservation
+        -- (sql/functions/protect_online.sql). Single non-terminal 'started'
+        -- state, exactly like 'maintain' -- flashback_protect_external_copy
+        -- and flashback_protect_external_publish are idempotent re-entries
+        -- driven by re-checking the underlying tracked_tables/coverage_
+        -- generations/snapshots state, not by advancing through granular
+        -- journal states themselves. 'activated' is the sole success
+        -- terminal (protection_state starting -> active); a duplicate
+        -- 'started' can never occur for the same lifecycle because a second
+        -- flashback_protect_begin() call is rejected up front by the
+        -- already-active tracked_tables check.
+        WHEN v_command = 'protect' THEN
+            (v_cur_event_type = 'started' AND p_event_type = 'activated')
             OR (v_cur_event_type = 'started' AND p_event_type = 'failed')
             OR (v_cur_event_type = 'started' AND p_event_type = 'abandoned')
         ELSE false

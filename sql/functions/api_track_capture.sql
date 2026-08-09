@@ -382,10 +382,27 @@ DECLARE
     v_generation_id bigint;
     v_boundary_xid bigint;
     v_provisional_lsn pg_lsn;
+    v_backend text;
 BEGIN
     PERFORM flashback_require_primary('flashback_track');
     -- Fail closed before any metadata: only wal is legal (raises for trigger/auto).
     PERFORM flashback_effective_capture_mode();
+
+    -- Step 9 Phase 2: flashback_track() is the heap_v1 CTAS bootstrap only.
+    -- It must never silently fall through to a heap snapshot for a table
+    -- the operator has configured for external_zstd -- that is exactly the
+    -- long-lock-at-scale incident this phase exists to close. heap_v1 (the
+    -- default) keeps this function's existing behavior completely
+    -- unchanged; only external_zstd is redirected.
+    v_backend := lower(COALESCE(
+        NULLIF(current_setting('pg_flashback.snapshot_storage_backend', true), ''),
+        'heap_v1'
+    ));
+    IF v_backend = 'external_zstd' THEN
+        RAISE EXCEPTION 'pg_flashback: flashback_track() does not support pg_flashback.snapshot_storage_backend = external_zstd'
+            USING ERRCODE = 'feature_not_supported',
+                  HINT = 'Use the non-blocking external_zstd initial-protection path instead: flashback_protect_begin(table_name), then (each in its own committed transaction) flashback_protect_prepare_replica_identity(operation_id), flashback_protect_external_copy(operation_id), and flashback_protect_external_publish(operation_id).';
+    END IF;
 
     SELECT c.oid, n.nspname, c.relname
       INTO v_rel_oid, v_schema_name, v_table_name
