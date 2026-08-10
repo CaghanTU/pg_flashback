@@ -40,6 +40,8 @@ DECLARE
     v_external_reserve bigint;
     v_external_available bigint;
     v_external_error text;
+    r_protect record;
+    v_next jsonb;
 BEGIN
     -- Read the configured GUC directly so doctor can report an actionable error
     -- row when capture_mode is illegal (effective_capture_mode() raises).
@@ -321,6 +323,72 @@ BEGIN
         action := 'wait for maintenance finalizer or run: pg_flashback doctor --reconcile';
     END IF;
     RETURN NEXT;
+
+    -- Step 9 Phase 3: per-lifecycle exact protect-in-progress detail.
+    -- Complements tracked_lifecycle_health above (which only reports the
+    -- coarse flashback_health() aggregate) with the precise
+    -- flashback_protect_next_action classification -- including the
+    -- hard_failure distinction flashback_health() cannot make, and
+    -- whether replica identity still needs restoring. Never reports 'ok'
+    -- for a lifecycle that is not yet protection_state='active'.
+    IF to_regprocedure('flashback_protect_next_action(bigint)') IS NOT NULL THEN
+        FOR r_protect IN
+            SELECT tt.tracking_id, tt.schema_name, tt.table_name,
+                   tt.protection_state, tt.rel_oid, tt.replica_identity_was,
+                   s.operation_id
+            FROM flashback.tracked_tables tt
+            LEFT JOIN flashback.operation_current_state s
+              ON s.tracking_id = tt.tracking_id
+             AND s.command = 'protect'
+             AND s.state = 'started'
+            WHERE COALESCE(tt.protection_state, 'active') = 'starting'
+               -- A fully-converged 'abandoned' row (its terminal journal
+               -- event already appended -- no more 'started' operation) is
+               -- not "in progress" at all, just awaiting an operator-run
+               -- cleanup; only surface it here while convergence is still
+               -- outstanding (a live 'started' operation still exists).
+               OR (tt.protection_state = 'abandoned' AND s.operation_id IS NOT NULL)
+            ORDER BY tt.tracking_id
+        LOOP
+            scope := 'table'; check_name := 'protect_in_progress';
+            IF r_protect.operation_id IS NULL THEN
+                -- No 'started' operation for a 'starting'/'abandoned' row is
+                -- itself an inconsistency worth surfacing rather than
+                -- silently skipping.
+                observed := format('tracking_id=%s table=%I.%I protection_state=%s no_started_operation_found',
+                                    r_protect.tracking_id, r_protect.schema_name, r_protect.table_name,
+                                    r_protect.protection_state);
+                expected := 'a started protect operation for every starting/abandoned lifecycle';
+                status := 'error';
+                action := format('inspect flashback.operations for tracking_id %s', r_protect.tracking_id);
+            ELSE
+                v_next := flashback_protect_next_action(r_protect.operation_id);
+                observed := format(
+                    'tracking_id=%s table=%I.%I operation_id=%s action=%s elapsed_seconds=%s stale=%s reason=%s replica_identity_restore_needed=%s',
+                    r_protect.tracking_id, r_protect.schema_name, r_protect.table_name,
+                    r_protect.operation_id, v_next->>'action',
+                    round((v_next->>'elapsed_seconds')::numeric, 1), v_next->>'stale',
+                    COALESCE(v_next->>'reason', 'none'),
+                    (r_protect.protection_state = 'abandoned' OR (v_next->>'action') = 'blocked')
+                );
+                expected := 'protection_state = active (complete)';
+                IF COALESCE((v_next->>'hard_failure')::boolean, false) THEN
+                    status := 'error';
+                    action := format('pg_flashback protect-abort %s --yes', r_protect.operation_id);
+                ELSIF (v_next->>'action') IN ('abort_finalize') THEN
+                    status := 'warning';
+                    action := 'reconciler will finish this automatically; or run: pg_flashback doctor --reconcile';
+                ELSIF (v_next->>'action') IN ('prepare_replica_identity', 'run_external_copy') THEN
+                    status := 'warning';
+                    action := format('re-run: pg_flashback protect %I.%I', r_protect.schema_name, r_protect.table_name);
+                ELSE
+                    status := 'warning';
+                    action := 'in progress; no action needed (reconciler/worker will finish automatically)';
+                END IF;
+            END IF;
+            RETURN NEXT;
+        END LOOP;
+    END IF;
 END;
 $$;
 

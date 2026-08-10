@@ -377,8 +377,26 @@ SQL
 fi
 
 log "phase 4: flashback_protect_external_publish (own committed transaction)"
+# Phase 3 addition: the maintenance worker now also runs a bounded protect
+# reconciler (flashback_internal_reconcile_external_protect) that may
+# auto-finalize this exact operation itself once the artifact and boundary
+# are both ready -- the same sanctioned "finalize an already-complete
+# artifact" shape the accepted maintain reconciler already performs for
+# flashback_maintain_finalize. flashback_protect_external_publish's own
+# precondition (operation_current_state.state = 'started') is part of the
+# accepted, unchanged contract and correctly raises rather than returning a
+# jsonb status once the reconciler has already moved the operation to
+# 'activated' -- so check the durable operation state first and treat an
+# already-activated operation as an equally valid pass, rather than only
+# accepting activation reached via this script's own explicit call.
 PUBLISH_STATUS=""
 for _ in $(seq 1 30); do
+    OP_STATE="$(psql_scalar "SELECT flashback_operation_state($OP_ID);")"
+    if [[ "$OP_STATE" == "activated" ]]; then
+        PUBLISH_STATUS="activated"
+        log "operation already activated by the maintenance reconciler before this call"
+        break
+    fi
     PUBLISH_STATUS="$(psql_scalar "SELECT (flashback_protect_external_publish($OP_ID))->>'status';")"
     [[ "$PUBLISH_STATUS" == "activated" ]] && break
     [[ "$PUBLISH_STATUS" == "pending" ]] || die "flashback_protect_external_publish returned unexpected status: $PUBLISH_STATUS"

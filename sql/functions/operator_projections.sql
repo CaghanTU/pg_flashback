@@ -167,10 +167,48 @@ BEGIN
         'snapshot_health_status', h.snapshot_health_status,
         'snapshot_health_reason', h.snapshot_health_reason,
         'snapshot_compressed_bytes', h.snapshot_compressed_bytes,
-        'snapshot_uncompressed_bytes', h.snapshot_uncompressed_bytes
+        'snapshot_uncompressed_bytes', h.snapshot_uncompressed_bytes,
+        'protect_in_progress', CASE WHEN pn.action IS NOT NULL THEN jsonb_build_object(
+            'operation_id', pop.operation_id,
+            'action', pn.action,
+            'hard_failure', pn.hard_failure,
+            'abortable', pn.abortable,
+            'reason', pn.reason,
+            'elapsed_seconds', pn.elapsed_seconds
+        ) ELSE NULL END
     ) ORDER BY h.table_name), '[]'::jsonb)
       INTO v_tables
     FROM flashback_health() h
+    LEFT JOIN flashback.tracked_tables tt ON tt.tracking_id = h.tracking_id
+    LEFT JOIN LATERAL (
+        SELECT s.operation_id
+        FROM flashback.operation_current_state s
+        WHERE s.tracking_id = tt.tracking_id
+          AND s.command = 'protect'
+          AND s.state = 'started'
+        LIMIT 1
+    ) pop ON COALESCE(tt.protection_state, 'active') IN ('starting', 'abandoned')
+    LEFT JOIN LATERAL (
+        -- CASE, not a JOIN...ON guard: a LATERAL subquery's SELECT list is
+        -- evaluated to produce its row before any ON condition is applied
+        -- (ON only filters already-produced rows), so gating the
+        -- flashback_protect_next_action(pop.operation_id) call behind the
+        -- join's ON clause alone still calls it with a NULL operation_id
+        -- for every ordinary table -- confirmed by a real pgrx test
+        -- failure ("flashback_protect_next_action requires operation_id")
+        -- before this fix. CASE WHEN genuinely short-circuits: the THEN
+        -- branch is never evaluated when the WHEN condition is false.
+        SELECT (x->>'action') AS action,
+               (x->>'hard_failure')::boolean AS hard_failure,
+               (x->>'abortable')::boolean AS abortable,
+               (x->>'reason') AS reason,
+               (x->>'elapsed_seconds')::double precision AS elapsed_seconds
+        FROM (
+            SELECT CASE WHEN pop.operation_id IS NOT NULL
+                        THEN flashback_protect_next_action(pop.operation_id)
+                   END AS x
+        ) q
+    ) pn ON true
     WHERE v_requested IS NULL
        OR h.table_name = v_requested
        OR h.table_name = flashback_resolve_lifecycle_name(v_requested);

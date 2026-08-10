@@ -994,6 +994,9 @@ fn run_external_snapshot_health() {
                  IF to_regprocedure('flashback_internal_reconcile_external_maintenance(interval,integer)') IS NOT NULL THEN
                      PERFORM flashback_internal_reconcile_external_maintenance(interval '5 minutes', 1);
                  END IF;
+                 IF to_regprocedure('flashback_internal_reconcile_external_protect(integer)') IS NOT NULL THEN
+                     PERFORM flashback_internal_reconcile_external_protect(5);
+                 END IF;
                EXCEPTION
                  WHEN lock_not_available OR query_canceled THEN
                    RAISE WARNING 'pg_flashback: external snapshot maintenance deferred: %', SQLERRM;

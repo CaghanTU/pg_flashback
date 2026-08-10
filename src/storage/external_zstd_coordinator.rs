@@ -1022,6 +1022,14 @@ fn flashback_internal_run_external_marker_transaction(
                 "fetched_row_count": segment.read_fetched_row_count(),
             }));
             segment.detach();
+            // Last point before this call returns to its PL/pgSQL caller
+            // (flashback_protect_external_copy / flashback_maintain_external_copy),
+            // which the caller's own psql session then commits (M8). Crash
+            // here exercises "backend dies after the marker transaction is
+            // fully assembled but before its COMMIT reaches the client."
+            crate::storage::worker::trigger_external_snapshot_failpoint(
+                "protect_before_copy_commit",
+            );
             result
         }
         Err(error) => {
