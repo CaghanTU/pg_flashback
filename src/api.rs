@@ -247,6 +247,22 @@ extension_sql_file!(
 );
 
 extension_sql_file!(
+    "../sql/functions/protect_reconcile.sql",
+    name = "flashback_protect_reconcile",
+    requires = [
+        "flashback_storage_schema_bootstrap",
+        "flashback_state_authority",
+        "flashback_snapshot_store",
+        "flashback_coverage_runtime",
+        "flashback_operation_journal",
+        "flashback_maintain_uninstall",
+        "flashback_protect_online",
+        "flashback_worker_admission",
+        flashback_set_restore_in_progress,
+    ],
+);
+
+extension_sql_file!(
     "../sql/functions/retention_runtime.sql",
     name = "flashback_retention_runtime",
     requires = [

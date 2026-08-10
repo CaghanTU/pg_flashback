@@ -41,6 +41,7 @@ extension_sql_file!(
         "flashback_operation_journal",
         "flashback_maintain_uninstall",
         "flashback_protect_online",
+        "flashback_protect_reconcile",
         "flashback_recover_plan_api",
         "flashback_unprotect_cleanup_api",
         "flashback_monitoring_cache",

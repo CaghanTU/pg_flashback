@@ -158,6 +158,19 @@ BEGIN
         );
     END IF;
 
+    -- Step 9: a lifecycle mid initial-protect (protection_state='starting')
+    -- is not necessarily caught by the generation-state check below -- once
+    -- its generation has reached 'active' but flashback_protect_finalize has
+    -- not yet run (waiting on activation-readiness), the generation is no
+    -- longer 'building'/'capturing' even though the lifecycle is still
+    -- unprotected/unfinished. Fail closed explicitly rather than letting
+    -- unprotect race protect_finalize's own protection_state CAS.
+    IF v_state = 'starting' THEN
+        RAISE EXCEPTION 'flashback_unprotect: lifecycle % is still being protected (protection_state=starting)', v_tracking_id
+            USING ERRCODE = 'object_not_in_prerequisite_state',
+                  HINT = 'Wait for protect to finish (pg_flashback status), or run pg_flashback protect-abort if it is stuck, before unprotect.';
+    END IF;
+
     IF EXISTS (
         SELECT 1 FROM flashback.coverage_generations cg
         WHERE cg.tracking_id = v_tracking_id AND cg.state IN ('building', 'capturing')
@@ -383,7 +396,13 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    IF r.is_active OR COALESCE(r.protection_state, 'active') NOT IN ('unprotected', 'cleaned') THEN
+    -- 'abandoned' (Step 9: an initial protect that never reached 'active',
+    -- cleaned up by flashback_protect_abort) is accepted here alongside
+    -- 'unprotected'/'cleaned': it is_active=false and fully sealed by the
+    -- time it reaches this state, and its tracking_id would otherwise be
+    -- permanently uncleanable -- any delta_log/schema_versions rows staged
+    -- while it was is_active=true and 'starting' could never be purged.
+    IF r.is_active OR COALESCE(r.protection_state, 'active') NOT IN ('unprotected', 'cleaned', 'abandoned') THEN
         RAISE EXCEPTION
             'flashback_cleanup: tracking_id % is not sealed unprotected (active=%s state=%s)',
             p_tracking_id, r.is_active, COALESCE(r.protection_state, 'active')
@@ -556,6 +575,6 @@ $$;
 COMMENT ON FUNCTION flashback_unprotect(text) IS
     'Begin two-phase unprotect: emit stopping marker; retain decoder filtering until marker COMMIT is consumed; worker seals inactive. Does not delete recovery payload.';
 COMMENT ON FUNCTION flashback_cleanup(bigint, boolean) IS
-    'Retire recovery payload for a sealed unprotected tracking_id. dry_run=true reports only. Never deletes required recovery payload for active/stopping lifecycles. Operation journal is retained.';
+    'Retire recovery payload for a sealed unprotected (or abandoned initial-protect) tracking_id. dry_run=true reports only. Never deletes required recovery payload for active/stopping/starting lifecycles. Operation journal is retained.';
 COMMENT ON FUNCTION flashback_untrack(text) IS
     'DEPRECATED for operators: destructive single-shot untrack. Prefer flashback_unprotect then flashback_cleanup(tracking_id). Kept for SQL compatibility.';

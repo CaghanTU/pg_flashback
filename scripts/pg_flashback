@@ -18,6 +18,8 @@ PROTECT_HEALTH_TIMEOUT_S="${PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S:-${PG_FLASHBAC
 RECOVER_HEALTH_TIMEOUT_S="${PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S:-${PG_FLASHBACKCTL_RESTORE_HEALTH_TIMEOUT_S:-120}}"
 DISCOVERY_TIMEOUT_S="${PG_FLASHBACK_DISCOVERY_TIMEOUT_S:-30}"
 MAINTAIN_FINALIZE_TIMEOUT_S="${PG_FLASHBACK_MAINTAIN_FINALIZE_TIMEOUT_S:-120}"
+PROTECT_ONLINE_TIMEOUT_S="${PG_FLASHBACK_PROTECT_ONLINE_TIMEOUT_S:-300}"
+PROTECT_NO_WAIT=0
 JSON_OUT=0
 VERBOSE=0
 YES=0
@@ -38,7 +40,8 @@ Commands:
   version
   doctor [--reconcile] [--all-databases]
   config recommend [TABLE]
-  protect TABLE
+  protect TABLE [--no-wait] [--timeout SECONDS]
+  protect-abort OPERATION_ID [--yes]
   list
   status [TABLE] [--all-databases]
   history [TABLE]
@@ -57,9 +60,13 @@ Options:
   -h, --help   Show this help
 
 Exit codes:
-  0  success
-  1  operational failure / partial multi-DB failure
-  2  usage / configuration error
+  0    success (or protect --no-wait accepted; still in progress)
+  1    operational failure / partial multi-DB failure
+  2    usage / configuration error
+  3    protect: blocked, operator action needed (see message; often
+       pg_flashback protect-abort OPERATION_ID --yes)
+  4    protect: timed out waiting, still safely resumable (not a failure)
+  130  protect: interrupted (Ctrl-C), still safely resumable
 
 Environment (libpq):
   PGHOST, PGPORT, PGDATABASE, PGUSER, .pgpass
@@ -67,7 +74,8 @@ Environment (libpq):
 
 Environment (pg_flashback):
   PG_FLASHBACK_STATEMENT_TIMEOUT_MS      default 120000
-  PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S  default 60
+  PG_FLASHBACK_PROTECT_HEALTH_TIMEOUT_S  default 60 (heap_v1 protect only)
+  PG_FLASHBACK_PROTECT_ONLINE_TIMEOUT_S  default 300 (external_zstd protect poll bound; --timeout overrides)
   PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S  default 120
   PG_FLASHBACK_DISCOVERY_TIMEOUT_S       default 30 (post-DROP / manifest bind poll)
 
@@ -268,9 +276,13 @@ SQL
 
     if [[ "${DOCTOR_RECONCILE:-0}" == 1 ]]; then
         n=$("${psql_cmd[@]}" <<'SQL'
+WITH protect_reconcile AS (
+    SELECT flashback_reconcile_protect_operations(5) AS r
+)
 SELECT flashback_finalize_recover_operations()
      + flashback_finalize_unprotect_operations()
-     + flashback_reconcile_recover_operations(interval '5 minutes');
+     + flashback_reconcile_recover_operations(interval '5 minutes')
+     + COALESCE((SELECT (r->>'resumed')::int + (r->>'finalized')::int FROM protect_reconcile), 0);
 SQL
 )
         if [[ -n "$db" ]]; then
@@ -524,8 +536,24 @@ SQL
 }
 
 cmd_protect() {
-    local table=$1
-    local canon already health rec advise_json
+    local table=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-wait) PROTECT_NO_WAIT=1; shift ;;
+            --timeout)
+                [[ $# -ge 2 ]] || die "--timeout requires SECONDS"
+                PROTECT_ONLINE_TIMEOUT_S=$2; shift 2 ;;
+            --json) JSON_OUT=1; shift ;;
+            --verbose|-v) VERBOSE=1; shift ;;
+            -*) die "unknown protect option: $1" ;;
+            *)
+                [[ -z "$table" ]] || die "protect accepts exactly one TABLE (got extra: $1)"
+                table=$1; shift ;;
+        esac
+    done
+    [[ -n "$table" ]] || die "protect requires TABLE"
+    [[ "$PROTECT_ONLINE_TIMEOUT_S" =~ ^[0-9]+$ ]] || die "--timeout requires a non-negative integer number of seconds"
+    local canon already health backend
     require_version_match
     reject_controls table "$table"
     canon="$(canonical_table_name "$table")"
@@ -546,6 +574,23 @@ SQL
         fi
         return 0
     fi
+
+    backend=$(psql_tuples <<'SQL'
+SELECT lower(COALESCE(NULLIF(current_setting('pg_flashback.snapshot_storage_backend', true), ''), 'heap_v1'));
+SQL
+)
+    if [[ "$backend" == "external_zstd" ]]; then
+        cmd_protect_external_zstd "$table" "$canon"
+    else
+        cmd_protect_heap_v1 "$table" "$canon"
+    fi
+}
+
+# heap_v1: unchanged from the pre-Step-9 behavior. Blocking-lock CTAS via
+# flashback_track(), then wait for coverage to become healthy.
+cmd_protect_heap_v1() {
+    local table=$1 canon=$2
+    local health rec advise_json
 
     advise_json=$(psql_tuples -v "table=$table" <<'SQL'
 SELECT row_to_json(a)
@@ -581,6 +626,249 @@ SQL
         echo "  pg_flashback recover $canon"
         if [[ "$VERBOSE" == 1 ]]; then
             echo "Technical: health=$health"
+        fi
+    fi
+}
+
+# external_zstd: online, non-blocking protect, driven entirely by the
+# flashback_protect_next_action projection (protect_reconcile.sql). Each
+# CLI-owned step (flashback_protect_begin/prepare_replica_identity/
+# external_copy/external_publish) is its own separate psql invocation --
+# its own separate committed transaction -- exactly matching the accepted
+# four-transaction contract. The maintenance worker's bounded reconciler may
+# independently finish the publish/finalize step first; that is a correct,
+# sanctioned outcome, not a race this CLI needs to prevent.
+#
+# Exit codes (protect only): 0 activated or --no-wait accepted; 1 operational
+# failure; 2 usage error; 3 blocked (operator action needed, see message);
+# 4 timed out waiting, still resumable; 130 interrupted (SIGINT), resumable.
+cmd_protect_external_zstd() {
+    local table=$1 canon=$2
+    local resume_json op_id=""
+    local printed_prepare=0 printed_copy=0 printed_wait=0 printed_verify=0
+    local deadline
+
+    on_protect_sigint() {
+        trap - INT
+        if [[ "$JSON_OUT" == 1 ]]; then
+            jq -n --arg table "$canon" --arg op_id "${op_id:-}" \
+                '{schema_version:1, command:"protect", status:"interrupted", code:"interrupted", data:{table_name:$table, operation_id:($op_id|select(length>0))}, error:null}'
+        else
+            echo
+            if [[ -n "$op_id" ]]; then
+                echo "Interrupted. operation_id=$op_id is safely resumable." >&2
+                echo "  Re-run: pg_flashback protect $canon" >&2
+                echo "  Or check: pg_flashback status $canon" >&2
+            else
+                echo "Interrupted before any reservation was made — nothing to resume." >&2
+            fi
+        fi
+        exit 130
+    }
+    trap on_protect_sigint INT
+
+    resume_json=$(psql_tuples -v "table=$table" <<'SQL'
+SELECT flashback_protect_find_resumable(:'table');
+SQL
+) || fail "could not check for a resumable protect operation for $canon"
+
+    if [[ "$(printf '%s' "$resume_json" | jq -r '.found')" == "true" ]]; then
+        op_id=$(printf '%s' "$resume_json" | jq -r '.operation_id')
+        [[ "$JSON_OUT" == 1 ]] || echo "Resuming protect operation_id=$op_id for $canon"
+    else
+        [[ "$JSON_OUT" == 1 ]] || { echo "Checking compatibility..."; echo "Reserving protection..."; }
+        local begin_json
+        begin_json=$(psql_tuples -v "table=$table" <<'SQL'
+SELECT flashback_protect_begin(:'table');
+SQL
+) || fail "protect reservation failed for $canon"
+        op_id=$(printf '%s' "$begin_json" | jq -r '.operation_id // empty')
+        [[ -n "$op_id" ]] || fail "protect reservation returned no operation_id for $canon"
+        [[ "$JSON_OUT" == 1 ]] || echo "operation_id=$op_id"
+    fi
+
+    deadline=$(( $(date +%s) + PROTECT_ONLINE_TIMEOUT_S ))
+
+    while true; do
+        local next action reason abortable
+        next=$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_protect_next_action(:'opid'::bigint);
+SQL
+) || fail "could not determine next action for operation_id=$op_id"
+        action=$(printf '%s' "$next" | jq -r '.action')
+        reason=$(printf '%s' "$next" | jq -r '.reason // empty')
+        abortable=$(printf '%s' "$next" | jq -r '.abortable')
+
+        case "$action" in
+            complete|activated)
+                trap - INT
+                if [[ "$JSON_OUT" == 1 ]]; then
+                    jq -n --arg table "$canon" --argjson op_id "$op_id" --argjson final "$next" \
+                        '{schema_version:1, command:"protect", status:"ok", code:"activated", data:{table_name:$table, operation_id:$op_id, final:$final}, error:null}'
+                else
+                    echo "Protection active."
+                    echo "  Accidental DROP can now be recovered with: pg_flashback recover $canon"
+                fi
+                return 0
+                ;;
+            blocked)
+                trap - INT
+                if [[ "$JSON_OUT" == 1 ]]; then
+                    jq -n --arg table "$canon" --argjson op_id "$op_id" --arg reason "$reason" --argjson abortable "$abortable" \
+                        '{schema_version:1, command:"protect", status:"error", code:"blocked", data:{table_name:$table, operation_id:$op_id, reason:$reason, abortable:$abortable}, error:{message:$reason}}'
+                else
+                    echo "Problem: protect is blocked for $canon (operation_id=$op_id)" >&2
+                    echo "  Reason: $reason" >&2
+                    if [[ "$abortable" == "true" ]]; then
+                        echo "  Action: pg_flashback protect-abort $op_id --yes" >&2
+                    fi
+                fi
+                exit 3
+                ;;
+            failed|abandoned)
+                trap - INT
+                fail "protect operation_id=$op_id ended $action for $canon (not resumable; start a fresh protect)"
+                ;;
+            prepare_replica_identity)
+                [[ "$JSON_OUT" == 1 || "$printed_prepare" == 1 ]] || { echo "Preparing WAL identity..."; printed_prepare=1; }
+                psql_tuples -v "opid=$op_id" <<'SQL' >/dev/null || fail "prepare_replica_identity failed for operation_id=$op_id"
+SELECT flashback_protect_prepare_replica_identity(:'opid'::bigint);
+SQL
+                ;;
+            run_external_copy)
+                [[ "$JSON_OUT" == 1 || "$printed_copy" == 1 ]] || { echo "Taking online snapshot..."; printed_copy=1; }
+                psql_tuples -v "opid=$op_id" <<'SQL' >/dev/null || fail "external_copy failed for operation_id=$op_id"
+SELECT flashback_protect_external_copy(:'opid'::bigint);
+SQL
+                ;;
+            wait_for_boundary|wait_for_copy)
+                if [[ "$PROTECT_NO_WAIT" == 1 ]]; then
+                    trap - INT
+                    if [[ "$JSON_OUT" == 1 ]]; then
+                        jq -n --arg table "$canon" --argjson op_id "$op_id" --arg action "$action" \
+                            '{schema_version:1, command:"protect", status:"ok", code:"in_progress", data:{table_name:$table, operation_id:$op_id, action:$action}, error:null}'
+                    else
+                        echo "Not waiting (--no-wait). operation_id=$op_id is in progress ($action)."
+                        echo "  Check later: pg_flashback status $canon"
+                    fi
+                    return 0
+                fi
+                [[ "$JSON_OUT" == 1 || "$printed_wait" == 1 ]] || { echo "Waiting for WAL boundary..."; printed_wait=1; }
+                if (( $(date +%s) >= deadline )); then
+                    trap - INT
+                    if [[ "$JSON_OUT" == 1 ]]; then
+                        jq -n --arg table "$canon" --argjson op_id "$op_id" --arg action "$action" \
+                            '{schema_version:1, command:"protect", status:"ok", code:"timed_out", data:{table_name:$table, operation_id:$op_id, action:$action}, error:null}'
+                    else
+                        echo "Still in progress after ${PROTECT_ONLINE_TIMEOUT_S}s (operation_id=$op_id, action=$action)." >&2
+                        echo "  Not a failure — re-run 'pg_flashback protect $canon' or check 'pg_flashback status $canon'." >&2
+                    fi
+                    exit 4
+                fi
+                sleep 0.2
+                ;;
+            publish|finalize)
+                [[ "$JSON_OUT" == 1 || "$printed_verify" == 1 ]] || { echo "Verifying artifact..."; printed_verify=1; }
+                # publish/finalize is the one action the bounded maintenance
+                # reconciler may also perform automatically (protect_
+                # reconcile.sql). If it wins that race between this loop's
+                # next_action read and this call, flashback_protect_
+                # external_publish's own precondition (state='started')
+                # correctly raises object_not_in_prerequisite_state -- not a
+                # genuine failure. Distinguish that specific, narrow,
+                # already-explained case from a real unknown error by
+                # re-checking durable operation state; never a blind retry.
+                if ! psql_tuples -v "opid=$op_id" <<'SQL' >/dev/null
+SELECT flashback_protect_external_publish(:'opid'::bigint);
+SQL
+                then
+                    local op_state
+                    op_state=$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_operation_state(:'opid'::bigint);
+SQL
+) || fail "external_publish failed for operation_id=$op_id (and could not read current operation state)"
+                    if [[ "$op_state" != "activated" ]]; then
+                        fail "external_publish failed for operation_id=$op_id (operation_state=$op_state)"
+                    fi
+                    # else: the reconciler already activated it -- benign;
+                    # the next loop iteration's next_action call reports
+                    # 'complete'.
+                fi
+                if (( $(date +%s) >= deadline )); then
+                    trap - INT
+                    if [[ "$JSON_OUT" == 1 ]]; then
+                        jq -n --arg table "$canon" --argjson op_id "$op_id" \
+                            '{schema_version:1, command:"protect", status:"ok", code:"timed_out", data:{table_name:$table, operation_id:$op_id}, error:null}'
+                    else
+                        echo "Still in progress after ${PROTECT_ONLINE_TIMEOUT_S}s (operation_id=$op_id)." >&2
+                        echo "  Not a failure — re-run 'pg_flashback protect $canon' or check 'pg_flashback status $canon'." >&2
+                    fi
+                    exit 4
+                fi
+                ;;
+            abort_finalize)
+                # Cleanup already converged (by a prior protect-abort or the
+                # reconciler); only the terminal journal append is
+                # outstanding. This CLI never calls protect-abort on its own
+                # initiative — that is an explicit operator/reconciler
+                # action — it just keeps polling until it converges.
+                if (( $(date +%s) >= deadline )); then
+                    trap - INT
+                    if [[ "$JSON_OUT" != 1 ]]; then
+                        echo "operation_id=$op_id is aborted/converging; run 'pg_flashback doctor --reconcile' or retry later." >&2
+                    fi
+                    exit 4
+                fi
+                sleep 0.2
+                ;;
+            *)
+                trap - INT
+                fail "protect operation_id=$op_id returned an unrecognized action: $action"
+                ;;
+        esac
+    done
+}
+
+cmd_protect_abort() {
+    local op_id=$1
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes) YES=1; shift ;;
+            --json) JSON_OUT=1; shift ;;
+            --verbose|-v) VERBOSE=1; shift ;;
+            *) die "unknown protect-abort option: $1" ;;
+        esac
+    done
+    require_version_match
+    reject_controls operation_id "$op_id"
+    [[ "$op_id" =~ ^[0-9]+$ ]] || die "protect-abort requires a numeric OPERATION_ID"
+
+    if ! confirm_yes "Abort protect operation_id=$op_id? This purges any staged snapshot and restores replica identity if safely possible. [y/N]"; then
+        echo "protect-abort cancelled."
+        exit 1
+    fi
+
+    local out status
+    out="$(psql_tuples -v "opid=$op_id" <<'SQL'
+SELECT flashback_protect_abort(:'opid'::bigint);
+SQL
+)" || fail "protect-abort failed for operation_id=$op_id"
+    status=$(printf '%s' "$out" | jq -r '.status // empty')
+
+    if [[ "$JSON_OUT" == 1 ]]; then
+        jq -n --argjson data "$out" \
+            '{schema_version:1, command:"protect-abort", status:"ok", code:($data.status // "ok"), data:$data, error:null}'
+    else
+        echo "protect-abort operation_id=$op_id -> $status"
+        if [[ "$(printf '%s' "$out" | jq -r '.identity_restored')" == "true" ]]; then
+            echo "  Replica identity restored to its original value."
+        elif [[ "$(printf '%s' "$out" | jq -r '.identity_restore_skipped_reason // empty')" != "" ]]; then
+            echo "  Replica identity NOT restored: $(printf '%s' "$out" | jq -r '.identity_restore_skipped_reason')"
+            echo "  Review REPLICA IDENTITY on the table manually if this matters for your workload."
+        fi
+        if [[ "$VERBOSE" == 1 ]]; then
+            echo "  Technical: $out"
         fi
     fi
 }
@@ -664,6 +952,10 @@ SQL
           (if (($t.recommended_action // "none") != "none" and ($t.recommended_action // "none") != "null")
             then "  Action needed: \($t.recommended_action)"
             else "  Action needed: none" end),
+          (if $t.protect_in_progress != null then
+            "  Protect in progress: action=\($t.protect_in_progress.action) operation_id=\($t.protect_in_progress.operation_id)" +
+            (if $t.protect_in_progress.hard_failure then " (BLOCKED: \($t.protect_in_progress.reason // "unknown") -- run: pg_flashback protect-abort \($t.protect_in_progress.operation_id) --yes)" else "" end)
+           else empty end),
           (if $verbose == "1" then
             "  Technical health: \($t.health)\n  Technical valid_through_lsn: \($t.valid_through_lsn // "")\n  Technical profile: \($t.recovery_profile // "")\n  Latest DROP reason: \($drop.reason // "")"
            else empty end)
@@ -1426,14 +1718,34 @@ case "$cmd" in
             case "$1" in
                 --json) JSON_OUT=1; shift ;;
                 --verbose|-v) VERBOSE=1; shift ;;
+                --no-wait) pargs+=("$1"); shift ;;
+                --timeout)
+                    [[ $# -ge 2 ]] || die "--timeout requires SECONDS"
+                    pargs+=("$1" "$2"); shift 2 ;;
                 -*) die "unknown protect option: $1" ;;
                 *) pargs+=("$1"); shift ;;
             esac
         done
         set -- "${pargs[@]+"${pargs[@]}"}"
-        [[ $# -eq 1 ]] || die "protect requires TABLE"
+        [[ $# -ge 1 ]] || die "protect requires TABLE"
         command -v jq >/dev/null || die "jq is required"
-        cmd_protect "$1"
+        cmd_protect "$@"
+        ;;
+    protect-abort)
+        aargs=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --json) JSON_OUT=1; shift ;;
+                --verbose|-v) VERBOSE=1; shift ;;
+                --yes) aargs+=("$1"); shift ;;
+                -*) die "unknown protect-abort option: $1" ;;
+                *) aargs+=("$1"); shift ;;
+            esac
+        done
+        set -- "${aargs[@]+"${aargs[@]}"}"
+        [[ $# -ge 1 ]] || die "protect-abort requires OPERATION_ID"
+        command -v jq >/dev/null || die "jq is required"
+        cmd_protect_abort "$@"
         ;;
     track)
         targs=()
