@@ -699,6 +699,21 @@ BEGIN
         RAISE EXCEPTION 'pg_flashback: operation % is not a pending external protect publish',
             p_operation_id USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
+
+    -- Canonical lifecycle lock, matching flashback_protect_begin/
+    -- flashback_protect_abort and the reconciler's own (non-blocking)
+    -- try-lock. Discovered by a real crash-E2E failure during Phase 3
+    -- qualification: without this, the CLI calling this function and the
+    -- bounded maintenance reconciler resuming the same 'publish' action
+    -- (protect_reconcile.sql) can both reach flashback_internal_finalize_
+    -- external_snapshot's real filesystem staging-lease flock truly
+    -- concurrently, surfacing as an opaque "external snapshot copy is
+    -- still active: Resource temporarily unavailable" OS-level error
+    -- instead of one side cleanly deferring. Blocking (not try-lock) is
+    -- correct here: this is an operator-invoked, single-lifecycle,
+    -- already-bounded call, not the reconciler's own bulk pass.
+    PERFORM flashback_internal_lock_lifecycle(v_op.tracking_id);
+
     v_snapshot_id := (v_op.details->>'snapshot_id')::bigint;
     IF NOT EXISTS (
         SELECT 1
@@ -848,9 +863,41 @@ BEGIN
        AND protection_state = 'starting';
     GET DIAGNOSTICS v_n = ROW_COUNT;
     IF v_n <> 1 THEN
-        RAISE EXCEPTION 'pg_flashback: tracking % protection_state was not ''starting'' at activation (raced?)',
-            v_tracking_id
-            USING ERRCODE = 'serialization_failure';
+        -- Crash-matrix boundary "after lifecycle activation before
+        -- journal": a prior call already flipped protection_state to
+        -- 'active' and then crashed before appending the journal event
+        -- (v_op.state, read at the top of this call, is still 'started' --
+        -- that is exactly what routed us in here rather than hitting the
+        -- terminal-state short-circuit above). This is not a race to
+        -- reject: it is this exact operation's own unfinished tail, and
+        -- retrying it must be able to converge without re-running the CAS
+        -- (which would legitimately fail a second time). Any other prior
+        -- value is a genuine race/corruption and still raises.
+        IF v_n = 0 THEN
+            PERFORM 1
+              FROM flashback.tracked_tables
+             WHERE tracking_id = v_tracking_id
+               AND protection_state = 'active';
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'pg_flashback: tracking % protection_state was not ''starting'' at activation (raced?)',
+                    v_tracking_id
+                    USING ERRCODE = 'serialization_failure';
+            END IF;
+            -- protection_state is already 'active' for this tracking_id
+            -- and the journal is still 'started': fall through to append
+            -- the one outstanding terminal event below, exactly as a
+            -- first-time call would have.
+        ELSE
+            RAISE EXCEPTION 'pg_flashback: tracking % protection_state CAS affected % rows (expected 0 or 1)',
+                v_tracking_id, v_n
+                USING ERRCODE = 'internal_error';
+        END IF;
+    END IF;
+
+    -- Crash-matrix boundary: "after lifecycle activation before journal".
+    -- No-op in production (function does not exist there; see worker.rs).
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_after_lifecycle_activation_before_journal');
     END IF;
 
     PERFORM flashback_operation_append_event(
@@ -858,6 +905,11 @@ BEGIN
         'external artifact published and generation activated; protection_state starting -> active',
         jsonb_build_object('tracking_id', v_tracking_id, 'generation_id', v_generation_id)
     );
+
+    -- Crash-matrix boundary: "after terminal journal append before commit".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_after_journal_before_commit');
+    END IF;
 
     RETURN jsonb_build_object(
         'schema_version', 1,

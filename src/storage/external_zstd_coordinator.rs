@@ -986,19 +986,59 @@ fn flashback_internal_run_external_marker_transaction(
 
     let db_oid = unsafe { pg_sys::MyDatabaseId };
     let segment = unsafe { HandoffSegment::coordinator_create(operation_nonce as u64) };
-    // pg_test cannot set a POSTMASTER-context artifact root per test. Its
-    // coordinator regressions therefore keep exercising the exact real
-    // lock/DSM/marker protocol in probe mode; production builds always bind
-    // the copy identity and execute the real staged persist path.
-    #[cfg(not(feature = "pg_test"))]
-    segment
-        .write_copy_identity(CopyIdentity {
-            tracking_id,
-            generation_id,
-            snapshot_id,
-            rel_oid: rel_oid as u32,
-        })
-        .unwrap_or_else(|error| pgrx::error!("cannot bind external copier identity: {error}"));
+    // #[pg_test] unit tests share one postmaster across the whole test run
+    // and cannot set the POSTMASTER-context pg_flashback.external_snapshot_root
+    // GUC per test, so their coordinator regressions exercise the exact
+    // real lock/DSM/marker protocol in probe mode (no copy identity bound,
+    // no real artifact written) rather than the full staged-persist path.
+    // That constraint is about whether a root is actually configured, not
+    // about which cargo features happened to be compiled in: a real
+    // instance built with --features pg_test (needed only for its
+    // cfg-gated test failpoint wrapper, e.g. the protect crash matrix)
+    // still sets a real postmaster-context root at initdb time and must
+    // still bind the identity and run the real copy -- gating on a runtime
+    // probe of the root instead of the pg_test compile-time feature keeps
+    // genuine #[pg_test] runs in probe mode while letting every other
+    // build (real root configured) always take the real path.
+    if let Ok(root) = crate::storage::worker::external_snapshot_root() {
+        // Retry safety: a prior attempt at this exact reservation (same
+        // operation_nonce -- assigned once at generation creation, not
+        // reissued per attempt) may have crashed after its copier created
+        // the staging directory but before this transaction committed
+        // (e.g. the protect_before_copy_commit boundary). The DB-side
+        // generation row correctly rolled back to retryable ('building',
+        // boundary_marker still NULL -- see flashback_protect_next_action's
+        // row 10), but a filesystem directory is not transactional and is
+        // left behind; the next copier's exclusive staging-directory create
+        // would otherwise fail with EEXIST. Purging it here is safe: by
+        // the time this function runs, flashback_protect_external_copy has
+        // already taken this reservation's own SHARE ROW EXCLUSIVE relation
+        // lock, so any *genuinely still-running* prior coordinator/copier
+        // for the same nonce would still be holding that same lock and
+        // this call could not have reached here yet -- and
+        // purge_staged_artifact itself additionally refuses to purge a
+        // directory whose lease is still actively held, so a live copier
+        // (if the lock argument were ever wrong) is never touched.
+        let root_is_valid = crate::storage::external_zstd::validate_root_os_level(&root)
+            .and_then(|_| crate::storage::external_zstd::validate_root_spi_level(&root))
+            .is_ok();
+        if root_is_valid {
+            let _ = purge_staged_artifact(
+                std::path::Path::new(&root),
+                unsafe { pg_sys::GetSystemIdentifier() },
+                db_oid.to_u32(),
+                operation_nonce as u64,
+            );
+        }
+        segment
+            .write_copy_identity(CopyIdentity {
+                tracking_id,
+                generation_id,
+                snapshot_id,
+                rel_oid: rel_oid as u32,
+            })
+            .unwrap_or_else(|error| pgrx::error!("cannot bind external copier identity: {error}"));
+    }
     let worker = launch_copier_worker(segment.handle(), db_oid)
         .expect("failed to launch external_zstd copier worker");
     worker

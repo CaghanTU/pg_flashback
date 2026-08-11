@@ -34,6 +34,45 @@
 -- (flashback_protect_abort, itself idempotent). Everything else is
 -- reported, never acted on -- so a 'blocked' operation is never retried
 -- automatically by anything, ever.
+--
+-- EXPLICIT STATE TABLE (Phase 3 corrective pass) -- every reachable durable
+-- shape of a protect lifecycle, and why no state can ever strand unfinished
+-- cleanup behind a terminal journal write:
+--
+--   State                | operation_      | protection_  | generation | snapshot
+--                        | current_state    | state        | .state     | .payload_state
+--   ---------------------+------------------+--------------+------------+----------------
+--   started protect      | started          | starting     | building/  | creating/
+--                        |                  |              | capturing/ | available
+--                        |                  |              | active     |
+--   hard-failure blocked | started          | starting     | unchanged  | unchanged
+--   (flashback_protect_  | (next_action     |              | from the   | from the
+--   next_action reports  | reports blocked, |              | moment the |  moment the
+--   blocked+hard_failure)| hard_failure)    |              | fault was  | fault was
+--                        |                  |              | observed   | observed
+--   abort requested /    | started (until   | starting, or | aborted or | aborted or
+--   partially completed  | step 9 commits)  | 'abandoned'  | mid-       | mid-
+--   abort (crash between |                  | if step 8    | transition | transition
+--   flashback_protect_   |                  | already ran  |            |
+--   abort's steps 4-8)   |                  |              |            |
+--   abandoned (terminal) | abandoned        | abandoned    | aborted    | aborted
+--   failed (terminal)    | failed           | abandoned    | aborted    | aborted
+--   activated (terminal) | activated        | active       | active     | available
+--
+-- The invariant this table proves: 'started' is the ONLY operation_current_
+-- state a partially-completed abort can durably show (steps 4-8 mutate
+-- snapshot/generation/protection_state/is_active, but never the operation
+-- journal). flashback_protect_abort's step 9 (terminal journal append) is
+-- unconditionally last and is the SOLE writer of 'failed'/'abandoned' --
+-- so by construction, observing either terminal word already means steps
+-- 4-8 converged. There is no ordering under which a crash can leave a
+-- terminal journal entry with snapshot/generation/artifact/replica-identity
+-- cleanup still outstanding: retrying flashback_protect_abort after a crash
+-- at ANY of its 9 steps (proven for real, with genuine process termination,
+-- by scripts/run_protect_online_abort_crash_matrix.sh -- all 8 documented
+-- boundaries plus a third-party-replica-identity-change variant) converges
+-- to exactly one of the 'abandoned'/'failed' rows above, never leaves a
+-- partial state stranded, and a subsequent call is a proven no-op.
 -- =================================================================
 
 -- ------------------------------------------------------------------
@@ -181,8 +220,23 @@ BEGIN
                 'elapsed_seconds', v_elapsed_seconds, 'stale', v_stale
             );
         END IF;
-        v_action := 'blocked'; v_hard_failure := true; v_abortable := true; v_automatic := false;
-        v_reason := format('protection_state_inconsistent:%s', COALESCE(v_tt.protection_state, 'active'));
+        -- Crash-matrix boundary "after lifecycle activation before
+        -- journal": protection_state already flipped to 'active' by a
+        -- prior flashback_protect_finalize call that then crashed before
+        -- appending the 'activated' journal event (confirmed above: the
+        -- fresh re-read still shows v_op.state='started', not terminal).
+        -- This is this operation's own unfinished tail, not a foreign
+        -- corruption -- route back to 'finalize' so a retry can append the
+        -- one outstanding event (flashback_protect_finalize's CAS
+        -- short-circuits safely when protection_state is already 'active'
+        -- for this tracking_id; see protect_online.sql).
+        IF v_tt.protection_state = 'active' AND v_op.state = 'started' THEN
+            v_action := 'finalize'; v_hard_failure := false; v_abortable := true; v_automatic := true;
+            v_reason := 'activation_converged_journal_pending';
+        ELSE
+            v_action := 'blocked'; v_hard_failure := true; v_abortable := true; v_automatic := false;
+            v_reason := format('protection_state_inconsistent:%s', COALESCE(v_tt.protection_state, 'active'));
+        END IF;
     ELSE
         -- Normal path: identity ok, protection_state='starting'. Fetch the
         -- generation and snapshot once for everything below.
@@ -496,6 +550,11 @@ BEGIN
         PERFORM public.flashback_internal_snapshot_abort(v_snapshot_id, v_op.tracking_id);
     END IF;
 
+    -- Crash-matrix boundary: "after snapshot abort".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_snapshot_abort');
+    END IF;
+
     -- Step 5: generation -- CAS from its observed current state; no-op if
     -- already 'aborted'.
     IF v_cg.generation_id IS NOT NULL AND v_cg.state IN ('building', 'capturing') THEN
@@ -504,6 +563,16 @@ BEGIN
             'operator_protect_abort', NULL, NULL, NULL, NULL, NULL, NULL,
             jsonb_build_object('protect_abort_operation_id', p_operation_id)
         );
+    END IF;
+
+    -- Crash-matrix boundary: "after generation abort".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_generation_abort');
+    END IF;
+
+    -- Crash-matrix boundary: "before artifact purge".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_before_artifact_purge');
     END IF;
 
     -- Step 6: artifact purge, idempotency-receipted exactly like the
@@ -530,6 +599,16 @@ BEGIN
             -- tries again. Never falsify a receipt.
             NULL;
         END;
+    END IF;
+
+    -- Crash-matrix boundary: "after artifact purge/receipt".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_artifact_purge');
+    END IF;
+
+    -- Crash-matrix boundary: "before replica-identity restoration".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_before_identity_restore');
     END IF;
 
     -- Step 7: replica identity restoration -- explicit, never a blind
@@ -588,6 +667,11 @@ BEGIN
         END IF;
     END IF;
 
+    -- Crash-matrix boundary: "after replica-identity restoration".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_identity_restore');
+    END IF;
+
     -- Step 8: deactivate the lifecycle -- CAS, kept (not deleted).
     UPDATE flashback.tracked_tables
        SET protection_state = 'abandoned', is_active = false
@@ -596,6 +680,11 @@ BEGIN
     GET DIAGNOSTICS v_n = ROW_COUNT;
     -- v_n = 0 means a prior crashed attempt already made this CAS; that is
     -- an expected, idempotent no-op, not an error.
+
+    -- Crash-matrix boundary: "after lifecycle deactivation".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_lifecycle_deactivation');
+    END IF;
 
     -- Step 9: exactly one terminal journal event, last, unconditionally.
     v_terminal_state := CASE WHEN v_hard_failure THEN 'failed' ELSE 'abandoned' END;
@@ -613,6 +702,12 @@ BEGIN
             'identity_restore_skipped_reason', v_identity_skip_reason
         )
     );
+
+    -- Crash-matrix boundary: "after terminal journal append but before
+    -- commit".
+    IF to_regprocedure('flashback_internal_test_trigger_failpoint(text)') IS NOT NULL THEN
+        PERFORM flashback_internal_test_trigger_failpoint('protect_abort_after_journal_before_commit');
+    END IF;
 
     RETURN jsonb_build_object(
         'operation_id', p_operation_id,
@@ -692,6 +787,14 @@ BEGIN
                     PERFORM public.flashback_internal_finalize_external_snapshot(
                         v_op.tracking_id, (v_next->>'generation_id')::bigint, (v_next->>'snapshot_id')::bigint
                     );
+                    PERFORM public.flashback_protect_finalize(v_op.operation_id);
+                    v_resumed := v_resumed + 1;
+                ELSIF v_next->>'action' = 'finalize' THEN
+                    -- Row 15, and the row-6 "activation converged, journal
+                    -- pending" sub-case: the artifact is already published
+                    -- and the generation is already 'active' -- only the
+                    -- CAS+journal tail (flashback_protect_finalize alone,
+                    -- no finalize_external_snapshot call) remains.
                     PERFORM public.flashback_protect_finalize(v_op.operation_id);
                     v_resumed := v_resumed + 1;
                 ELSIF v_next->>'action' = 'abort_finalize' THEN

@@ -177,6 +177,32 @@ pub fn trigger_external_snapshot_failpoint(name: &str) {
     }
 }
 
+/// SQL-callable entrypoint for the failpoint boundaries above that have no
+/// Rust call site of their own (pure PL/pgSQL statement boundaries inside
+/// flashback_protect_abort / flashback_protect_finalize). Reuses the exact
+/// same GUC-gated mechanism as every other named failpoint -- no new fault-
+/// injection system, just a way for PL/pgSQL to reach it at a specific
+/// statement boundary.
+///
+/// `#[cfg(any(test, feature = "pg_test"))]`, not merely GUC-gated like the
+/// call sites above: a production build (`--features pg17`, no `pg_test`)
+/// never compiles this function in at all, so it cannot appear in that
+/// build's generated SQL (proven by check_generated_sql_no_test_surface.sh,
+/// which generates with exactly that feature set) -- not just inert-by-
+/// default, genuinely absent. Every PL/pgSQL call site guards on
+/// `to_regprocedure(...) IS NOT NULL` first, so production bodies are
+/// byte-for-byte the same whether or not this function exists.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_extern]
+fn flashback_internal_test_trigger_failpoint(name: &str) {
+    if !unsafe { pg_sys::superuser() } {
+        pgrx::error!(
+            "flashback_internal_test_trigger_failpoint is an internal superuser-only function"
+        );
+    }
+    trigger_external_snapshot_failpoint(name);
+}
+
 pub fn register_worker_and_guc() {
     GucRegistry::define_int_guc(
         c"pg_flashback.worker_interval_ms",
