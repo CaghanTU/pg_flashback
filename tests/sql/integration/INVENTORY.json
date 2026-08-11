@@ -400,6 +400,22 @@
     "wal_test_seam_contract.sql": {
       "class": "supported-core",
       "reason": "seam contract regressions under wal"
+    },
+    "capturing_health_doctor.sql": {
+      "class": "infra",
+      "reason": "flashback_doctor()/flashback_health() correctness for the 'capturing' pending protect state -- never reports healthy/protected before protection_state=active"
+    },
+    "capturing_state_authority.sql": {
+      "class": "infra",
+      "reason": "structural invariants around the 'capturing' coverage_generations state, exercised directly against the SQL authority functions"
+    },
+    "protect_online_authority.sql": {
+      "class": "infra",
+      "reason": "SQL authority tests for the online external_zstd initial-protection entrypoints (protect_online.sql)"
+    },
+    "protect_reconcile_authority.sql": {
+      "class": "infra",
+      "reason": "SQL authority tests for the protect reconciliation projection, abort authority, and bounded reconciler (protect_reconcile.sql)"
     }
   },
   "schema_version": 1

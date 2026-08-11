@@ -203,4 +203,80 @@ printf '%s' "$STATUS_JSON" | jq -e '.tables[0].protect_in_progress.action' >/dev
 psql_q -c "SELECT flashback_protect_abort($DOCTOR_OP_ID);" >/dev/null
 log "case 4: PASS"
 
+# ==================================================================
+# Case 5: full "abandoned" lifecycle audit -- aborted protect -> cleanup,
+# aborted protect -> protect again, historical lifecycle remains
+# distinguishable via the operation journal, no non-terminal
+# generation/snapshot/artifact leaks, never reported protected/healthy at
+# any point.
+# ==================================================================
+log "case 5: full abandoned-lifecycle audit (cleanup, reprotect, journal, no leaks)"
+psql_q -c "CREATE TABLE public.cli_e2e_audit (id int PRIMARY KEY);"
+psql_q -c "INSERT INTO public.cli_e2e_audit VALUES (1);"
+AUDIT_OP_ID="$(psql_scalar "SELECT (flashback_protect_begin('public.cli_e2e_audit'))->>'operation_id';")"
+[[ -n "$AUDIT_OP_ID" ]] || die "case 5: flashback_protect_begin did not return operation_id"
+AUDIT_TRACKING_ID="$(psql_scalar "SELECT tracking_id FROM flashback.operation_current_state WHERE operation_id = $AUDIT_OP_ID;")"
+[[ -n "$AUDIT_TRACKING_ID" ]] || die "case 5: could not resolve tracking_id for operation_id=$AUDIT_OP_ID"
+
+# Never reported protected/healthy while starting.
+HEALTHY_WHILE_STARTING="$(psql_scalar "SELECT flashback_is_actively_protected('public.cli_e2e_audit');")"
+[[ "$HEALTHY_WHILE_STARTING" == "f" ]] || die "case 5: table reported actively protected while still starting"
+# A 'starting' lifecycle has is_active=true (set at reservation, so
+# flashback_consume_wal's tracked_oids computation sees it), so it DOES
+# appear in flashback_health() -- but must never show health='healthy'.
+HEALTH_WHILE_STARTING="$(psql_scalar "SELECT health FROM flashback_health() WHERE table_name = 'public.cli_e2e_audit';")"
+[[ "$HEALTH_WHILE_STARTING" != "healthy" ]] || die "case 5: flashback_health() reported healthy for a still-starting lifecycle"
+
+# Clean abort (no relation-identity change) -> genuinely 'abandoned', not
+# 'failed'.
+ABORT_JSON="$(psql_q -tAc "SELECT flashback_protect_abort($AUDIT_OP_ID);")"
+printf '%s' "$ABORT_JSON" | grep -q '"status": "abandoned"' \
+    || die "case 5: expected a clean abort to journal abandoned, got: $ABORT_JSON"
+
+# Never reported protected/healthy while abandoned-awaiting-cleanup either.
+HEALTHY_WHILE_ABANDONED="$(psql_scalar "SELECT flashback_is_actively_protected('public.cli_e2e_audit');")"
+[[ "$HEALTHY_WHILE_ABANDONED" == "f" ]] || die "case 5: table reported actively protected while abandoned"
+HEALTH_ROWS_WHILE_ABANDONED="$(psql_scalar "SELECT count(*) FROM flashback_health() WHERE table_name = 'public.cli_e2e_audit';")"
+[[ "$HEALTH_ROWS_WHILE_ABANDONED" == "0" ]] || die "case 5: flashback_health() listed an abandoned lifecycle"
+
+# No non-terminal generation/snapshot leaks: the generation and snapshot
+# reserved for this attempt must both be in a terminal (aborted) state, and
+# no OTHER row for this tracking_id may be non-terminal.
+NON_TERMINAL_GEN="$(psql_scalar "SELECT count(*) FROM flashback.coverage_generations WHERE tracking_id = $AUDIT_TRACKING_ID AND state NOT IN ('aborted','sealed','retired');")"
+[[ "$NON_TERMINAL_GEN" == "0" ]] || die "case 5: leaked non-terminal coverage_generations row(s) for an abandoned lifecycle"
+NON_TERMINAL_SNAP="$(psql_scalar "SELECT count(*) FROM flashback.snapshots WHERE tracking_id = $AUDIT_TRACKING_ID AND payload_state NOT IN ('aborted','retired');")"
+[[ "$NON_TERMINAL_SNAP" == "0" ]] || die "case 5: leaked non-terminal snapshots row(s) for an abandoned lifecycle"
+
+# aborted protect -> cleanup.
+CLEANUP_JSON="$("${CLI[@]}" cleanup --tracking-id "$AUDIT_TRACKING_ID" --yes 2>&1)" \
+    || die "case 5: cleanup on an abandoned tracking_id failed: $CLEANUP_JSON"
+echo "$CLEANUP_JSON" | grep -qi "cleaned" \
+    || die "case 5: cleanup did not report cleaned for an abandoned tracking_id: $CLEANUP_JSON"
+PS_AFTER_CLEANUP="$(psql_scalar "SELECT protection_state FROM flashback.tracked_tables WHERE tracking_id = $AUDIT_TRACKING_ID;")"
+[[ "$PS_AFTER_CLEANUP" == "cleaned" ]] || die "case 5: expected protection_state=cleaned after cleanup, got: $PS_AFTER_CLEANUP"
+RESIDUAL_DELTA="$(psql_scalar "SELECT count(*) FROM flashback.delta_log WHERE tracking_id = $AUDIT_TRACKING_ID;")"
+[[ "$RESIDUAL_DELTA" == "0" ]] || die "case 5: cleanup left residual delta_log rows for tracking_id=$AUDIT_TRACKING_ID"
+
+# aborted protect -> protect again: a fresh attempt under the same name
+# gets a NEW tracking_id (never reuses or resurrects the cleaned one).
+OUT="$("${CLI[@]}" protect public.cli_e2e_audit --timeout 60 2>&1)" \
+    || die "case 5: fresh protect after cleanup failed: $OUT"
+echo "$OUT" | grep -q "Protection active\." \
+    || die "case 5: fresh protect after cleanup did not reach Protection active.: $OUT"
+NEW_TRACKING_ID="$(psql_scalar "SELECT tracking_id FROM flashback.tracked_tables WHERE table_name = 'cli_e2e_audit' AND is_active;")"
+[[ -n "$NEW_TRACKING_ID" && "$NEW_TRACKING_ID" != "$AUDIT_TRACKING_ID" ]] \
+    || die "case 5: fresh protect must use a new tracking_id, not reuse/resurrect $AUDIT_TRACKING_ID (got: $NEW_TRACKING_ID)"
+
+# Historical lifecycle remains distinguishable: the OLD tracking_id's
+# journal still shows the exact abandoned-then-cleaned sequence, separate
+# from the NEW tracking_id's activated sequence -- both coexist and are
+# never confused with each other.
+OLD_JOURNAL="$(psql_scalar "SELECT string_agg(s.state, ',' ORDER BY s.state_at) FROM flashback.operation_current_state s JOIN flashback.operations o ON o.operation_id = s.operation_id WHERE o.tracking_id = $AUDIT_TRACKING_ID;")"
+echo "$OLD_JOURNAL" | grep -q "abandoned" || die "case 5: old tracking_id's journal lost its abandoned event: $OLD_JOURNAL"
+echo "$OLD_JOURNAL" | grep -q "cleaned" || die "case 5: old tracking_id's journal lost its cleaned event: $OLD_JOURNAL"
+NEW_JOURNAL="$(psql_scalar "SELECT string_agg(s.state, ',' ORDER BY s.state_at) FROM flashback.operation_current_state s JOIN flashback.operations o ON o.operation_id = s.operation_id WHERE o.tracking_id = $NEW_TRACKING_ID AND o.command = 'protect';")"
+echo "$NEW_JOURNAL" | grep -q "activated" || die "case 5: new tracking_id's journal did not show activated: $NEW_JOURNAL"
+echo "$NEW_JOURNAL" | grep -q "abandoned" && die "case 5: new tracking_id's journal incorrectly carries the old lifecycle's abandoned event"
+log "case 5: PASS (cleanup, reprotect, distinguishable history, no leaks, never reported protected/healthy)"
+
 log "ALL CASES PASSED"

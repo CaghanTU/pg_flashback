@@ -346,7 +346,7 @@ SELECT state AS generation_state_after_diag FROM flashback.coverage_generations 
 SELECT pg_advisory_unlock(358945::integer, (SELECT oid::integer FROM pg_database WHERE datname = current_database()));
 SQL
     "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -f "$DIAG_SQL" > "$WORK/diag_consume.log" 2>&1 || true
-    cat "$WORK/diag_consume.log" | tee -a "$WORK/phases.log"
+    tee -a "$WORK/phases.log" < "$WORK/diag_consume.log"
 
     resolved="$(psql_scalar "SELECT (snapshot_lsn IS NOT NULL) FROM flashback.snapshots WHERE snapshot_id = $SNAP_ID;")"
     CC_AFTER="$(psql_scalar "SELECT count(*) FROM flashback.capture_commits WHERE source_xid = $BOUNDARY_XID;")"
