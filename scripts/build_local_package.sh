@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# Canonical local_delta package builder (extension + CLI).
+# Quick LOCAL DEV package builder (extension + CLI) -- NOT the
+# release-candidate path. scripts/build_candidate_archive.sh is canonical
+# for qualification/release evidence (source commit/tree provenance, full
+# SBOM, reproducibility report, and the exact digests
+# check_candidate_archive_integrity-style consumers bind against); it is
+# the only builder .github/workflows/qualification.yml invokes. This
+# script exists only for a fast local install during day-to-day
+# development (docs/DEVELOPMENT.md's "quick local package" section) and
+# must never be substituted for scripts/build_candidate_archive.sh when
+# producing evidence for a qualification run or a release.
+#
 # The experimental physical-backup recovery prototype is not part of the
 # supported tree; see docs/DEFERRED_BACKUP.md.
 #

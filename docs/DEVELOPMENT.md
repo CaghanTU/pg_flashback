@@ -17,7 +17,11 @@ cargo install --locked cargo-pgrx --version 0.16.1
 cargo pgrx init --pg17 /path/to/pg_config
 ```
 
-## Local package
+## Quick local dev package
+
+For a fast local install during day-to-day development only -- this is
+**not** the release-candidate path and its archive must never be used as
+qualification or release evidence. See "Packages" below for that.
 
 ```bash
 PG_MAJOR=17 ./scripts/build_local_package.sh
@@ -148,9 +152,15 @@ Changing code after a run does not erase the run; it simply means the evidence
 belongs to the commit that was actually tested. Development can continue
 normally.
 
-## Packages
+## Packages (release candidate -- canonical)
 
-Build a local package:
+This is the canonical, only-supported path for producing qualification or
+release evidence: full source-commit/tree provenance, an SBOM, a
+reproducibility report, and extension/CLI binary digests that every
+downstream qualification script binds against. `.github/workflows/
+qualification.yml` invokes this and only this. Never substitute the quick
+local dev package above for this when the output needs to be trusted as
+evidence.
 
 ```bash
 PG_MAJOR=17 ./scripts/build_candidate_archive.sh
