@@ -88,6 +88,8 @@ chmod 700 "$SOCKET_DIR"
 PORT=$((41000 + ($$ % 20000)))
 
 "$EC_PG_BIN/initdb" -D "$PRIMARY_DIR" --no-locale --encoding=UTF8 --auth=trust >/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$EC_PG_BIN" "$PRIMARY_DIR"
 cat >>"$PRIMARY_DIR/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical

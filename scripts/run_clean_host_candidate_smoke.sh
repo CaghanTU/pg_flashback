@@ -172,6 +172,8 @@ install -m 0644 "$EXT_ROOT/share/extension/pg_flashback.control" \
 pass "installed extension and CLI from candidate archive only"
 
 "$PG_BIN/initdb" -D "$DATA" --no-locale --encoding=UTF8 --auth=trust >/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$DATA"
 cat >>"$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical

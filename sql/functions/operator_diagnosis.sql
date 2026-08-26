@@ -23,6 +23,7 @@ DECLARE
     v_mode text;
     v_wal_level text;
     v_preload text;
+    v_output_plugin_libs text;
     v_override boolean;
     v_snap bigint;
     v_peak bigint;
@@ -51,6 +52,10 @@ BEGIN
     END IF;
     v_wal_level := current_setting('wal_level');
     v_preload := current_setting('shared_preload_libraries');
+    -- missing_ok=true: output_plugin_libraries does not exist on every
+    -- supported PostgreSQL minor. A NULL here means "not applicable on this
+    -- minor", never "misconfigured".
+    v_output_plugin_libs := current_setting('output_plugin_libraries', true);
     SELECT * INTO STRICT v_workers FROM flashback_worker_readiness();
     SELECT * INTO v_slot FROM flashback_slot_status_snapshot() LIMIT 1;
     v_override := flashback_local_capacity_override_active();
@@ -84,6 +89,27 @@ BEGIN
     ELSE
         status := 'error'; observed := v_preload; expected := 'contains pg_flashback';
         action := 'add pg_flashback to shared_preload_libraries and restart PostgreSQL';
+    END IF;
+    RETURN NEXT;
+
+    -- output_plugin_libraries: introduced as a GUC in current security-patched
+    -- PostgreSQL minors (all four supported majors). A real logical slot
+    -- creation for the pg_flashback output plugin fails on those minors
+    -- without an explicit allowlist entry. Older minors do not have this GUC
+    -- at all -- current_setting(..., true) returns NULL there, which is
+    -- reported as not-applicable/ok, never as a false failure.
+    scope := 'cluster'; check_name := 'output_plugin_libraries';
+    IF v_output_plugin_libs IS NULL THEN
+        status := 'ok';
+        observed := 'not applicable (this PostgreSQL minor has no output_plugin_libraries GUC)';
+        expected := 'n/a on this PostgreSQL minor';
+        action := 'none';
+    ELSIF v_output_plugin_libs ~ '(^|,) *pg_flashback *(,|$)' THEN
+        status := 'ok'; observed := v_output_plugin_libs; expected := 'contains pg_flashback';
+        action := 'none';
+    ELSE
+        status := 'error'; observed := v_output_plugin_libs; expected := 'contains pg_flashback';
+        action := 'add output_plugin_libraries = ''pg_flashback'' to postgresql.conf and restart PostgreSQL';
     END IF;
     RETURN NEXT;
 

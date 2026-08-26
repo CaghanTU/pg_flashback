@@ -30,6 +30,8 @@ test -f /usr/local/pgsql-17/share/extension/pg_flashback.control \
     || die "pg_flashback not installed into prefix"
 
 "$PG_BIN/initdb" -D "$PRIMARY" --locale=C.UTF-8 -A trust >/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$PRIMARY"
 cat >>"$PRIMARY/postgresql.conf" <<EOF
 port = $PORT_PRIMARY
 unix_socket_directories = '$SOCK'

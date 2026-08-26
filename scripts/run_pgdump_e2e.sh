@@ -67,6 +67,9 @@ mkdir -p "$SOCKET_DIR"
 "$PG_BIN/initdb" -D "$PGDATA" --no-locale --encoding=UTF8 -U postgres \
     >"$WORKDIR/initdb.log"
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$PGDATA"
+
 {
     printf "listen_addresses = ''\n"
     printf 'port = %s\n' "$PORT"

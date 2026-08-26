@@ -125,6 +125,9 @@ start_case_instance() {
     "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >"$WORK/initdb.log" 2>&1 \
         || die "[$CASE_NAME] initdb failed"
 
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+    opal_configure_postgresql_conf "$PG_BIN" "$DATA"
+
     {
         echo "shared_preload_libraries = 'pg_flashback'"
         echo "wal_level = logical"

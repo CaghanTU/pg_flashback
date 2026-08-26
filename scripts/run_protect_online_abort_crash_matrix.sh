@@ -71,6 +71,9 @@ run_one_case() {
     "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >"$WORK/initdb.log" 2>&1 \
         || die "[$failpoint] initdb failed"
 
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+    opal_configure_postgresql_conf "$PG_BIN" "$DATA"
+
     cat >> "$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical
@@ -241,6 +244,8 @@ run_third_party_identity_case() {
 
     "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >"$WORK/initdb.log" 2>&1 \
         || die "[third_party_identity] initdb failed"
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+    opal_configure_postgresql_conf "$PG_BIN" "$DATA"
     cat >> "$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical

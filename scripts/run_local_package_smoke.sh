@@ -55,6 +55,8 @@ SOCKET="$WORKDIR/socket"
 mkdir -p "$SOCKET"
 PORT=$((55000 + PG_MAJOR))
 "$PG_BIN/initdb" -D "$PGDATA" --locale=C.UTF-8 -A trust >/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$PGDATA"
 cat >> "$PGDATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical

@@ -698,6 +698,7 @@ DECLARE
     v_senders integer;
     v_slot_keep text;
     v_targets text;
+    v_output_plugin_applicable boolean;
 BEGIN
     -- Filesystem free space for the default tablespace (cluster-local estimate).
     SELECT flashback_tablespace_filesystem_available_bytes(0::oid) INTO v_fs;
@@ -755,6 +756,11 @@ BEGIN
     v_senders := current_setting('max_wal_senders')::integer;
     v_slot_keep := current_setting('max_slot_wal_keep_size', true);
 
+    -- output_plugin_libraries only exists on PostgreSQL minors that carry the
+    -- GUC (current security-patched minors of every supported major); missing
+    -- on older minors is not-applicable, never a false recommendation.
+    v_output_plugin_applicable := current_setting('output_plugin_libraries', true) IS NOT NULL;
+
     v_lines := ARRAY[
         format('shared_preload_libraries = ''pg_flashback'''),
         format('wal_level = logical'),
@@ -770,6 +776,10 @@ BEGIN
         format('pg_flashback.local_min_filesystem_bytes = ''%s''', v_min_fs),
         format('pg_flashback.local_safety_reserve_bytes = ''%s''', v_safety)
     ];
+
+    IF v_output_plugin_applicable THEN
+        v_lines := v_lines || ARRAY[format('output_plugin_libraries = ''pg_flashback''')];
+    END IF;
 
     IF v_slot_keep IS NULL OR v_slot_keep IN ('-1', '') THEN
         v_notes := v_notes || ARRAY[

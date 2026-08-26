@@ -107,6 +107,8 @@ trap cleanup EXIT
 
 mkdir -p "$WORK_ROOT" "$SOCKET" "$RESULT_DIR"
 "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$DATA"
 cat >>"$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical

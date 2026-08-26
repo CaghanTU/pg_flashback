@@ -239,6 +239,9 @@ qp "ALTER SYSTEM SET pg_flashback.local_min_filesystem_bytes = '64MB'" > /dev/nu
 qp "ALTER SYSTEM SET pg_flashback.local_safety_reserve_bytes = '16MB'" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.allow_unaudited_restore = on" > /dev/null
 qp "ALTER SYSTEM SET pg_flashback.local_boundary_write_stall_ms = 60000" > /dev/null
+# shellcheck source=scripts/lib/output_plugin_allowlist.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_live_ensure_output_plugin_libraries $PSQL -d postgres > /dev/null
 restart_pg || { echo "FAIL: PostgreSQL yeniden başlatılamadı"; exit 1; }
 echo "  ok: instance yeniden başladı (target_databases=$DB, capture_mode=wal)"
 

@@ -358,6 +358,8 @@ perform_local_drop_restore() {
 }
 
 "$PG_BIN/initdb" -D "$PRIMARY_DIR" --no-locale --encoding=UTF8 --auth=trust > "$LOG_DIR/initdb.log"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$PRIMARY_DIR"
 cat >> "$PRIMARY_DIR/postgresql.conf" <<EOF
 port = $PRIMARY_PORT
 unix_socket_directories = '$SOCKET_DIR'

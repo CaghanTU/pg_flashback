@@ -69,6 +69,9 @@ cargo pgrx install --pg-config "$PG_CONFIG" --no-default-features --features pg1
 "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >"$WORK/initdb.log" 2>&1 \
     || die "initdb failed; see $WORK/initdb.log"
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/output_plugin_allowlist.sh"
+opal_configure_postgresql_conf "$PG_BIN" "$DATA"
+
 # Deliberately NO pg_flashback.worker_interval_ms or
 # pg_flashback.maintenance_every_n_cycles override anywhere in this file --
 # the entire point is measuring the shipped DEFAULT.
