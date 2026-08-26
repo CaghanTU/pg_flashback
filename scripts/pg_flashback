@@ -1112,6 +1112,8 @@ SQL
                 echo "  Action: wait for worker catch-up, then retry; inspect: pg_flashback doctor / status $canon"
             elif [[ "$code" == "exact_manifest_pending" || "$code" == "exact_manifest_missing" ]]; then
                 echo "  Action: wait for exact event-bound dependency manifest bind, then retry; refuse recovery without it"
+            elif [[ "$code" == "capture_stream_unavailable" ]]; then
+                echo "  Action: capture stream is not active (broken/missing slot); run pg_flashback doctor to diagnose and reconcile before retrying"
             else
                 echo "  Action: run pg_flashback doctor and pg_flashback status $canon"
             fi

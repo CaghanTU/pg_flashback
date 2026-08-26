@@ -32,8 +32,9 @@ DECLARE
     v_canonical text;
     v_selection text;
     v_resolved pg_lsn;
-    v_slot record;
     v_frontier pg_lsn;
+    v_stream_restart pg_lsn;
+    v_stream_state text;
     v_pending_wal boolean := false;
     v_epoch_schema_def jsonb;
     v_epoch_compat jsonb;
@@ -173,9 +174,54 @@ BEGIN
     END IF;
 
     IF v_row IS NULL OR v_row.table_name IS NULL THEN
-        -- Distinguish true absence of DROP from capture frontier lag.
-        SELECT * INTO v_slot FROM flashback_slot_status_snapshot() LIMIT 1;
-        v_frontier := COALESCE(v_slot.confirmed_flush_lsn, v_slot.restart_lsn);
+        -- Distinguish true absence of DROP from capture frontier lag using the
+        -- durable, transactionally-consistent flashback.capture_streams
+        -- watermark -- never the raw pg_replication_slots row. PostgreSQL
+        -- advances a slot's confirmed_flush_lsn as a non-transactional side
+        -- effect of pg_logical_slot_get_changes itself (see the comment in
+        -- flashback_consume_wal and flashback_apply_decoded_wal_batch), so
+        -- the raw slot value can race ahead of flashback.delta_log's own
+        -- commit of the same decoded batch: a concurrent reader could see the
+        -- slot already "caught up" to the DROP's LSN while the DROP row is
+        -- still invisible (uncommitted) in delta_log, and wrongly conclude
+        -- no_drop_event. flashback.capture_streams.confirmed_flush_lsn is
+        -- only advanced inside the same committed transaction as the
+        -- delta_log insert it describes (flashback_apply_decoded_wal_batch),
+        -- so comparing against it cannot report "no DROP" while a DROP is
+        -- still mid-decode.
+        SELECT cs.confirmed_flush_lsn, cs.restart_lsn, cs.state
+          INTO v_frontier, v_stream_restart, v_stream_state
+        FROM flashback.capture_streams cs
+        WHERE cs.database_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        ORDER BY cs.epoch_no DESC
+        LIMIT 1;
+
+        IF NOT FOUND OR v_stream_state IS DISTINCT FROM 'active' THEN
+            -- No provably active capture stream for this database: never
+            -- invent a DROP and never treat this as ordinary catch-up
+            -- (which the CLI polls indefinitely up to its timeout). Slot
+            -- loss, broken streams and missing streams are hard failures.
+            RETURN jsonb_build_object(
+                'schema_version', v_plan_version,
+                'plan_version', v_plan_version,
+                'selection', v_selection,
+                'table_name', v_canonical,
+                'tracking_id', v_tracking_id,
+                'status', 'error',
+                'code', 'capture_stream_unavailable',
+                'identity_conflict', v_identity_conflict,
+                'capture_frontier_lsn', v_frontier,
+                'current_wal_lsn', pg_current_wal_lsn(),
+                'duration_estimate', 'unknown',
+                'blockers', jsonb_build_array(
+                    format('capture stream is not active (state=%s); cannot prove capture has reached any DROP',
+                           COALESCE(v_stream_state, 'missing'))
+                ),
+                'action', 'run pg_flashback doctor to diagnose the capture stream before retrying recovery'
+            );
+        END IF;
+
+        v_frontier := COALESCE(v_frontier, v_stream_restart);
         v_pending_wal := COALESCE(
             pg_wal_lsn_diff(pg_current_wal_lsn(), COALESCE(v_frontier, '0/0'::pg_lsn)) > 0,
             true
