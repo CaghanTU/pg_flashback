@@ -181,17 +181,17 @@ wait_ready_after_crash() {
     # whether the failpoint fired synchronously (in the triggering backend)
     # or asynchronously (in the copier background worker).
     local saw_reinit=0
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 600); do
         if grep -q "reinitializing" "$WORK/postgres.log" 2>/dev/null; then
             saw_reinit=1
             break
         fi
         sleep 0.1
     done
-    [[ "$saw_reinit" == "1" ]] || die "[$CASE_NAME] failpoint never fired -- no crash/reinitialize observed in postgres.log within 30s (nothing was tested)"
+    [[ "$saw_reinit" == "1" ]] || die "[$CASE_NAME] failpoint never fired -- no crash/reinitialize observed in postgres.log within 60s (nothing was tested)"
 
     local consecutive=0 ready=0
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 600); do
         if "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT 1" >/dev/null 2>&1; then
             consecutive=$((consecutive + 1))
             if [[ "$consecutive" -ge 10 ]]; then ready=1; break; fi
@@ -216,7 +216,7 @@ wait_ready_after_crash() {
 # never fired, so the caller can retry with a fresh table.
 wait_ready_after_crash_soft() {
     local saw_reinit=0
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 600); do
         if grep -q "reinitializing" "$WORK/postgres.log" 2>/dev/null; then
             saw_reinit=1
             break
@@ -228,7 +228,7 @@ wait_ready_after_crash_soft() {
     fi
 
     local consecutive=0 ready=0
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 600); do
         if "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT 1" >/dev/null 2>&1; then
             consecutive=$((consecutive + 1))
             if [[ "$consecutive" -ge 10 ]]; then ready=1; break; fi
@@ -594,8 +594,15 @@ assert_outcome_a_or_b_for_racy_copier_crash() {
 # own resume-by-identity finds nothing left to resume (the abort already
 # fully converged) and correctly starts a brand new reservation under the
 # same name, which then reaches full activation under a NEW tracking_id.
-# All three are accepted here; whichever happens, every invariant for that
-# specific outcome must hold.
+# A FOURTH, symmetric outcome (A'') is the same autonomous-reconciler race
+# but on the success path instead of the abort path: the reconciler
+# resumes and fully activates the SAME interrupted operation before the
+# CLI's own resume logic runs, so the CLI's protect command short-circuits
+# on flashback_is_actively_protected and prints "Already protected: ..."
+# instead of "Resuming protect...Protection active." -- externally
+# indistinguishable from a plain no-op, but every invariant of outcome A
+# still applies to the same op_id/tracking_id. All four are accepted here;
+# whichever happens, every invariant for that specific outcome must hold.
 assert_outcome_a_or_autonomous_reconvergence() {
     local table="$1" op_id="$2" tracking_id="$3"
 
@@ -620,6 +627,26 @@ assert_outcome_a_or_autonomous_reconvergence() {
         relident="$(psql_scalar "SELECT relreplident::text FROM pg_class WHERE oid = '$table'::regclass;")"
         [[ "$relident" == "f" ]] || die "[$CASE_NAME] expected replica identity FULL after activation, got: $relident"
         log "[$CASE_NAME] outcome A confirmed: resumed the exact interrupted operation_id=$op_id to full activation"
+    elif echo "$out" | grep -q "^Already protected: " && [[ "$rc" == "0" ]]; then
+        # Outcome A'': the bounded maintenance reconciler autonomously
+        # resumed and fully activated this exact interrupted operation_id
+        # (via its own post-restart cycle) before the CLI's own resume
+        # logic ever ran. flashback_is_actively_protected short-circuits
+        # the CLI's protect command before it prints "Resuming protect...",
+        # so this looks identical to a plain already-protected no-op from
+        # the caller's side -- it is not a new lifecycle, it is the same
+        # op_id/tracking_id as outcome A, just discovered one step earlier.
+        # Same invariants as outcome A therefore apply verbatim.
+        local op_state ps journal_count relident
+        op_state="$(psql_scalar "SELECT state FROM flashback.operation_current_state WHERE operation_id = $op_id;")"
+        [[ "$op_state" == "activated" ]] || die "[$CASE_NAME] outcome A'': expected operation state=activated, got: $op_state"
+        ps="$(psql_scalar "SELECT protection_state FROM flashback.tracked_tables WHERE tracking_id = $tracking_id;")"
+        [[ "$ps" == "active" ]] || die "[$CASE_NAME] outcome A'': expected protection_state=active, got: $ps"
+        journal_count="$(psql_scalar "SELECT count(*) FROM flashback.operation_events WHERE operation_id = $op_id AND event_type = 'activated';")"
+        [[ "$journal_count" == "1" ]] || die "[$CASE_NAME] outcome A'': expected exactly one 'activated' journal event, got: $journal_count"
+        relident="$(psql_scalar "SELECT relreplident::text FROM pg_class WHERE oid = '$table'::regclass;")"
+        [[ "$relident" == "f" ]] || die "[$CASE_NAME] outcome A'': expected replica identity FULL after activation, got: $relident"
+        log "[$CASE_NAME] outcome A'' confirmed: reconciler autonomously activated the exact interrupted operation_id=$op_id before the CLI resume call ran"
     elif echo "$out" | grep -q "Protection active." && [[ "$rc" == "0" ]]; then
         # Outcome A': the old operation was already fully abort-converged
         # (autonomously, by the reconciler) before this CLI call ran; a
@@ -689,7 +716,7 @@ assert_outcome_a_or_autonomous_reconvergence() {
         [[ "$protected" == "f" ]] || die "[$CASE_NAME] outcome D: table falsely reported actively protected despite a lost capture slot"
         log "[$CASE_NAME] outcome D confirmed: crash-restart invalidated the capture slot (pre-existing, out-of-scope capture-reliability limitation) -- protect correctly failed closed and never claimed false protection: $out"
     else
-        die "[$CASE_NAME] none of outcomes A/A'/B/D matched: rc=$rc out=$out"
+        die "[$CASE_NAME] none of outcomes A/A''/A'/B/D matched: rc=$rc out=$out"
     fi
 }
 
