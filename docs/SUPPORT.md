@@ -26,10 +26,23 @@ fail closed. Use `pg_flashback config recommend` for read-only advice.
 | `capture_mode` | Deprecated compatibility GUC; only `wal` is valid |
 | DML capture triggers | Not installed on user tables |
 | Ordinary (non-internal) triggers | Preserved through protect/restore |
+| SnapshotStore backend | `heap_v1` (default) or `external_zstd` (supported opt-in production backend); see below |
+| `output_plugin_libraries` | Required on current security-patched PostgreSQL minors (15.19/16.15/17.11/18.6+); not applicable on older minors that lack the GUC |
 
 Native macOS is not supported. Linux/aarch64 development under Lima and
 Linux/x86_64 builds are separate environments; evidence from one architecture
 is not silently generalized to the other.
+
+## SnapshotStore backends
+
+| Backend | Status | Notes |
+|---|---|---|
+| `heap_v1` | Default | Base image stored inside PostgreSQL as an ordinary heap table |
+| `external_zstd` | Supported opt-in production backend | Base image streamed as a zstd-compressed artifact to `pg_flashback.external_snapshot_root` (0700, outside PGDATA/tablespaces, explicit min-free/reserve budgets required). Activated per table via `pg_flashback maintain TABLE --yes`. Not yet qualified at 10/25/50 GiB scale or a 24-hour soak — see [DEVELOPMENT.md](DEVELOPMENT.md). |
+
+`external_zstd` is a local/attached-filesystem SnapshotStore, not a backup
+product; see [Physical-backup subsystem (deferred)](#physical-backup-subsystem-deferred)
+below.
 
 ## Tables
 

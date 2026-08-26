@@ -12,6 +12,7 @@ transactionally aligned base image plus a proven prefix of logical WAL.
 | Capture worker | Drains the logical slot, stores complete transactions, and advances coverage |
 | Maintenance worker | Runs bounded retention and lifecycle work without blocking capture |
 | Coverage generation | Binds one base image to one WAL stream and a complete-commit watermark |
+| SnapshotStore | Pluggable base-image storage: `heap_v1` (default, in-database) or `external_zstd` (opt-in, compressed artifact on an external filesystem root) |
 | Recovery planner | Selects one disaster event and proves that it is recoverable |
 | Recovery executor | Materializes, verifies, and atomically swaps a shadow table |
 | Operation journal | Records started, failed, abandoned, applied, and verified operations |
@@ -135,10 +136,21 @@ or an open coverage gap back to healthy.
 Legal coverage generation edges (enforced by guard + authority):
 
 ```text
-building → active | aborted
-active   → sealed
-sealed   → retired
+building   → active | aborted | capturing
+capturing  → active | aborted
+active     → sealed
+sealed     → retired
 ```
+
+`capturing` is the online `external_zstd` protect/maintain path's
+intermediate state (`protect_online.sql`): the boundary marker has committed
+and WAL is already being absorbed for it, but the generation is not yet a
+recoverable boundary — that only happens once the background copier's
+artifact is verified and publish/activate commits (`building`/`capturing` →
+`active`). A crash or an explicit `protect-abort` while a generation is
+`building` or `capturing` is reconciled to `aborted` rather than left
+half-published; `heap_v1`'s synchronous CTAS path never enters `capturing`
+and goes directly `building` → `active`.
 
 Capture stream edges used by runtime:
 
@@ -155,17 +167,37 @@ further non-matching progress; retrying the exact same terminal payload is an id
 
 ## Storage
 
-The active local path stores its base image and changes inside PostgreSQL.
-Admission estimates:
+The base image is stored through one of two SnapshotStore backends:
 
-- heap and TOAST size;
+- **`heap_v1`** (default) — inside PostgreSQL as an ordinary heap table,
+  created synchronously by `flashback_track()`'s CTAS under a brief lock.
+- **`external_zstd`** (supported opt-in production backend) — streamed as a
+  zstd-compressed artifact to `pg_flashback.external_snapshot_root`, an
+  operator-provisioned directory (owner/mode `0700`) outside PGDATA and
+  outside any tablespace, with explicit positive
+  `external_snapshot_min_free_bytes` / `external_snapshot_safety_reserve_bytes`
+  budgets. Created via the online, non-blocking `protect`/`maintain`
+  orchestration (see "State and progress authority" above for the
+  `capturing` generation state); admission never assumes unlimited external
+  space. Row-batching and compression are tunable via
+  `external_snapshot_batch_rows`, `external_snapshot_zstd_level`, and
+  `external_snapshot_max_row_bytes`. A superseded generation's external
+  artifact is retired (payload removed) only once no recovery path can still
+  reference it and retention has elapsed.
+
+Admission estimates, for either backend:
+
+- heap and TOAST size (source table) or artifact size estimate (`external_zstd`);
 - index rebuild requirements;
 - simultaneous old/new relation peak during recovery;
 - configured reserve;
-- current filesystem free space.
+- current filesystem free space (PGDATA's filesystem, or the external root's
+  filesystem for `external_zstd`).
 
 The estimate is a guard, not a reservation: tables and filesystems can change
 after the check. Runtime limits and fail-closed behavior remain necessary.
+`flashback_doctor()` and `flashback_health()` report the active backend,
+external-root health, and each generation's `snapshot_payload_state`.
 
 ## Security boundary
 

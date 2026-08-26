@@ -24,10 +24,26 @@ source tree, not a published stable release.
 - Multi-database worker admission and CLI status/doctor aggregation.
 - Versioned extension upgrade from 0.1.0 to 0.2.0.
 - Candidate package provenance, checksums, and SBOM generation.
-- Experimental pgBackRest physical-recovery provider for future large-table
-  work.
+- `external_zstd` SnapshotStore: a supported opt-in production backend that
+  stores the protected base image as a compressed artifact on an external
+  filesystem root instead of inside PostgreSQL, with online (non-blocking)
+  protect/maintain orchestration, crash/abort reconciliation, and doctor/
+  health reporting. `heap_v1` remains the default. `external_zstd` has not
+  yet been qualified at 10/25/50 GiB scale or over a 24-hour soak.
+- Centralized, version-tolerant `output_plugin_libraries` compatibility
+  handling (`scripts/lib/output_plugin_allowlist.sh`,
+  `flashback_doctor()`, `pg_flashback config recommend`) for current
+  security-patched PostgreSQL minors that added this GUC.
 
 ### Correctness and safety
+
+- `flashback_recover_plan` now distinguishes "capture frontier still
+  catching up" from "genuinely no DROP" using the durable
+  `flashback.capture_streams` watermark instead of the raw replication
+  slot, which could appear caught up before the corresponding
+  `flashback.delta_log` row was actually committed. A capture stream that is
+  missing or broken is now a distinct, immediately-reported hard failure
+  (`capture_stream_unavailable`) rather than indefinite catch-up polling.
 
 - Recovery now refuses ambiguous DROP events, unsupported CASCADE dependency
   graphs, same-name identity conflicts, coverage gaps, missing slots, and

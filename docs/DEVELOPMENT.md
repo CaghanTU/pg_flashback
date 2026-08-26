@@ -60,7 +60,9 @@ Results are written under `target/bench/` and are host/config specific.
 git diff --check
 cargo fmt --all -- --check
 cargo clippy --no-default-features --features pg17 -- -D warnings
-shellcheck scripts/pg_flashback scripts/*.sh
+find scripts -type f -name '*.sh' -exec shellcheck -S warning {} +
+shellcheck -S warning scripts/pg_flashback
+./scripts/check_output_plugin_allowlist_coverage.sh
 ```
 
 ## PostgreSQL matrix
@@ -122,7 +124,11 @@ The `scripts/` directory contains isolated-cluster suites for:
 - upgrade from 0.1.0 to 0.2.0;
 - HA promotion and timeline refusal;
 - capacity admission;
-- clean-host package installation.
+- clean-host package installation;
+- `external_zstd` SnapshotStore: artifact/marker/adversarial E2Es, failpoint
+  matrix, online protect happy path, protect crash and protect-abort crash
+  matrices, protect concurrency matrix, worker pickup latency;
+- immediate-DROP discovery race regressions.
 
 The most important local-product commands are:
 
@@ -132,10 +138,19 @@ The most important local-product commands are:
 ./scripts/run_exact_wal_transaction_schema_matrix.sh
 ./scripts/run_dba_acceptance_regressions.sh
 ./scripts/run_extension_upgrade_e2e.sh
+./scripts/run_external_zstd_artifact_e2e.sh
+./scripts/run_protect_online_happy_path_e2e.sh
+./scripts/run_drop_discovery_adversarial_regressions.sh
 ```
 
 Read each script's header before running it. Most create and remove temporary
-databases, slots, clusters, sockets, or installed extension files.
+databases, slots, clusters, sockets, or installed extension files. Every
+script that starts a real cluster and creates a pg_flashback logical slot
+sources `scripts/lib/output_plugin_allowlist.sh`, which appends
+`output_plugin_libraries = 'pg_flashback'` only on PostgreSQL minors that
+have the GUC; do not copy an unconditional line into a new script instead of
+sourcing the helper (`scripts/check_output_plugin_allowlist_coverage.sh`
+enforces this).
 
 ## Long-running tests
 

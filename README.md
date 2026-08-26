@@ -175,7 +175,9 @@ pg_flashback status public.orders
 
 Before protection starts, pg_flashback checks table topology, worker
 availability, write-stall limits, configured storage budgets, and filesystem
-free space. The initial base image is stored inside PostgreSQL.
+free space. The initial base image is stored inside PostgreSQL (the `heap_v1`
+backend) unless an external SnapshotStore has been configured and activated;
+see [SnapshotStore backends](#snapshotstore-backends) below.
 
 After an accidental DROP:
 
@@ -242,12 +244,93 @@ modifying the live database.
 
 See [architecture](docs/ARCHITECTURE.md) for the invariants behind this model.
 
+## SnapshotStore backends
+
+pg_flashback stores each protected table's base image (and, after `maintain`,
+each successor boundary) through a pluggable SnapshotStore. Two backends are
+supported:
+
+- **`heap_v1`** (default) — the base image lives inside PostgreSQL as an
+  ordinary heap table. No extra configuration; this remains the safe default
+  for now.
+- **`external_zstd`** — a supported, opt-in **production** backend (not a
+  proof of concept) that streams the base image as a zstd-compressed artifact
+  to a filesystem location outside PGDATA, keeping PostgreSQL's own heap free
+  of the base-image copy. It has been exercised end-to-end (protect, DML,
+  DROP, recover, crash/abort, doctor) as part of this repository's real
+  PostgreSQL test suites, but has not yet been qualified at 10/25/50 GiB
+  scale or over a 24-hour soak — see
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+`heap_v1` remains the default; nothing changes it automatically. Switching a
+table's *next* boundary to `external_zstd` is an explicit operator action via
+`pg_flashback maintain TABLE --yes` after setting
+`pg_flashback.snapshot_storage_backend = 'external_zstd'`.
+
+### external_zstd requirements
+
+- `pg_flashback.external_snapshot_root` — an existing directory **outside
+  PGDATA and outside any tablespace directory**, owned by the PostgreSQL
+  server user with mode `0700`. pg_flashback refuses to activate the backend
+  otherwise.
+- `pg_flashback.external_snapshot_min_free_bytes` and
+  `pg_flashback.external_snapshot_safety_reserve_bytes` — explicit,
+  positive minimum-free and reserve budgets for that filesystem; there is no
+  implicit "use whatever is left" behavior.
+- `pg_flashback.external_snapshot_batch_rows`, `.external_snapshot_zstd_level`,
+  and `.external_snapshot_max_row_bytes` — row-batching and compression
+  tuning; sensible defaults are used if unset.
+
+### Online protect/maintain orchestration
+
+Creating or moving a boundary onto `external_zstd` never holds a long lock and
+never blocks writers. It runs as four separate, individually committed
+server-side transactions (`flashback_protect_begin` →
+`flashback_protect_prepare_replica_identity` →
+`flashback_protect_external_copy` → `flashback_protect_external_publish`, with
+the analogous `flashback_maintain_*` calls for re-anchoring an already-tracked
+table): a brief `SHARE ROW EXCLUSIVE` marker transaction records the boundary,
+a background copier streams the compressed artifact while the table stays
+fully writable, and only once the artifact is verified and WAL capture has
+caught up to the boundary does a final transaction publish and activate it.
+The CLI drives this sequence for you (`pg_flashback protect`/`maintain`); the
+underlying SQL functions exist for advanced/scripted use.
+
+Between the marker commit and activation, the generation is in a
+**`capturing`** state: WAL is already being absorbed for it, but it is not yet
+a recoverable boundary. A crash or `protect-abort` during this window is
+reconciled safely — an interrupted reservation is either resumed or cleanly
+aborted (its partial artifact retired), never left half-published. The CLI
+exposes this via `pg_flashback protect-abort OPERATION_ID --yes` when
+`status` reports a blocked in-progress protect.
+
+### Health, integrity, and retirement
+
+`pg_flashback doctor` and `pg_flashback status` report the active backend
+(`snapshot_storage_backend`), the external root's health
+(`external_snapshot_root`), and each generation's `snapshot_payload_state`
+(e.g. `available` once the artifact is verified). A superseded generation's
+external artifact is retired (its on-disk payload removed) only once no
+recovery path can still need it and the configured retention interval has
+elapsed — `cleanup`/retention never deletes payload a proven recovery target
+still depends on.
+
+### What is still deferred
+
+Backup-provider integration (pgBackRest or otherwise) is not part of the
+supported core regardless of SnapshotStore backend — see
+[Physical-backup recovery (deferred)](#physical-backup-recovery-deferred).
+`external_zstd` is a local/attached-filesystem SnapshotStore, not a backup
+target.
+
 ## Storage and retention
 
 Local protection trades storage for fast, table-level recovery. Space usage is
 primarily:
 
-- one base image per active protected lifecycle;
+- one base image per active protected lifecycle, inside PostgreSQL
+  (`heap_v1`) or on the configured external filesystem root
+  (`external_zstd`, compressed);
 - retained WAL-derived row changes;
 - temporary peak space while a recovery is materialized.
 

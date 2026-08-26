@@ -54,6 +54,24 @@ fail closed. `track_commit_timestamp` is not required.
 pg_flashback does **not** edit `postgresql.conf` for you. Copy the lines,
 restart PostgreSQL, then continue.
 
+### Current PostgreSQL minors: `output_plugin_libraries`
+
+Current security-patched PostgreSQL minors (15.19, 16.15, 17.11, 18.6, and
+later) added an `output_plugin_libraries` allowlist GUC. Without it, real
+logical slot creation for pg_flashback's output plugin fails with `library
+"pg_flashback" may not be used as an output plugin`. If your PostgreSQL
+minor has this GUC (`SHOW output_plugin_libraries;` succeeds instead of
+erroring), add:
+
+```conf
+output_plugin_libraries = 'pg_flashback'
+```
+
+Older minors do not have this GUC at all — omit the line; do not set it to
+`*`. `pg_flashback config recommend` prints this line automatically when it
+applies to your server, and `pg_flashback doctor` reports it as an
+actionable error if the GUC exists but does not allow `pg_flashback`.
+
 ## 2. Install extension and operator role
 
 Superuser is typically required for install. Day-to-day operations should use a
@@ -142,6 +160,18 @@ pg_flashback history public.orders
 pg_flashback unprotect public.orders --yes
 pg_flashback cleanup --tracking-id <id> --yes
 ```
+
+## Optional: external SnapshotStore (`external_zstd`)
+
+The base image above was stored inside PostgreSQL (`heap_v1`, the default).
+For a supported opt-in production backend that streams the base image as a
+compressed artifact to an external filesystem root instead, set
+`pg_flashback.snapshot_storage_backend = 'external_zstd'` plus
+`pg_flashback.external_snapshot_root` (an 0700 directory outside PGDATA and
+tablespaces) and the required min-free/reserve budgets, then run
+`pg_flashback maintain public.orders --yes` to create and activate the new
+boundary. See [README.md](../README.md#snapshotstore-backends) for the full
+requirements and the online, non-blocking orchestration behind `maintain`.
 
 ## Next reading
 
