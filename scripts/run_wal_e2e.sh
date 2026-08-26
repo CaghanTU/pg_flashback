@@ -1412,7 +1412,7 @@ $PSQL -d "$DB" -qc "ALTER TABLE orders SET (autovacuum_enabled = false)" \
 # the durable stream-state check, the fail-closed guard reports either the
 # stream state or the disabled/no-active-epoch reason. Both are the required
 # invariant: no DDL may commit while the qualified WAL stream is broken.
-grep -Eq "DDL capture refused because (WAL stream|capture configuration is disabled)|capture_mode=.*is not supported" \
+grep -Eq "(DDL capture|table DDL) refused because (WAL stream|capture configuration is disabled)|capture_mode=.*is not supported" \
     /tmp/pg_flashback_mode_ddl_reject.out
 echo "  ok: broken qualified stream üzerinde DDL fail-closed"
 
