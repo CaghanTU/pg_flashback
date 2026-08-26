@@ -109,7 +109,20 @@ BEGIN
         action := 'none';
     ELSE
         status := 'error'; observed := v_output_plugin_libs; expected := 'contains pg_flashback';
-        action := 'add output_plugin_libraries = ''pg_flashback'' to postgresql.conf and restart PostgreSQL';
+        -- Merge, never replace: output_plugin_libraries is a list GUC and
+        -- may already allowlist other output plugins (decoderbufs,
+        -- wal2json, test_decoding, ...). A bare
+        -- output_plugin_libraries = 'pg_flashback' line would silently
+        -- drop every other entry (postgresql.conf is last-assignment-wins).
+        -- context=superuser: a reload is sufficient, no restart needed.
+        IF btrim(COALESCE(v_output_plugin_libs, '')) = '' THEN
+            action := 'set output_plugin_libraries = ''pg_flashback'' in postgresql.conf and reload (SELECT pg_reload_conf();)';
+        ELSE
+            action := format(
+                'add pg_flashback to the existing output_plugin_libraries list (do not replace it) in postgresql.conf, e.g. output_plugin_libraries = ''%s, pg_flashback'', and reload (SELECT pg_reload_conf();)',
+                v_output_plugin_libs
+            );
+        END IF;
     END IF;
     RETURN NEXT;
 

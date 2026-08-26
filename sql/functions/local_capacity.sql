@@ -699,6 +699,7 @@ DECLARE
     v_slot_keep text;
     v_targets text;
     v_output_plugin_applicable boolean;
+    v_output_plugin_current text;
 BEGIN
     -- Filesystem free space for the default tablespace (cluster-local estimate).
     SELECT flashback_tablespace_filesystem_available_bytes(0::oid) INTO v_fs;
@@ -759,7 +760,9 @@ BEGIN
     -- output_plugin_libraries only exists on PostgreSQL minors that carry the
     -- GUC (current security-patched minors of every supported major); missing
     -- on older minors is not-applicable, never a false recommendation.
-    v_output_plugin_applicable := current_setting('output_plugin_libraries', true) IS NOT NULL;
+    v_output_plugin_current := current_setting('output_plugin_libraries', true);
+    v_output_plugin_applicable := v_output_plugin_current IS NOT NULL
+        AND NOT (v_output_plugin_current ~ '(^|,) *pg_flashback *(,|$)');
 
     v_lines := ARRAY[
         format('shared_preload_libraries = ''pg_flashback'''),
@@ -778,7 +781,21 @@ BEGIN
     ];
 
     IF v_output_plugin_applicable THEN
-        v_lines := v_lines || ARRAY[format('output_plugin_libraries = ''pg_flashback''')];
+        -- Merge, never replace: output_plugin_libraries is a list GUC and
+        -- may already allowlist other output plugins. A bare
+        -- output_plugin_libraries = 'pg_flashback' recommendation would
+        -- silently drop every other entry (postgresql.conf/ALTER SYSTEM
+        -- are last-assignment-wins). v_output_plugin_applicable is only
+        -- true here when pg_flashback is not already present, so this
+        -- always has something to add.
+        IF btrim(COALESCE(v_output_plugin_current, '')) = '' THEN
+            v_lines := v_lines || ARRAY[format('output_plugin_libraries = ''pg_flashback''')];
+        ELSE
+            v_lines := v_lines || ARRAY[format(
+                'output_plugin_libraries = ''%s, pg_flashback''  # merged with the existing list; do not replace it',
+                v_output_plugin_current
+            )];
+        END IF;
     END IF;
 
     IF v_slot_keep IS NULL OR v_slot_keep IN ('-1', '') THEN

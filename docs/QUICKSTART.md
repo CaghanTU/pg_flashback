@@ -61,16 +61,32 @@ later) added an `output_plugin_libraries` allowlist GUC. Without it, real
 logical slot creation for pg_flashback's output plugin fails with `library
 "pg_flashback" may not be used as an output plugin`. If your PostgreSQL
 minor has this GUC (`SHOW output_plugin_libraries;` succeeds instead of
-erroring), add:
+erroring), it needs `pg_flashback` in it.
+
+`output_plugin_libraries` is a **list** GUC. If the server does not already
+allowlist any other logical output plugin, set:
 
 ```conf
 output_plugin_libraries = 'pg_flashback'
 ```
 
-Older minors do not have this GUC at all — omit the line; do not set it to
-`*`. `pg_flashback config recommend` prints this line automatically when it
-applies to your server, and `pg_flashback doctor` reports it as an
-actionable error if the GUC exists but does not allow `pg_flashback`.
+If it already allowlists others (decoderbufs, wal2json, test_decoding, a
+CDC tool, ...), **merge** `pg_flashback` into that list instead of
+replacing it — `postgresql.conf` is last-assignment-wins, so a bare
+`output_plugin_libraries = 'pg_flashback'` line added below an existing one
+silently drops every other plugin. For example, if the current value is
+`wal2json`:
+
+```conf
+output_plugin_libraries = 'wal2json, pg_flashback'
+```
+
+Older minors do not have this GUC at all — omit the line; never set it to
+`*`. `pg_flashback config recommend` reads the server's current value and
+prints the correctly merged line automatically when it applies, and
+`pg_flashback doctor` reports the same merge-aware action if the GUC exists
+but does not yet allow `pg_flashback` — prefer these over hand-editing when
+the server might already have other plugins allowlisted.
 
 ## 2. Install extension and operator role
 

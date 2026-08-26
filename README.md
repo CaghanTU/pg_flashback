@@ -75,6 +75,15 @@ See [the support matrix](docs/SUPPORT.md) for the precise contract.
 - A supported PostgreSQL server and matching development/package files
 - `wal_level = logical` (required; capture is WAL-only)
 - `shared_preload_libraries = 'pg_flashback'`
+- On current security-patched PostgreSQL minors (15.19/16.15/17.11/18.6+),
+  `pg_flashback` must be present in `output_plugin_libraries`. That GUC is
+  a **list**: if the server already allowlists other logical output
+  plugins, merge `pg_flashback` into the existing list (e.g.
+  `output_plugin_libraries = 'wal2json, pg_flashback'`) — never replace it
+  with a bare `'pg_flashback'`, which would silently drop the others. Older
+  minors do not have this GUC; leave it unset there. `pg_flashback config
+  recommend`/`doctor` read the server's current value and emit the
+  correctly merged line. See [Quickstart](docs/QUICKSTART.md#current-postgresql-minors-output_plugin_libraries).
 - An admitted capture worker and a logical replication slot per configured
   database (`pg_flashback.target_databases`)
 - Explicit capacity budgets:
