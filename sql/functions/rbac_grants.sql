@@ -261,6 +261,8 @@ COMMENT ON FUNCTION flashback_collect_schema_def(oid)
     IS '[Internal] Collect full schema definition for a table OID as JSONB. Not callable by users.';
 COMMENT ON FUNCTION flashback_build_predicate(jsonb, jsonb)
     IS '[Internal] Build a WHERE-clause predicate from a JSONB row payload.';
+COMMENT ON FUNCTION flashback_build_pk_predicate(jsonb, jsonb, text[])
+    IS '[Internal] Build an index-usable primary-key predicate from a JSONB row payload.';
 COMMENT ON FUNCTION flashback_build_insert_parts(jsonb, jsonb)
     IS '[Internal] Build column-list and values-list from a JSONB payload for INSERT.';
 COMMENT ON FUNCTION flashback_build_update_set(jsonb, jsonb, text[])

@@ -78,5 +78,42 @@ BEGIN
         )
     );
     EXECUTE format('SELECT 1 FROM pg_temp.it_payload_types WHERE %s', v_pred);
+
+    -- Scale/correctness contract: PK-backed DELETE replay must emit only the
+    -- immutable key and ordinary equality so PostgreSQL can use the already
+    -- built primary-key index.  Non-key replica-identity columns must not leak
+    -- into this predicate.
+    v_pred := flashback_build_pk_predicate(
+        v_col_meta,
+        jsonb_build_object(
+            'id', '1',
+            'meta', '{"kind":"must-not-appear"}'::text,
+            'nums', '{9,9}'::text
+        ),
+        v_pk_cols
+    );
+    IF v_pred IS NULL
+       OR v_pred NOT LIKE 'id = %'
+       OR v_pred LIKE '%meta%'
+       OR v_pred LIKE '%nums%'
+       OR v_pred LIKE '%IS NOT DISTINCT FROM%'
+    THEN
+        RAISE EXCEPTION 'PK predicate is not index-usable or contains non-key columns: %', v_pred;
+    END IF;
+    EXECUTE format('DELETE FROM pg_temp.it_payload_types WHERE %s', v_pred);
+    IF EXISTS (SELECT 1 FROM pg_temp.it_payload_types WHERE id = 1) THEN
+        RAISE EXCEPTION 'PK predicate did not identify the expected row';
+    END IF;
+
+    -- Incomplete composite-key evidence must never produce a partial DELETE
+    -- predicate.  The caller will use the correctness-first full-row fallback.
+    v_pred := flashback_build_pk_predicate(
+        v_col_meta,
+        jsonb_build_object('id', '2'),
+        ARRAY['id', 'nums']
+    );
+    IF v_pred IS NOT NULL THEN
+        RAISE EXCEPTION 'incomplete PK evidence produced a partial predicate: %', v_pred;
+    END IF;
 END;
 $tv$;

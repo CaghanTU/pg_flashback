@@ -66,6 +66,56 @@ AS $$
     WHERE col_meta ? kv.key;
 $$;
 
+-- Build an index-usable predicate from the immutable primary-key columns in
+-- one row image.  DELETE replay must not use the full replica-identity row as
+-- its normal lookup predicate: even when the shadow already has its deferred
+-- primary key, a full-row `IS NOT DISTINCT FROM` predicate forces a sequential
+-- scan for every delta event and turns replay into O(table_rows * deletes).
+-- A NULL result means the table has no usable PK evidence, so the caller must
+-- fall back to the correctness-first full-row predicate.
+CREATE OR REPLACE FUNCTION flashback_build_pk_predicate(
+    col_meta jsonb,
+    payload jsonb,
+    pk_cols text[]
+)
+RETURNS text
+LANGUAGE sql
+AS $$
+    WITH required_keys AS (
+        SELECT key, ordinality
+        FROM unnest(pk_cols) WITH ORDINALITY AS p(key, ordinality)
+    ), encoded AS (
+        SELECT
+            rk.ordinality,
+            CASE
+                WHEN payload->rk.key = 'null'::jsonb THEN
+                    format('%I IS NULL', rk.key)
+                WHEN (col_meta->rk.key->>'is_array')::boolean THEN
+                    format('%I = %L::%s', rk.key,
+                        CASE WHEN jsonb_typeof(payload->rk.key) = 'string'
+                             THEN payload->rk.key #>> '{}'
+                             ELSE translate((payload->rk.key)::text, '[]', '{}') END,
+                        col_meta->rk.key->>'type')
+                ELSE format(
+                    '%I = %L::%s',
+                    rk.key,
+                    payload->rk.key #>> '{}',
+                    col_meta->rk.key->>'type'
+                )
+            END AS predicate
+        FROM required_keys rk
+        WHERE col_meta ? rk.key
+          AND payload ? rk.key
+    )
+    SELECT CASE
+        WHEN cardinality(pk_cols) > 0
+         AND count(*) = cardinality(pk_cols)
+        THEN string_agg(predicate, ' AND ' ORDER BY ordinality)
+        ELSE NULL
+    END
+    FROM encoded;
+$$;
+
 CREATE OR REPLACE FUNCTION flashback_build_insert_parts(
     col_meta jsonb,
     payload jsonb,

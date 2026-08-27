@@ -280,14 +280,27 @@ BEGIN
                                v_cols, v_identity_override, v_vals);
             END IF;
         ELSIF rec.event_type = 'DELETE' THEN
-            v_pred := flashback_build_predicate(v_col_meta, rec.old_data);
+            -- The deferred PK is already present on the materialization table.
+            -- Prefer its unique, index-usable identity; only genuinely PK-less
+            -- tables use the full-row/ctid correctness fallback.
+            v_pred := flashback_build_pk_predicate(
+                v_col_meta, rec.old_data, v_pk_cols
+            );
             IF v_pred IS NOT NULL AND v_pred <> '' THEN
                 EXECUTE format(
-                    'DELETE FROM %I.%I WHERE (tableoid, ctid) IN '
-                    '(SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
-                    p_destination_schema, p_destination_table,
+                    'DELETE FROM %I.%I WHERE %s',
                     p_destination_schema, p_destination_table, v_pred
                 );
+            ELSE
+                v_pred := flashback_build_predicate(v_col_meta, rec.old_data);
+                IF v_pred IS NOT NULL AND v_pred <> '' THEN
+                    EXECUTE format(
+                        'DELETE FROM %I.%I WHERE (tableoid, ctid) IN '
+                        '(SELECT tableoid, ctid FROM %I.%I WHERE %s LIMIT 1)',
+                        p_destination_schema, p_destination_table,
+                        p_destination_schema, p_destination_table, v_pred
+                    );
+                END IF;
             END IF;
         ELSIF rec.event_type = 'UPDATE' THEN
             SELECT us.set_clause, us.pk_predicate
