@@ -1516,6 +1516,64 @@ assert_eq "exact restore XID row suppression marker/COMMIT'i korudu, normal XID'
     "4|1|1|2" "$SUPPRESS_RESULT"
 q "SELECT pg_drop_replication_slot('$SUPPRESS_SLOT')" > /dev/null
 
+echo "━━━ 4j. Boş metadata peek / dolu get yarışı coverage'ı kırmıyor ━━━"
+# Reproduces the production race found at 1 GiB scale: the metadata peek can
+# legitimately observe nothing while the consuming call, against the same
+# fixed upper bound, returns rows for a transaction whose COMMIT record was
+# already below that bound but became visible only afterwards. The
+# force_empty_peek failpoint makes that ordering deterministic. Consuming
+# advances the slot outside SQL rollback semantics, so the branch must
+# promote the authoritative payload; treating it as corruption used to break
+# the stream permanently under ordinary large-transaction churn.
+q "CREATE TABLE peek_race_probe (id bigint PRIMARY KEY, payload text)" > /dev/null
+q "SELECT flashback_track('peek_race_probe')" > /dev/null
+for _ in $(seq 1 200); do
+    [[ "$(q "SELECT count(*) FROM flashback.coverage_generations cg
+              JOIN flashback.tracked_tables tt USING (tracking_id)
+              WHERE tt.table_name='peek_race_probe' AND cg.state='active'")" == "1" ]] && break
+    sleep 0.1
+done
+assert_eq "peek_race_probe generation aktif" "1" \
+    "$(q "SELECT count(*) FROM flashback.coverage_generations cg
+           JOIN flashback.tracked_tables tt USING (tracking_id)
+           WHERE tt.table_name='peek_race_probe' AND cg.state='active'")"
+PEEK_RACE_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams
+                       WHERE state='active' ORDER BY epoch_no DESC LIMIT 1")
+# Well over v_empty_min_advance_bytes so the branch cannot take its
+# small-tail RETURN 0 shortcut and skip the path under test.
+q "INSERT INTO peek_race_probe
+   SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 20000) AS g" > /dev/null
+
+PEEK_RACE_RC=0
+PEEK_RACE_OUT=$(q "SET pg_flashback.test_consume_wal_failpoint = 'force_empty_peek';
+                   SELECT flashback_consume_wal(65536)" 2>&1) || PEEK_RACE_RC=$?
+[[ "$PEEK_RACE_RC" == "0" ]] || {
+    echo "FAIL: boş-peek yarışı hata verdi (rc=$PEEK_RACE_RC): $PEEK_RACE_OUT"; exit 1; }
+printf '%s' "$PEEK_RACE_OUT" | grep -q "empty metadata peek/get race" && {
+    echo "FAIL: yarış hâlâ data_corrupted olarak ele alınıyor: $PEEK_RACE_OUT"; exit 1; }
+echo "  ok: boş-peek/dolu-get yolu istisna atmadı"
+
+assert_eq "yarış sonrası capture stream hâlâ active" "active" \
+    "$(q "SELECT state FROM flashback.capture_streams WHERE stream_id=$PEEK_RACE_STREAM")"
+assert_eq "yarış sonrası stream invalidation_reason yok" "" \
+    "$(q "SELECT COALESCE(invalidation_reason,'') FROM flashback.capture_streams
+           WHERE stream_id=$PEEK_RACE_STREAM")"
+# The authoritative payload must be promoted, not silently dropped: the slot
+# advanced past these rows, so anything less is lost coverage.
+PEEK_RACE_ROWS=$(q "SELECT count(*) FROM flashback.delta_log d
+                    JOIN flashback.tracked_tables t ON t.tracking_id=d.tracking_id
+                    WHERE t.table_name='peek_race_probe' AND d.event_type='INSERT'")
+[[ "$PEEK_RACE_ROWS" -ge 20000 ]] || {
+    echo "FAIL: yarış batch'i promote edilmedi (delta_log INSERT=$PEEK_RACE_ROWS, beklenen >=20000)"; exit 1; }
+echo "  ok: yarış batch'i eksiksiz promote edildi = $PEEK_RACE_ROWS"
+assert_eq "yarış sonrası lifecycle sağlıklı" "healthy" \
+    "$(q "SELECT health FROM flashback_health() WHERE table_name='public.peek_race_probe'
+           ORDER BY generation_id DESC LIMIT 1")"
+assert_eq "yarış coverage gap açmadı" "0" \
+    "$(q "SELECT COALESCE(open_gap_count,0) FROM flashback_health()
+           WHERE table_name='public.peek_race_probe' ORDER BY generation_id DESC LIMIT 1")"
+q "SELECT flashback_unprotect('peek_race_probe')" > /dev/null 2>&1 || true
+
 echo "━━━ 5. Kapsam dışı veritabanı fail-closed ━━━"
 qp "CREATE DATABASE $UNCOV_DB" > /dev/null
 $PSQL -d "$UNCOV_DB" -qc "CREATE EXTENSION pg_flashback" -c "CREATE TABLE t (id int PRIMARY KEY)" > /dev/null

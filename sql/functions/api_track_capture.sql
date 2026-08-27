@@ -586,7 +586,6 @@ DECLARE
     v_upto_lsn pg_lsn;
     v_scan_window_bytes constant bigint := 16777216;
     v_empty_min_advance_bytes constant bigint := 65536;
-    v_discarded integer;
     pending record;
     v_gap_inserted integer;
     lock_rec record;
@@ -662,6 +661,34 @@ BEGIN
           AND cg.state IN ('building', 'capturing', 'active', 'sealed')
     ) recoverable_relations;
 
+    -- pg_logical_slot_get_changes() advances the slot outside ordinary SQL
+    -- rollback semantics.  A transaction whose COMMIT record is already
+    -- below v_upto_lsn can become visible between the metadata peek and the
+    -- consuming call.  Pin every currently active lifecycle before either
+    -- call so such a late-visible transaction can be applied safely instead
+    -- of advancing the slot and forcing a coverage gap.  The database-stream
+    -- lock held by flashback_ensure_active_wal_stream() prevents a concurrent
+    -- lifecycle enrollment from escaping this snapshot.
+    DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
+    CREATE TEMP TABLE _fb_wal_lock_ids (
+        tracking_id bigint PRIMARY KEY
+    ) ON COMMIT DROP;
+
+    INSERT INTO _fb_wal_lock_ids(tracking_id)
+    SELECT tt.tracking_id
+    FROM flashback.tracked_tables tt
+    WHERE tt.is_active
+      AND tt.recovery_profile = 'local_delta'
+    ORDER BY tt.tracking_id;
+
+    FOR lock_rec IN
+        SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
+    LOOP
+        IF NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
+            RETURN 0;
+        END IF;
+    END LOOP;
+
     -- Preflight the fixed prefix with tuple payload conversion disabled. A
     -- single transaction may decode to more than PostgreSQL's 256 MiB varlena
     -- limit, so never aggregate the peek into one JSONB value. This lightweight
@@ -718,6 +745,20 @@ BEGIN
         RAISE;
     END;
 
+    IF NULLIF(current_setting('pg_flashback.test_consume_wal_failpoint', true), '')
+         = 'force_empty_peek'
+    THEN
+        -- TEST ONLY: deterministically reproduces the real peek/get race.
+        -- In production the metadata peek can legitimately observe nothing
+        -- while the consuming call, run moments later against the same fixed
+        -- upper bound, returns rows for a transaction whose COMMIT record
+        -- was already below that bound but not yet visible. Forcing the
+        -- empty-peek branch here while rows really are pending proves that
+        -- branch promotes the authoritative payload instead of advancing the
+        -- slot past it and breaking coverage closed.
+        v_has_output := false;
+    END IF;
+
     IF NOT v_has_output THEN
         -- Avoid a self-sustaining metadata-WAL loop for tiny internal tails.
         IF pg_wal_lsn_diff(v_upto_lsn, v_scan_start_lsn)
@@ -740,27 +781,28 @@ BEGIN
             NULL
         );
 
-        SELECT count(*)::integer
-          INTO v_discarded
+        DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
+        CREATE TEMP TABLE _fb_wal_batch (
+            change_lsn pg_lsn,
+            source_xid bigint,
+            data jsonb,
+            ord bigint
+        ) ON COMMIT DROP;
+
+        -- Consume full payload, not metadata-only output.  If a transaction
+        -- becomes visible after the empty peek, every active lifecycle is
+        -- already pinned above and the authoritative payload can be promoted
+        -- without loss.  Treating that legitimate race as corruption used to
+        -- break coverage under ordinary large-transaction churn.
+        INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
+        SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
         FROM pg_logical_slot_get_changes(
-            v_slot_name, v_upto_lsn, batch_size,
-            'tracked_oids', v_tracked_oids,
-            'metadata_only', 'true',
-            'suppress_row_xids', v_suppressed_row_xids
-        );
-        IF v_discarded <> 0 THEN
-            -- A transaction can finish COMMIT between two READ COMMITTED
-            -- decoding statements while its commit record is already below
-            -- the fixed LSN bound. Logical-slot advancement performed by
-            -- get_changes is not transactional, so this exception deliberately
-            -- leaves the stream to fail closed on the next lifecycle audit. It
-            -- must never be described as a safe retry: the decoded rows were
-            -- not admitted to the trusted history.
-            RAISE EXCEPTION 'pg_flashback: empty metadata peek/get race consumed % unexpected rows; capture coverage must be re-anchored',
-                v_discarded
-                USING ERRCODE = 'data_corrupted',
-                      HINT = 'Inspect flashback_health(); re-anchor affected tables before accepting later restore targets.';
-        END IF;
+                 v_slot_name, v_upto_lsn, batch_size,
+                 'tracked_oids', v_tracked_oids,
+                 'suppress_row_xids', v_suppressed_row_xids
+             ) WITH ORDINALITY AS ch(lsn, xid, data, ord)
+        WHERE ch.data LIKE '{%'
+        ORDER BY ch.ord;
 
         -- PostgreSQL may confirm through the end of the containing WAL record,
         -- a few bytes beyond the requested upto_lsn. Record the catalog's
@@ -773,20 +815,12 @@ BEGIN
         WHERE slot_name = v_slot_name
           AND database = current_database();
 
-        PERFORM flashback_internal_advance_capture_stream_progress(
+        v_inserted := flashback_apply_decoded_wal_batch(
             v_stream_id,
-            NULL,
-            NULL,
             v_confirmed_flush_lsn,
-            v_restart_lsn,
-            jsonb_build_object(
-                'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
-                'safe_slot_advance_recorded_at', clock_timestamp()
-            ),
-            NULL
-        );
-        RETURN 0;
+            v_restart_lsn
+        )::integer;
+        RETURN v_inserted;
     END IF;
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_peek;
@@ -816,11 +850,6 @@ BEGIN
     --
     -- If any required lifecycle pin is busy, skip without get_changes so the
     -- slot does not advance past rows we are not allowed to promote yet.
-    DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
-    CREATE TEMP TABLE _fb_wal_lock_ids (
-        tracking_id bigint PRIMARY KEY
-    ) ON COMMIT DROP;
-
     INSERT INTO _fb_wal_lock_ids(tracking_id)
     SELECT DISTINCT needed.tracking_id
     FROM (
@@ -877,7 +906,8 @@ BEGIN
                 AND (p.data->>'commit')::bigint = pend.source_xid
           )
     ) needed
-    WHERE needed.tracking_id IS NOT NULL;
+    WHERE needed.tracking_id IS NOT NULL
+    ON CONFLICT (tracking_id) DO NOTHING;
 
     FOR lock_rec IN
         SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
@@ -922,32 +952,11 @@ BEGIN
     WHERE ch.data LIKE '{%'
     ORDER BY ch.ord;
 
-    -- The full pass must describe the same ordered logical records as the
-    -- lightweight preflight. Payload fields intentionally differ.
-    IF EXISTS (
-        (SELECT change_lsn, source_xid, ord,
-                data->>'op', data->>'oid', data->>'xid',
-                data->>'commit', data->>'marker'
-           FROM _fb_wal_peek
-         EXCEPT ALL
-         SELECT change_lsn, source_xid, ord,
-                data->>'op', data->>'oid', data->>'xid',
-                data->>'commit', data->>'marker'
-           FROM _fb_wal_batch)
-        UNION ALL
-        (SELECT change_lsn, source_xid, ord,
-                data->>'op', data->>'oid', data->>'xid',
-                data->>'commit', data->>'marker'
-           FROM _fb_wal_batch
-         EXCEPT ALL
-         SELECT change_lsn, source_xid, ord,
-                data->>'op', data->>'oid', data->>'xid',
-                data->>'commit', data->>'marker'
-           FROM _fb_wal_peek)
-    ) THEN
-        RAISE EXCEPTION 'pg_flashback: metadata/full prefix changed during preflight; retrying without slot advancement'
-            USING ERRCODE = 'serialization_failure';
-    END IF;
+    -- The consuming pass is authoritative.  It may legitimately contain a
+    -- transaction that became visible after the metadata peek; all active
+    -- lifecycles are pinned, so promote the complete returned batch.  The
+    -- decoder and promote core still validate row size, COMMIT evidence and
+    -- generation identity fail-closed.
 
     -- Shared promote path (also used by the pg_test injection seam).
     SELECT confirmed_flush_lsn, restart_lsn
