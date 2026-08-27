@@ -67,6 +67,7 @@ TIERS="${S10_TIERS:-$ALL_TIERS}"
 HEARTBEAT_PID=""
 WRITER_PID=""
 STARTED_PG=0
+RESUMING=0
 
 log() { printf '[step10] %s %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -175,7 +176,22 @@ if [[ -f "$RUN_MANIFEST" ]]; then
         || die "resume refused: manifest package sha $prev_pkg != candidate $EC_PACKAGE_SHA"
     [[ "$prev_run" == "$RUN_ID" ]] \
         || die "resume refused: manifest run_id $prev_run != $RUN_ID"
+    RESUMING=1
     log "resuming run $RUN_ID (identity verified)"
+    # A resumed qualification starts a fresh isolated PostgreSQL instance.
+    # Compact evidence for completed tiers is retained, while a cluster or
+    # artifact tree left by an interrupted tier is never trusted/reused.
+    if [[ -f "$DATA/postmaster.pid" ]]; then
+        stale_pid="$(head -n1 "$DATA/postmaster.pid" 2>/dev/null || true)"
+        if [[ "$stale_pid" =~ ^[0-9]+$ ]] && kill -0 "$stale_pid" 2>/dev/null; then
+            die "resume refused: prior qualification postmaster pid $stale_pid is still running"
+        fi
+    fi
+    rm -rf "$DATA" "$ARTIFACT_ROOT" "$SOCKET" "$WRITER_DIR"
+    mkdir -p "$LOG_DIR" "$EVIDENCE_DIR/tiers" "$WRITER_DIR" "$SOCKET" "$ARTIFACT_ROOT"
+    chmod 0700 "$ARTIFACT_ROOT"
+elif [[ "${S10_RESUME:-0}" == "1" ]]; then
+    die "resume requested but no run manifest exists at $RUN_MANIFEST"
 fi
 
 "$PG_BIN/initdb" -D "$DATA" --locale=C.UTF-8 -A trust >"$LOG_DIR/initdb.log" 2>&1 \
@@ -235,10 +251,10 @@ export PGUSER="$PGUSER_NAME"
 # Scale-appropriate CLI bounds. These are timeouts, never correctness
 # synchronisation: every wait below still polls durable state and fails
 # closed on expiry.
-export PG_FLASHBACK_STATEMENT_TIMEOUT_MS=10800000
-export PG_FLASHBACK_PROTECT_ONLINE_TIMEOUT_S=10800
-export PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S=7200
-export PG_FLASHBACK_DISCOVERY_TIMEOUT_S=600
+export PG_FLASHBACK_STATEMENT_TIMEOUT_MS="${PG_FLASHBACK_STATEMENT_TIMEOUT_MS:-10800000}"
+export PG_FLASHBACK_PROTECT_ONLINE_TIMEOUT_S="${PG_FLASHBACK_PROTECT_ONLINE_TIMEOUT_S:-10800}"
+export PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S="${PG_FLASHBACK_RECOVER_HEALTH_TIMEOUT_S:-7200}"
+export PG_FLASHBACK_DISCOVERY_TIMEOUT_S="${PG_FLASHBACK_DISCOVERY_TIMEOUT_S:-600}"
 export PATH="$WORK_ROOT/bin:$PG_BIN:$PATH"
 
 # Wait for admitted capture + maintenance workers on the target database.
@@ -268,12 +284,31 @@ jq -n --arg run_id "$RUN_ID" --arg commit "$EC_SOURCE_COMMIT" \
 # Heartbeat: periodic durable progress/free-space samples.
 heartbeat_loop() {
     while true; do
+        local progress
+        progress="$(s10_q "SELECT jsonb_build_object(
+            'worker', (SELECT to_jsonb(w) FROM flashback_worker_readiness() w),
+            'stream', (SELECT jsonb_build_object(
+                'stream_id',stream_id,'state',state,
+                'confirmed_flush_lsn',confirmed_flush_lsn::text,
+                'last_error',last_error)
+              FROM flashback.capture_streams
+              WHERE database_oid=(SELECT oid FROM pg_database WHERE datname=current_database())
+              ORDER BY epoch_no DESC LIMIT 1),
+            'lifecycles', COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                'tracking_id',tracking_id,'table',format('%I.%I',schema_name,table_name),
+                'active',is_active,'protection_state',protection_state)
+                ORDER BY tracking_id)
+              FROM flashback.tracked_tables
+              WHERE is_active OR protection_state IN ('starting','stopping')), '[]'::jsonb)
+        );" 2>/dev/null || echo null)"
+        jq -e . >/dev/null 2>&1 <<<"$progress" || progress=null
         jq -n --arg ts "$(date -u +%FT%TZ)" \
             --argjson free_home "$(s10_free_bytes /home)" \
             --argjson pgdata_bytes "$(s10_dir_bytes "$DATA")" \
             --argjson artifact_bytes "$(s10_dir_bytes "$ARTIFACT_ROOT")" \
+            --argjson progress "$progress" \
             '{ts:$ts, free_home_bytes:$free_home, pgdata_bytes:$pgdata_bytes,
-              artifact_root_bytes:$artifact_bytes}' >> "$HEARTBEAT_JSONL" 2>/dev/null || true
+              artifact_root_bytes:$artifact_bytes, progress:$progress}' >> "$HEARTBEAT_JSONL" 2>/dev/null || true
         sleep 30
     done
 }
@@ -533,10 +568,9 @@ writer_start() {
     : > "$lat"; : > "$commits"; : > "$rolled"
     (
         set +e
-        local i=0 seq id t0 t1
+        local i=0 id t0 t1
         while [[ ! -f "$WRITER_DIR/$tag.stop" ]]; do
             i=$(( i + 1 ))
-            seq=$i
             id=$(( base_id + i ))
             t0=$(date +%s%3N)
             if (( i % 20 == 0 )); then
@@ -554,7 +588,7 @@ SQL
                 if (( $? == 0 )); then
                     t1=$(date +%s%3N)
                     echo $(( t1 - t0 )) >> "$lat"
-                    echo "$seq $t1" >> "$commits"
+                    echo "$id $t1" >> "$commits"
                 fi
             fi
         done
@@ -785,7 +819,7 @@ run_tier() {
         log "  protect failed; see $protect_log"
         sed -n '1,40p' "$protect_log" >&2
         (( writer == 1 )) && writer_stop "$tag"
-        cleanup_tier_lifecycle "$rel" ""
+        cleanup_tier_lifecycle "$rel" "" || true
         jq -n --arg tier "$tier" --arg shape "$shape" --argjson sizes "$sizes" \
             --argjson checks "$TIER_CHECKS_JSON" --argjson failed "$TIER_FAILED" \
             --arg protect_err "$(tail -c 2000 "$protect_log" | tr -d '\000')" \
@@ -816,11 +850,14 @@ run_tier() {
         local p50 p95 p99 pmax
         p50="$(s10_percentile "$lat_file" 50)"; p95="$(s10_percentile "$lat_file" 95)"
         p99="$(s10_percentile "$lat_file" 99)"; pmax="$(s10_percentile "$lat_file" 100)"
+        local expected_writer_sha
+        expected_writer_sha="$(awk '{print $1}' "$commits_file" | LC_ALL=C sort -n | sha256sum | awk '{print $1}')"
         writer_json="$(jq -n --argjson total "$total_commits" --argjson during "$during_commits" \
             --argjson rb "$rollbacks" --argjson p50 "$p50" --argjson p95 "$p95" \
             --argjson p99 "$p99" --argjson pmax "$pmax" \
-            --argjson cs "$copy_start_ms" --argjson ce "$copy_end_ms" \
+            --argjson cs "$copy_start_ms" --argjson ce "$copy_end_ms" --arg idsha "$expected_writer_sha" \
             '{total_commits:$total, commits_during_protect:$during, rolled_back_txns:$rb,
+              expected_id_sha256:$idsha,
               latency_ms:{p50:$p50,p95:$p95,p99:$p99,max:$pmax},
               protect_window_ms:{start:$cs,end:$ce}}')"
         # A writer that never actually overlapped the copy proves nothing.
@@ -932,12 +969,25 @@ run_tier() {
     # -- cleanup + reclamation ------------------------------------------
     local t_cl0 t_cl1 cleanup_ms
     t_cl0="$(s10_now_ms)"
-    cleanup_tier_lifecycle "$rel" "$tracking_id"
+    local cleanup_rc=0
+    cleanup_tier_lifecycle "$rel" "$tracking_id" || cleanup_rc=$?
     t_cl1="$(s10_now_ms)"
     cleanup_ms=$(( t_cl1 - t_cl0 ))
     local free_after; free_after="$(s10_free_bytes /home)"
     local artifact_after; artifact_after="$(artifact_root_bytes_now)"
     log "  cleanup ${cleanup_ms}ms; artifact_root now ${artifact_after}B; free ${free_after}B"
+    local cleanup_active cleanup_payloads
+    cleanup_active="$(s10_q "SELECT count(*) FROM flashback.tracked_tables
+        WHERE tracking_id=$tracking_id AND is_active;" 2>/dev/null || echo -1)"
+    cleanup_payloads="$(s10_q "SELECT count(*) FROM flashback.snapshots
+        WHERE tracking_id=$tracking_id
+          AND payload_state IN ('creating','available','retiring');" 2>/dev/null || echo -1)"
+    chk_eq "cleanup_cli_exit_zero" "0" "$cleanup_rc"
+    chk_eq "cleanup_no_active_lifecycle" "0" "$cleanup_active"
+    chk_eq "cleanup_no_live_payload" "0" "$cleanup_payloads"
+    chk "cleanup_external_bytes_reclaimed" \
+        "$(( artifact_after <= 1048576 ? 1 : 0 ))" \
+        "artifact_root_bytes_after=$artifact_after"
 
     local status=PASS
     (( TIER_FAILED == 0 )) || status=FAIL
@@ -1097,11 +1147,17 @@ verify_after_recovery() {
 
     # writer commits exactly once; aborted work absent
     if (( writer == 1 )); then
-        local w_rows w_dupes poison_col poison
+        local w_rows w_dupes poison_col poison expected_ids_sha actual_ids_sha expected_writer_count
+        expected_writer_count="$(wc -l < "$WRITER_DIR/$tier.commits" 2>/dev/null || echo 0)"
+        expected_ids_sha="$(awk '{print $1}' "$WRITER_DIR/$tier.commits" | LC_ALL=C sort -n | sha256sum | awk '{print $1}')"
+        actual_ids_sha="$("$PSQL" -h "$SOCKET" -p "$PORT" -d "$DB_NAME" -X -qAtc \
+            "COPY (SELECT id::text FROM $rel WHERE id >= 900000000 ORDER BY id) TO STDOUT" \
+            | sha256sum | awk '{print $1}')"
         w_rows="$(s10_q "SELECT count(*) FROM $rel WHERE id >= 900000000;")"
         w_dupes="$(s10_q "SELECT COALESCE(count(*),0) FROM (SELECT id FROM $rel WHERE id >= 900000000 GROUP BY id HAVING count(*)>1) d;")"
         chk_eq "writer_rows_no_duplicates" "0" "$w_dupes"
-        chk "writer_rows_present_after_recovery" "$(( w_rows > 0 ? 1 : 0 ))" "writer_rows=$w_rows"
+        chk_eq "writer_commit_count_exact" "$expected_writer_count" "$w_rows"
+        chk_eq "writer_committed_id_set_exact" "$expected_ids_sha" "$actual_ids_sha"
         poison_col=label
         case "$shape" in toast) poison_col=incompressible ;; hybrid) poison_col=code ;; esac
         poison="$(s10_q "SELECT count(*) FROM $rel WHERE $poison_col LIKE 'rollback-poison%';" 2>/dev/null || echo 0)"
@@ -1181,7 +1237,8 @@ run_negative_capacity() {
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '8MB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '16MB';" >/dev/null
     s10_q "SELECT pg_reload_conf();" >/dev/null
-    sleep 1
+    wait_setting_value pg_flashback.local_max_snapshot_bytes 8MB 30
+    wait_setting_value pg_flashback.local_max_restore_peak_bytes 16MB 30
 
     local rc=0
     "$CLI" protect "$rel" > "$LOG_DIR/$tier-negative-protect.log" 2>&1 || rc=$?
@@ -1211,12 +1268,15 @@ run_negative_capacity() {
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '80GB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '160GB';" >/dev/null
     s10_q "SELECT pg_reload_conf();" >/dev/null
-    sleep 1
+    wait_setting_value pg_flashback.local_max_snapshot_bytes 80GB 30
+    wait_setting_value pg_flashback.local_max_restore_peak_bytes 160GB 30
     local restored
     restored="$(s10_q "SELECT current_setting('pg_flashback.local_max_snapshot_bytes');")"
     chk_eq "negative_capacity_settings_restored" "80GB" "$restored"
 
-    cleanup_tier_lifecycle "$rel" ""
+    local cleanup_rc=0
+    cleanup_tier_lifecycle "$rel" "" || cleanup_rc=$?
+    chk_eq "negative_cleanup_exit_zero" "0" "$cleanup_rc"
     local free_after; free_after="$(s10_free_bytes /home)"
     local status=PASS; (( TIER_FAILED == 0 )) || status=FAIL
     jq -n --arg tier "$tier" --arg status "$status" --argjson sizes "$sizes" \
@@ -1236,6 +1296,7 @@ run_negative_capacity() {
 # ---------------------------------------------------------------------
 cleanup_tier_lifecycle() {
     local rel=$1 tid=$2
+    local cleanup_rc=0
     set +e
     if [[ -z "$tid" ]]; then
         tid="$(s10_q "SELECT tracking_id FROM flashback.tracked_tables
@@ -1243,7 +1304,7 @@ cleanup_tier_lifecycle() {
                       ORDER BY tracking_id DESC LIMIT 1;" 2>/dev/null)"
     fi
     if [[ -n "$tid" && "$tid" != "null" ]]; then
-        "$CLI" unprotect "$rel" --yes >/dev/null 2>&1
+        "$CLI" unprotect "$rel" --yes >/dev/null 2>&1 || cleanup_rc=1
         local _
         for _ in $(seq 1 240); do
             local st
@@ -1253,13 +1314,25 @@ cleanup_tier_lifecycle() {
             s10_q "SELECT flashback_finalize_unprotect_operations();" >/dev/null 2>&1
             sleep 0.5
         done
-        "$CLI" cleanup --tracking-id "$tid" --yes >/dev/null 2>&1
+        "$CLI" cleanup --tracking-id "$tid" --yes >/dev/null 2>&1 || cleanup_rc=1
     fi
     s10_q "DROP TABLE IF EXISTS $rel CASCADE;" >/dev/null 2>&1
     s10_q "DROP TABLE IF EXISTS public.s10_parent_${rel##*.} CASCADE;" >/dev/null 2>&1
     s10_q "VACUUM;" >/dev/null 2>&1
     s10_q "CHECKPOINT;" >/dev/null 2>&1
     set -e
+    return "$cleanup_rc"
+}
+
+wait_setting_value() {
+    local name=$1 expected=$2 timeout_s=${3:-30}
+    local deadline=$(( $(date +%s) + timeout_s )) observed=""
+    while (( $(date +%s) <= deadline )); do
+        observed="$(s10_q "SELECT current_setting('$name');" 2>/dev/null || true)"
+        [[ "$observed" == "$expected" ]] && return 0
+        sleep 0.1
+    done
+    die "configuration reload did not expose $name=$expected (last=$observed)"
 }
 
 # ---------------------------------------------------------------------
@@ -1274,8 +1347,24 @@ END \$\$;" >/dev/null
 # shellcheck disable=SC2086
 qst_init $TIERS
 
+# Resume only compact PASS evidence bound by this run's verified manifest.
+# Failed/missing tiers are rerun from a fresh cluster; completed tiers are
+# never silently inferred from logs or a stale summary.
+if (( RESUMING == 1 )); then
+    for tier in $TIERS; do
+        tier_file="$EVIDENCE_DIR/tiers/$tier.json"
+        if [[ -f "$tier_file" ]] && [[ "$(jq -r '.status // ""' "$tier_file")" == "PASS" ]]; then
+            qst_mark_step "$tier" pass "resumed: existing tier evidence verified under run manifest"
+        fi
+    done
+fi
+
 OVERALL_RC=0
 for tier in $TIERS; do
+    if [[ "${QST_STEP_STATUS[$tier]:-pending}" == "pass" ]]; then
+        log "=== tier $tier: already PASS in this identity-bound run; skipping ==="
+        continue
+    fi
     qst_mark_step "$tier" running ""
     QST_CURRENT_STEP="$tier"
     if run_tier "$tier"; then
