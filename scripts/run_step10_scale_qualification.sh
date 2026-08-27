@@ -148,6 +148,14 @@ chmod 0700 "$ARTIFACT_ROOT"
 install -m 0755 "$EC_EXT_ROOT/bin/pg_flashback" "$CLI" \
     || die "packaged CLI missing under candidate extraction root"
 
+# exact_candidate_identity.sh does not expose the CLI digest; read it from
+# the manifest here and verify the packaged binary matches it, so the
+# evidence names a CLI hash that was actually executed.
+EC_CLI_BIN_SHA="$(jq -r '.artifacts.cli_binary_sha256' "$CANDIDATE_DIR/MANIFEST.json")"
+got_cli="$(exact_candidate_sha256 "$CLI")"
+[[ "$got_cli" == "$EC_CLI_BIN_SHA" ]] \
+    || die "installed CLI sha $got_cli != manifest cli_binary_sha256 $EC_CLI_BIN_SHA"
+
 log "run_id=$RUN_ID work_root=$WORK_ROOT"
 log "candidate commit=$EC_SOURCE_COMMIT pkg=$EC_PACKAGE_SHA"
 
@@ -418,8 +426,9 @@ insert_batch() {
                JOIN public.s10_chunks c ON c.cid = (g % 1024);" >/dev/null
         ;;
       rich)
-        s10_q "INSERT INTO $rel(parent_id,tenant,code,qty,payload)
-               SELECT (g % 512) + 1,
+        s10_q "INSERT INTO $rel(id,parent_id,tenant,code,qty,payload)
+               OVERRIDING SYSTEM VALUE
+               SELECT g, (g % 512) + 1,
                       't'||(g % 4), 'code-'||g, (g % 97) + 1,
                       substr(c.body, 1, 900) || '-' || g
                FROM generate_series($lo,$hi) g
@@ -609,6 +618,20 @@ wait_capture_caught_up() {
     die "$label: durable capture frontier did not reach $target within ${timeout_s}s (last lag=${lag}B)"
 }
 
+# Non-fatal variant: returns 1 instead of exiting, so a verification step
+# can record an explicit failed check rather than aborting the whole run.
+wait_lifecycle_healthy_soft() {
+    local rel=$1 timeout_s=${2:-1800}
+    local deadline=$(( $(date +%s) + timeout_s )) h
+    while (( $(date +%s) <= deadline )); do
+        h="$(s10_q "SELECT COALESCE((SELECT health FROM flashback_health()
+                      WHERE table_name='$rel' ORDER BY generation_id DESC LIMIT 1),'missing');" 2>/dev/null || true)"
+        [[ "$h" == "healthy" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
 wait_lifecycle_healthy() {
     local rel=$1 timeout_s=${2:-1800}
     local deadline=$(( $(date +%s) + timeout_s )) h
@@ -729,11 +752,21 @@ run_tier() {
     fi
 
     # -- concurrent writer over the online copy -------------------------
-    local writer_base_id=$(( 900000000 ))
+    local writer_base_id=$(( 900000000 )) wdead
     local copy_start_ms copy_end_ms
     if (( writer == 1 )); then
         writer_start "$shape" "$rel" "$tag" "$writer_base_id"
-        sleep 2   # let the writer establish a baseline commit rate before protect
+        # Deterministic warm-up: wait until the writer has actually recorded
+        # a commit, so protect never starts against an idle writer. This is a
+        # readiness poll with a deadline, not a correctness sleep -- the real
+        # overlap proof is the commit-window assertion after protect.
+        wdead=$(( $(date +%s) + 120 ))
+        while (( $(date +%s) <= wdead )); do
+            [[ -s "$WRITER_DIR/$tag.commits" ]] && break
+            sleep 0.2
+        done
+        [[ -s "$WRITER_DIR/$tag.commits" ]] \
+            || die "concurrent writer produced no commit within 120s; overlap could not be established"
     fi
 
     # -- protect (production CLI, real online external_zstd path) -------
@@ -972,11 +1005,13 @@ apply_churn() {
     esac
     t1="$(s10_now_ms)"
 
-    local upd_now del_now ins_now
+    local upd_now del_now ins_now upd_col=notes
     case "$shape" in
-      mixed|hybrid|rich) upd_now="$(s10_q "SELECT count(*) FROM $rel WHERE ${CHURN_UPD_COL:-notes} LIKE 'churn-upd-%';" 2>/dev/null || echo 0)" ;;
-      toast)             upd_now="$(s10_q "SELECT count(*) FROM $rel WHERE compressible LIKE 'churn-upd-%';")" ;;
+      toast)  upd_col=compressible ;;
+      rich)   upd_col=payload ;;
+      hybrid) upd_col=doc ;;
     esac
+    upd_now="$(s10_q "SELECT count(*) FROM $rel WHERE $upd_col LIKE 'churn-upd-%';")"
     del_now="$(s10_q "SELECT count(*) FROM $rel WHERE id BETWEEN $(( upd + 1 )) AND $(( upd + del ));")"
     ins_now="$(s10_q "SELECT count(*) FROM $rel WHERE id > $ins_base;")"
 
@@ -1101,7 +1136,7 @@ verify_after_recovery() {
     chk_eq "successor_tracking_identity_preserved" "$tracking_id" "$post_tracking"
 
     # 14-15: truthful post-recovery health, no hidden open gap
-    wait_lifecycle_healthy "$rel" 1800 || true
+    wait_lifecycle_healthy_soft "$rel" 1800 || true
     local health gaps
     health="$(s10_q "SELECT health FROM flashback_health() WHERE table_name='$rel' ORDER BY generation_id DESC LIMIT 1;")"
     gaps="$(s10_q "SELECT COALESCE(open_gap_count,0) FROM flashback_health() WHERE table_name='$rel' ORDER BY generation_id DESC LIMIT 1;")"
