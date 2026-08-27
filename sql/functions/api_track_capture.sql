@@ -579,6 +579,8 @@ DECLARE
     v_missing_commits integer;
     v_has_output boolean;
     v_tracked_oids text;
+    v_suppressed_row_xids text;
+    v_has_post_restore_boundary boolean;
     v_slot_name text;
     v_scan_start_lsn pg_lsn;
     v_upto_lsn pg_lsn;
@@ -615,10 +617,28 @@ BEGIN
         RETURN 0;
     END IF;
 
-    v_upto_lsn := LEAST(
-        pg_current_wal_insert_lsn(),
-        v_scan_start_lsn + v_scan_window_bytes
-    );
+    -- Freeze the absolute ceiling before reading lifecycle metadata.  Normal
+    -- traffic retains the bounded 16 MiB prefix below.  A visible post-restore
+    -- generation is different: its one transaction rebuilt the entire base,
+    -- so repeatedly decoding 16 MiB prefixes from the same transaction start
+    -- is quadratic.  Its exact XID is trusted state-authority data; suppress
+    -- only that transaction's reconstructed row callbacks while preserving
+    -- its transactional marker + COMMIT, and scan the fixed ceiling once.
+    v_upto_lsn := pg_current_wal_insert_lsn();
+
+    SELECT
+        COALESCE(string_agg(cg.boundary_xid::text, ',' ORDER BY cg.boundary_xid), ''),
+        count(*) > 0
+      INTO v_suppressed_row_xids, v_has_post_restore_boundary
+    FROM flashback.coverage_generations cg
+    WHERE cg.stream_id = v_stream_id
+      AND cg.state = 'building'
+      AND cg.boundary_kind = 'post_restore'
+      AND cg.boundary_xid IS NOT NULL;
+
+    IF NOT v_has_post_restore_boundary THEN
+        v_upto_lsn := LEAST(v_upto_lsn, v_scan_start_lsn + v_scan_window_bytes);
+    END IF;
     IF v_upto_lsn <= v_scan_start_lsn THEN
         RETURN 0;
     END IF;
@@ -662,7 +682,8 @@ BEGIN
             FROM pg_logical_slot_peek_changes(
                      v_slot_name, v_upto_lsn, batch_size,
                      'tracked_oids', v_tracked_oids,
-                     'metadata_only', 'true'
+                     'metadata_only', 'true',
+                     'suppress_row_xids', v_suppressed_row_xids
                  ) AS ch(lsn, xid, data)
             WHERE ch.data LIKE '{%'
         ) INTO v_has_output;
@@ -724,7 +745,8 @@ BEGIN
         FROM pg_logical_slot_get_changes(
             v_slot_name, v_upto_lsn, batch_size,
             'tracked_oids', v_tracked_oids,
-            'metadata_only', 'true'
+            'metadata_only', 'true',
+            'suppress_row_xids', v_suppressed_row_xids
         );
         IF v_discarded <> 0 THEN
             -- A transaction can finish COMMIT between two READ COMMITTED
@@ -780,7 +802,8 @@ BEGIN
     FROM pg_logical_slot_peek_changes(
              v_slot_name, v_upto_lsn, batch_size,
              'tracked_oids', v_tracked_oids,
-             'metadata_only', 'true'
+             'metadata_only', 'true',
+             'suppress_row_xids', v_suppressed_row_xids
          )
          WITH ORDINALITY AS ch(lsn, xid, data, ord)
     WHERE ch.data LIKE '{%'
@@ -892,7 +915,8 @@ BEGIN
     SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
     FROM pg_logical_slot_get_changes(
              v_slot_name, v_upto_lsn, batch_size,
-             'tracked_oids', v_tracked_oids
+             'tracked_oids', v_tracked_oids,
+             'suppress_row_xids', v_suppressed_row_xids
          )
          WITH ORDINALITY AS ch(lsn, xid, data, ord)
     WHERE ch.data LIKE '{%'

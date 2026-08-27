@@ -21,6 +21,7 @@ static EMITTED_TRANSACTIONS: OnceLock<Mutex<HashSet<TransactionId>>> = OnceLock:
 
 struct DecoderState {
     tracked_relations: HashSet<u32>,
+    suppressed_row_xids: HashSet<TransactionId>,
     metadata_only: bool,
 }
 
@@ -60,8 +61,19 @@ fn parse_tracked_oids(value: &str) -> HashSet<u32> {
         .collect()
 }
 
+fn parse_transaction_ids(value: &str) -> HashSet<TransactionId> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let xid = TransactionId::from(part.trim().parse::<u32>().ok()?);
+            (xid != pg_sys::InvalidTransactionId).then_some(xid)
+        })
+        .collect()
+}
+
 unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
     let mut tracked_relations = HashSet::new();
+    let mut suppressed_row_xids = HashSet::new();
     let mut metadata_only = false;
 
     if !options.is_null() {
@@ -84,6 +96,9 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
                 let value = unsafe { CStr::from_ptr(value_ptr) }.to_str().unwrap_or("");
                 match name {
                     "tracked_oids" => tracked_relations.extend(parse_tracked_oids(value)),
+                    "suppress_row_xids" => {
+                        suppressed_row_xids.extend(parse_transaction_ids(value));
+                    }
                     "metadata_only" => metadata_only = value == "true",
                     _ => {}
                 }
@@ -93,6 +108,7 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
 
     DecoderState {
         tracked_relations,
+        suppressed_row_xids,
         metadata_only,
     }
 }
@@ -113,6 +129,15 @@ unsafe fn metadata_only(ctx: *mut LogicalDecodingContext) -> bool {
 
     let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
     state.metadata_only
+}
+
+unsafe fn row_changes_suppressed(ctx: *mut LogicalDecodingContext, xid: TransactionId) -> bool {
+    if ctx.is_null() || unsafe { (*ctx).output_plugin_private }.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
+    state.suppressed_row_xids.contains(&xid)
 }
 
 // ─── Output Plugin Entry Point ──────────────────────────────────────
@@ -180,6 +205,18 @@ unsafe extern "C-unwind" fn fb_decode_change(
         ReorderBufferChangeType::REORDER_BUFFER_CHANGE_DELETE => "DELETE",
         _ => return,
     };
+
+    let xid = unsafe { (*txn).xid };
+    // A post-restore transaction reconstructs the new base relation and emits
+    // one transactional BOUNDARY marker.  Those reconstructed rows are
+    // already embodied in the successor snapshot; emitting millions of them
+    // again both wastes hours in logical decoding and would misrepresent base
+    // construction as application DML.  Suppress only the exact XIDs supplied
+    // by the trusted consumer.  The message callback remains enabled, so the
+    // real marker and COMMIT LSN are still emitted and independently verified.
+    if unsafe { row_changes_suppressed(ctx, xid) } {
+        return;
+    }
 
     let rel = unsafe { &*relation };
     let rd_rel = unsafe { &*rel.rd_rel };
@@ -281,7 +318,6 @@ unsafe extern "C-unwind" fn fb_decode_change(
         (old_json, new_json, len)
     };
 
-    let xid = unsafe { (*txn).xid };
     mark_transaction_emitted(xid);
 
     // pg_flashback.max_row_size's documented contract ("rows larger than this
@@ -622,8 +658,9 @@ fn json_escape_into(buf: &mut std::string::String, s: &str) {
 
 #[cfg(test)]
 mod json_format_tests {
-    use super::{json_escape_into, parse_tracked_oids, push_json_value};
+    use super::{json_escape_into, parse_tracked_oids, parse_transaction_ids, push_json_value};
     use pgrx::pg_sys;
+    use pgrx::pg_sys::TransactionId;
 
     fn escaped(s: &str) -> String {
         let mut buf = String::new();
@@ -669,5 +706,14 @@ mod json_format_tests {
         assert!(parsed.contains(&16384));
         assert!(parsed.contains(&16385));
         assert!(!parsed.contains(&0));
+    }
+
+    #[test]
+    fn suppressed_xid_option_is_strict_and_deduplicated() {
+        let parsed = parse_transaction_ids("41, 42,41,invalid,0");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&TransactionId::from(41)));
+        assert!(parsed.contains(&TransactionId::from(42)));
+        assert!(!parsed.contains(&TransactionId::from(0)));
     }
 }

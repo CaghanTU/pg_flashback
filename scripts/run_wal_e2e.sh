@@ -51,6 +51,7 @@ fi
 PSQL="$BINDIR/psql -h $SOCKDIR -p $PORT -v ON_ERROR_STOP=on"
 DB="wal_e2e"
 UNCOV_DB="wal_e2e_uncov"
+SUPPRESS_SLOT="pg_flashback_suppressed_xid_e2e"
 
 SAVED_GUCS=()
 GUCS_MODIFIED=0
@@ -183,7 +184,7 @@ cleanup() {
         restart_pg || echo "  uyarı: instance yeniden başlatılamadı — elle kontrol edin"
     fi
     qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
-        WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}')" > /dev/null 2>&1
+        WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}', '$SUPPRESS_SLOT')" > /dev/null 2>&1
     qp "DROP DATABASE IF EXISTS $DB WITH (FORCE)" > /dev/null 2>&1
     qp "DROP DATABASE IF EXISTS $UNCOV_DB WITH (FORCE)" > /dev/null 2>&1
     qp "DROP ROLE IF EXISTS wal_e2e_app" > /dev/null 2>&1
@@ -223,7 +224,7 @@ echo "━━━ 0. Ortam hazırlığı (GUC kaydet, DB + slot temizle, restart) 
 snapshot_gucs
 
 qp "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
-    WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}')" > /dev/null || true
+    WHERE slot_name IN ('pg_flashback_${DB}', 'pg_flashback_${UNCOV_DB}', '$SUPPRESS_SLOT')" > /dev/null || true
 qp "DROP DATABASE IF EXISTS $DB WITH (FORCE)" > /dev/null
 qp "DROP DATABASE IF EXISTS $UNCOV_DB WITH (FORCE)" > /dev/null
 qp "DROP ROLE IF EXISTS wal_e2e_app" > /dev/null
@@ -1479,6 +1480,41 @@ assert_eq "aborted ilk boundary yeni exact re-anchor ile kurtarıldı" "active" 
 assert_eq "yeni generation aborted tombstone'u lineage olarak korudu" "$INITIAL_ABORT_GENERATION" \
     "$(q "SELECT parent_generation_id FROM flashback.coverage_generations
            WHERE generation_id=$INITIAL_RECOVERY_GENERATION")"
+
+echo "━━━ 4i. Post-restore XID yalnız reconstructed row'ları bastırıyor ━━━"
+q "CREATE TABLE suppressed_xid_probe (id bigint PRIMARY KEY, payload text);
+   ALTER TABLE suppressed_xid_probe REPLICA IDENTITY FULL" > /dev/null
+SUPPRESS_OID=$(q "SELECT 'suppressed_xid_probe'::regclass::oid")
+q "SELECT slot_name FROM pg_create_logical_replication_slot('$SUPPRESS_SLOT', 'pg_flashback')" > /dev/null
+
+SUPPRESS_TX_OUTPUT=$(q "BEGIN;
+    SELECT txid_current();
+    INSERT INTO suppressed_xid_probe
+    SELECT g, repeat(md5(g::text), 4) FROM generate_series(1, 10000) AS g;
+    SELECT pg_logical_emit_message(true, 'pg_flashback', 'ignored-untrusted-body');
+    COMMIT")
+SUPPRESS_XID=$(printf '%s\n' "$SUPPRESS_TX_OUTPUT" | grep -E '^[0-9]+$' | head -1)
+[[ -n "$SUPPRESS_XID" ]] || { echo "FAIL: suppressed transaction XID çözülemedi"; exit 1; }
+
+# An unrelated transaction must still be decoded normally.  This proves the
+# option is exact-XID scoped rather than a broad relation/decoder bypass.
+q "INSERT INTO suppressed_xid_probe VALUES (10001, 'ordinary')" > /dev/null
+SUPPRESS_RESULT=$(q "WITH decoded AS (
+    SELECT data::jsonb AS data
+    FROM pg_logical_slot_get_changes(
+        '$SUPPRESS_SLOT', NULL, NULL,
+        'tracked_oids', '$SUPPRESS_OID',
+        'suppress_row_xids', '$SUPPRESS_XID'
+    )
+)
+SELECT count(*) || '|' ||
+       count(*) FILTER (WHERE data ? 'op') || '|' ||
+       count(*) FILTER (WHERE data ? 'marker') || '|' ||
+       count(*) FILTER (WHERE data ? 'commit')
+FROM decoded")
+assert_eq "exact restore XID row suppression marker/COMMIT'i korudu, normal XID'i korudu" \
+    "4|1|1|2" "$SUPPRESS_RESULT"
+q "SELECT pg_drop_replication_slot('$SUPPRESS_SLOT')" > /dev/null
 
 echo "━━━ 5. Kapsam dışı veritabanı fail-closed ━━━"
 qp "CREATE DATABASE $UNCOV_DB" > /dev/null
