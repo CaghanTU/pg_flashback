@@ -955,10 +955,16 @@ run_tier() {
     log "  pre-DROP: rows=$(jq -r '.row_count' <<<"$pre_fp") digest=$(jq -r '.digest' <<<"$pre_fp")"
 
     # -- immediate DROP, then recovery with no fixed sleep --------------
-    local t_drop0 t_drop1
+    local t_drop0 t_drop1 drop_rc=0
     t_drop0="$(s10_now_ms)"
-    s10_q "DROP TABLE $rel;" >/dev/null
+    s10_q "DROP TABLE $rel;" >"$LOG_DIR/$tier-drop.out" 2>"$LOG_DIR/$tier-drop.err" || drop_rc=$?
     t_drop1="$(s10_now_ms)"
+    chk_eq "drop_statement_exit_zero" "0" "$drop_rc"
+    if (( drop_rc != 0 )); then
+        sed -n '1,40p' "$LOG_DIR/$tier-drop.err" >&2
+        log "  DROP failed; refusing to poll discovery/recovery for an event that does not exist"
+        return 1
+    fi
 
     local discover_ms t_disc0 t_disc1 dryrun_rc=0
     t_disc0="$(s10_now_ms)"
