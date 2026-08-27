@@ -773,39 +773,64 @@ fn stream_cursor_to_staging(
             }
             let tupdesc = unsafe { (*tuptable).tupdesc };
             let tuples = unsafe { (*tuptable).vals };
-            for row_index in 0..processed {
-                let tuple = unsafe { *tuples.add(row_index) };
-                let mut values = Vec::with_capacity(columns.len());
-                let mut encoded_size = columns.len().div_ceil(8);
-                for (column_index, send) in sends.iter().enumerate() {
-                    let mut is_null = false;
-                    let datum = unsafe {
-                        pg_sys::SPI_getbinval(
-                            tuple,
-                            tupdesc,
-                            (column_index + 1) as i32,
-                            &mut is_null,
-                        )
-                    };
-                    if is_null {
-                        values.push(None);
-                    } else {
-                        let bytes = unsafe { encode_datum(datum, send) };
-                        encoded_size = encoded_size
-                            .checked_add(4 + bytes.len())
-                            .ok_or_else(|| "encoded row size overflow".to_string())?;
-                        if encoded_size > max_row_bytes {
-                            unsafe { pg_sys::SPI_cursor_close(portal) };
-                            return Err(format!(
-                                "encoded row exceeds pg_flashback.external_snapshot_max_row_bytes ({max_row_bytes})"
-                            ));
+            // Binary send functions (and TOAST detoasting beneath them) allocate in
+            // CurrentMemoryContext.  The SPI cursor's own tuple table is freed below,
+            // but those auxiliary allocations are not owned by the tuple table.  If
+            // encoding runs directly in SPI's long-lived procedure context, a large
+            // snapshot therefore grows the copier backend until the host is exhausted.
+            // Keep the cursor tuples in their parent context and perform only the
+            // per-batch encode/write work in a transient child context.  Deleting the
+            // child after every fetch gives memory usage a real batch-sized bound.
+            let parent = unsafe { pg_sys::CurrentMemoryContext };
+            let mut batch_context = pgrx::PgMemoryContexts::Transient {
+                parent,
+                name: "pg_flashback external snapshot encode batch",
+                min_context_size: 8 * 1024,
+                initial_block_size: 64 * 1024,
+                max_block_size: 8 * 1024 * 1024,
+            };
+            let encode_result = unsafe {
+                batch_context.switch_to(|_| -> Result<(), String> {
+                    for row_index in 0..processed {
+                        let tuple = *tuples.add(row_index);
+                        let mut values = Vec::with_capacity(columns.len());
+                        let mut encoded_size = columns.len().div_ceil(8);
+                        for (column_index, send) in sends.iter().enumerate() {
+                            let mut is_null = false;
+                            let datum = pg_sys::SPI_getbinval(
+                                tuple,
+                                tupdesc,
+                                (column_index + 1) as i32,
+                                &mut is_null,
+                            );
+                            if is_null {
+                                values.push(None);
+                            } else {
+                                let bytes = encode_datum(datum, send);
+                                encoded_size = encoded_size
+                                    .checked_add(4 + bytes.len())
+                                    .ok_or_else(|| "encoded row size overflow".to_string())?;
+                                if encoded_size > max_row_bytes {
+                                    return Err(format!(
+                                        "encoded row exceeds pg_flashback.external_snapshot_max_row_bytes ({max_row_bytes})"
+                                    ));
+                                }
+                                values.push(Some(bytes));
+                            }
                         }
-                        values.push(Some(bytes));
+                        write_row(artifact.writer()?, &values)
+                            .map_err(|e| format!("write artifact row: {e}"))?;
+                        row_count = row_count.saturating_add(1);
                     }
+                    Ok(())
+                })
+            };
+            if let Err(error) = encode_result {
+                unsafe {
+                    pg_sys::SPI_freetuptable(tuptable);
+                    pg_sys::SPI_cursor_close(portal);
                 }
-                write_row(artifact.writer()?, &values)
-                    .map_err(|e| format!("write artifact row: {e}"))?;
-                row_count = row_count.saturating_add(1);
+                return Err(error);
             }
             unsafe { pg_sys::SPI_freetuptable(tuptable) };
             if row_count == processed as u64 {

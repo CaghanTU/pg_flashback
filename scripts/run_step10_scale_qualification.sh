@@ -24,6 +24,8 @@
 #   S10_TIERS       space-separated tier ids (default: all)
 #   S10_WORK_ROOT   large-data root (default: /home/$USER/pgfb-step10)
 #   S10_RESERVE_GIB emergency free-space reserve (default: 40)
+#   S10_MAX_COPIER_RSS_BYTES fail the run before one copier can exhaust the host
+#                            (default: 2 GiB; qualification guard, not a product GUC)
 #   S10_KEEP=1      keep cluster + data after the run (debugging only)
 #   S10_RUN_ID      override run id (resume only)
 #   S10_RESUME=1    resume an existing run id whose manifest matches exactly
@@ -60,6 +62,8 @@ DB_NAME="s10db"
 SUMMARY_JSON="$EVIDENCE_DIR/summary.json"
 HEARTBEAT_JSONL="$EVIDENCE_DIR/heartbeat.jsonl"
 RUN_MANIFEST="$EVIDENCE_DIR/run-manifest.json"
+RESOURCE_GUARD_JSON="$EVIDENCE_DIR/resource-guard.json"
+MAX_COPIER_RSS_BYTES="${S10_MAX_COPIER_RSS_BYTES:-2147483648}"
 
 ALL_TIERS="t1_mixed t1_toast t1_rich t1_negative_capacity t10_mixed t10_toast t25_mixed t50_hybrid"
 TIERS="${S10_TIERS:-$ALL_TIERS}"
@@ -284,13 +288,13 @@ jq -n --arg run_id "$RUN_ID" --arg commit "$EC_SOURCE_COMMIT" \
 # Heartbeat: periodic durable progress/free-space samples.
 heartbeat_loop() {
     while true; do
-        local progress
+        local progress copier_pid copier_rss_bytes
         progress="$(s10_q "SELECT jsonb_build_object(
             'worker', (SELECT to_jsonb(w) FROM flashback_worker_readiness() w),
             'stream', (SELECT jsonb_build_object(
                 'stream_id',stream_id,'state',state,
                 'confirmed_flush_lsn',confirmed_flush_lsn::text,
-                'last_error',last_error)
+                'invalidation_reason',invalidation_reason)
               FROM flashback.capture_streams
               WHERE database_oid=(SELECT oid FROM pg_database WHERE datname=current_database())
               ORDER BY epoch_no DESC LIMIT 1),
@@ -302,14 +306,33 @@ heartbeat_loop() {
               WHERE is_active OR protection_state IN ('starting','stopping')), '[]'::jsonb)
         );" 2>/dev/null || echo null)"
         jq -e . >/dev/null 2>&1 <<<"$progress" || progress=null
-        jq -n --arg ts "$(date -u +%FT%TZ)" \
+        copier_pid="$(s10_q "SELECT pid FROM pg_stat_activity WHERE backend_type='pg_flashback external_zstd copier' ORDER BY backend_start DESC LIMIT 1;" 2>/dev/null || true)"
+        copier_rss_bytes=0
+        if [[ "$copier_pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$copier_pid/status" ]]; then
+            copier_rss_bytes="$(( $(awk '/^VmRSS:/ {print $2; exit}' "/proc/$copier_pid/status") * 1024 ))"
+        fi
+        jq -cn --arg ts "$(date -u +%FT%TZ)" \
             --argjson free_home "$(s10_free_bytes /home)" \
             --argjson pgdata_bytes "$(s10_dir_bytes "$DATA")" \
             --argjson artifact_bytes "$(s10_dir_bytes "$ARTIFACT_ROOT")" \
+            --argjson copier_pid "${copier_pid:-0}" \
+            --argjson copier_rss_bytes "$copier_rss_bytes" \
             --argjson progress "$progress" \
             '{ts:$ts, free_home_bytes:$free_home, pgdata_bytes:$pgdata_bytes,
-              artifact_root_bytes:$artifact_bytes, progress:$progress}' >> "$HEARTBEAT_JSONL" 2>/dev/null || true
-        sleep 30
+              artifact_root_bytes:$artifact_bytes, copier_pid:$copier_pid,
+              copier_rss_bytes:$copier_rss_bytes, progress:$progress}' >> "$HEARTBEAT_JSONL" 2>/dev/null || true
+        if (( copier_rss_bytes > MAX_COPIER_RSS_BYTES )); then
+            jq -cn --arg ts "$(date -u +%FT%TZ)" \
+                --argjson copier_pid "$copier_pid" \
+                --argjson copier_rss_bytes "$copier_rss_bytes" \
+                --argjson limit_bytes "$MAX_COPIER_RSS_BYTES" \
+                '{status:"FAIL",reason:"copier_rss_limit_exceeded",ts:$ts,
+                  copier_pid:$copier_pid,copier_rss_bytes:$copier_rss_bytes,
+                  limit_bytes:$limit_bytes}' > "$RESOURCE_GUARD_JSON"
+            kill -TERM "$copier_pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 5
     done
 }
 heartbeat_loop &
