@@ -202,18 +202,20 @@ SELECT jsonb_build_object(
 # ---------------------------------------------------------------------
 s10_percentile() {
     local file=$1 pct=$2
-    awk -v p="$pct" '
-        /^[0-9]+$/ { v[n++] = $1 }
+    # The selection below is unchanged; only the ordering step is.  Sorting
+    # in awk with an insertion sort is quadratic, and a 10 GiB tier's writer
+    # produces enough latency samples that the four percentile calls cost
+    # more wall-clock than the protect they measure.  sort -n is O(n log n)
+    # and yields the same ascending order, so the same index is selected.
+    grep -E '^[0-9]+$' "$file" | sort -n | awk -v p="$pct" '
+        { v[n++] = $1 }
         END {
             if (n == 0) { print 0; exit }
-            for (i = 0; i < n; i++)
-                for (j = i + 1; j < n; j++)
-                    if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
             idx = int((p / 100.0) * n + 0.9999) - 1
             if (idx < 0) idx = 0
             if (idx >= n) idx = n - 1
             print v[idx]
-        }' "$file"
+        }'
 }
 
 # ---------------------------------------------------------------------
