@@ -441,6 +441,19 @@ BEGIN
             WHEN v_stream.slot_name IS DISTINCT FROM v_slot.slot_name THEN 'replication_slot_changed'
             WHEN v_stream.plugin_name IS DISTINCT FROM v_slot.plugin THEN 'output_plugin_changed'
             WHEN v_stream.timeline_id IS DISTINCT FROM v_timeline THEN 'timeline_changed'
+            -- Logical-slot confirmed_flush_lsn is checkpoint-persisted rather
+            -- than transactionally coupled to delta_log. After an immediate
+            -- postmaster crash PostgreSQL may therefore restart the slot at an
+            -- older confirmed position while pg_flashback's already-promoted
+            -- payload and monotonic stream watermark remain durable. Replaying
+            -- that retained prefix is safe: capture_commits/delta_log promotion
+            -- is idempotent and the stream watermark never moves backward.
+            -- A catalog position ahead of our durable record remains suspicious
+            -- and is accepted only inside the explicitly persisted safe intent
+            -- handled by the following branch.
+            WHEN v_stream.confirmed_flush_lsn IS DISTINCT FROM v_slot.confirmed_flush_lsn
+                 AND v_slot.confirmed_flush_lsn < v_stream.confirmed_flush_lsn
+                THEN NULL
             WHEN v_stream.confirmed_flush_lsn IS DISTINCT FROM v_slot.confirmed_flush_lsn
                  AND v_slot.confirmed_flush_lsn >= v_stream.confirmed_flush_lsn
                  AND v_slot.confirmed_flush_lsn <= NULLIF(

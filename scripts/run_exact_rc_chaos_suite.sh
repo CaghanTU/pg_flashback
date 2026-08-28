@@ -22,6 +22,7 @@ PREFIX_INSTALLED=0
 EC_BOUND=0
 RUN_COMPLETE=0
 PASSED=0
+LOCK_HOLDER_PID=""
 declare -A FAULT
 
 log() { printf '[local-chaos] %s %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -58,6 +59,7 @@ cleanup() {
     local rc=$?
     trap - EXIT INT TERM
     set +e
+    [[ -n "$LOCK_HOLDER_PID" ]] && kill -TERM "$LOCK_HOLDER_PID" >/dev/null 2>&1
     [[ "$PRIMARY_STARTED" == 1 ]] && "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1
     [[ "$PREFIX_INSTALLED" == 1 ]] && exact_candidate_restore_prefix >/dev/null 2>&1
     write_result "$rc"
@@ -157,36 +159,59 @@ PRIMARY_STARTED=0
 PRIMARY_STARTED=1
 wait_ready || die "workers not ready after postmaster crash"
 q "INSERT INTO public.chaos_probe VALUES (4,'postmaster-restart');"
-POST_CRASH_HEALTH="$(q "SELECT health FROM flashback_health()
-                         WHERE table_name='public.chaos_probe';")"
-if [[ "$POST_CRASH_HEALTH" == healthy ]]; then
-    wait_events 4 || die "healthy stream failed to capture after postmaster crash"
-elif [[ "$POST_CRASH_HEALTH" == slot_lost ]]; then
+if ! wait_events 4; then
+    POST_CRASH_HEALTH="$(q "SELECT health FROM flashback_health()
+                             WHERE table_name='public.chaos_probe';" 2>/dev/null || true)"
     POST_CRASH_REASON="$(q "SELECT reason FROM flashback_health()
-                            WHERE table_name='public.chaos_probe';")"
-    [[ "$POST_CRASH_REASON" == replication_slot_advanced_externally ]] \
-        || die "unexpected post-crash slot-loss reason: $POST_CRASH_REASON"
-    q "SELECT flashback_reanchor('public.chaos_probe');" >/dev/null
-    for _ in $(seq 1 400); do
-        [[ "$(q "SELECT health FROM flashback_health()
-                 WHERE table_name='public.chaos_probe';")" == healthy ]] && break
-        sleep 0.05
-    done
-    [[ "$(q "SELECT health FROM flashback_health()
-             WHERE table_name='public.chaos_probe';")" == healthy ]] \
-        || die "post-crash fail-closed stream could not be re-anchored"
-    q "INSERT INTO public.chaos_probe VALUES (5,'post-crash-reanchor');"
-    wait_events 4 || die "capture failed after post-crash re-anchor"
-else
-    die "unexpected health after postmaster crash: $POST_CRASH_HEALTH"
+                             WHERE table_name='public.chaos_probe';" 2>/dev/null || true)"
+    die "capture failed after postmaster crash (health=${POST_CRASH_HEALTH:-missing}, reason=${POST_CRASH_REASON:-missing})"
 fi
+[[ "$(q "SELECT health FROM flashback_health()
+         WHERE table_name='public.chaos_probe';")" == healthy ]] \
+    || die "post-crash replay captured data but coverage is not healthy"
 pass postmaster_crash_restart
 
 SLOT="$(q "SELECT flashback_effective_slot_name();")"
+LOCK_READY="$RUN_ROOT/slot-loss-lock.ready"
+rm -f "$LOCK_READY"
+"$PG_BIN/psql" -X -h "$SOCKET" -p "$PORT" -d postgres -v ON_ERROR_STOP=1 -q <<SQL \
+    >"$RUN_ROOT/slot-loss-lock.out" 2>&1 &
+BEGIN;
+SET application_name = 'pgfb-chaos-slot-lock';
+SELECT public.flashback_internal_lock_database_stream(
+    (SELECT oid FROM pg_database WHERE datname = current_database())
+);
+\! touch "$LOCK_READY"
+SELECT pg_sleep(120);
+COMMIT;
+SQL
+LOCK_HOLDER_PID=$!
+for _ in $(seq 1 400); do
+    [[ -f "$LOCK_READY" ]] && break
+    sleep 0.05
+done
+[[ -f "$LOCK_READY" ]] || die "could not acquire database-stream lock for slot-loss injection"
+
+# Stop the current worker only after the database-stream lock is held. Its
+# replacement blocks on that lock and cannot reactivate the slot between the
+# inactive check and pg_drop_replication_slot(), eliminating the old
+# STOP-while-active harness race.
 CAPTURE_PID="$(q "SELECT flashback_capture_worker_pid();")"
-kill -STOP "$CAPTURE_PID"
+kill -TERM "$CAPTURE_PID"
+for _ in $(seq 1 400); do
+    SLOT_ACTIVE="$(q "SELECT active FROM pg_replication_slots WHERE slot_name='$SLOT';" 2>/dev/null || true)"
+    [[ "$SLOT_ACTIVE" == f ]] && break
+    sleep 0.05
+done
+[[ "${SLOT_ACTIVE:-}" == f ]] || die "capture worker did not release slot before slot-loss injection"
 q "SELECT pg_drop_replication_slot('$SLOT');"
-kill -CONT "$CAPTURE_PID" >/dev/null 2>&1 || true
+q "SELECT pg_terminate_backend(pid)
+   FROM pg_stat_activity
+   WHERE application_name='pgfb-chaos-slot-lock'
+     AND pid <> pg_backend_pid();" >/dev/null
+kill -TERM "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
+wait "$LOCK_HOLDER_PID" >/dev/null 2>&1 || true
+LOCK_HOLDER_PID=""
 for _ in $(seq 1 400); do
     HEALTH="$(q "SELECT health FROM flashback_health() WHERE table_name='public.chaos_probe';" 2>/dev/null || true)"
     [[ "$HEALTH" == slot_lost ]] && break
