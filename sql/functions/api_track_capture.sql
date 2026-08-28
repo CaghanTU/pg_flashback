@@ -592,7 +592,10 @@ DECLARE
     v_advanced_lsn pg_lsn;
     v_is_live_tail boolean := false;
     v_peek_change_limit integer;
-    v_scan_window_bytes constant bigint := 16777216;
+    v_scan_window_min_bytes constant bigint := 16777216;
+    v_scan_window_max_bytes constant bigint := 536870912;
+    v_scan_window_bytes bigint := 16777216;
+    v_backlog_bytes bigint;
     v_empty_min_advance_bytes constant bigint := 65536;
     pending record;
     v_gap_inserted integer;
@@ -701,6 +704,21 @@ BEGIN
     -- its transactional marker + COMMIT, and scan the fixed ceiling once.
     v_wal_tip_lsn := pg_current_wal_insert_lsn();
     v_upto_lsn := v_wal_tip_lsn;
+
+    -- Logical decoding always restarts from the slot's restart_lsn, so each
+    -- cycle re-reads the WAL between restart_lsn and the window it actually
+    -- wants.  Paying that catch-up once per fixed 16 MiB of progress is
+    -- quadratic in the backlog: a 10 GiB bulk load leaves ~21 GB of WAL and
+    -- drains at under 1 MB/s while reading a terabyte to do it.  Scale the
+    -- window with the backlog so the catch-up is amortised.  A backlog below
+    -- 128 MiB keeps the historical 16 MiB window exactly, so steady-state
+    -- behaviour is unchanged.  Widening is safe because an empty batch
+    -- acknowledges the whole window, while a batch that reaches batch_size
+    -- still acknowledges only through its last promoted record.
+    v_backlog_bytes := pg_wal_lsn_diff(v_wal_tip_lsn, v_scan_start_lsn)::bigint;
+    v_scan_window_bytes := GREATEST(
+        v_scan_window_min_bytes,
+        LEAST(v_scan_window_max_bytes, v_backlog_bytes / 8));
 
     SELECT
         COALESCE(string_agg(cg.boundary_xid::text, ',' ORDER BY cg.boundary_xid), ''),
