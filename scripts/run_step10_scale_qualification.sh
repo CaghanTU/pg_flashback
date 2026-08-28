@@ -791,6 +791,7 @@ run_tier() {
     log "  capacity ok: free=$(jq -r '.path_free_bytes' <<<"$cap_json") est_peak=$(jq -r '.estimated_peak_bytes' <<<"$cap_json")"
 
     local free_before; free_before="$(s10_free_bytes /home)"
+    local artifact_before; artifact_before="$(artifact_root_bytes_now)"
     ensure_chunk_pool
 
     # -- create + load --------------------------------------------------
@@ -1021,9 +1022,14 @@ run_tier() {
     chk_eq "cleanup_cli_exit_zero" "0" "$cleanup_rc"
     chk_eq "cleanup_no_active_lifecycle" "0" "$cleanup_active"
     chk_eq "cleanup_no_live_payload" "0" "$cleanup_payloads"
+    # Scoped to this tier: the artifact root is shared by every tier in the
+    # run, so an earlier tier that legitimately failed to reclaim would
+    # otherwise be re-reported as this tier's failure. Compare against the
+    # baseline captured before this tier allocated anything.
+    local artifact_delta=$(( artifact_after - artifact_before ))
     chk "cleanup_external_bytes_reclaimed" \
-        "$(( artifact_after <= 1048576 ? 1 : 0 ))" \
-        "artifact_root_bytes_after=$artifact_after"
+        "$(( artifact_delta <= 1048576 ? 1 : 0 ))" \
+        "tier_delta=${artifact_delta}B (before=${artifact_before}B after=${artifact_after}B; root is shared across tiers)"
 
     local status=PASS
     (( TIER_FAILED == 0 )) || status=FAIL
@@ -1269,10 +1275,20 @@ run_negative_capacity() {
     pre_fp="$(s10_data_fingerprint "$rel")"
     pre_rows="$(jq -r '.row_count' <<<"$pre_fp")"
 
-    # Starve the snapshot budget far below the real table size.
+    # Starve the budget this backend actually consults. external_zstd
+    # persist admission (flashback_measure_external_snapshot_capacity) reads
+    # only external_snapshot_min_free_bytes / _safety_reserve_bytes and
+    # admits when available >= projected + min_free + reserve; the local_*
+    # budgets govern the in-database heap_v1 path instead. Starving only the
+    # local ones left the operative external budget wide open, so protect
+    # was correctly admitted and this scenario proved nothing. Demand more
+    # free space than the filesystem can ever offer, and starve the local
+    # budgets too so neither path could admit.
+    s10_q "ALTER SYSTEM SET pg_flashback.external_snapshot_min_free_bytes = '900TB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '8MB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '16MB';" >/dev/null
     s10_q "SELECT pg_reload_conf();" >/dev/null
+    wait_setting_value pg_flashback.external_snapshot_min_free_bytes 900TB 30
     wait_setting_value pg_flashback.local_max_snapshot_bytes 8MB 30
     wait_setting_value pg_flashback.local_max_restore_peak_bytes 16MB 30
 
@@ -1301,14 +1317,18 @@ run_negative_capacity() {
                           FROM flashback_doctor() WHERE status <> 'ok';" 2>/dev/null || echo 'null')"
 
     # Restore the real settings for the remaining tiers.
+    s10_q "ALTER SYSTEM SET pg_flashback.external_snapshot_min_free_bytes = '2GB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_snapshot_bytes = '80GB';" >/dev/null
     s10_q "ALTER SYSTEM SET pg_flashback.local_max_restore_peak_bytes = '160GB';" >/dev/null
     s10_q "SELECT pg_reload_conf();" >/dev/null
+    wait_setting_value pg_flashback.external_snapshot_min_free_bytes 2GB 30
     wait_setting_value pg_flashback.local_max_snapshot_bytes 80GB 30
     wait_setting_value pg_flashback.local_max_restore_peak_bytes 160GB 30
-    local restored
+    local restored restored_ext
     restored="$(s10_q "SELECT current_setting('pg_flashback.local_max_snapshot_bytes');")"
+    restored_ext="$(s10_q "SELECT current_setting('pg_flashback.external_snapshot_min_free_bytes');")"
     chk_eq "negative_capacity_settings_restored" "80GB" "$restored"
+    chk_eq "negative_external_capacity_settings_restored" "2GB" "$restored_ext"
 
     local cleanup_rc=0
     cleanup_tier_lifecycle "$rel" "" || cleanup_rc=$?
