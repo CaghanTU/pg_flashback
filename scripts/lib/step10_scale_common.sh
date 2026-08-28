@@ -215,3 +215,125 @@ s10_percentile() {
             print v[idx]
         }' "$file"
 }
+
+# ---------------------------------------------------------------------
+# Constraint-rendering variance, characterized rather than normalized away.
+#
+# pg_get_constraintdef() is not round-trip stable for an IN-list over a
+# varchar column: PostgreSQL renders the array cast at array level, and a
+# rebuilt relation renders it distributed over the elements. The two are the
+# same constraint. A recovered table therefore carries a semantically
+# identical but textually different CHECK definition, and its pg_dump output
+# differs on exactly those lines.
+#
+# These helpers never assert "identical". They assert "different ONLY in that
+# characterized way", and the caller records the raw before/after so the
+# deviation stays visible in the evidence instead of being erased.
+# ---------------------------------------------------------------------
+
+# Canonical form used only for comparison. Mirrors the product's
+# flashback_canonical_constraint_def: strip cast decorations and parentheses
+# wrapping a single atom; keep identifiers, literals, operators and grouping.
+s10_canon_constraint() {
+    python3 - "$1" <<'PY'
+import re, sys
+s = sys.argv[1]
+s = re.sub(r'::\s*"[^"]+"(\[\])?', '', s)
+s = re.sub(r'::\s*[A-Za-z_][A-Za-z_0-9]*(\s+[A-Za-z_][A-Za-z_0-9]*)*(\[\])?', '', s)
+while True:
+    p = s
+    s = re.sub(r"\(\s*([A-Za-z_][A-Za-z_0-9$]*|'[^']*'|[0-9]+(\.[0-9]+)?)\s*\)", r"\1", s)
+    s = re.sub(r"\(\s*\(([^()]*)\)\s*\)", r"(\1)", s)
+    if s == p:
+        break
+print(re.sub(r'\s+', ' ', s).strip())
+PY
+}
+
+# Compares two JSON constraint arrays. Prints one of:
+#   identical
+#   equivalent:<n>            (n entries differ only by the known rendering)
+#   differ:<detail>
+s10_compare_constraints() {
+    python3 - "$1" "$2" <<'PY'
+import json, re, sys
+
+def canon(s):
+    s = re.sub(r'::\s*"[^"]+"(\[\])?', '', s or '')
+    s = re.sub(r'::\s*[A-Za-z_][A-Za-z_0-9]*(\s+[A-Za-z_][A-Za-z_0-9]*)*(\[\])?', '', s)
+    while True:
+        p = s
+        s = re.sub(r"\(\s*([A-Za-z_][A-Za-z_0-9$]*|'[^']*'|[0-9]+(\.[0-9]+)?)\s*\)", r"\1", s)
+        s = re.sub(r"\(\s*\(([^()]*)\)\s*\)", r"(\1)", s)
+        if s == p:
+            break
+    return re.sub(r'\s+', ' ', s).strip()
+
+try:
+    a = json.loads(sys.argv[1]); b = json.loads(sys.argv[2])
+except Exception as e:
+    print("differ:unparseable(%s)" % e); raise SystemExit
+
+if a == b:
+    print("identical"); raise SystemExit
+
+ka = {(c.get('name'), c.get('type')): c.get('def', '') for c in a}
+kb = {(c.get('name'), c.get('type')): c.get('def', '') for c in b}
+if set(ka) != set(kb):
+    print("differ:constraint set changed %s vs %s" % (sorted(map(str, ka)), sorted(map(str, kb))))
+    raise SystemExit
+
+soft = 0
+for k in ka:
+    if ka[k] == kb[k]:
+        continue
+    if canon(ka[k]) == canon(kb[k]):
+        soft += 1
+    else:
+        print("differ:%s expected=%r actual=%r" % (k, ka[k], kb[k]))
+        raise SystemExit
+print("equivalent:%d" % soft)
+PY
+}
+
+# Compares two pg_dump files. Prints identical / equivalent:<n> / differ:<detail>.
+# Every differing line must reduce to the same canonical form; anything else
+# is a real schema difference and fails.
+s10_compare_schema_dumps() {
+    python3 - "$1" "$2" <<'PY'
+import difflib, re, sys
+
+def canon(s):
+    s = re.sub(r'::\s*"[^"]+"(\[\])?', '', s or '')
+    s = re.sub(r'::\s*[A-Za-z_][A-Za-z_0-9]*(\s+[A-Za-z_][A-Za-z_0-9]*)*(\[\])?', '', s)
+    while True:
+        p = s
+        s = re.sub(r"\(\s*([A-Za-z_][A-Za-z_0-9$]*|'[^']*'|[0-9]+(\.[0-9]+)?)\s*\)", r"\1", s)
+        s = re.sub(r"\(\s*\(([^()]*)\)\s*\)", r"(\1)", s)
+        if s == p:
+            break
+    return re.sub(r'\s+', ' ', s).strip()
+
+A = open(sys.argv[1]).read().splitlines()
+B = open(sys.argv[2]).read().splitlines()
+if A == B:
+    print("identical"); raise SystemExit
+
+sm = difflib.SequenceMatcher(None, A, B, autojunk=False)
+soft = 0
+for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    if tag == 'equal':
+        continue
+    if tag != 'replace' or (i2 - i1) != (j2 - j1):
+        print("differ:%s block a[%d:%d]=%r b[%d:%d]=%r"
+              % (tag, i1, i2, A[i1:i2][:2], j1, j2, B[j1:j2][:2]))
+        raise SystemExit
+    for x, y in zip(A[i1:i2], B[j1:j2]):
+        if canon(x) == canon(y):
+            soft += 1
+        else:
+            print("differ:line expected=%r actual=%r" % (x, y))
+            raise SystemExit
+print("equivalent:%d" % soft)
+PY
+}

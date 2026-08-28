@@ -1209,18 +1209,48 @@ verify_after_recovery() {
     # 5: schema fingerprint
     local post_schema_sha
     post_schema_sha="$(schema_fingerprint_file "$rel" "$LOG_DIR/$tier-schema-after.sql" || echo dump_failed)"
-    chk_eq "schema_dump_sha256" "$pre_schema_sha" "$post_schema_sha"
-    if [[ "$pre_schema_sha" != "$post_schema_sha" ]]; then
+    if [[ "$pre_schema_sha" == "$post_schema_sha" ]]; then
+        chk "schema_dump_equivalent" 1 "byte-identical sha256=$post_schema_sha"
+    else
+        # A recovered relation can carry a semantically identical CHECK that
+        # PostgreSQL renders differently after the rebuild (array-level cast
+        # vs per-element cast). That is a real, characterized deviation, so
+        # it is reported explicitly rather than normalized away -- but it is
+        # not a schema difference. Any other differing line fails.
         diff -u "$LOG_DIR/$tier-schema-before.sql" "$LOG_DIR/$tier-schema-after.sql" \
             > "$LOG_DIR/$tier-schema.diff" 2>&1 || true
+        local dump_cmp
+        dump_cmp="$(s10_compare_schema_dumps "$LOG_DIR/$tier-schema-before.sql" "$LOG_DIR/$tier-schema-after.sql")"
+        case "$dump_cmp" in
+          identical|equivalent:*)
+            chk "schema_dump_equivalent" 1 \
+                "not byte-identical ($pre_schema_sha -> $post_schema_sha); $dump_cmp line(s) differ only by PostgreSQL constraint re-rendering; see $tier-schema.diff" ;;
+          *)
+            chk "schema_dump_equivalent" 0 "$dump_cmp (see $tier-schema.diff)" ;;
+        esac
     fi
 
     # 6-9: constraints/indexes/FK, owner+ACL, comments, RLS
     local post_meta; post_meta="$(s10_metadata_fingerprint "$rel")"
     local f
-    for f in owner relacl rls_enabled rls_forced policies table_comment column_comments constraints indexes columns; do
+    for f in owner relacl rls_enabled rls_forced policies table_comment column_comments indexes columns; do
         chk_eq "metadata_$f" "$(jq -cS ".$f" <<<"$pre_meta")" "$(jq -cS ".$f" <<<"$post_meta")"
     done
+    # Constraints are compared by identity (name+type set must match exactly)
+    # and by definition, allowing only the characterized PostgreSQL
+    # re-rendering; a changed value/column/operator, or a dropped or added
+    # constraint, still fails. The raw pair is recorded either way.
+    local con_cmp
+    con_cmp="$(s10_compare_constraints "$(jq -c '.constraints' <<<"$pre_meta")" "$(jq -c '.constraints' <<<"$post_meta")")"
+    case "$con_cmp" in
+      identical)
+        chk "metadata_constraints" 1 "identical" ;;
+      equivalent:*)
+        chk "metadata_constraints" 1 \
+            "$con_cmp constraint(s) differ only by PostgreSQL re-rendering; expected=$(jq -c '.constraints' <<<"$pre_meta") actual=$(jq -c '.constraints' <<<"$post_meta")" ;;
+      *)
+        chk "metadata_constraints" 0 "$con_cmp" ;;
+    esac
 
     # 10: sequence/identity next value must be past the recovered data edge
     local seqname nextv maxid
