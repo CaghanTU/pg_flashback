@@ -246,7 +246,22 @@ FP_SLOT=$(fingerprint public.adv_slot)
 q "DROP TABLE public.adv_slot;"
 wait_drop_restorable public.adv_slot || die "adv_slot DROP not restorable before slot drop"
 SLOT=$(q "SELECT flashback_effective_slot_name();")
-q "SELECT pg_drop_replication_slot('$SLOT');" >/dev/null
+# The capture worker attaches to the slot for the duration of each consume
+# cycle, so pg_drop_replication_slot legitimately reports "replication slot
+# is active" when it lands inside one. That is ordinary PostgreSQL
+# behaviour, not slot loss: retry within a deadline instead of failing the
+# scenario before it has simulated anything.
+slot_dropped=0
+for _ in $(seq 1 100); do
+    if q "SELECT pg_drop_replication_slot('$SLOT');" >/dev/null 2>/tmp/pgfb-adv-slotdrop.err; then
+        slot_dropped=1
+        break
+    fi
+    grep -q "is active for PID" /tmp/pgfb-adv-slotdrop.err \
+        || die "adv_slot: dropping slot $SLOT failed for an unexpected reason: $(cat /tmp/pgfb-adv-slotdrop.err)"
+    sleep 0.1
+done
+(( slot_dropped == 1 )) || die "adv_slot: slot $SLOT stayed active for 10s; could not simulate slot loss"
 # Force health/gap recognition
 sleep 0.5
 rc=0

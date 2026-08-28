@@ -915,13 +915,30 @@ case_after_publish_rename() {
         # early would starve promotion forever -- a real self-inflicted
         # deadlock observed in an actual run (stuck at wait_for_boundary
         # indefinitely).
-        local generation_state=""
+        # The capturing window is short -- measured at roughly 20ms on this
+        # path -- so a 100ms poll routinely misses it even though the
+        # generation really does pass through building -> capturing ->
+        # active. Missing the sample is the same benign race this case
+        # already retries for at publish-ready: treat an operation that has
+        # already run to completion as a lost sampling race and retry with a
+        # fresh instance, never as a product failure. A generation that is
+        # genuinely stuck still times out and dies below.
+        local generation_state="" next_action=""
         for _ in $(seq 1 300); do
             generation_state="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'generation_state';")"
             [[ "$generation_state" == "capturing" ]] && break
+            next_action="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'action';")"
+            [[ "$next_action" == "complete" ]] && break
             sleep 0.1
         done
-        [[ "$generation_state" == "capturing" ]] || die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state)"
+        if [[ "$generation_state" != "capturing" ]]; then
+            if [[ "$next_action" == "complete" ]]; then
+                log "[$CASE_NAME] attempt $attempt: the operation completed before the capturing window could be sampled -- retrying with a fresh instance"
+                stop_case_instance
+                continue
+            fi
+            die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state action=$next_action)"
+        fi
 
         # The instant the boundary has promoted (capturing), hold the
         # lifecycle lock -- BEFORE the artifact becomes publish-ready, not
@@ -1013,13 +1030,30 @@ case_after_snapshot_available_before_activation() {
         # from the instant the boundary promotes (capturing) -- BEFORE
         # polling for publish-ready -- so the reconciler's own non-blocking
         # try-lock can never win the race to finalize first.
-        local generation_state=""
+        # The capturing window is short -- measured at roughly 20ms on this
+        # path -- so a 100ms poll routinely misses it even though the
+        # generation really does pass through building -> capturing ->
+        # active. Missing the sample is the same benign race this case
+        # already retries for at publish-ready: treat an operation that has
+        # already run to completion as a lost sampling race and retry with a
+        # fresh instance, never as a product failure. A generation that is
+        # genuinely stuck still times out and dies below.
+        local generation_state="" next_action=""
         for _ in $(seq 1 300); do
             generation_state="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'generation_state';")"
             [[ "$generation_state" == "capturing" ]] && break
+            next_action="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'action';")"
+            [[ "$next_action" == "complete" ]] && break
             sleep 0.1
         done
-        [[ "$generation_state" == "capturing" ]] || die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state)"
+        if [[ "$generation_state" != "capturing" ]]; then
+            if [[ "$next_action" == "complete" ]]; then
+                log "[$CASE_NAME] attempt $attempt: the operation completed before the capturing window could be sampled -- retrying with a fresh instance"
+                stop_case_instance
+                continue
+            fi
+            die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state action=$next_action)"
+        fi
 
         hold_lifecycle_lock "$tracking_id" \
             || die "[$CASE_NAME] could not confirm the lifecycle advisory lock was acquired"
@@ -1091,13 +1125,30 @@ case_after_generation_activation() {
         # from the instant the boundary promotes (capturing) -- BEFORE
         # polling for publish-ready -- so the reconciler's own non-blocking
         # try-lock can never win the race to finalize first.
-        local generation_state=""
+        # The capturing window is short -- measured at roughly 20ms on this
+        # path -- so a 100ms poll routinely misses it even though the
+        # generation really does pass through building -> capturing ->
+        # active. Missing the sample is the same benign race this case
+        # already retries for at publish-ready: treat an operation that has
+        # already run to completion as a lost sampling race and retry with a
+        # fresh instance, never as a product failure. A generation that is
+        # genuinely stuck still times out and dies below.
+        local generation_state="" next_action=""
         for _ in $(seq 1 300); do
             generation_state="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'generation_state';")"
             [[ "$generation_state" == "capturing" ]] && break
+            next_action="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'action';")"
+            [[ "$next_action" == "complete" ]] && break
             sleep 0.1
         done
-        [[ "$generation_state" == "capturing" ]] || die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state)"
+        if [[ "$generation_state" != "capturing" ]]; then
+            if [[ "$next_action" == "complete" ]]; then
+                log "[$CASE_NAME] attempt $attempt: the operation completed before the capturing window could be sampled -- retrying with a fresh instance"
+                stop_case_instance
+                continue
+            fi
+            die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state action=$next_action)"
+        fi
 
         hold_lifecycle_lock "$tracking_id" \
             || die "[$CASE_NAME] could not confirm the lifecycle advisory lock was acquired"
@@ -1173,13 +1224,30 @@ case_after_lifecycle_activation_before_journal() {
         # from the instant the boundary promotes (capturing) -- BEFORE
         # polling for publish-ready -- so the reconciler's own non-blocking
         # try-lock can never win the race to finalize first.
-        local generation_state=""
+        # The capturing window is short -- measured at roughly 20ms on this
+        # path -- so a 100ms poll routinely misses it even though the
+        # generation really does pass through building -> capturing ->
+        # active. Missing the sample is the same benign race this case
+        # already retries for at publish-ready: treat an operation that has
+        # already run to completion as a lost sampling race and retry with a
+        # fresh instance, never as a product failure. A generation that is
+        # genuinely stuck still times out and dies below.
+        local generation_state="" next_action=""
         for _ in $(seq 1 300); do
             generation_state="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'generation_state';")"
             [[ "$generation_state" == "capturing" ]] && break
+            next_action="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'action';")"
+            [[ "$next_action" == "complete" ]] && break
             sleep 0.1
         done
-        [[ "$generation_state" == "capturing" ]] || die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state)"
+        if [[ "$generation_state" != "capturing" ]]; then
+            if [[ "$next_action" == "complete" ]]; then
+                log "[$CASE_NAME] attempt $attempt: the operation completed before the capturing window could be sampled -- retrying with a fresh instance"
+                stop_case_instance
+                continue
+            fi
+            die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state action=$next_action)"
+        fi
 
         hold_lifecycle_lock "$tracking_id" \
             || die "[$CASE_NAME] could not confirm the lifecycle advisory lock was acquired"
@@ -1268,13 +1336,30 @@ case_after_journal_before_commit() {
         # from the instant the boundary promotes (capturing) -- BEFORE
         # polling for publish-ready -- so the reconciler's own non-blocking
         # try-lock can never win the race to finalize first.
-        local generation_state=""
+        # The capturing window is short -- measured at roughly 20ms on this
+        # path -- so a 100ms poll routinely misses it even though the
+        # generation really does pass through building -> capturing ->
+        # active. Missing the sample is the same benign race this case
+        # already retries for at publish-ready: treat an operation that has
+        # already run to completion as a lost sampling race and retry with a
+        # fresh instance, never as a product failure. A generation that is
+        # genuinely stuck still times out and dies below.
+        local generation_state="" next_action=""
         for _ in $(seq 1 300); do
             generation_state="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'generation_state';")"
             [[ "$generation_state" == "capturing" ]] && break
+            next_action="$(psql_scalar "SELECT (flashback_protect_next_action($op_id))->>'action';")"
+            [[ "$next_action" == "complete" ]] && break
             sleep 0.1
         done
-        [[ "$generation_state" == "capturing" ]] || die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state)"
+        if [[ "$generation_state" != "capturing" ]]; then
+            if [[ "$next_action" == "complete" ]]; then
+                log "[$CASE_NAME] attempt $attempt: the operation completed before the capturing window could be sampled -- retrying with a fresh instance"
+                stop_case_instance
+                continue
+            fi
+            die "[$CASE_NAME] boundary never promoted to capturing before timeout (last generation_state=$generation_state action=$next_action)"
+        fi
 
         hold_lifecycle_lock "$tracking_id" \
             || die "[$CASE_NAME] could not confirm the lifecycle advisory lock was acquired"
