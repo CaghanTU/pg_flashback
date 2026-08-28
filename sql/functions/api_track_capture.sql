@@ -661,34 +661,6 @@ BEGIN
           AND cg.state IN ('building', 'capturing', 'active', 'sealed')
     ) recoverable_relations;
 
-    -- pg_logical_slot_get_changes() advances the slot outside ordinary SQL
-    -- rollback semantics.  A transaction whose COMMIT record is already
-    -- below v_upto_lsn can become visible between the metadata peek and the
-    -- consuming call.  Pin every currently active lifecycle before either
-    -- call so such a late-visible transaction can be applied safely instead
-    -- of advancing the slot and forcing a coverage gap.  The database-stream
-    -- lock held by flashback_ensure_active_wal_stream() prevents a concurrent
-    -- lifecycle enrollment from escaping this snapshot.
-    DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
-    CREATE TEMP TABLE _fb_wal_lock_ids (
-        tracking_id bigint PRIMARY KEY
-    ) ON COMMIT DROP;
-
-    INSERT INTO _fb_wal_lock_ids(tracking_id)
-    SELECT tt.tracking_id
-    FROM flashback.tracked_tables tt
-    WHERE tt.is_active
-      AND tt.recovery_profile = 'local_delta'
-    ORDER BY tt.tracking_id;
-
-    FOR lock_rec IN
-        SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
-    LOOP
-        IF NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
-            RETURN 0;
-        END IF;
-    END LOOP;
-
     -- Preflight the fixed prefix with tuple payload conversion disabled. A
     -- single transaction may decode to more than PostgreSQL's 256 MiB varlena
     -- limit, so never aggregate the peek into one JSONB value. This lightweight
@@ -748,16 +720,47 @@ BEGIN
     IF NULLIF(current_setting('pg_flashback.test_consume_wal_failpoint', true), '')
          = 'force_empty_peek'
     THEN
-        -- TEST ONLY: deterministically reproduces the real peek/get race.
-        -- In production the metadata peek can legitimately observe nothing
-        -- while the consuming call, run moments later against the same fixed
-        -- upper bound, returns rows for a transaction whose COMMIT record
-        -- was already below that bound but not yet visible. Forcing the
-        -- empty-peek branch here while rows really are pending proves that
-        -- branch promotes the authoritative payload instead of advancing the
-        -- slot past it and breaking coverage closed.
+        -- TEST ONLY: deterministically reproduces the peek/get race. The
+        -- metadata peek can legitimately observe nothing while the consuming
+        -- call, against the same fixed upper bound, returns rows for a
+        -- transaction whose COMMIT record was already below that bound but
+        -- became visible only afterwards.
         v_has_output := false;
     END IF;
+
+    -- The next get_changes() call advances the logical slot outside ordinary
+    -- SQL rollback semantics.  Its result can legitimately include a
+    -- transaction that was not visible to the metadata peek even though its
+    -- COMMIT record is already below v_upto_lsn.  Pin every lifecycle that
+    -- this fixed tracked-OID snapshot could affect before any consuming call;
+    -- then the consuming result is safe to treat as authoritative.
+    --
+    -- flashback_ensure_active_wal_stream() already holds the database-stream
+    -- lock, so a new lifecycle cannot enroll between this snapshot and the
+    -- consume.  Try-locks preserve the worker's non-blocking behavior: when a
+    -- lifecycle operation is in progress, return before the slot advances.
+    DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
+    CREATE TEMP TABLE _fb_wal_lock_ids (
+        tracking_id bigint PRIMARY KEY
+    ) ON COMMIT DROP;
+
+    INSERT INTO _fb_wal_lock_ids(tracking_id)
+    SELECT DISTINCT cg.tracking_id
+    FROM flashback.coverage_generations cg
+    JOIN flashback.tracked_tables tt
+      ON tt.tracking_id = cg.tracking_id
+     AND tt.recovery_profile = 'local_delta'
+    WHERE cg.stream_id = v_stream_id
+      AND cg.state IN ('building', 'capturing', 'active', 'sealed')
+    ORDER BY cg.tracking_id;
+
+    FOR lock_rec IN
+        SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
+    LOOP
+        IF NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
+            RETURN 0;
+        END IF;
+    END LOOP;
 
     IF NOT v_has_output THEN
         -- Avoid a self-sustaining metadata-WAL loop for tiny internal tails.
@@ -789,11 +792,6 @@ BEGIN
             ord bigint
         ) ON COMMIT DROP;
 
-        -- Consume full payload, not metadata-only output.  If a transaction
-        -- becomes visible after the empty peek, every active lifecycle is
-        -- already pinned above and the authoritative payload can be promoted
-        -- without loss.  Treating that legitimate race as corruption used to
-        -- break coverage under ordinary large-transaction churn.
         INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
         SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
         FROM pg_logical_slot_get_changes(
@@ -803,6 +801,24 @@ BEGIN
              ) WITH ORDINALITY AS ch(lsn, xid, data, ord)
         WHERE ch.data LIKE '{%'
         ORDER BY ch.ord;
+
+        IF EXISTS (SELECT 1 FROM _fb_wal_batch) THEN
+            -- The race really happened: promote the authoritative payload
+            -- rather than advancing the slot past rows nothing recorded.
+            SELECT confirmed_flush_lsn, restart_lsn
+              INTO v_confirmed_flush_lsn, v_restart_lsn
+            FROM pg_replication_slots
+            WHERE slot_name = v_slot_name
+              AND database = current_database();
+            v_inserted := flashback_apply_decoded_wal_batch(
+                v_stream_id, v_confirmed_flush_lsn, v_restart_lsn
+            )::integer;
+            RETURN v_inserted;
+        END IF;
+        -- Ordinary empty prefix: fall through and record only the slot
+        -- position below. Coverage watermarks must NOT advance here -- doing
+        -- so would let a lifecycle whose capture is absent still look
+        -- healthy.
 
         -- PostgreSQL may confirm through the end of the containing WAL record,
         -- a few bytes beyond the requested upto_lsn. Record the catalog's
@@ -815,12 +831,20 @@ BEGIN
         WHERE slot_name = v_slot_name
           AND database = current_database();
 
-        v_inserted := flashback_apply_decoded_wal_batch(
+        PERFORM flashback_internal_advance_capture_stream_progress(
             v_stream_id,
+            NULL,
+            NULL,
             v_confirmed_flush_lsn,
-            v_restart_lsn
-        )::integer;
-        RETURN v_inserted;
+            v_restart_lsn,
+            jsonb_build_object(
+                'safe_slot_advance_start_lsn', v_scan_start_lsn,
+                'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
+                'safe_slot_advance_recorded_at', clock_timestamp()
+            ),
+            NULL
+        );
+        RETURN 0;
     END IF;
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_peek;
@@ -843,13 +867,9 @@ BEGIN
     WHERE ch.data LIKE '{%'
     ORDER BY ch.ord;
 
-    -- Pin only lifecycles touched by this peeked batch (plus building boundary
-    -- resolutions and pending protected DDL for commits in the batch). Waiting
-    -- on every active lifecycle made an unrelated restore/maintenance hold
-    -- head-of-line block capture for other tables.
-    --
-    -- If any required lifecycle pin is busy, skip without get_changes so the
-    -- slot does not advance past rows we are not allowed to promote yet.
+    -- Retain the exact touched-lifecycle derivation as a defensive assertion
+    -- over the broader pre-consume pin set.  Every row inserted here must
+    -- already be pinned; ON CONFLICT makes the expected case a no-op.
     INSERT INTO _fb_wal_lock_ids(tracking_id)
     SELECT DISTINCT needed.tracking_id
     FROM (
@@ -952,11 +972,10 @@ BEGIN
     WHERE ch.data LIKE '{%'
     ORDER BY ch.ord;
 
-    -- The consuming pass is authoritative.  It may legitimately contain a
-    -- transaction that became visible after the metadata peek; all active
-    -- lifecycles are pinned, so promote the complete returned batch.  The
-    -- decoder and promote core still validate row size, COMMIT evidence and
-    -- generation identity fail-closed.
+    -- The consuming pass is authoritative.  It may legitimately include a
+    -- transaction that became visible after the metadata preflight.  Every
+    -- lifecycle in the fixed tracked-OID snapshot was pinned before the slot
+    -- advanced, so the complete returned batch can be promoted without loss.
 
     -- Shared promote path (also used by the pg_test injection seam).
     SELECT confirmed_flush_lsn, restart_lsn

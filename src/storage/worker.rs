@@ -915,18 +915,22 @@ fn consume_wal_changes() -> Option<i32> {
             return Ok(false);
         }
 
-        // Use a session lock so the transaction that waited for a concurrent
-        // track/re-anchor can commit before decoding starts. The next
-        // BackgroundWorker::transaction gets a fresh READ COMMITTED snapshot
-        // while this backend still owns the stream lock.
-        Spi::run(
-            "SELECT pg_advisory_lock(
+        // Use a session lock so the next BackgroundWorker::transaction gets a
+        // fresh READ COMMITTED snapshot while this backend still owns the
+        // stream lock.  Never block here: first-time tracking holds the xact
+        // form of this lock while pg_create_logical_replication_slot() waits
+        // for older transactions to finish.  Blocking inside this worker
+        // transaction would make each side wait for the other (a real
+        // deadlock).  A failed try-lock commits this short transaction and the
+        // normal worker cadence retries after the lifecycle operation commits.
+        Ok(Spi::get_one::<bool>(
+            "SELECT pg_try_advisory_lock(
                  358945::integer,
                  (SELECT oid::integer FROM pg_database
                   WHERE datname = current_database())
              )",
-        )?;
-        Ok(true)
+        )?
+        .unwrap_or(false))
     });
 
     let Ok(true) = locked else {
