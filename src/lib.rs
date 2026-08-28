@@ -263,6 +263,10 @@ mod tests {
         "../tests/sql/integration/capturing_health_doctor.sql"
     );
     sql_test!(
+        it_constraint_def_canonical_roundtrip,
+        "../tests/sql/integration/constraint_def_canonical_roundtrip.sql"
+    );
+    sql_test!(
         it_external_snapshot_activation_authority,
         "../tests/sql/integration/external_snapshot_activation_authority.sql"
     );

@@ -416,6 +416,10 @@
     "protect_reconcile_authority.sql": {
       "class": "infra",
       "reason": "SQL authority tests for the protect reconciliation projection, abort authority, and bounded reconciler (protect_reconcile.sql)"
+    },
+    "constraint_def_canonical_roundtrip.sql": {
+      "class": "supported-core",
+      "reason": "constraint definitions compare stably across a PostgreSQL re-render (IN-list over varchar round-trip)"
     }
   },
   "schema_version": 1

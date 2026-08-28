@@ -7,6 +7,56 @@
 --   flashback_fingerprint_order_spec(jsonb) -> jsonb
 --   flashback_relation_full_data_fingerprint(regclass, jsonb) -> text
 
+-- Canonical, round-trip-stable rendering of a constraint definition.
+--
+-- pg_get_constraintdef() is NOT round-trip stable for a very common shape:
+-- an IN-list over a varchar column. PostgreSQL renders the array cast at
+-- array level, and once that text is re-parsed -- which is exactly what
+-- restore does when it rebuilds the relation from schema_def -- it comes
+-- back distributed over the elements:
+--
+--   captured : ... = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])
+--   rebuilt  : ... = ANY (ARRAY[('a'::character varying)::text, ('b'::character varying)::text])
+--
+-- Both are the same constraint. Comparing the raw strings made every table
+-- carrying CHECK (col IN (...)) on a varchar column fail restore
+-- verification with "inventory digest mismatch", and therefore made such a
+-- table unrecoverable even though its data and every other attribute
+-- verified clean.
+--
+-- This normalizes only what PostgreSQL itself varies between those two
+-- renderings: cast decorations, and parentheses wrapping a single atom.
+-- Identifiers, literals, operators and real grouping are preserved, so a
+-- changed value/column/operator -- or changed precedence such as
+-- (a OR b) AND c versus a OR (b AND c) -- still compares unequal. Column
+-- type drift is caught independently by the inventory's own 'columns'
+-- section, which is still compared verbatim.
+CREATE OR REPLACE FUNCTION flashback_canonical_constraint_def(p_def text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $fn$
+DECLARE
+    s text := COALESCE(p_def, '');
+    prev text;
+BEGIN
+    IF s = '' THEN
+        RETURN '';
+    END IF;
+    s := regexp_replace(s, '::\s*"[^"]+"(\[\])?', '', 'g');
+    s := regexp_replace(s, '::\s*[A-Za-z_][A-Za-z_0-9]*(\s+[A-Za-z_][A-Za-z_0-9]*)*(\[\])?', '', 'g');
+    LOOP
+        prev := s;
+        s := regexp_replace(s,
+             '\(\s*([A-Za-z_][A-Za-z_0-9$]*|''[^'']*''|[0-9]+(\.[0-9]+)?)\s*\)', '\1', 'g');
+        s := regexp_replace(s, '\(\s*\(([^()]*)\)\s*\)', '(\1)', 'g');
+        EXIT WHEN s = prev;
+    END LOOP;
+    RETURN btrim(regexp_replace(s, '\s+', ' ', 'g'));
+END;
+$fn$;
+
 CREATE OR REPLACE FUNCTION flashback_canonical_inventory_from_schema_def(
     p_schema_def jsonb
 )
@@ -25,12 +75,14 @@ DECLARE
     v_sequences jsonb := '[]'::jsonb;
     v_elem jsonb;
 BEGIN
-    -- Constraints: full semantic definition from schema_def.
+    -- Constraints: full semantic definition from schema_def, canonicalized
+    -- so a PostgreSQL re-render of the same constraint is not read as drift.
     SELECT COALESCE(jsonb_agg(
         jsonb_build_object(
             'name', elem->>'name',
             'type', COALESCE(elem->>'type', elem->>'contype'),
-            'def', COALESCE(elem->>'def', elem->>'definition', '')
+            'def', public.flashback_canonical_constraint_def(
+                       COALESCE(elem->>'def', elem->>'definition', ''))
         )
         ORDER BY COALESCE(elem->>'name', ''), COALESCE(elem->>'type', '')
     ), '[]'::jsonb)
@@ -205,6 +257,12 @@ BEGIN
         'primary_key_constraint', COALESCE((
             SELECT jsonb_build_object(
                 'name', con.conname,
+                -- Deliberately NOT canonicalized: the schema_def side leaves
+                -- this key raw, so canonicalizing only here would introduce
+                -- the very asymmetry this fix exists to remove. A PRIMARY KEY
+                -- definition has no cast decoration to begin with, so it is
+                -- round-trip stable as emitted. The same constraint is also
+                -- carried, canonicalized on both sides, in 'constraints'.
                 'def', pg_get_constraintdef(con.oid, true)
             )
             FROM pg_constraint con
@@ -245,7 +303,7 @@ BEGIN
                 jsonb_build_object(
                     'name', con.conname,
                     'type', con.contype::text,
-                    'def', pg_get_constraintdef(con.oid, true)
+                    'def', public.flashback_canonical_constraint_def(pg_get_constraintdef(con.oid, true))
                 )
                 ORDER BY con.conname, con.contype::text
             )
