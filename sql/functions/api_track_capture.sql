@@ -586,6 +586,10 @@ DECLARE
     v_upto_lsn pg_lsn;
     v_wal_tip_lsn pg_lsn;
     v_scan_barrier_lsn pg_lsn;
+    v_pending_advance_start_lsn pg_lsn;
+    v_pending_advance_upto_lsn pg_lsn;
+    v_safe_advance_upto_lsn pg_lsn;
+    v_advanced_lsn pg_lsn;
     v_is_live_tail boolean := false;
     v_peek_change_limit integer;
     v_scan_window_bytes constant bigint := 16777216;
@@ -601,6 +605,74 @@ BEGIN
 
     v_stream_id := flashback_ensure_active_wal_stream();
     IF v_stream_id IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    -- Slot advancement is deliberately one committed cycle behind payload
+    -- promotion. pg_logical_slot_get_changes()/slot advancement survives an
+    -- SQL rollback and even an immediate postmaster crash, while delta_log
+    -- writes do not. The previous single-transaction design could therefore
+    -- lose an already-consumed batch and then misclassify its own slot move as
+    -- external. A durable safe-slot intent means every byte acknowledged here
+    -- was fully peeked and promoted by the previous committed call.
+    SELECT
+        NULLIF(details->>'safe_slot_advance_start_lsn', '')::pg_lsn,
+        NULLIF(details->>'safe_slot_advance_upto_lsn', '')::pg_lsn
+      INTO v_pending_advance_start_lsn, v_pending_advance_upto_lsn
+    FROM flashback.capture_streams
+    WHERE stream_id = v_stream_id;
+
+    IF v_pending_advance_start_lsn IS NOT NULL
+       AND v_pending_advance_upto_lsn IS NOT NULL
+    THEN
+        v_slot_name := flashback_effective_slot_name();
+        SELECT a.end_lsn
+          INTO v_advanced_lsn
+        FROM pg_replication_slot_advance(
+                 v_slot_name,
+                 v_pending_advance_upto_lsn
+             ) AS a;
+
+        IF NULLIF(current_setting('pg_flashback.test_consume_wal_failpoint', true), '')
+             = 'after_durable_payload_slot_advance'
+        THEN
+            -- TEST ONLY: the slot move above survives this transaction abort;
+            -- the durable intent and payload from the previous call must let
+            -- the next call finish without a gap or a duplicate.
+            RAISE EXCEPTION 'pg_flashback: test crash after durable payload slot advance'
+                USING ERRCODE = 'query_canceled';
+        END IF;
+
+        SELECT confirmed_flush_lsn, restart_lsn
+          INTO v_confirmed_flush_lsn, v_restart_lsn
+        FROM pg_replication_slots
+        WHERE slot_name = v_slot_name
+          AND database = current_database();
+
+        IF v_confirmed_flush_lsn < v_pending_advance_start_lsn
+           OR v_confirmed_flush_lsn > v_pending_advance_upto_lsn
+        THEN
+            RAISE EXCEPTION
+                'pg_flashback: slot acknowledgement % escaped durable safe range [%..%]',
+                v_confirmed_flush_lsn,
+                v_pending_advance_start_lsn,
+                v_pending_advance_upto_lsn
+                USING ERRCODE = 'data_exception';
+        END IF;
+
+        PERFORM flashback_internal_advance_capture_stream_progress(
+            v_stream_id,
+            NULL,
+            NULL,
+            v_confirmed_flush_lsn,
+            v_restart_lsn,
+            NULL,
+            ARRAY[
+                'safe_slot_advance_start_lsn',
+                'safe_slot_advance_upto_lsn',
+                'safe_slot_advance_recorded_at'
+            ]
+        );
         RETURN 0;
     END IF;
 
@@ -797,20 +869,6 @@ BEGIN
     ) ON COMMIT DROP;
 
     IF NOT v_has_output THEN
-        PERFORM flashback_internal_advance_capture_stream_progress(
-            v_stream_id,
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-            jsonb_build_object(
-                'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                'safe_slot_advance_upto_lsn', v_upto_lsn,
-                'safe_slot_advance_recorded_at', clock_timestamp()
-            ),
-            NULL
-        );
-
         DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
         CREATE TEMP TABLE _fb_wal_batch (
             change_lsn pg_lsn,
@@ -821,7 +879,7 @@ BEGIN
 
         INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
         SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
-        FROM pg_logical_slot_get_changes(
+        FROM pg_logical_slot_peek_changes(
                  v_slot_name, v_upto_lsn, batch_size,
                  'tracked_oids', v_tracked_oids,
                  'suppress_row_xids', v_suppressed_row_xids,
@@ -836,48 +894,30 @@ BEGIN
         ORDER BY ch.ord;
 
         IF EXISTS (SELECT 1 FROM _fb_wal_batch) THEN
-            -- The race really happened: promote the authoritative payload
-            -- rather than advancing the slot past rows nothing recorded.
-            SELECT confirmed_flush_lsn, restart_lsn
-              INTO v_confirmed_flush_lsn, v_restart_lsn
-            FROM pg_replication_slots
-            WHERE slot_name = v_slot_name
-              AND database = current_database();
+            -- The race really happened: promote the authoritative peeked
+            -- payload before any later call is allowed to acknowledge it.
             v_inserted := flashback_apply_decoded_wal_batch(
-                v_stream_id, v_confirmed_flush_lsn, v_restart_lsn
+                v_stream_id, v_scan_start_lsn, NULL
             )::integer;
-            RETURN v_inserted;
         END IF;
-        -- Ordinary empty prefix: fall through and record only the slot
-        -- position below. Coverage watermarks must NOT advance here -- doing
-        -- so would let a lifecycle whose capture is absent still look
-        -- healthy.
 
-        -- PostgreSQL may confirm through the end of the containing WAL record,
-        -- a few bytes beyond the requested upto_lsn. Record the catalog's
-        -- actual post-consume position in the same successful call; otherwise
-        -- the next lifecycle audit mistakes our own bounded empty-prefix
-        -- advancement for an external slot move and creates a false gap.
-        SELECT confirmed_flush_lsn, restart_lsn
-          INTO v_confirmed_flush_lsn, v_restart_lsn
-        FROM pg_replication_slots
-        WHERE slot_name = v_slot_name
-          AND database = current_database();
-
+        -- Empty filtered prefixes also need a durable receipt before the slot
+        -- can move. Coverage watermarks must not advance: only the physical
+        -- slot position is eligible for acknowledgement on the next call.
         PERFORM flashback_internal_advance_capture_stream_progress(
             v_stream_id,
             NULL,
             NULL,
-            v_confirmed_flush_lsn,
-            v_restart_lsn,
+            NULL,
+            NULL,
             jsonb_build_object(
                 'safe_slot_advance_start_lsn', v_scan_start_lsn,
-                'safe_slot_advance_upto_lsn', v_confirmed_flush_lsn,
+                'safe_slot_advance_upto_lsn', v_upto_lsn,
                 'safe_slot_advance_recorded_at', clock_timestamp()
             ),
             NULL
         );
-        RETURN 0;
+        RETURN v_inserted;
     END IF;
 
     DROP TABLE IF EXISTS pg_temp._fb_wal_peek;
@@ -974,22 +1014,6 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- The required locks are now pinned. Record this consumer's exact safe
-    -- advancement and fetch the full payload in the same transaction.
-    PERFORM flashback_internal_advance_capture_stream_progress(
-        v_stream_id,
-        NULL,
-        NULL,
-        NULL,
-        NULL,
-        jsonb_build_object(
-            'safe_slot_advance_start_lsn', v_scan_start_lsn,
-            'safe_slot_advance_upto_lsn', v_upto_lsn,
-            'safe_slot_advance_recorded_at', clock_timestamp()
-        ),
-        NULL
-    );
-
     DROP TABLE IF EXISTS pg_temp._fb_wal_batch;
     CREATE TEMP TABLE _fb_wal_batch (
         change_lsn pg_lsn,
@@ -1000,8 +1024,8 @@ BEGIN
 
     INSERT INTO _fb_wal_batch(change_lsn, source_xid, data, ord)
     SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
-    FROM pg_logical_slot_get_changes(
-             v_slot_name, v_upto_lsn, batch_size,
+    FROM pg_logical_slot_peek_changes(
+             v_slot_name, v_upto_lsn, v_peek_change_limit,
              'tracked_oids', v_tracked_oids,
              'suppress_row_xids', v_suppressed_row_xids,
              'emit_scan_barrier', 'true'
@@ -1015,23 +1039,44 @@ BEGIN
       AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
     ORDER BY ch.ord;
 
-    -- The consuming pass is authoritative. Historical prefixes cannot gain a
-    -- new earlier COMMIT; live-tail prefixes were stabilized by the decoded
-    -- barrier. Therefore the full result cannot introduce an unpinned
-    -- lifecycle after the slot advances.
+    -- The full peek is authoritative. Historical prefixes cannot gain a new
+    -- earlier COMMIT; live-tail prefixes were stabilized by the decoded
+    -- barrier. Payload is made durable now, before any future call can move
+    -- the logical slot.
 
     -- Shared promote path (also used by the pg_test injection seam).
-    SELECT confirmed_flush_lsn, restart_lsn
-      INTO v_confirmed_flush_lsn, v_restart_lsn
-    FROM pg_replication_slots
-    WHERE slot_name = v_slot_name
-      AND database = current_database();
-
     v_inserted := flashback_apply_decoded_wal_batch(
         v_stream_id,
-        v_confirmed_flush_lsn,
-        v_restart_lsn
+        v_scan_start_lsn,
+        NULL
     )::integer;
+
+    -- A live-tail full peek reaches the barrier and therefore covers the whole
+    -- fixed prefix. A historical peek is batch-limited, so acknowledge only
+    -- through the last output record actually promoted.
+    IF v_is_live_tail THEN
+        v_safe_advance_upto_lsn := v_upto_lsn;
+    ELSE
+        SELECT max(change_lsn) INTO v_safe_advance_upto_lsn
+        FROM _fb_wal_batch;
+    END IF;
+    IF v_safe_advance_upto_lsn IS NULL THEN
+        v_safe_advance_upto_lsn := v_upto_lsn;
+    END IF;
+
+    PERFORM flashback_internal_advance_capture_stream_progress(
+        v_stream_id,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        jsonb_build_object(
+            'safe_slot_advance_start_lsn', v_scan_start_lsn,
+            'safe_slot_advance_upto_lsn', v_safe_advance_upto_lsn,
+            'safe_slot_advance_recorded_at', clock_timestamp()
+        ),
+        NULL
+    );
 
     RETURN v_inserted;
 END;
