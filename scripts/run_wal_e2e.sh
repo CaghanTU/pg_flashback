@@ -689,11 +689,16 @@ assert_eq "reddedilen restore canlı tabloyu değiştirmedi" "501" \
 kill -CONT "$STOPPED_WORKER_PID"
 STOPPED_WORKER_PID=""
 for _ in $(seq 1 200); do
-    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")" == "1" ]] && break
+    [[ "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")" == "1" \
+       && "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+                    FROM flashback.capture_streams WHERE state='active'")" == "t" ]] && break
     sleep 0.05
 done
 assert_eq "worker retry öncesi buffered eski-OID WAL'ı tüketti" "1" \
     "$(q "SELECT count(*) FROM flashback.delta_log WHERE source_xid=$BUFFERED_OLD_OID_XID")"
+assert_eq "worker retry öncesi durable slot acknowledgement tamamlandı" "t" \
+    "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+           FROM flashback.capture_streams WHERE state='active'")"
 
 q "SELECT flashback_restore_lsn(
        ARRAY['orders', '\"we\"\"ird\"'], '$RESOLVED_LSN'
@@ -1539,6 +1544,16 @@ assert_eq "peek_race_probe generation aktif" "1" \
            WHERE tt.table_name='peek_race_probe' AND cg.state='active'")"
 PEEK_RACE_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams
                        WHERE state='active' ORDER BY epoch_no DESC LIMIT 1")
+STOPPED_WORKER_PID="$(stop_idle_worker)" || {
+    echo "FAIL: peek/ack yarış testleri için idle capture worker durdurulamadı"; exit 1; }
+for _ in $(seq 1 20); do
+    [[ "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+               FROM flashback.capture_streams WHERE stream_id=$PEEK_RACE_STREAM")" == "t" ]] && break
+    q "SELECT flashback_consume_wal(65536)" > /dev/null
+done
+assert_eq "peek yarışı öncesi eski safe intent temiz" "t" \
+    "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+           FROM flashback.capture_streams WHERE stream_id=$PEEK_RACE_STREAM")"
 # Well over v_empty_min_advance_bytes so the branch cannot take its
 # small-tail RETURN 0 shortcut and skip the path under test.
 q "INSERT INTO peek_race_probe
@@ -1572,6 +1587,72 @@ assert_eq "yarış sonrası lifecycle sağlıklı" "healthy" \
 assert_eq "yarış coverage gap açmadı" "0" \
     "$(q "SELECT COALESCE(open_gap_count,0) FROM flashback_health()
            WHERE table_name='public.peek_race_probe' ORDER BY generation_id DESC LIMIT 1")"
+
+echo "━━━ 4k. Durable payload / slot acknowledgement crash tekrar-okuması güvenli ━━━"
+# Freeze an idle worker without leaving an advisory lock behind, then exercise
+# the two committed phases directly. The first consume call must persist the
+# decoded row and a safe acknowledgement intent without moving the slot. The
+# failpoint aborts the second SQL transaction after PostgreSQL has moved the
+# slot (that move survives rollback). A third call must reconcile the durable
+# intent, remain healthy and never duplicate the already-promoted row.
+[[ -n "$STOPPED_WORKER_PID" ]] || {
+    echo "FAIL: durable-ack testine girerken capture worker durmuş değil"; exit 1; }
+REPLAY_STREAM=$(q "SELECT stream_id FROM flashback.capture_streams
+                    WHERE state='active' ORDER BY epoch_no DESC LIMIT 1")
+for _ in $(seq 1 20); do
+    [[ "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+               FROM flashback.capture_streams WHERE stream_id=$REPLAY_STREAM")" == "t" ]] && break
+    q "SELECT flashback_consume_wal(65536)" > /dev/null
+done
+assert_eq "durable-ack başlangıcında bekleyen intent yok" "t" \
+    "$(q "SELECT NOT (details ? 'safe_slot_advance_upto_lsn')
+           FROM flashback.capture_streams WHERE stream_id=$REPLAY_STREAM")"
+
+q "INSERT INTO peek_race_probe VALUES (30001, 'durable-ack-crash')" > /dev/null
+REPLAY_SLOT_BEFORE=$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
+                         WHERE slot_name='pg_flashback_${DB}'")
+q "SELECT flashback_consume_wal(65536)" > /dev/null
+assert_eq "ilk faz decoded payload'ı durable yazdı" "1" \
+    "$(q "SELECT count(*) FROM flashback.delta_log d
+           JOIN flashback.tracked_tables t USING (tracking_id)
+           WHERE t.table_name='peek_race_probe'
+             AND d.event_type='INSERT'
+             AND d.new_data->>'id'='30001'")"
+assert_eq "ilk faz safe slot intent yazdı" "t" \
+    "$(q "SELECT details ? 'safe_slot_advance_upto_lsn'
+           FROM flashback.capture_streams WHERE stream_id=$REPLAY_STREAM")"
+assert_eq "ilk faz slotu henüz ilerletmedi" "$REPLAY_SLOT_BEFORE" \
+    "$(q "SELECT confirmed_flush_lsn FROM pg_replication_slots
+           WHERE slot_name='pg_flashback_${DB}'")"
+
+REPLAY_FAIL_RC=0
+$PSQL -d "$DB" -qc \
+    "SET pg_flashback.test_consume_wal_failpoint='after_durable_payload_slot_advance';
+     SELECT flashback_consume_wal(65536);" \
+    >/tmp/pg_flashback_durable_ack_failpoint.out 2>&1 || REPLAY_FAIL_RC=$?
+[[ "$REPLAY_FAIL_RC" != "0" ]] || {
+    echo "FAIL: durable-ack failpoint slot advance sonrası transaction'ı abort etmedi"; exit 1; }
+grep -q "test crash after durable payload slot advance" \
+    /tmp/pg_flashback_durable_ack_failpoint.out
+
+q "SELECT flashback_consume_wal(65536)" > /dev/null
+assert_eq "crash-retry safe intent'i temizledi" "f" \
+    "$(q "SELECT details ? 'safe_slot_advance_upto_lsn'
+           FROM flashback.capture_streams WHERE stream_id=$REPLAY_STREAM")"
+assert_eq "crash-retry decoded row'u çoğaltmadı" "1" \
+    "$(q "SELECT count(*) FROM flashback.delta_log d
+           JOIN flashback.tracked_tables t USING (tracking_id)
+           WHERE t.table_name='peek_race_probe'
+             AND d.event_type='INSERT'
+             AND d.new_data->>'id'='30001'")"
+assert_eq "crash-retry stream'i active tuttu" "active" \
+    "$(q "SELECT state FROM flashback.capture_streams WHERE stream_id=$REPLAY_STREAM")"
+assert_eq "crash-retry coverage gap açmadı" "0" \
+    "$(q "SELECT COALESCE(open_gap_count,0) FROM flashback_health()
+           WHERE table_name='public.peek_race_probe' ORDER BY generation_id DESC LIMIT 1")"
+kill -CONT "$STOPPED_WORKER_PID" > /dev/null 2>&1 || true
+STOPPED_WORKER_PID=""
+
 q "SELECT flashback_unprotect('peek_race_probe')" > /dev/null 2>&1 || true
 
 echo "━━━ 5. Kapsam dışı veritabanı fail-closed ━━━"
