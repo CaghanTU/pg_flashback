@@ -23,6 +23,17 @@ struct DecoderState {
     tracked_relations: HashSet<u32>,
     suppressed_row_xids: HashSet<TransactionId>,
     metadata_only: bool,
+    /// Emit the flashback_consume_wal scan barrier as a decoded record.
+    ///
+    /// Off by default, and deliberately opt-in per consumer. The barrier is a
+    /// synchronisation marker, not relation data, and several independent
+    /// callers peek this slot with their own assumptions -- including
+    /// flashback_assert_relation_wal_drained, which samples a single change.
+    /// Emitting the barrier unconditionally put a synthetic record at the head
+    /// of the stream where it masked genuinely pending relation WAL from those
+    /// callers and defeated their fail-closed checks. Only the consuming path
+    /// that emits the barrier asks to see it.
+    emit_scan_barrier: bool,
 }
 
 fn emitted_transactions() -> &'static Mutex<HashSet<TransactionId>> {
@@ -75,6 +86,7 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
     let mut tracked_relations = HashSet::new();
     let mut suppressed_row_xids = HashSet::new();
     let mut metadata_only = false;
+    let mut emit_scan_barrier = false;
 
     if !options.is_null() {
         let options_ref = unsafe { &*options };
@@ -100,6 +112,7 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
                         suppressed_row_xids.extend(parse_transaction_ids(value));
                     }
                     "metadata_only" => metadata_only = value == "true",
+                    "emit_scan_barrier" => emit_scan_barrier = value == "true",
                     _ => {}
                 }
             }
@@ -110,6 +123,7 @@ unsafe fn decoder_options(options: *mut pg_sys::List) -> DecoderState {
         tracked_relations,
         suppressed_row_xids,
         metadata_only,
+        emit_scan_barrier,
     }
 }
 
@@ -129,6 +143,15 @@ unsafe fn metadata_only(ctx: *mut LogicalDecodingContext) -> bool {
 
     let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
     state.metadata_only
+}
+
+unsafe fn scan_barrier_requested(ctx: *mut LogicalDecodingContext) -> bool {
+    if ctx.is_null() || unsafe { (*ctx).output_plugin_private }.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*((*ctx).output_plugin_private.cast::<DecoderState>()) };
+    state.emit_scan_barrier
 }
 
 unsafe fn row_changes_suppressed(ctx: *mut LogicalDecodingContext, xid: TransactionId) -> bool {
@@ -408,11 +431,37 @@ unsafe extern "C-unwind" fn fb_decode_message(
     _message_size: Size,
     _message: *const ::core::ffi::c_char,
 ) {
-    if prefix.is_null() || !transactional || txn.is_null() {
+    if prefix.is_null() {
         return;
     }
 
     let prefix_str = unsafe { CStr::from_ptr(prefix) }.to_str().unwrap_or("");
+
+    // flashback_consume_wal() emits this non-transactional message only when
+    // it is scanning the live tail of the slot.  Logical decoding cannot
+    // reach the barrier until every transaction with an earlier COMMIT record
+    // has been emitted, so a metadata peek that includes it is a stable map of
+    // the exact lifecycles the following consuming call can touch.  The body
+    // is intentionally ignored: pg_logical_emit_message() is public and the
+    // barrier carries no authority or user data.
+    if !transactional
+        && prefix_str == "pg_flashback_scan_barrier"
+        && unsafe { scan_barrier_requested(ctx) }
+    {
+        let marker = format!("{{\"scan_barrier_lsn\":\"{_message_lsn:X}\"}}");
+        let c_msg = std::ffi::CString::new(marker).unwrap_or_default();
+        unsafe {
+            OutputPluginPrepareWrite(ctx, true);
+            let buf = (*ctx).out;
+            appendStringInfoString(buf, c_msg.as_ptr());
+            OutputPluginWrite(ctx, true);
+        }
+        return;
+    }
+
+    if !transactional || txn.is_null() {
+        return;
+    }
 
     if prefix_str != "pg_flashback" {
         return;

@@ -584,6 +584,10 @@ DECLARE
     v_slot_name text;
     v_scan_start_lsn pg_lsn;
     v_upto_lsn pg_lsn;
+    v_wal_tip_lsn pg_lsn;
+    v_scan_barrier_lsn pg_lsn;
+    v_is_live_tail boolean := false;
+    v_peek_change_limit integer;
     v_scan_window_bytes constant bigint := 16777216;
     v_empty_min_advance_bytes constant bigint := 65536;
     pending record;
@@ -623,7 +627,8 @@ BEGIN
     -- is quadratic.  Its exact XID is trusted state-authority data; suppress
     -- only that transaction's reconstructed row callbacks while preserving
     -- its transactional marker + COMMIT, and scan the fixed ceiling once.
-    v_upto_lsn := pg_current_wal_insert_lsn();
+    v_wal_tip_lsn := pg_current_wal_insert_lsn();
+    v_upto_lsn := v_wal_tip_lsn;
 
     SELECT
         COALESCE(string_agg(cg.boundary_xid::text, ',' ORDER BY cg.boundary_xid), ''),
@@ -637,6 +642,9 @@ BEGIN
 
     IF NOT v_has_post_restore_boundary THEN
         v_upto_lsn := LEAST(v_upto_lsn, v_scan_start_lsn + v_scan_window_bytes);
+        v_is_live_tail := v_wal_tip_lsn <= v_scan_start_lsn + v_scan_window_bytes;
+    ELSE
+        v_is_live_tail := true;
     END IF;
     IF v_upto_lsn <= v_scan_start_lsn THEN
         RETURN 0;
@@ -682,9 +690,15 @@ BEGIN
                      v_slot_name, v_upto_lsn, batch_size,
                      'tracked_oids', v_tracked_oids,
                      'metadata_only', 'true',
-                     'suppress_row_xids', v_suppressed_row_xids
+                     'suppress_row_xids', v_suppressed_row_xids,
+                     'emit_scan_barrier', 'true'
                  ) AS ch(lsn, xid, data)
             WHERE ch.data LIKE '{%'
+              -- The scan barrier is a synchronisation marker, not data: counting
+              -- it as relevant output would make the next cycle believe there is
+              -- work and emit another barrier -- a self-sustaining WAL loop that
+              -- never lets the slot drain.
+              AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
         ) INTO v_has_output;
     EXCEPTION WHEN OBJECT_NOT_IN_PREREQUISITE_STATE THEN
         -- SQLSTATE 55000 is not unique to slot invalidation: e.g. pointing
@@ -728,48 +742,61 @@ BEGIN
         v_has_output := false;
     END IF;
 
-    -- The next get_changes() call advances the logical slot outside ordinary
-    -- SQL rollback semantics.  Its result can legitimately include a
-    -- transaction that was not visible to the metadata peek even though its
-    -- COMMIT record is already below v_upto_lsn.  Pin every lifecycle that
-    -- this fixed tracked-OID snapshot could affect before any consuming call;
-    -- then the consuming result is safe to treat as authoritative.
-    --
-    -- flashback_ensure_active_wal_stream() already holds the database-stream
-    -- lock, so a new lifecycle cannot enroll between this snapshot and the
-    -- consume.  Try-locks preserve the worker's non-blocking behavior: when a
-    -- lifecycle operation is in progress, return before the slot advances.
+    -- Do not create WAL merely to prove that a tiny idle tail is empty.  Once
+    -- enough WAL exists to advance, stabilize only the live tail with a
+    -- non-transactional logical-decoding barrier.  Reaching that record proves
+    -- every transaction whose COMMIT precedes it has been emitted.  Historical
+    -- bounded prefixes are already immutable and need no barrier.
+    IF NOT v_has_output
+       AND pg_wal_lsn_diff(v_upto_lsn, v_scan_start_lsn)
+               < v_empty_min_advance_bytes
+    THEN
+        RETURN 0;
+    END IF;
+
+    IF v_is_live_tail THEN
+        SELECT pg_logical_emit_message(
+                   false,
+                   'pg_flashback_scan_barrier',
+                   v_stream_id::text
+               )
+          INTO v_scan_barrier_lsn;
+        v_upto_lsn := v_scan_barrier_lsn;
+        -- The detailed metadata pass below must reach the barrier.  A normal
+        -- 16 MiB prefix remains bounded by LSN; post-restore reconstructed-row
+        -- callbacks are suppressed before this point.
+        v_peek_change_limit := NULL;
+        -- Re-derive relevance against the stabilized prefix instead of
+        -- assuming there is work. Forcing this true sent every live-tail
+        -- cycle down the full decode path, and each such pass emitted
+        -- another barrier, so the slot could never catch up to
+        -- pg_current_wal_lsn() and committed relation WAL stayed
+        -- permanently "pending" at the restore barrier.
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_logical_slot_peek_changes(
+                     v_slot_name, v_upto_lsn, v_peek_change_limit,
+                     'tracked_oids', v_tracked_oids,
+                     'metadata_only', 'true',
+                     'suppress_row_xids', v_suppressed_row_xids,
+                     'emit_scan_barrier', 'true'
+                 ) AS ch(lsn, xid, data)
+            WHERE ch.data LIKE '{%'
+              AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
+        ) INTO v_has_output;
+    ELSE
+        v_peek_change_limit := batch_size;
+    END IF;
+
+    -- Pin only lifecycles proven to be present in the stable prefix.  This is
+    -- what keeps an unrelated restore/maintenance hold from head-of-line
+    -- blocking capture for every other protected table.
     DROP TABLE IF EXISTS pg_temp._fb_wal_lock_ids;
     CREATE TEMP TABLE _fb_wal_lock_ids (
         tracking_id bigint PRIMARY KEY
     ) ON COMMIT DROP;
 
-    INSERT INTO _fb_wal_lock_ids(tracking_id)
-    SELECT DISTINCT cg.tracking_id
-    FROM flashback.coverage_generations cg
-    JOIN flashback.tracked_tables tt
-      ON tt.tracking_id = cg.tracking_id
-     AND tt.recovery_profile = 'local_delta'
-    WHERE cg.stream_id = v_stream_id
-      AND cg.state IN ('building', 'capturing', 'active', 'sealed')
-    ORDER BY cg.tracking_id;
-
-    FOR lock_rec IN
-        SELECT tracking_id FROM _fb_wal_lock_ids ORDER BY tracking_id
-    LOOP
-        IF NOT flashback_internal_try_lock_lifecycle(lock_rec.tracking_id) THEN
-            RETURN 0;
-        END IF;
-    END LOOP;
-
     IF NOT v_has_output THEN
-        -- Avoid a self-sustaining metadata-WAL loop for tiny internal tails.
-        IF pg_wal_lsn_diff(v_upto_lsn, v_scan_start_lsn)
-               < v_empty_min_advance_bytes
-        THEN
-            RETURN 0;
-        END IF;
-
         PERFORM flashback_internal_advance_capture_stream_progress(
             v_stream_id,
             NULL,
@@ -797,9 +824,15 @@ BEGIN
         FROM pg_logical_slot_get_changes(
                  v_slot_name, v_upto_lsn, batch_size,
                  'tracked_oids', v_tracked_oids,
-                 'suppress_row_xids', v_suppressed_row_xids
+                 'suppress_row_xids', v_suppressed_row_xids,
+                 'emit_scan_barrier', 'true'
              ) WITH ORDINALITY AS ch(lsn, xid, data, ord)
         WHERE ch.data LIKE '{%'
+          -- The scan barrier is a synchronisation marker, not data: counting
+          -- it as relevant output would make the next cycle believe there is
+          -- work and emit another barrier -- a self-sustaining WAL loop that
+          -- never lets the slot drain.
+          AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
         ORDER BY ch.ord;
 
         IF EXISTS (SELECT 1 FROM _fb_wal_batch) THEN
@@ -858,18 +891,22 @@ BEGIN
     INSERT INTO _fb_wal_peek(change_lsn, source_xid, data, ord)
     SELECT ch.lsn, ch.xid::text::bigint, ch.data::jsonb, ch.ord
     FROM pg_logical_slot_peek_changes(
-             v_slot_name, v_upto_lsn, batch_size,
+             v_slot_name, v_upto_lsn, v_peek_change_limit,
              'tracked_oids', v_tracked_oids,
              'metadata_only', 'true',
-             'suppress_row_xids', v_suppressed_row_xids
+             'suppress_row_xids', v_suppressed_row_xids,
+             'emit_scan_barrier', 'true'
          )
          WITH ORDINALITY AS ch(lsn, xid, data, ord)
     WHERE ch.data LIKE '{%'
+      -- The scan barrier is a synchronisation marker, not data: counting
+      -- it as relevant output would make the next cycle believe there is
+      -- work and emit another barrier -- a self-sustaining WAL loop that
+      -- never lets the slot drain.
+      AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
     ORDER BY ch.ord;
 
-    -- Retain the exact touched-lifecycle derivation as a defensive assertion
-    -- over the broader pre-consume pin set.  Every row inserted here must
-    -- already be pinned; ON CONFLICT makes the expected case a no-op.
+    -- Derive the exact touched lifecycle set from the stable metadata prefix.
     INSERT INTO _fb_wal_lock_ids(tracking_id)
     SELECT DISTINCT needed.tracking_id
     FROM (
@@ -966,16 +1003,22 @@ BEGIN
     FROM pg_logical_slot_get_changes(
              v_slot_name, v_upto_lsn, batch_size,
              'tracked_oids', v_tracked_oids,
-             'suppress_row_xids', v_suppressed_row_xids
+             'suppress_row_xids', v_suppressed_row_xids,
+             'emit_scan_barrier', 'true'
          )
          WITH ORDINALITY AS ch(lsn, xid, data, ord)
     WHERE ch.data LIKE '{%'
+      -- The scan barrier is a synchronisation marker, not data: counting
+      -- it as relevant output would make the next cycle believe there is
+      -- work and emit another barrier -- a self-sustaining WAL loop that
+      -- never lets the slot drain.
+      AND ch.data NOT LIKE '{"scan_barrier_lsn"%'
     ORDER BY ch.ord;
 
-    -- The consuming pass is authoritative.  It may legitimately include a
-    -- transaction that became visible after the metadata preflight.  Every
-    -- lifecycle in the fixed tracked-OID snapshot was pinned before the slot
-    -- advanced, so the complete returned batch can be promoted without loss.
+    -- The consuming pass is authoritative. Historical prefixes cannot gain a
+    -- new earlier COMMIT; live-tail prefixes were stabilized by the decoded
+    -- barrier. Therefore the full result cannot introduce an unpinned
+    -- lifecycle after the slot advances.
 
     -- Shared promote path (also used by the pg_test injection seam).
     SELECT confirmed_flush_lsn, restart_lsn
