@@ -23,8 +23,13 @@ BEGIN
         kind varchar(16) NOT NULL,
         CONSTRAINT it_cdef_chk CHECK (kind IN ('mixed', 'dense'))
     );
+    -- contype='c' is required, not incidental: PostgreSQL 18 records NOT NULL
+    -- as a real named constraint in pg_constraint, so an unfiltered read here
+    -- can return the NOT NULL row and then try to re-apply it as a CHECK.
     SELECT pg_get_constraintdef(oid) INTO v_def_original
-    FROM pg_constraint WHERE conrelid = 'public.it_cdef_a'::regclass;
+    FROM pg_constraint
+    WHERE conrelid = 'public.it_cdef_a'::regclass
+      AND contype = 'c' AND conname = 'it_cdef_chk';
 
     -- Rebuild the same constraint from its own rendered text, the way a
     -- restore rebuilds it from schema_def.
@@ -32,7 +37,9 @@ BEGIN
     EXECUTE format('ALTER TABLE public.it_cdef_b ADD CONSTRAINT it_cdef_chk %s',
                    v_def_original);
     SELECT pg_get_constraintdef(oid) INTO v_def_reparsed
-    FROM pg_constraint WHERE conrelid = 'public.it_cdef_b'::regclass;
+    FROM pg_constraint
+    WHERE conrelid = 'public.it_cdef_b'::regclass
+      AND contype = 'c' AND conname = 'it_cdef_chk';
 
     -- (a) the raw strings really do differ -- if PostgreSQL ever becomes
     -- round-trip stable here this assertion is what tells us the guard is
@@ -69,13 +76,24 @@ BEGIN
     END IF;
 
     -- The inventory the restore actually digests must agree for the same
-    -- constraint on both sides of a re-render.
-    IF public.flashback_canonical_inventory_from_relation('public.it_cdef_a'::regclass)->'constraints'
+    -- constraint on both sides of a re-render. Compare the named CHECK entry
+    -- only: PostgreSQL 18 also carries NOT NULL in pg_constraint under an
+    -- auto-generated, table-name-derived name, which necessarily differs
+    -- between these two probe tables and is not what this test is about.
+    IF (SELECT c FROM jsonb_array_elements(
+            public.flashback_canonical_inventory_from_relation('public.it_cdef_a'::regclass)->'constraints') c
+        WHERE c->>'name' = 'it_cdef_chk')
        IS DISTINCT FROM
-       public.flashback_canonical_inventory_from_relation('public.it_cdef_b'::regclass)->'constraints' THEN
-        RAISE EXCEPTION 'canonical inventory constraints differ across a re-render: % vs %',
-            public.flashback_canonical_inventory_from_relation('public.it_cdef_a'::regclass)->'constraints',
-            public.flashback_canonical_inventory_from_relation('public.it_cdef_b'::regclass)->'constraints';
+       (SELECT c FROM jsonb_array_elements(
+            public.flashback_canonical_inventory_from_relation('public.it_cdef_b'::regclass)->'constraints') c
+        WHERE c->>'name' = 'it_cdef_chk') THEN
+        RAISE EXCEPTION 'canonical inventory CHECK entry differs across a re-render: % vs %',
+            (SELECT c FROM jsonb_array_elements(
+                public.flashback_canonical_inventory_from_relation('public.it_cdef_a'::regclass)->'constraints') c
+             WHERE c->>'name' = 'it_cdef_chk'),
+            (SELECT c FROM jsonb_array_elements(
+                public.flashback_canonical_inventory_from_relation('public.it_cdef_b'::regclass)->'constraints') c
+             WHERE c->>'name' = 'it_cdef_chk');
     END IF;
 
     DROP TABLE public.it_cdef_a CASCADE;
