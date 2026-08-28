@@ -102,6 +102,7 @@ WORK=""
 DATA=""
 SOCKET=""
 ARTIFACT_ROOT=""
+MAINTENANCE_RECONCILER_PID=""
 
 SOCKET_SEQ=0
 start_case_instance() {
@@ -169,9 +170,53 @@ start_case_instance() {
     done
     [[ "$running" == "t" ]] || die "[$CASE_NAME] capture worker never became admitted/running"
 
+    # Late-finalizer cases must exercise the named failpoint, not race the
+    # autonomous reconciler.  Freeze only the maintenance worker for these
+    # per-case throwaway postmasters; the capture worker remains live and
+    # resolves the marker boundary normally.  The injected postmaster crash
+    # Once the test owns the same lifecycle advisory lock, it resumes that
+    # worker before the injected crash.  Recovery is therefore still
+    # validated with the production reconciler enabled.
+    case "$CASE_NAME" in
+        07_*|08_*|10_*|11_*|12_*) freeze_maintenance_reconciler ;;
+    esac
+
     export PGHOST="$SOCKET"
     export PGDATABASE=postgres
     export PSQL_BIN="$PG_BIN/psql"
+}
+
+freeze_maintenance_reconciler() {
+    local pid state
+    for _ in $(seq 1 100); do
+        pid="$(psql_scalar "SELECT pid FROM pg_stat_activity
+            WHERE backend_type='pg_flashback maintenance worker'
+              AND datname=current_database()
+              AND wait_event_type='Extension'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_locks l
+                  WHERE l.pid=pg_stat_activity.pid AND l.granted
+              )
+            LIMIT 1;")"
+        if [[ -n "$pid" ]]; then
+            kill -STOP "$pid"
+            state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+            if [[ "$state" == T* ]]; then
+                MAINTENANCE_RECONCILER_PID="$pid"
+                return 0
+            fi
+            kill -CONT "$pid" >/dev/null 2>&1 || true
+        fi
+        sleep 0.05
+    done
+    die "[$CASE_NAME] could not deterministically freeze the maintenance reconciler"
+}
+
+resume_maintenance_reconciler() {
+    if [[ -n "$MAINTENANCE_RECONCILER_PID" ]]; then
+        kill -CONT "$MAINTENANCE_RECONCILER_PID" >/dev/null 2>&1 || true
+        MAINTENANCE_RECONCILER_PID=""
+    fi
 }
 
 wait_ready_after_crash() {
@@ -249,43 +294,28 @@ disable_failpoint() {
     sleep 0.2
 }
 
-# Arms a failpoint on an ALREADY-RUNNING instance (rather than at startup
-# via postgresql.conf). Required for any boundary reached only after a
-# "wait until publish-ready" polling window: the bounded maintenance
-# reconciler (automatic=true for 'publish'/'finalize') runs autonomously
-# every ~300ms and would otherwise reach that SAME already-armed failpoint
-# on its own, well before this script's own deliberate trigger call --
-# discovered via a real run where boundary 7 (finalizer_after_publish_
-# rename) crashed repeatedly under the reconciler's own retries before this
-# script ever issued its trigger call, eventually leaving the operation in
-# a state this test wasn't exercising on purpose. Arming just-in-time
-# (after the setup+wait phase, immediately before the one deliberate
-# trigger) makes the crash this script actually intends the only one that
-# happens.
-arm_failpoint_now() {
-    local failpoint="$1"
-    "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -q -v ON_ERROR_STOP=1 \
-        -c "ALTER SYSTEM SET pg_flashback.test_external_zstd_failpoint = '$failpoint';" >/dev/null
-    "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -q -v ON_ERROR_STOP=1 \
-        -c "SELECT pg_reload_conf();" >/dev/null
-    # A fixed sleep after reload is not a reliable signal that every backend
-    # (including the maintenance worker's own long-lived connection) has
-    # actually picked up the new GUC value -- SIGHUP reload propagation
-    # timing is not bounded, and a real run observed the trigger call below
-    # completing successfully with the failpoint never firing at all under
-    # load. Poll a fresh connection's own SHOW until it reflects the armed
-    # value before proceeding; since all backends reload from the same
-    # config generation, this is a reliable proxy for "the change is live".
-    local seen=""
-    for _ in $(seq 1 100); do
-        seen="$("$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SHOW pg_flashback.test_external_zstd_failpoint;" 2>/dev/null)"
-        [[ "$seen" == "$failpoint" ]] && break
-        sleep 0.05
-    done
-    [[ "$seen" == "$failpoint" ]] || die "[$CASE_NAME] failpoint '$failpoint' did not become visible via SHOW after arming"
+# Arms the failpoint only in the backend that performs the deliberate late
+# publish/finalize transition.  A cluster-wide setting lets the autonomous
+# reconciler steal the injection before the harness reaches it and remains
+# armed across crash recovery, so it cannot provide deterministic evidence.
+trigger_publish_with_session_failpoint() {
+    local op_id="$1" failpoint="$2"
+    # Keep the failpoint local to the one backend deliberately executing the
+    # transition.  ALTER SYSTEM made it survive the crash, allowing the new
+    # maintenance worker to hit the same failpoint immediately on every
+    # restart and create a crash loop before the harness could reconnect.
+    # SUSET permits a superuser session SET, which disappears with the
+    # crashing backend and leaves restart/reconciliation production-real.
+    "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -v ON_ERROR_STOP=1 \
+        -c "SET pg_flashback.test_external_zstd_failpoint = '$failpoint';" \
+        -c "SELECT flashback_protect_external_publish($op_id);" \
+        >"$WORK/trigger.log" 2>&1
 }
 
 stop_case_instance() {
+    # A stopped background worker cannot receive PostgreSQL's normal crash
+    # signal.  Always thaw it before asking the postmaster to stop.
+    resume_maintenance_reconciler
     "$PG_BIN/pg_ctl" -D "$DATA" stop -m immediate -w >/dev/null 2>&1 || true
     rm -rf "$SOCKET"
 }
@@ -325,6 +355,11 @@ hold_lifecycle_lock() {
         held="$(psql_scalar "SELECT l.pid FROM pg_locks l WHERE l.locktype='advisory' AND l.classid=358944 AND l.objid=hashint8($tracking_id)::integer AND l.granted;")"
         if [[ -n "$held" ]]; then
             LOCK_HOLDER_BACKEND_PID="$held"
+            # The lifecycle lock now excludes the reconciler without
+            # leaving a SIGSTOP'ed child behind.  This is essential because
+            # the failpoint deliberately crashes the postmaster and a
+            # stopped child cannot process its termination signal.
+            resume_maintenance_reconciler
             return 0
         fi
         sleep 0.05
@@ -980,7 +1015,6 @@ case_after_publish_rename() {
         fi
         [[ "$artifact_status" == "publish" ]] || die "[$CASE_NAME] artifact never reached publish-ready before timeout (last action=$artifact_status)"
 
-        arm_failpoint_now "$failpoint"
         # Release just before triggering: flashback_protect_external_publish
         # itself takes this same lock (blocking), so holding it through the
         # trigger call would self-deadlock. This leaves only the few
@@ -990,8 +1024,7 @@ case_after_publish_rename() {
         # was held across.
         release_lifecycle_lock
         set +e
-        "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT flashback_protect_external_publish($op_id);" \
-            >"$WORK/trigger.log" 2>&1
+        trigger_publish_with_session_failpoint "$op_id" "$failpoint"
         set -e
         if wait_ready_after_crash_soft; then
             crashed=1
@@ -1083,11 +1116,9 @@ case_after_snapshot_available_before_activation() {
         fi
         [[ "$artifact_status" == "publish" ]] || die "[$CASE_NAME] artifact never reached publish-ready before timeout (last action=$artifact_status)"
 
-        arm_failpoint_now "$failpoint"
         release_lifecycle_lock
         set +e
-        "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT flashback_protect_external_publish($op_id);" \
-            >"$WORK/trigger.log" 2>&1
+        trigger_publish_with_session_failpoint "$op_id" "$failpoint"
         set -e
         if wait_ready_after_crash_soft; then
             crashed=1
@@ -1178,11 +1209,9 @@ case_after_generation_activation() {
         fi
         [[ "$artifact_status" == "publish" ]] || die "[$CASE_NAME] artifact never reached publish-ready before timeout (last action=$artifact_status)"
 
-        arm_failpoint_now "$failpoint"
         release_lifecycle_lock
         set +e
-        "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT flashback_protect_external_publish($op_id);" \
-            >"$WORK/trigger.log" 2>&1
+        trigger_publish_with_session_failpoint "$op_id" "$failpoint"
         set -e
         if wait_ready_after_crash_soft; then
             crashed=1
@@ -1277,11 +1306,9 @@ case_after_lifecycle_activation_before_journal() {
         fi
         [[ "$artifact_status" == "publish" ]] || die "[$CASE_NAME] artifact never reached publish-ready before timeout (last action=$artifact_status)"
 
-        arm_failpoint_now "$failpoint"
         release_lifecycle_lock
         set +e
-        "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT flashback_protect_external_publish($op_id);" \
-            >"$WORK/trigger.log" 2>&1
+        trigger_publish_with_session_failpoint "$op_id" "$failpoint"
         set -e
         if wait_ready_after_crash_soft; then
             crashed=1
@@ -1389,11 +1416,9 @@ case_after_journal_before_commit() {
         fi
         [[ "$artifact_status" == "publish" ]] || die "[$CASE_NAME] artifact never reached publish-ready before timeout (last action=$artifact_status)"
 
-        arm_failpoint_now "$failpoint"
         release_lifecycle_lock
         set +e
-        "$PG_BIN/psql" -h "$SOCKET" -d postgres -X -tAc "SELECT flashback_protect_external_publish($op_id);" \
-            >"$WORK/trigger.log" 2>&1
+        trigger_publish_with_session_failpoint "$op_id" "$failpoint"
         set -e
         if wait_ready_after_crash_soft; then
             crashed=1

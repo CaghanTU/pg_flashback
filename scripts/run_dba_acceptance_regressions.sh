@@ -123,12 +123,21 @@ wait_worker() {
 
 wait_health() {
     local table=$1 expected=${2:-healthy} db=${3:-$DB} timeout_s=${4:-60}
-    local deadline health
+    local deadline health ack_pending
     deadline=$(( $(date +%s) + timeout_s ))
     while (( $(date +%s) <= deadline )); do
+        # A healthy coverage row alone is not a WAL-drain barrier.  The
+        # crash-safe consumer deliberately commits decoded payload before
+        # acknowledging the logical slot, leaving a short-lived durable
+        # safe_slot_advance intent between those two transactions.  Drive
+        # both phases here and require the acknowledgement intent to clear
+        # before the next destructive/restore operation.
+        DB="$db" q "SELECT flashback_consume_wal();" >/dev/null 2>&1 || true
         health=$(DB="$db" q "SELECT COALESCE((SELECT h.health FROM flashback_health() h
             WHERE h.table_name = '$table' ORDER BY h.generation_id DESC LIMIT 1),'missing');")
-        [[ "$health" == "$expected" ]] && return 0
+        ack_pending=$(DB="$db" q "SELECT count(*) FROM flashback.capture_streams
+            WHERE state='active' AND details ? 'safe_slot_advance_upto_lsn';")
+        [[ "$health" == "$expected" && "$ack_pending" == "0" ]] && return 0
         sleep 0.1
     done
     return 1

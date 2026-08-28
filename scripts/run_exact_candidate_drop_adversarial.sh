@@ -278,6 +278,13 @@ else
     pass "slot_loss_drop_path"
 fi
 
+# Losing the slot intentionally terminates the capture worker's current
+# cycle.  The postmaster restart is asynchronous; do not let the following
+# independent concurrency case race that lifecycle.  This is a readiness
+# barrier, not a fixed sleep, and turns a missing automatic restart into an
+# explicit failure of the slot-loss scenario itself.
+wait_ready || die "capture worker did not restart after slot-loss handling"
+
 # Concurrent recover calls fail-closed / serialize safely
 q "CREATE TABLE public.adv_conc(id int PRIMARY KEY, v text);"
 q "SELECT flashback_track('public.adv_conc');" >/dev/null

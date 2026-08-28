@@ -171,7 +171,22 @@ for _ in $(seq 1 200); do
 done
 [[ "$h" == "healthy" ]] || die "s4 lifecycle never became healthy"
 q "INSERT INTO public.dda_t4 VALUES (1,'a');" >/dev/null
-sleep 1
+# `healthy` is not a post-DML drain barrier: crash-safe WAL consumption
+# persists decoded payload and acknowledges the slot in two transactions.
+# Wait for both the row event and the cleared acknowledgement intent before
+# freezing the worker, otherwise the DROP hook can correctly refuse an
+# unrelated still-pending commit and this slot-loss scenario tests nothing.
+for _ in $(seq 1 600); do
+    captured=$(q "SELECT count(*) FROM flashback.delta_log
+        WHERE table_name='public.dda_t4' AND event_type='INSERT'
+          AND (new_data->>'id')='1';")
+    ack_pending=$(q "SELECT count(*) FROM flashback.capture_streams
+        WHERE state='active' AND details ? 'safe_slot_advance_upto_lsn';")
+    [[ "$captured" == "1" && "$ack_pending" == "0" ]] && break
+    sleep 0.1
+done
+[[ "$captured" == "1" && "$ack_pending" == "0" ]] \
+    || die "s4 precondition never reached a durable drained INSERT"
 slot=$(q "SELECT slot_name FROM pg_replication_slots WHERE plugin='pg_flashback';")
 [[ -n "$slot" ]] || die "s4 no pg_flashback slot found"
 # The DROP's ProcessUtility hook itself needs the slot to exist (it peeks a
