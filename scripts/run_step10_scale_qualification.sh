@@ -237,6 +237,7 @@ pg_flashback.local_safety_reserve_bytes = '1GB'
 pg_flashback.local_boundary_write_stall_ms = 120000
 pg_flashback.restore_work_mem = '512MB'
 pg_flashback.index_build_work_mem = '2GB'
+${S10_EXTRA_CONF:-}
 EOF
 
 "$PG_BIN/pg_ctl" -D "$DATA" -l "$PGLOG" -w -t 120 start >/dev/null || die "pg_ctl start failed"
