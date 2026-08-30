@@ -267,6 +267,10 @@ mod tests {
         "../tests/sql/integration/constraint_def_canonical_roundtrip.sql"
     );
     sql_test!(
+        it_restore_proof_fingerprint_v2,
+        "../tests/sql/integration/restore_proof_fingerprint_v2.sql"
+    );
+    sql_test!(
         it_external_snapshot_activation_authority,
         "../tests/sql/integration/external_snapshot_activation_authority.sql"
     );

@@ -8,8 +8,12 @@
 //! keeps the whole row cryptographically covered while the sort moves a
 //! fixed 32 bytes per row.  Digests are not comparable across versions.
 //!
-//! Ordering comes from an immutable `order_spec` derived from target
-//! `schema_def`, never from the live/shadow catalog PK presence.
+//! Stream order comes from the row digest itself, so it is independent of
+//! both the heap's physical order and the catalog.  `order_spec` is still
+//! required and still derived from target `schema_def` rather than the
+//! live/shadow catalog, but in v2 it contributes only the `mode` label bound
+//! into the digest and the primary-key column names, which are validated
+//! against the relation.
 
 use pgrx::prelude::*;
 use pgrx::PgRelation;
@@ -66,23 +70,29 @@ fn flashback_relation_full_data_fingerprint(
     .unwrap_or_else(|e| pgrx::error!("pg_flashback: cannot resolve relation {oid}: {e}"));
     let schema = schema.unwrap_or_else(|| pgrx::error!("pg_flashback: relation {oid} missing"));
     let name = name.unwrap_or_else(|| pgrx::error!("pg_flashback: relation {oid} missing name"));
-    let (order_sql, mode) = match order_clause_from_spec(&order_spec.0) {
+    let (mode, pk_columns) = match mode_and_columns_from_spec(&order_spec.0) {
         Ok(v) => v,
         Err(msg) => pgrx::error!("pg_flashback: invalid fingerprint order_spec: {msg}"),
     };
+    // v1 embedded these columns in an ORDER BY, so a name that did not exist
+    // was rejected when the query was planned. v2 does not order by them, so
+    // the check has to be explicit or a bogus spec would silently produce a
+    // digest that looks valid.
+    reject_unknown_columns(oid, &pk_columns);
 
-    // Hash first, sort second.  `order_sql` no longer decides the stream
-    // order -- the row digest does -- but it stays in the query so the scan
-    // remains a plain ordered read of the same rows, and `mode` is still
-    // bound into the digest so expected and actual must agree on the spec.
+    // Hash first, sort second: the sort then moves 32 bytes per row instead
+    // of the row's whole JSON encoding. Ordering by the digest keeps the
+    // result independent of the heap's physical order, and identical rows
+    // still yield identical digests, so duplicate multiplicity survives.
     let query = format!(
-        "SELECT sha256(convert_to(row_to_json(t)::text, 'UTF8')) AS row_h \
+        "SELECT pg_catalog.sha256(\
+             pg_catalog.convert_to(\
+                 pg_catalog.row_to_json(t)::pg_catalog.text, 'UTF8')) AS row_h \
          FROM {}.{} t \
          ORDER BY 1",
         quote_ident(&schema),
         quote_ident(&name),
     );
-    let _ = &order_sql;
 
     let mut hasher = Sha256::new();
     hasher.update(b"flashback_full_data_fingerprint_v2|");
@@ -126,7 +136,7 @@ fn flashback_relation_full_data_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
-fn order_clause_from_spec(spec: &Value) -> Result<(String, String), String> {
+fn mode_and_columns_from_spec(spec: &Value) -> Result<(String, Vec<String>), String> {
     let mode = spec
         .get("mode")
         .and_then(|v| v.as_str())
@@ -142,20 +152,41 @@ fn order_clause_from_spec(spec: &Value) -> Result<(String, String), String> {
                 .iter()
                 .filter_map(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| format!("t.{}", quote_ident(s)))
+                .map(|s| s.to_string())
                 .collect();
             if names.is_empty() {
                 return Err("pk mode requires non-empty columns".to_owned());
             }
-            // ctid is a last-resort internal tie-break only — not hashed.
-            Ok((format!("{}, t.ctid", names.join(", ")), "pk".to_string()))
+            Ok(("pk".to_string(), names))
         }
-        "full_row" => Ok((
-            "row_to_json(t)::text, t.ctid".to_string(),
-            "full_row".to_string(),
-        )),
+        "full_row" => Ok(("full_row".to_string(), Vec::new())),
         other => Err(format!("unknown mode '{other}'")),
     }
+}
+
+/// Fail closed on a spec naming a column the relation does not have.
+fn reject_unknown_columns(oid: u32, columns: &[String]) {
+    for column in columns {
+        let found = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped \
+             AND a.attname OPERATOR(pg_catalog.=) {}::pg_catalog.name)",
+            quote_literal(column)
+        ))
+        .unwrap_or_else(|e| {
+            pgrx::error!("pg_flashback: cannot validate fingerprint order_spec: {e}")
+        })
+        .unwrap_or(false);
+        if !found {
+            pgrx::error!(
+                "pg_flashback: fingerprint order_spec names unknown column '{column}' on relation {oid}"
+            );
+        }
+    }
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn quote_ident(ident: &str) -> String {
