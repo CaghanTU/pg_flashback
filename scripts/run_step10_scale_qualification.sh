@@ -1159,6 +1159,38 @@ verify_after_recovery() {
     chk_eq "logical_data_xor64" "$(jq -r '.xor64' <<<"$pre_fp")" "$(jq -r '.xor64' <<<"$post_fp")"
     chk_eq "logical_data_sum32" "$(jq -r '.sum32' <<<"$pre_fp")" "$(jq -r '.sum32' <<<"$post_fp")"
 
+    # 2b: the product's own restore proof, not the harness fingerprint.
+    # The digest checked above is an independent MD5 this script computes; it
+    # says nothing about what pg_flashback itself proved. The expected proof
+    # is built from the pre-swap shadow and the actual proof from the live
+    # relation, and the restore only commits when the two agree, so recording
+    # both binds that decision to this run's evidence instead of leaving it
+    # inside the operation journal.
+    local expected_proof_fp actual_proof_fp
+    expected_proof_fp="$(s10_q "
+        SELECT COALESCE(
+            (SELECT e.payload->'expected_proof'->>'data_fingerprint'
+               FROM flashback.operation_events e
+              WHERE e.payload ? 'expected_proof'
+              ORDER BY e.event_id DESC LIMIT 1), 'missing');" 2>/dev/null || echo missing)"
+    actual_proof_fp="$(s10_q "
+        SELECT COALESCE(
+            (SELECT e.payload->'restore_verification'->'actual_proof'->>'data_fingerprint'
+               FROM flashback.operation_events e
+              WHERE e.payload ? 'restore_verification'
+              ORDER BY e.event_id DESC LIMIT 1), 'missing');" 2>/dev/null || echo missing)"
+    if [[ "$expected_proof_fp" =~ ^[0-9a-f]{64}$ ]]; then
+        chk "product_proof_expected_is_sha256" 1 "$expected_proof_fp"
+    else
+        chk "product_proof_expected_is_sha256" 0 "value=$expected_proof_fp"
+    fi
+    if [[ "$actual_proof_fp" =~ ^[0-9a-f]{64}$ ]]; then
+        chk "product_proof_actual_is_sha256" 1 "$actual_proof_fp"
+    else
+        chk "product_proof_actual_is_sha256" 0 "value=$actual_proof_fp"
+    fi
+    chk_eq "product_proof_expected_equals_actual" "$expected_proof_fp" "$actual_proof_fp"
+
     # 3: primary-key domain and uniqueness
     local post_pk_distinct post_pk_min post_pk_max post_rows
     post_pk_distinct="$(s10_q "SELECT count(DISTINCT id) FROM $rel;")"
