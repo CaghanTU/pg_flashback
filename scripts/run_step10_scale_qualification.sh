@@ -1187,6 +1187,28 @@ verify_after_recovery() {
              WHERE o.operation_id = $recover_op_id), 'missing');" 2>/dev/null || echo missing)"
     chk_eq "recover_operation_binds_this_tier" "recover|$rel|$tracking_id" "$op_binding"
 
+    # The remaining identifiers this restore is bound to. They are recorded
+    # rather than compared against a literal because the plan already
+    # asserted the disaster event, and the successor generation is created
+    # by this restore; what matters here is that the evidence names them.
+    local proof_disaster_id proof_generation_id
+    proof_disaster_id="$(s10_q "
+        SELECT COALESCE((SELECT o.disaster_event_id::text FROM flashback.operations o
+                          WHERE o.operation_id = $recover_op_id), 'none');" 2>/dev/null || echo missing)"
+    proof_generation_id="$(s10_q "
+        SELECT COALESCE(
+            (SELECT e.payload->'successor'->>'generation_id'
+               FROM flashback.operation_events e
+              WHERE e.operation_id = $recover_op_id
+                AND e.payload ? 'successor'
+              ORDER BY e.event_id DESC LIMIT 1), 'missing');" 2>/dev/null || echo missing)"
+    chk "recover_disaster_event_id" 1 "$proof_disaster_id"
+    if [[ "$proof_generation_id" =~ ^[0-9]+$ ]]; then
+        chk "recover_successor_generation_id" 1 "$proof_generation_id"
+    else
+        chk "recover_successor_generation_id" 0 "value=$proof_generation_id"
+    fi
+
     expected_proof_fp="$(s10_q "
         SELECT COALESCE(
             (SELECT e.payload->'expected_proof'->>'data_fingerprint'
