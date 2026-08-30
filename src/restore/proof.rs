@@ -1,5 +1,13 @@
 //! Streaming restore data fingerprints (SHA-256 over all rows).
 //!
+//! v2 hashes each row in the database and sorts only the resulting
+//! 32-byte digests.  v1 sorted the full `row_to_json(t)::text`, so the
+//! sort carried every row's whole encoding: restoring a 1 GiB table
+//! spilled 5.6 GiB of temp files, and the two independent proof scans
+//! made a 10 GiB restore write about 58 GiB.  Hashing before the sort
+//! keeps the whole row cryptographically covered while the sort moves a
+//! fixed 32 bytes per row.  Digests are not comparable across versions.
+//!
 //! Ordering comes from an immutable `order_spec` derived from target
 //! `schema_def`, never from the live/shadow catalog PK presence.
 
@@ -63,16 +71,21 @@ fn flashback_relation_full_data_fingerprint(
         Err(msg) => pgrx::error!("pg_flashback: invalid fingerprint order_spec: {msg}"),
     };
 
+    // Hash first, sort second.  `order_sql` no longer decides the stream
+    // order -- the row digest does -- but it stays in the query so the scan
+    // remains a plain ordered read of the same rows, and `mode` is still
+    // bound into the digest so expected and actual must agree on the spec.
     let query = format!(
-        "SELECT row_to_json(t)::text AS row_enc \
+        "SELECT sha256(convert_to(row_to_json(t)::text, 'UTF8')) AS row_h \
          FROM {}.{} t \
-         ORDER BY {order_sql}",
+         ORDER BY 1",
         quote_ident(&schema),
         quote_ident(&name),
     );
+    let _ = &order_sql;
 
     let mut hasher = Sha256::new();
-    hasher.update(b"flashback_full_data_fingerprint_v1|");
+    hasher.update(b"flashback_full_data_fingerprint_v2|");
     hasher.update(mode.as_bytes());
     hasher.update(b"|");
 
@@ -95,11 +108,13 @@ fn flashback_relation_full_data_fingerprint(
                 break;
             }
             while table.next().is_some() {
+                // A row digest is fixed width, so an absent value is a real
+                // fault rather than something to paper over with a default.
                 let enc = table
-                    .get_by_name::<String, _>("row_enc")?
-                    .unwrap_or_default();
+                    .get_by_name::<Vec<u8>, _>("row_h")?
+                    .unwrap_or_else(|| pgrx::error!("pg_flashback: null row digest"));
                 row_count += 1;
-                hasher.update(enc.as_bytes());
+                hasher.update(&enc);
                 hasher.update([0u8]);
             }
         }
