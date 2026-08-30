@@ -1163,31 +1163,53 @@ verify_after_recovery() {
     # The digest checked above is an independent MD5 this script computes; it
     # says nothing about what pg_flashback itself proved. The expected proof
     # is built from the pre-swap shadow and the actual proof from the live
-    # relation, and the restore only commits when the two agree, so recording
-    # both binds that decision to this run's evidence instead of leaving it
-    # inside the operation journal.
-    local expected_proof_fp actual_proof_fp
+    # relation, and the restore only commits when the two agree.
+    #
+    # Both must be read from *this* tier's recover operation. Taking the
+    # journal's newest proof instead would let a tier whose own proof is
+    # missing pass on the previous tier's value -- silently, and only in the
+    # multi-tier runs where it matters.
+    local recover_op_id expected_proof_fp actual_proof_fp op_binding
+    recover_op_id="$(jq -r '.data.begin.operation_id // empty' \
+        "$LOG_DIR/$tier-recover.json" 2>/dev/null || true)"
+    if [[ ! "$recover_op_id" =~ ^[0-9]+$ ]]; then
+        chk "recover_operation_id_present" 0 "value=${recover_op_id:-missing}"
+        return 0
+    fi
+    chk "recover_operation_id_present" 1 "operation_id=$recover_op_id"
+
+    # Prove the operation is this tier's recover before trusting its proofs.
+    op_binding="$(s10_q "
+        SELECT COALESCE((
+            SELECT o.command || '|' || COALESCE(o.table_name,'-') || '|'
+                   || COALESCE(o.tracking_id::text,'-')
+              FROM flashback.operations o
+             WHERE o.operation_id = $recover_op_id), 'missing');" 2>/dev/null || echo missing)"
+    chk_eq "recover_operation_binds_this_tier" "recover|$rel|$tracking_id" "$op_binding"
+
     expected_proof_fp="$(s10_q "
         SELECT COALESCE(
             (SELECT e.payload->'expected_proof'->>'data_fingerprint'
                FROM flashback.operation_events e
-              WHERE e.payload ? 'expected_proof'
+              WHERE e.operation_id = $recover_op_id
+                AND e.payload ? 'expected_proof'
               ORDER BY e.event_id DESC LIMIT 1), 'missing');" 2>/dev/null || echo missing)"
     actual_proof_fp="$(s10_q "
         SELECT COALESCE(
             (SELECT e.payload->'restore_verification'->'actual_proof'->>'data_fingerprint'
                FROM flashback.operation_events e
-              WHERE e.payload ? 'restore_verification'
+              WHERE e.operation_id = $recover_op_id
+                AND e.payload ? 'restore_verification'
               ORDER BY e.event_id DESC LIMIT 1), 'missing');" 2>/dev/null || echo missing)"
     if [[ "$expected_proof_fp" =~ ^[0-9a-f]{64}$ ]]; then
-        chk "product_proof_expected_is_sha256" 1 "$expected_proof_fp"
+        chk "expected_proof_sha256" 1 "$expected_proof_fp"
     else
-        chk "product_proof_expected_is_sha256" 0 "value=$expected_proof_fp"
+        chk "expected_proof_sha256" 0 "value=$expected_proof_fp"
     fi
     if [[ "$actual_proof_fp" =~ ^[0-9a-f]{64}$ ]]; then
-        chk "product_proof_actual_is_sha256" 1 "$actual_proof_fp"
+        chk "actual_proof_sha256" 1 "$actual_proof_fp"
     else
-        chk "product_proof_actual_is_sha256" 0 "value=$actual_proof_fp"
+        chk "actual_proof_sha256" 0 "value=$actual_proof_fp"
     fi
     chk_eq "product_proof_expected_equals_actual" "$expected_proof_fp" "$actual_proof_fp"
 
