@@ -20,6 +20,14 @@
       "class": "infra",
       "reason": "flashback_guard_capture_stream trigger rejects direct identity mutation, illegal transitions, backward LSN moves, and post-terminal details edits"
     },
+    "capturing_health_doctor.sql": {
+      "class": "infra",
+      "reason": "flashback_doctor()/flashback_health() correctness for the 'capturing' pending protect state -- never reports healthy/protected before protection_state=active"
+    },
+    "capturing_state_authority.sql": {
+      "class": "infra",
+      "reason": "structural invariants around the 'capturing' coverage_generations state, exercised directly against the SQL authority functions"
+    },
     "checkpoint_after_restore.sql": {
       "class": "supported-core",
       "reason": "checkpoint after restore via seam"
@@ -43,6 +51,10 @@
     "concurrent_restore_stress.sql": {
       "class": "supported-core",
       "reason": "concurrent restore via seam"
+    },
+    "constraint_def_canonical_roundtrip.sql": {
+      "class": "supported-core",
+      "reason": "constraint definitions compare stably across a PostgreSQL re-render (IN-list over varchar round-trip)"
     },
     "coverage_lifecycle_hardening.sql": {
       "class": "infra",
@@ -139,13 +151,13 @@
       "class": "supported-core",
       "reason": "toast restore via seam"
     },
-    "external_snapshot_activation_authority.sql": {
-      "class": "infra",
-      "reason": "external artifact publication and generation activation eligibility boundary"
-    },
     "exact_drop_identity_propagation.sql": {
       "class": "supported-core",
       "reason": "exact DROP disaster_event_id propagation lock_phase\u2192core\u2192expected_proof"
+    },
+    "external_snapshot_activation_authority.sql": {
+      "class": "infra",
+      "reason": "external artifact publication and generation activation eligibility boundary"
     },
     "flashback_query_basic.sql": {
       "class": "supported-core",
@@ -163,6 +175,10 @@
       "class": "infra",
       "reason": "inheritance parent track rejection"
     },
+    "large_row_capture_honesty.sql": {
+      "class": "infra",
+      "reason": "a decoded row too large to capture (pg_flashback.max_row_size) must freeze the stream, not be silently promoted as a data-less delta"
+    },
     "leaf_partition_restore_reattach.sql": {
       "class": "infra",
       "reason": "leaf partition track rejection"
@@ -170,10 +186,6 @@
     "legacy_snapshot_paths_fail_closed.sql": {
       "class": "infra",
       "reason": "proves pre-generation legacy snapshot APIs fail closed under WAL coverage"
-    },
-    "large_row_capture_honesty.sql": {
-      "class": "infra",
-      "reason": "a decoded row too large to capture (pg_flashback.max_row_size) must freeze the stream, not be silently promoted as a data-less delta"
     },
     "lifecycle_resolver_ambiguity_failclosed.sql": {
       "class": "infra",
@@ -224,6 +236,14 @@
       "class": "supported-core",
       "reason": "non-public schema restore via seam"
     },
+    "online_boundary_bind.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 6: flashback_internal_bind_online_boundary marker-transaction authority regressions (happy path, CAS/no-bypass, marker rollback with durable reservation, adversarial DDL drift)"
+    },
+    "online_reservation_authority.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 5: online-reservation authority (snapshot+generation atomic bind, admission check, operation_nonce uniqueness) regressions"
+    },
     "operation_journal_restore_log_authority.sql": {
       "class": "infra",
       "reason": "restore_log must be populated only from the operation journal's own terminal transition (failed/abandoned), never eagerly written before the outcome is known"
@@ -244,6 +264,10 @@
       "class": "supported-core",
       "reason": "post-restore checkpoint via seam"
     },
+    "pre_drop_schema_drift_failclosed.sql": {
+      "class": "supported-core",
+      "reason": "uncaptured related-object metadata drift must abort DROP before stale-schema recovery can be promised"
+    },
     "production_capture_surface_absent.sql": {
       "class": "supported-core",
       "reason": "catalog asserts no legacy trigger-capture CREATE surface"
@@ -253,29 +277,17 @@
       "adversarial_fixture": true,
       "reason": "adversarial-fixture: production must not trust synthetic streams/names under wal"
     },
+    "protect_online_authority.sql": {
+      "class": "infra",
+      "reason": "SQL authority tests for the online external_zstd initial-protection entrypoints (protect_online.sql)"
+    },
+    "protect_reconcile_authority.sql": {
+      "class": "infra",
+      "reason": "SQL authority tests for the protect reconciliation projection, abort authority, and bounded reconciler (protect_reconcile.sql)"
+    },
     "rbac_enforcement.sql": {
       "class": "infra",
       "reason": "RBAC grant surface; legacy capture APIs absent"
-    },
-    "state_authority_transitions.sql": {
-      "class": "infra",
-      "reason": "centralized state/progress/lock/journal authority regressions"
-    },
-    "online_reservation_authority.sql": {
-      "class": "infra",
-      "reason": "Step 9 Stage 5: online-reservation authority (snapshot+generation atomic bind, admission check, operation_nonce uniqueness) regressions"
-    },
-    "snapshot_stack_abort_regression.sql": {
-      "class": "infra",
-      "reason": "Step 9 Stage 6: real PostgreSQL ERROR/cancel regression proving PushActiveSnapshot/PopActiveSnapshot balance after a genuine transaction/subtransaction abort"
-    },
-    "online_boundary_bind.sql": {
-      "class": "infra",
-      "reason": "Step 9 Stage 6: flashback_internal_bind_online_boundary marker-transaction authority regressions (happy path, CAS/no-bypass, marker rollback with durable reservation, adversarial DDL drift)"
-    },
-    "tracked_table_resolver_search_path.sql": {
-      "class": "infra",
-      "reason": "tracked-table name resolution without writable search_path"
     },
     "recover_deleted_rows.sql": {
       "class": "supported-core",
@@ -285,25 +297,25 @@
       "class": "supported-core",
       "reason": "dropped table restore via seam"
     },
-    "restore_parallel_basic.sql": {
+    "restore_metadata_domain_type.sql": {
       "class": "supported-core",
-      "reason": "parallel restore via seam"
+      "reason": "domain column metadata cache coverage via seam"
     },
     "restore_metadata_enum_type.sql": {
       "class": "supported-core",
       "reason": "enum column metadata cache coverage via seam"
     },
-    "restore_metadata_domain_type.sql": {
-      "class": "supported-core",
-      "reason": "domain column metadata cache coverage via seam"
-    },
     "restore_metadata_no_pk_table.sql": {
       "class": "supported-core",
       "reason": "primary-key-less table metadata cache coverage via seam"
     },
-    "pre_drop_schema_drift_failclosed.sql": {
+    "restore_parallel_basic.sql": {
       "class": "supported-core",
-      "reason": "uncaptured related-object metadata drift must abort DROP before stale-schema recovery can be promised"
+      "reason": "parallel restore via seam"
+    },
+    "restore_proof_fingerprint_v2.sql": {
+      "class": "supported-core",
+      "reason": "restore data fingerprint proves row content, not heap layout: duplicate multiplicity, physical rewrite, NULL/TOAST, and rejection of an order_spec naming an unknown column"
     },
     "restore_verify_adversarial_metadata.sql": {
       "class": "infra",
@@ -321,10 +333,6 @@
       "class": "supported-core",
       "reason": "RLS restore via seam"
     },
-    "schema_collation_roundtrip.sql": {
-      "class": "supported-core",
-      "reason": "qualified column collation capture, recreation and independent catalog verification"
-    },
     "schema_add_column_restore_old_time.sql": {
       "class": "supported-core",
       "reason": "add column restore via seam"
@@ -332,6 +340,10 @@
     "schema_alter_type_restore.sql": {
       "class": "supported-core",
       "reason": "alter type restore via seam"
+    },
+    "schema_collation_roundtrip.sql": {
+      "class": "supported-core",
+      "reason": "qualified column collation capture, recreation and independent catalog verification"
     },
     "schema_drop_column_restore_old_time.sql": {
       "class": "supported-core",
@@ -353,13 +365,25 @@
       "class": "infra",
       "reason": "slot health actions"
     },
+    "snapshot_stack_abort_regression.sql": {
+      "class": "infra",
+      "reason": "Step 9 Stage 6: real PostgreSQL ERROR/cancel regression proving PushActiveSnapshot/PopActiveSnapshot balance after a genuine transaction/subtransaction abort"
+    },
     "snapshot_store_contract.sql": {
       "class": "infra",
       "reason": "SnapshotStore create/resolve/require_available/materialize/retire regression suite"
     },
+    "state_authority_transitions.sql": {
+      "class": "infra",
+      "reason": "centralized state/progress/lock/journal authority regressions"
+    },
     "subtxn_rollback_restore.sql": {
       "class": "supported-core",
       "reason": "subtransaction restore via seam"
+    },
+    "tracked_table_resolver_search_path.sql": {
+      "class": "infra",
+      "reason": "tracked-table name resolution without writable search_path"
     },
     "unsupported_capture_mode_rejected.sql": {
       "class": "supported-core",
@@ -400,26 +424,6 @@
     "wal_test_seam_contract.sql": {
       "class": "supported-core",
       "reason": "seam contract regressions under wal"
-    },
-    "capturing_health_doctor.sql": {
-      "class": "infra",
-      "reason": "flashback_doctor()/flashback_health() correctness for the 'capturing' pending protect state -- never reports healthy/protected before protection_state=active"
-    },
-    "capturing_state_authority.sql": {
-      "class": "infra",
-      "reason": "structural invariants around the 'capturing' coverage_generations state, exercised directly against the SQL authority functions"
-    },
-    "protect_online_authority.sql": {
-      "class": "infra",
-      "reason": "SQL authority tests for the online external_zstd initial-protection entrypoints (protect_online.sql)"
-    },
-    "protect_reconcile_authority.sql": {
-      "class": "infra",
-      "reason": "SQL authority tests for the protect reconciliation projection, abort authority, and bounded reconciler (protect_reconcile.sql)"
-    },
-    "constraint_def_canonical_roundtrip.sql": {
-      "class": "supported-core",
-      "reason": "constraint definitions compare stably across a PostgreSQL re-render (IN-list over varchar round-trip)"
     }
   },
   "schema_version": 1
