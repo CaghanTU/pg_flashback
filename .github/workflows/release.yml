@@ -137,7 +137,7 @@ jobs:
 
       - name: Verify archive set and generate checksums
         run: |
-          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
           (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
           (cd dist && sha256sum -c SHA256SUMS)
 

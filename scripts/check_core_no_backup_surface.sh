@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Fail if the supported core tree carries any pgBackRest-backed recovery
-# surface. The experimental backup prototype is deferred, not shipped
-# (docs/DEFERRED_BACKUP.md); this keeps it from silently creeping back into
-# the generated install SQL, the core Rust, or the packaging scripts.
+# surface. This keeps physical-backup/provider code from silently creeping
+# back into the generated install SQL, core Rust, or packaging scripts.
 #
 # Scans: the generated core install SQL, src/*.rs, and scripts/*.sh (the
-# packaging surface). The single deferred-history note in docs/ is exempt by
-# construction — docs/ is not scanned.
+# packaging surface). Documentation is not scanned.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

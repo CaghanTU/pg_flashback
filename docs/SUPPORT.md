@@ -1,9 +1,8 @@
 # Support matrix
 
 This document defines the current local DROP-recovery contract (`local_delta`
-+ logical WAL). This is the only supported product path. Physical-backup
-recovery is deferred and not part of the tree (see
-[deferred backup](DEFERRED_BACKUP.md)).
++ logical WAL). This is the only supported product path. pg_flashback is not a
+physical backup product and does not replace a cluster-level backup system.
 
 Capacity is sized by **protected table size**, **change rate**, and **free
 disk**, not by total database size. The three capacity GUCs
@@ -26,7 +25,7 @@ fail closed. Use `pg_flashback config recommend` for read-only advice.
 | `capture_mode` | Deprecated compatibility GUC; only `wal` is valid |
 | DML capture triggers | Not installed on user tables |
 | Ordinary (non-internal) triggers | Preserved through protect/restore |
-| SnapshotStore backend | `heap_v1` (default) or `external_zstd` (supported opt-in production backend); see below |
+| SnapshotStore backend | `heap_v1` (default) or `external_zstd` (opt-in technical preview); see below |
 | `output_plugin_libraries` | Required on current security-patched PostgreSQL minors (15.19/16.15/17.11/18.6+); not applicable on older minors that lack the GUC |
 
 Native macOS is not supported. Linux/aarch64 development under Lima and
@@ -38,11 +37,10 @@ is not silently generalized to the other.
 | Backend | Status | Notes |
 |---|---|---|
 | `heap_v1` | Default | Base image stored inside PostgreSQL as an ordinary heap table |
-| `external_zstd` | Supported opt-in production backend | Base image streamed as a zstd-compressed artifact to `pg_flashback.external_snapshot_root` (0700, outside PGDATA/tablespaces, explicit min-free/reserve budgets required). Activated per table via `pg_flashback maintain TABLE --yes`. Not yet qualified at 10/25/50 GiB scale or a 24-hour soak — see [DEVELOPMENT.md](DEVELOPMENT.md). |
+| `external_zstd` | Opt-in technical preview | Base image streamed as a zstd-compressed artifact to `pg_flashback.external_snapshot_root` (0700, outside PGDATA/tablespaces, explicit min-free/reserve budgets required). Used in successful 10 GiB mixed and TOAST-heavy qualification runs on commit `7b77476`; 25/50 GiB and the final 24-hour soak are not claimed. |
 
-`external_zstd` is a local/attached-filesystem SnapshotStore, not a backup
-product; see [Physical-backup subsystem (deferred)](#physical-backup-subsystem-deferred)
-below.
+`external_zstd` is a local/attached-filesystem SnapshotStore, not an off-host
+backup product.
 
 ## Tables
 
@@ -162,8 +160,8 @@ successful verified recovery.
 | Upgrade from legacy trigger installs | Flush old `staging_events` (previous binary) or unprotect/drain, then upgrade; nonempty staging refuses WAL-only migration |
 | PostgreSQL major `pg_upgrade` | Not yet a supported workflow |
 
-## Physical-backup subsystem (deferred)
+## Explicit non-goals
 
-The physical-backup recovery prototype has been removed from the tree and its
-redesign is deferred; see [deferred backup](DEFERRED_BACKUP.md). There is no
-supported large-database or backup-provider claim.
+The extension does not manage physical backups, archived-WAL repositories,
+remote backup retention, or whole-cluster disaster recovery. Use pgBackRest or
+another proven backup system for those responsibilities.

@@ -10,8 +10,7 @@
 # must never be substituted for scripts/build_candidate_archive.sh when
 # producing evidence for a qualification run or a release.
 #
-# The experimental physical-backup recovery prototype is not part of the
-# supported tree; see docs/DEFERRED_BACKUP.md.
+# Physical-backup recovery is outside this table-level product's scope.
 #
 # Usage:
 #   PG_MAJOR=17 ./scripts/build_local_package.sh
@@ -147,7 +146,7 @@ jq -n \
         shared_object_sha256:$so,
         cli_binary_sha256:$cli
       },
-      notes:["Supported product is local_delta/exact-WAL DROP recovery only; the physical-backup recovery prototype is deferred (docs/DEFERRED_BACKUP.md)."]
+      notes:["Supported product is local_delta/exact-WAL table-level DROP recovery only; physical backup is outside its scope."]
     }' > "$STAGE/$ARCHIVE_ROOT/MANIFEST.json"
 
 # Minimal SPDX-ish SBOM stub (file inventory).

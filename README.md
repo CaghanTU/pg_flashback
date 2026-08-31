@@ -4,12 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Recover an accidentally dropped PostgreSQL table without restoring the whole
-database.
-
-pg_flashback keeps a protected base image of a table, captures later changes
-from logical WAL, detects `DROP TABLE`, and reconstructs the last proven state
-before the DROP. The normal recovery command does not ask the operator for an
-LSN or a timestamp.
+cluster.
 
 ```console
 $ pg_flashback protect public.orders
@@ -17,117 +12,129 @@ Protection enabled for public.orders.
 
 # Later: DROP TABLE public.orders;
 
-$ pg_flashback recover public.orders
+$ pg_flashback recover public.orders --dry-run
 DROP found for public.orders.
 Recovery point: immediately before the DROP
 Status: recoverable
-Recover public.orders? [y/N]
+
+$ pg_flashback recover public.orders --yes
+Recovery verified.
 ```
 
-> pg_flashback is under active development. The primary product is local
-> recovery (`local_delta` + WAL) for small and medium ordinary PostgreSQL
-> tables. Capacity is sized by protected table size, change rate, and free
-> disk — not by whole-database size. Physical-backup recovery is deferred and
-> not part of the supported product. Test in staging before
-> production use.
+pg_flashback keeps a transactionally aligned base image for each protected
+table, captures later committed changes from logical WAL, records the exact
+`DROP TABLE` event, and reconstructs the last proven state before that DROP.
+The operator does not need to choose an LSN.
 
-## Why pg_flashback?
+## Project status
 
-A normal point-in-time recovery restores an entire PostgreSQL cluster to a
-separate location, replays WAL, and then extracts the missing table.
-pg_flashback provides a narrower recovery path for a common incident:
+**Experimental technical preview. Test it in staging; do not treat it as your
+only backup.**
 
-- protect selected tables rather than restore the whole cluster;
-- recover the latest safe point before an accidental DROP;
-- restore data, table definition, indexes, constraints, identity sequences,
-  owner, and ACLs;
-- refuse recovery when the available evidence is incomplete or ambiguous.
+The current code is a real, working table-level DROP recovery engine, but it
+has an intentionally narrow support contract and a high recovery cost. The
+qualified envelope for the public preview is:
 
-Local protection does not require any external backup product. It does consume
-additional database storage for the base image and retained changes.
+- PostgreSQL 15, 16, 17, and 18 on Linux;
+- one protected ordinary, permanent, logged table;
+- full-table recovery after an ordinary `DROP TABLE`;
+- table sizes up to 10 GiB in the measured mixed-row and TOAST-heavy shapes;
+- exact-WAL capture with fail-closed coverage and post-recovery verification.
 
-## Supported scope
+The 10 GiB qualification on commit `7b77476` completed with 115 checks and no
+failures. It included concurrent writes, DROP discovery, full logical data
+fingerprints, schema/metadata checks, artifact integrity, and successor
+coverage.
 
-The local recovery path supports:
+| 10 GiB data shape | Protect | Recover | Compressed base image |
+|---|---:|---:|---:|
+| Mixed rows | about 14 minutes | about 102 minutes | about 1.1 GiB (8.9x) |
+| TOAST-heavy | about 52 minutes | about 52 minutes | about 4.0 GiB (2.6x) |
 
-- PostgreSQL 15, 16, 17, and 18;
-- ordinary permanent `LOGGED` tables;
-- primary and secondary indexes, named/deferrable primary keys, unique and
-  check constraints;
-- qualified column collations;
-- identity/serial sequences (restored to a safe recovered-data edge), TOAST
-  values, quoted identifiers, and
-  non-`public` schemas;
-- `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and ordinary `DROP TABLE`;
-- PostgreSQL restart and background-worker restart without losing confirmed
-  WAL coverage.
+These are measurements from one qualification host, not universal performance
+promises. PostgreSQL configuration, storage, row width, TOAST behavior, change
+rate, and indexes materially change the result.
 
-pg_flashback rejects unsupported or unproven cases instead of guessing. The
-current local product does not support partitioned, foreign, temporary,
-`UNLOGGED`, or materialized-view targets. Recovery is also rejected across a
-lost logical slot, a coverage gap, an ambiguous DROP, an identity conflict, or
-unsupported `DROP ... CASCADE` dependencies.
+Not yet claimed:
 
-See [the support matrix](docs/SUPPORT.md) for the precise contract.
+- 25 GiB or 50 GiB support;
+- a final 24-hour soak on this candidate;
+- live-table PITR as a public workflow;
+- multi-table atomic recovery;
+- row-level `DELETE`/`UPDATE` undo. The engine captures those changes and the
+  privileged `changes` command can inspect them, but safe partial-row recovery
+  is not productized.
+
+See [the support matrix](docs/SUPPORT.md) for the exact accepted and rejected
+schema features and [qualification](docs/QUALIFICATION.md) for the measured
+envelope and its limitations.
+
+## How this differs from pgBackRest
+
+pgBackRest and pg_flashback both combine a base copy with WAL, but they solve
+different recovery problems.
+
+**pgBackRest is physical disaster recovery.** It backs up PostgreSQL data
+files for the cluster and archives WAL. To recover one dropped table, the
+usual procedure is to restore a backup into a separate PostgreSQL instance,
+replay the cluster to just before the DROP, export the table, and import it
+back into production. pgBackRest is mature, supports incremental/differential
+backups, retention, remote repositories, and large databases.
+
+**pg_flashback is selective operational recovery.** It protects chosen tables,
+stores their schema and table-level base image, decodes later row changes, and
+rebuilds only the dropped table. It avoids restoring and running a second copy
+of the whole cluster, but pays for that granularity with per-table capture,
+metadata reconstruction, verification, and substantial temporary disk use.
+
+pg_flashback therefore **does not replace pgBackRest**. A sensible deployment
+uses pgBackRest (or another proven backup system) for disaster recovery and,
+if its measured cost is acceptable, pg_flashback as an additional fast-path
+for a narrow class of accidental table drops.
+
+## The cost, honestly
+
+Normal protection with the `external_zstd` SnapshotStore held roughly
+1.1–4.0 GiB of compressed base-image data for the measured 10 GiB tables,
+plus retained WAL-derived changes.
+
+Recovery is more expensive. The current path temporarily materializes the
+restored table, builds indexes and metadata, creates a successor snapshot, and
+verifies the result. After the streaming proof improvement, the measured
+10 GiB mixed recovery still used roughly:
+
+- 10 GiB for the reconstructed table;
+- about 9.5 GiB for the current `heap_v1` successor snapshot;
+- about 9.5 GiB of temporary work at peak;
+- the existing compressed base image, retained changes/WAL, indexes, and
+  safety headroom.
+
+Plan for the capacity recommendation from `pg_flashback config recommend`,
+not just the source table size. Protection and recovery fail closed when the
+configured budgets or filesystem space are insufficient.
 
 ## Requirements
 
-- A supported PostgreSQL server and matching development/package files
-- `wal_level = logical` (required; capture is WAL-only)
+- PostgreSQL 15–18 on Linux
+- Rust 1.85+ and `cargo-pgrx` 0.16.1 when building from source
+- `wal_level = logical`
 - `shared_preload_libraries = 'pg_flashback'`
-- On current security-patched PostgreSQL minors (15.19/16.15/17.11/18.6+),
-  `pg_flashback` must be present in `output_plugin_libraries`. That GUC is
-  a **list**: if the server already allowlists other logical output
-  plugins, merge `pg_flashback` into the existing list (e.g.
-  `output_plugin_libraries = 'wal2json, pg_flashback'`) — never replace it
-  with a bare `'pg_flashback'`, which would silently drop the others. Older
-  minors do not have this GUC; leave it unset there. `pg_flashback config
-  recommend`/`doctor` read the server's current value and emit the
-  correctly merged line. See [Quickstart](docs/QUICKSTART.md#current-postgresql-minors-output_plugin_libraries).
-- An admitted capture worker and a logical replication slot per configured
-  database (`pg_flashback.target_databases`)
-- Explicit capacity budgets:
-  `pg_flashback.local_max_snapshot_bytes`,
-  `pg_flashback.local_max_restore_peak_bytes`,
-  `pg_flashback.local_min_filesystem_bytes`
-- Enough `max_worker_processes` capacity for one capture worker and one
-  maintenance worker per configured database
-- `psql` and `jq` for the `pg_flashback` command
+- `psql` and `jq` for the operator CLI
+- one logical replication slot and capture/maintenance worker capacity per
+  configured database
+- explicit snapshot, restore-peak, and minimum-free-space budgets
 
-`track_commit_timestamp` is **not** required. `pg_flashback.capture_mode` is a
-deprecated compatibility GUC; only `wal` is valid (`trigger` and `auto` fail
-closed). pg_flashback does **not** install DML capture triggers on user tables;
-ordinary user triggers are preserved through protect/restore.
+Current security-patched PostgreSQL minors also require `pg_flashback` in the
+`output_plugin_libraries` list. Do not overwrite an existing allowlist;
+`pg_flashback config recommend` prints a merged recommendation.
 
-See [Quickstart](docs/QUICKSTART.md) and
-[`docs/samples/postgresql.pg_flashback.conf`](docs/samples/postgresql.pg_flashback.conf).
-Use `pg_flashback config recommend` for read-only conf line suggestions.
-Day-to-day operations should use a login role granted `flashback_admin`
-(`pgfb_operator` in the Quickstart), not a standing superuser session.
+`track_commit_timestamp` is not required. DML capture is WAL-only; the
+extension does not install capture triggers on user tables.
 
-## Installation
+## Build and install
 
-### From a release archive
-
-Use the archive matching the PostgreSQL major version reported by
-`pg_config`.
-
-```bash
-test "$(cat PG_MAJOR)" = \
-  "$(pg_config --version | awk '{print $2}' | cut -d. -f1)"
-
-sudo install -m 0755 lib/pg_flashback.so \
-  "$(pg_config --pkglibdir)/pg_flashback.so"
-sudo install -m 0644 share/extension/pg_flashback.control \
-  share/extension/pg_flashback--*.sql \
-  "$(pg_config --sharedir)/extension/"
-sudo install -m 0755 bin/pg_flashback /usr/local/bin/pg_flashback
-```
-
-### From source
-
-Install Rust 1.85 or newer and `cargo-pgrx` 0.16.1, then initialize the target
-PostgreSQL installation once:
+This preview is currently distributed from source. Initialize pgrx with the
+matching PostgreSQL installation and install the extension:
 
 ```bash
 cargo install --locked cargo-pgrx --version 0.16.1
@@ -138,90 +145,75 @@ sudo install -m 0755 scripts/pg_flashback /usr/local/bin/pg_flashback
 
 Replace `pg17` with `pg15`, `pg16`, or `pg18` as appropriate.
 
-## Configuration
-
-Add the extension and protected databases to `postgresql.conf`:
+Add a minimal configuration for the target database:
 
 ```conf
 shared_preload_libraries = 'pg_flashback'
 wal_level = logical
+max_worker_processes = 16
+max_replication_slots = 8
+max_wal_senders = 8
 
+pg_flashback.enabled = on
 pg_flashback.target_databases = 'appdb'
 pg_flashback.max_workers = 4
+
+# Mandatory admission budgets; size these for your tables and host.
+pg_flashback.local_max_snapshot_bytes = '16GB'
+pg_flashback.local_max_restore_peak_bytes = '40GB'
+pg_flashback.local_min_filesystem_bytes = '45GB'
+pg_flashback.local_safety_reserve_bytes = '1GB'
 ```
 
-Each configured database uses two background-worker slots. Restart PostgreSQL
-after changing these startup settings, then install the SQL extension in every
-configured database:
-
-```bash
-psql -d appdb -c "CREATE EXTENSION pg_flashback;"
-pg_flashback doctor
-```
-
-`doctor` reports configuration, worker, slot, storage, and coverage problems
-with a non-zero exit status.
-
-## Protect and recover a table
-
-Create or choose an ordinary table:
-
-```sql
-CREATE TABLE public.orders (
-    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    customer text NOT NULL,
-    total numeric(12,2) NOT NULL
-);
-```
-
-Enable protection and wait for healthy coverage:
+The values above are examples, not sizing advice. See the complete
+[sample configuration](docs/samples/postgresql.pg_flashback.conf), restart
+PostgreSQL, then install the SQL extension:
 
 ```bash
 export PGDATABASE=appdb
+psql -c 'CREATE EXTENSION pg_flashback;'
+pg_flashback config recommend
+pg_flashback doctor
+```
+
+Do not proceed until `doctor` reports that the workers, slot, storage root,
+and capacity settings are healthy.
+
+## Protect and recover
+
+Use a dedicated login role granted `flashback_admin` for normal operations;
+reserve superuser access for installation and configuration.
+
+```bash
+export PGDATABASE=appdb
+
 pg_flashback protect public.orders
 pg_flashback status public.orders
-```
 
-Before protection starts, pg_flashback checks table topology, worker
-availability, write-stall limits, configured storage budgets, and filesystem
-free space. The initial base image is stored inside PostgreSQL (the `heap_v1`
-backend) unless an external SnapshotStore has been configured and activated;
-see [SnapshotStore backends](#snapshotstore-backends) below.
-
-After an accidental DROP:
-
-```sql
-DROP TABLE public.orders;
-```
-
-Preview the recovery without changing the database:
-
-```bash
+# After an accidental DROP:
 pg_flashback recover public.orders --dry-run
+pg_flashback recover public.orders --yes
 ```
 
-Recover interactively, or explicitly confirm a non-interactive operation:
+The dry run identifies the exact DROP, recovery boundary, dependencies, and
+coverage status. Execution recomputes the plan, restores a shadow relation,
+verifies the live result against an independently derived proof, swaps it into
+place, and establishes successor coverage before reporting success.
 
-```bash
-pg_flashback recover public.orders
-pg_flashback recover public.orders --latest-drop --yes
-```
-
-Recovery is journaled. A successful operation is not reported as verified
-until the reconstructed table and its successor coverage have passed the
-post-recovery checks.
-
-## Operator commands
+Useful operator commands:
 
 ```text
 pg_flashback version
+pg_flashback config recommend [TABLE]
 pg_flashback doctor [--reconcile] [--all-databases]
 pg_flashback protect TABLE
+pg_flashback protect-abort OPERATION_ID --yes
 pg_flashback list
-pg_flashback status [TABLE] [--all-databases]
+pg_flashback status [TABLE]
 pg_flashback history [TABLE]
 pg_flashback changes [TABLE]
 pg_flashback recover TABLE [--dry-run] [--latest-drop] [--yes]
+pg_flashback maintain TABLE [--dry-run|--yes]
 pg_flashback unprotect TABLE --yes
 pg_flashback cleanup --tracking-id ID [--dry-run] --yes
 ```
@@ -230,171 +222,70 @@ Global `--json` and `--verbose` flags may appear before or after the command.
 The CLI uses normal libpq environment variables and `.pgpass`; it does not
 store passwords.
 
-`history` shows lifecycle and recovery operations. `changes` can expose old
-and new row values and therefore has a stricter authorization boundary.
+## Snapshot storage
 
-## How recovery works
+- `heap_v1` is the conservative default. It stores the base image inside
+  PostgreSQL as another heap table.
+- `external_zstd` is an opt-in local/attached-filesystem backend. It streams
+  a compressed artifact outside PGDATA, verifies it before activation, and
+  supports resumable/reconciled online protection. It is the backend used for
+  the measured 10 GiB protection runs.
 
-1. `protect` takes a transactionally aligned base image and creates an active
-   coverage generation.
-2. A logical decoding slot observes committed row and DDL changes.
-3. The capture worker records only complete transactions and advances a proven
-   COMMIT-LSN watermark.
-4. The DDL hook records the DROP and its dependency manifest inside the
-   original transaction.
-5. `recover --dry-run` selects the latest unambiguous DROP and builds a
-   recovery plan.
-6. `recover` recomputes that plan, materializes a shadow table, verifies it,
-   swaps it into place, and creates a new coverage generation.
+`external_zstd` is not an object-store backup and is not a substitute for an
+off-host backup. Its root must be outside PGDATA and all tablespaces, owned by
+the PostgreSQL server user, mode `0700`, and protected by explicit free-space
+and reserve budgets. See [Quickstart](docs/QUICKSTART.md) for configuration.
 
-If the slot is lost, WAL continuity cannot be proven, the schema is
-unsupported, or a newer same-name relation exists, recovery stops without
-modifying the live database.
+## Supported and rejected cases
 
-See [architecture](docs/ARCHITECTURE.md) for the invariants behind this model.
+The supported target is an ordinary permanent `LOGGED` table. The proven
+contract includes ordinary columns, primary/unique/check constraints, outgoing
+foreign keys, plain btree indexes, identity/serial sequences, table owner and
+ACL, basic RLS policies, comments, ordinary triggers, quoted identifiers, and
+non-`public` schemas.
 
-## SnapshotStore backends
+The compatibility gate rejects unproven structures before protection or
+recovery. Examples include partitioned/inherited/foreign/temporary/unlogged
+tables, incoming foreign keys, generated columns, exclusion constraints,
+rules, publications, column-level ACLs, non-btree/expression/partial indexes,
+custom tablespaces, and unsupported `DROP ... CASCADE` dependency graphs.
 
-pg_flashback stores each protected table's base image (and, after `maintain`,
-each successor boundary) through a pluggable SnapshotStore. Two backends are
-supported:
+If WAL continuity is lost, a row exceeds the configured decoder limit, the
+DROP identity is ambiguous, or metadata cannot be proven, coverage opens a
+durable gap and recovery is refused rather than guessed.
 
-- **`heap_v1`** (default) — the base image lives inside PostgreSQL as an
-  ordinary heap table. No extra configuration; this remains the safe default
-  for now.
-- **`external_zstd`** — a supported, opt-in **production** backend (not a
-  proof of concept) that streams the base image as a zstd-compressed artifact
-  to a filesystem location outside PGDATA, keeping PostgreSQL's own heap free
-  of the base-image copy. It has been exercised end-to-end (protect, DML,
-  DROP, recover, crash/abort, doctor) as part of this repository's real
-  PostgreSQL test suites, but has not yet been qualified at 10/25/50 GiB
-  scale or over a 24-hour soak — see
-  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+## Architecture in one paragraph
 
-`heap_v1` remains the default; nothing changes it automatically. Switching a
-table's *next* boundary to `external_zstd` is an explicit operator action via
-`pg_flashback maintain TABLE --yes` after setting
-`pg_flashback.snapshot_storage_backend = 'external_zstd'`.
+Protection creates a transactionally aligned base image and coverage
+generation. A logical output plugin and background worker record complete
+committed row/DDL changes and advance a proven COMMIT-LSN watermark. A DDL hook
+binds the DROP event to its pre-DROP dependency manifest. Recovery materializes
+a shadow table from the base plus its exact WAL prefix, rebuilds metadata,
+compares independent expected and actual fingerprints, atomically swaps the
+table, and records the result in an append-only operation journal.
 
-### external_zstd requirements
-
-- `pg_flashback.external_snapshot_root` — an existing directory **outside
-  PGDATA and outside any tablespace directory**, owned by the PostgreSQL
-  server user with mode `0700`. pg_flashback refuses to activate the backend
-  otherwise.
-- `pg_flashback.external_snapshot_min_free_bytes` and
-  `pg_flashback.external_snapshot_safety_reserve_bytes` — explicit,
-  positive minimum-free and reserve budgets for that filesystem; there is no
-  implicit "use whatever is left" behavior.
-- `pg_flashback.external_snapshot_batch_rows`, `.external_snapshot_zstd_level`,
-  and `.external_snapshot_max_row_bytes` — row-batching and compression
-  tuning; sensible defaults are used if unset.
-
-### Online protect/maintain orchestration
-
-Creating or moving a boundary onto `external_zstd` never holds a long lock and
-never blocks writers. It runs as four separate, individually committed
-server-side transactions (`flashback_protect_begin` →
-`flashback_protect_prepare_replica_identity` →
-`flashback_protect_external_copy` → `flashback_protect_external_publish`, with
-the analogous `flashback_maintain_*` calls for re-anchoring an already-tracked
-table): a brief `SHARE ROW EXCLUSIVE` marker transaction records the boundary,
-a background copier streams the compressed artifact while the table stays
-fully writable, and only once the artifact is verified and WAL capture has
-caught up to the boundary does a final transaction publish and activate it.
-The CLI drives this sequence for you (`pg_flashback protect`/`maintain`); the
-underlying SQL functions exist for advanced/scripted use.
-
-Between the marker commit and activation, the generation is in a
-**`capturing`** state: WAL is already being absorbed for it, but it is not yet
-a recoverable boundary. A crash or `protect-abort` during this window is
-reconciled safely — an interrupted reservation is either resumed or cleanly
-aborted (its partial artifact retired), never left half-published. The CLI
-exposes this via `pg_flashback protect-abort OPERATION_ID --yes` when
-`status` reports a blocked in-progress protect.
-
-### Health, integrity, and retirement
-
-`pg_flashback doctor` and `pg_flashback status` report the active backend
-(`snapshot_storage_backend`), the external root's health
-(`external_snapshot_root`), and each generation's `snapshot_payload_state`
-(e.g. `available` once the artifact is verified). A superseded generation's
-external artifact is retired (its on-disk payload removed) only once no
-recovery path can still need it and the configured retention interval has
-elapsed — `cleanup`/retention never deletes payload a proven recovery target
-still depends on.
-
-### What is still deferred
-
-Backup-provider integration (pgBackRest or otherwise) is not part of the
-supported core regardless of SnapshotStore backend — see
-[Physical-backup recovery (deferred)](#physical-backup-recovery-deferred).
-`external_zstd` is a local/attached-filesystem SnapshotStore, not a backup
-target.
-
-## Storage and retention
-
-Local protection trades storage for fast, table-level recovery. Space usage is
-primarily:
-
-- one base image per active protected lifecycle, inside PostgreSQL
-  (`heap_v1`) or on the configured external filesystem root
-  (`external_zstd`, compressed);
-- retained WAL-derived row changes;
-- temporary peak space while a recovery is materialized.
-
-Use these commands to inspect the current state:
-
-```bash
-pg_flashback status
-pg_flashback doctor
-psql -c "SELECT * FROM flashback_advise('public.orders'::regclass);"
-psql -c "SELECT * FROM flashback_retention_status();"
-```
-
-`unprotect` first closes the WAL boundary; `cleanup` removes an inactive
-lifecycle only when its recovery evidence is no longer needed. Cleanup is
-explicit and supports a dry run.
-
-## Physical-backup recovery (deferred)
-
-An experimental physical-backup recovery prototype (for larger tables, via an
-existing backup plus archived WAL) used to live here. It has been removed from
-the supported tree and its redesign is deferred; the supported product is
-local DROP recovery only. See [deferred backup](docs/DEFERRED_BACKUP.md).
-
-## Documentation
-
-- [Quickstart](docs/QUICKSTART.md)
-- [Support matrix](docs/SUPPORT.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Testing and development](docs/DEVELOPMENT.md)
-- [Deferred backup recovery](docs/DEFERRED_BACKUP.md)
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
+Read [Architecture](docs/ARCHITECTURE.md) for the invariants and
+[Support](docs/SUPPORT.md) for the precise contract.
 
 ## Development
+
+Fast local checks:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --no-default-features --features pg17 -- -D warnings
-cargo pgrx test pg17
+RUST_TEST_THREADS=1 cargo pgrx test pg17
+python3 scripts/check_integration_inventory.py
 ```
 
-The full PostgreSQL 15–18 matrix, WAL recovery suites, destructive DROP tests,
-upgrade tests, package smoke tests, and longer stability tests are documented
-in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Generated logs and qualification
-artifacts belong under `target/`, not in the source tree.
+The full matrix covers PostgreSQL 15–18, generated-SQL surface checks,
+exact-WAL/DROP adversarial suites, package installation, crash/restart paths,
+RBAC, and SnapshotStore failpoints. See
+[Development](docs/DEVELOPMENT.md) before running destructive or long-lived
+qualification scripts.
 
-## Security
+## License and security
 
-The extension is installed by a PostgreSQL superuser. Mutating recovery
-operations require dedicated roles and use deny-by-default grants. Snapshot and
-change data must be treated with the same sensitivity as the protected table.
-
-Report vulnerabilities through GitHub private vulnerability reporting. See
-[SECURITY.md](SECURITY.md).
-
-## License
-
-MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT licensed. See [SECURITY.md](SECURITY.md) for private vulnerability
+reporting. Snapshot and WAL-derived payloads contain user data and must be
+protected with the same controls as the source database.

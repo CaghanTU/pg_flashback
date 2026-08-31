@@ -166,7 +166,7 @@ tar -tzf "$ORIG_CANDIDATE_DIR/$EXT_ARCHIVE" > "$EXT_LIST"
 ARCHIVE_CONTENT_OK=1
 for required in LICENSE SECURITY.md THIRD_PARTY_NOTICES.md README.md \
     docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
-    docs/DEVELOPMENT.md docs/DEFERRED_BACKUP.md; do
+    docs/DEVELOPMENT.md; do
     rg -F "/$required" "$EXT_LIST" >/dev/null || ARCHIVE_CONTENT_OK=0
 done
 rm -f "$EXT_LIST"

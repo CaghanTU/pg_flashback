@@ -56,3 +56,11 @@ compile_commands.json
 
 # Personal planning notes
 ROADMAP.md
+/PLAN.md
+/plans/
+/notes/
+/docs/internal/
+/.claude/
+/.codex/
+*.bundle
+*.patch

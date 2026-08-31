@@ -171,7 +171,7 @@ The base image is stored through one of two SnapshotStore backends:
 
 - **`heap_v1`** (default) — inside PostgreSQL as an ordinary heap table,
   created synchronously by `flashback_track()`'s CTAS under a brief lock.
-- **`external_zstd`** (supported opt-in production backend) — streamed as a
+- **`external_zstd`** (opt-in technical preview) — streamed as a
   zstd-compressed artifact to `pg_flashback.external_snapshot_root`, an
   operator-provisioned directory (owner/mode `0700`) outside PGDATA and
   outside any tablespace, with explicit positive
@@ -207,9 +207,9 @@ Internal functions use fixed `search_path` values. Row-change payloads are
 more sensitive than health metadata and are not exposed through the monitoring
 role.
 
-## Physical-backup recovery (deferred)
+## Backup boundary
 
-A prototype that materialized a table from an existing physical backup plus
-archived WAL used to live here. It has been removed from the supported tree
-and its redesign is deferred; see [deferred backup](DEFERRED_BACKUP.md). The
-architecture above describes the local product in full.
+This architecture is table-level operational recovery, not physical backup.
+It does not manage cluster backups, archived-WAL repositories, or off-host
+retention. Those remain the responsibility of pgBackRest or another backup
+system.

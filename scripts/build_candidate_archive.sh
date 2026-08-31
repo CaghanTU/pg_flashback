@@ -96,7 +96,7 @@ printf '%s\n' \
     > "$EXT_DIR/bin/INSTALL.txt"
 cp README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "$EXT_DIR/"
 cp docs/QUICKSTART.md docs/SUPPORT.md docs/ARCHITECTURE.md \
-    docs/DEVELOPMENT.md docs/DEFERRED_BACKUP.md "$EXT_DIR/docs/"
+    docs/DEVELOPMENT.md "$EXT_DIR/docs/"
 mkdir -p "$EXT_DIR/scripts/lib"
 install -m 0755 \
     "$ROOT/scripts/run_clean_host_candidate_smoke.sh" \

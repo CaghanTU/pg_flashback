@@ -24,8 +24,7 @@ topologies are defined in [`docs/SUPPORT.md`](docs/SUPPORT.md).
 Snapshot and WAL-derived row data are as sensitive as the protected source
 table. Monitoring access does not imply permission to read those payloads.
 
-The experimental backup recovery helper and reference controller must run as a
-dedicated, non-root operating-system account with private configuration and
-work directories. That subsystem is outside the current local-product support
-contract; see
-[`docs/EXPERIMENTAL_BACKUP.md`](docs/EXPERIMENTAL_BACKUP.md).
+The `external_zstd` root must be accessible only to the PostgreSQL operating-
+system account and must be protected like database storage. pg_flashback is
+not an off-host backup system; compromise or loss of the database host may also
+compromise or remove locally attached snapshot artifacts.

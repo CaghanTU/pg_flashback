@@ -9,8 +9,8 @@ product.
 Protection cost is driven by **table size**, **change rate**, and **free disk**,
 not by total database size. The supported path is local base image + logical
 WAL capture only (`wal_level=logical`, capture worker + logical slot). There is
-no trigger-based DML capture path and no auto fallback. Physical-backup recovery
-is deferred and not part of the tree (see [deferred backup](DEFERRED_BACKUP.md)).
+no trigger-based DML capture path and no auto fallback. pg_flashback is not a
+physical backup product and does not replace cluster-level backups.
 
 `pg_flashback.capture_mode` is deprecated compatibility wiring: only `wal` is
 operational. `track_commit_timestamp` is not required.
@@ -180,13 +180,13 @@ pg_flashback cleanup --tracking-id <id> --yes
 ## Optional: external SnapshotStore (`external_zstd`)
 
 The base image above was stored inside PostgreSQL (`heap_v1`, the default).
-For a supported opt-in production backend that streams the base image as a
+For the opt-in technical-preview backend that streams the base image as a
 compressed artifact to an external filesystem root instead, set
 `pg_flashback.snapshot_storage_backend = 'external_zstd'` plus
 `pg_flashback.external_snapshot_root` (an 0700 directory outside PGDATA and
 tablespaces) and the required min-free/reserve budgets, then run
 `pg_flashback maintain public.orders --yes` to create and activate the new
-boundary. See [README.md](../README.md#snapshotstore-backends) for the full
+boundary. See [README.md](../README.md#snapshot-storage) for the full
 requirements and the online, non-blocking orchestration behind `maintain`.
 
 ## Next reading
